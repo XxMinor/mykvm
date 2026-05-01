@@ -194,10 +194,11 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
       - name: Build and publish desktop bundles
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tauriScript: npm run tauri
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseName: "MyKVM ${{ needs.prepare.outputs.tag }}"
           releaseBody: ${{ needs.prepare.outputs.release_notes }}
