@@ -28,6 +28,9 @@ export interface Device {
   platform: Platform
   host: string
   transportPort: number
+  quicPort: number
+  transportPublicKey: string
+  protocolVersion: number
   color: string
   online: boolean
   inputReady: boolean
@@ -48,6 +51,7 @@ export interface LayoutState {
   performanceMonitor: boolean
   transportPortMode: TransportPortMode
   transportPort: number
+  quicPort: number
 }
 
 export interface ScreenAdjacency {

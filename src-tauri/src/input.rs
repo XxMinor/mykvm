@@ -1,5 +1,5 @@
 use std::{
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex, OnceLock,
@@ -10,7 +10,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{broadcast_addrs, Device, LayoutState, NativeStageStatus, Screen};
+use crate::{quic_transport, Device, LayoutState, NativeStageStatus, Screen};
 
 const INPUT_PROTOCOL: &str = "mykvm.input.v1";
 const EDGE_TOLERANCE: i32 = 80;
@@ -25,7 +25,6 @@ const MIDDLE_BUTTON_MASK: u64 = 1 << 2;
 
 static INPUT_TX_FAILURES: AtomicU64 = AtomicU64::new(0);
 static INPUT_TX_SKIPS: AtomicU64 = AtomicU64::new(0);
-static INPUT_BROADCAST_ONLY_DEVICES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,7 +39,8 @@ enum Edge {
 struct InputTarget {
     device_id: String,
     target_addr: String,
-    target_port: u16,
+    transport_public_key: String,
+    protocol_version: u16,
     screen_id: String,
     local_screen: Screen,
     layout_local_screen: Screen,
@@ -61,6 +61,8 @@ struct ActiveTarget {
 pub struct ClipboardTarget {
     pub device_id: String,
     pub addr: String,
+    pub transport_public_key: String,
+    pub protocol_version: u16,
     pub expires_at: Option<Instant>,
 }
 
@@ -74,6 +76,10 @@ struct InputPacket {
     origin_device_id: String,
     #[serde(default)]
     origin_port: u16,
+    #[serde(default)]
+    origin_transport_public_key: String,
+    #[serde(default = "default_protocol_version")]
+    origin_protocol_version: u16,
     event: InputEvent,
 }
 
@@ -119,6 +125,7 @@ pub fn start_input_runtime(
     layout: LayoutState,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
+    quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
@@ -136,6 +143,7 @@ pub fn start_input_runtime(
         targets,
         layout_state,
         native_layout,
+        quic_transport,
         stop,
         remote_active,
         clipboard_target,
@@ -179,8 +187,8 @@ fn input_receive_status(layout: &LayoutState) -> NativeStageStatus {
     NativeStageStatus {
         state: "ready".into(),
         detail: format!(
-            "Receiving shared input on the MessagePack transport UDP {}.",
-            layout.transport_port
+            "Receiving shared input on QUIC datagrams at UDP {}.",
+            normalize_quic_port(layout.transport_port, layout.quic_port)
         ),
     }
 }
@@ -189,6 +197,7 @@ fn start_input_capture(
     targets: Vec<InputTarget>,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
+    quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
@@ -198,6 +207,7 @@ fn start_input_capture(
         targets,
         layout_state,
         native_layout,
+        quic_transport,
         stop,
         remote_active,
         clipboard_target,
@@ -210,6 +220,7 @@ fn start_platform_capture(
     targets: Vec<InputTarget>,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
+    quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
@@ -224,17 +235,9 @@ fn start_platform_capture(
     let target_count = targets.len();
 
     thread::spawn(move || {
-        let socket = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(socket) => socket,
-            Err(error) => {
-                let _ = ready_tx.send(Err(format!("failed to open shared input sender: {error}")));
-                return;
-            }
-        };
-
         let local_y_bounds = local_y_bounds(&targets);
         let context = Arc::new(MacCaptureContext {
-            socket,
+            quic_transport,
             layout_state,
             native_layout,
             active: Mutex::new(None),
@@ -318,6 +321,7 @@ fn start_platform_capture(
     targets: Vec<InputTarget>,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
+    quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
@@ -332,16 +336,8 @@ fn start_platform_capture(
     let (ready_tx, ready_rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let socket = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(socket) => socket,
-            Err(error) => {
-                let _ = ready_tx.send(Err(format!("failed to open shared input sender: {error}")));
-                return;
-            }
-        };
-
         let context = Arc::new(WindowsCaptureContext {
-            socket,
+            quic_transport,
             layout_state,
             native_layout,
             active: Mutex::new(None),
@@ -435,6 +431,7 @@ fn start_platform_capture(
     _targets: Vec<InputTarget>,
     _layout_state: Arc<Mutex<LayoutState>>,
     _native_layout: LayoutState,
+    _quic_transport: quic_transport::TransportHandle,
     _stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
@@ -497,11 +494,14 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
     let local_screens = &local_device.screens;
     let mut targets = Vec::new();
 
-    for device in layout
-        .devices
-        .iter()
-        .filter(|device| device.role != "local" && device.online && device.input_ready)
-    {
+    for device in layout.devices.iter().filter(|device| {
+        device.role != "local"
+            && device.online
+            && device.input_ready
+            && device.protocol_version == quic_transport::PROTOCOL_VERSION
+            && !device.transport_public_key.trim().is_empty()
+    }) {
+        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
         for layout_local_screen in local_screens {
             let native_local_screen = native_device
                 .and_then(|device| {
@@ -516,8 +516,9 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
                 if let Some(edge) = touching_edge(layout_local_screen, remote_screen) {
                     targets.push(InputTarget {
                         device_id: device.id.clone(),
-                        target_addr: format!("{}:{}", device.host, device.transport_port),
-                        target_port: device.transport_port,
+                        target_addr: format!("{}:{}", device.host, quic_port),
+                        transport_public_key: device.transport_public_key.clone(),
+                        protocol_version: device.protocol_version,
                         screen_id: peer_screen_id(device, remote_screen),
                         local_screen: native_local_screen.clone(),
                         layout_local_screen: layout_local_screen.clone(),
@@ -607,21 +608,23 @@ fn peer_screen_id(device: &Device, screen: &Screen) -> String {
 }
 
 fn send_packet(
-    socket: &UdpSocket,
+    quic_transport: &quic_transport::TransportHandle,
     target: &InputTarget,
     event: InputEvent,
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
-    let (origin_device_id, origin_port) = input_origin(layout_state);
+    let (origin_device_id, origin_port) = input_origin(layout_state, quic_transport);
     let packet = InputPacket {
         protocol: INPUT_PROTOCOL.into(),
         target_device_id: target.device_id.clone(),
         origin_device_id,
         origin_port,
+        origin_transport_public_key: quic_transport.public_key().to_string(),
+        origin_protocol_version: quic_transport::PROTOCOL_VERSION,
         event,
     };
-    let Some((target_addr, target_port)) = live_target_endpoint(target, layout_state) else {
+    let Some(peer) = live_target_endpoint(target, layout_state) else {
         INPUT_TX_SKIPS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
@@ -631,101 +634,38 @@ fn send_packet(
         Err(error) => {
             log::warn!(
                 "input tx encode failed target={} error={}",
-                target_addr,
+                peer.addr,
                 error
             );
             return false;
         }
     };
 
-    let direct_send = !target_prefers_broadcast(&target.device_id);
-    if direct_send {
-        match socket.send_to(&payload, target_addr.as_str()) {
-            Ok(bytes) => {
-                let _ = bytes;
-                input_events.fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-            Err(error) => {
-                INPUT_TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-                let error_text = error.to_string();
-
-                if send_broadcast_packet(socket, &payload, target_port, input_events) {
-                    remember_broadcast_fallback(&target.device_id);
-                    return true;
-                }
-
-                mark_target_offline(layout_state, target, &error_text);
-                return false;
-            }
-        }
-    }
-
-    if send_broadcast_packet(socket, &payload, target_port, input_events) {
-        return true;
-    }
-
-    mark_target_offline(layout_state, target, "broadcast send failed");
-    false
-}
-
-fn input_origin(layout_state: &Arc<Mutex<LayoutState>>) -> (String, u16) {
-    let Ok(layout) = layout_state.lock() else {
-        return (String::new(), 0);
-    };
-    let device_id = local_device(&layout)
-        .map(|device| device.id.clone())
-        .unwrap_or_default();
-
-    (device_id, layout.transport_port)
-}
-
-fn send_broadcast_packet(
-    socket: &UdpSocket,
-    payload: &[u8],
-    target_port: u16,
-    input_events: &Arc<AtomicU64>,
-) -> bool {
-    let Some(target_addr) = broadcast_addrs(target_port).into_iter().next() else {
-        return false;
-    };
-
-    let _ = socket.set_broadcast(true);
-    match socket.send_to(payload, target_addr.as_str()) {
-        Ok(bytes) => {
-            let _ = bytes;
+    match quic_transport.send_datagram(peer, payload) {
+        Ok(()) => {
             input_events.fetch_add(1, Ordering::Relaxed);
             true
         }
         Err(error) => {
-            let _ = error;
             INPUT_TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+            mark_target_offline(layout_state, target, &error);
             false
         }
     }
 }
 
-fn broadcast_fallbacks() -> &'static Mutex<Vec<String>> {
-    INPUT_BROADCAST_ONLY_DEVICES.get_or_init(|| Mutex::new(Vec::new()))
-}
+fn input_origin(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    quic_transport: &quic_transport::TransportHandle,
+) -> (String, u16) {
+    let Ok(layout) = layout_state.lock() else {
+        return (String::new(), quic_transport.port());
+    };
+    let device_id = local_device(&layout)
+        .map(|device| device.id.clone())
+        .unwrap_or_default();
 
-fn target_prefers_broadcast(device_id: &str) -> bool {
-    broadcast_fallbacks()
-        .lock()
-        .map(|devices| devices.iter().any(|id| id == device_id))
-        .unwrap_or(false)
-}
-
-fn remember_broadcast_fallback(device_id: &str) {
-    if let Ok(mut devices) = broadcast_fallbacks().lock() {
-        if devices.iter().any(|id| id == device_id) {
-            return;
-        }
-        if devices.len() >= 32 {
-            devices.remove(0);
-        }
-        devices.push(device_id.to_string());
-    }
+    (device_id, quic_transport.port())
 }
 
 fn mark_target_offline(
@@ -753,9 +693,13 @@ fn mark_target_offline(
 fn live_target_endpoint(
     target: &InputTarget,
     layout_state: &Arc<Mutex<LayoutState>>,
-) -> Option<(String, u16)> {
+) -> Option<quic_transport::PeerEndpoint> {
     let Ok(layout) = layout_state.lock() else {
-        return Some((target.target_addr.clone(), target.target_port));
+        return Some(quic_transport::PeerEndpoint {
+            addr: target.target_addr.clone(),
+            public_key: target.transport_public_key.clone(),
+            protocol_version: target.protocol_version,
+        });
     };
 
     layout
@@ -763,11 +707,14 @@ fn live_target_endpoint(
         .iter()
         .find(|device| device.id == target.device_id)
         .and_then(|device| {
-            (device.online && device.input_ready).then(|| {
-                (
-                    format!("{}:{}", device.host, device.transport_port),
-                    device.transport_port,
-                )
+            (device.online && device.input_ready).then(|| quic_transport::PeerEndpoint {
+                addr: format!(
+                    "{}:{}",
+                    device.host,
+                    normalize_quic_port(device.transport_port, device.quic_port)
+                ),
+                public_key: device.transport_public_key.clone(),
+                protocol_version: device.protocol_version,
             })
         })
 }
@@ -806,7 +753,7 @@ pub fn try_inject_packet_from_source(
         return true;
     }
 
-    if packet.origin_port != 0 {
+    if packet.origin_port != 0 && !packet.origin_transport_public_key.trim().is_empty() {
         let device_id = if packet.origin_device_id.trim().is_empty() {
             source.ip().to_string()
         } else {
@@ -816,6 +763,8 @@ pub fn try_inject_packet_from_source(
             clipboard_target,
             device_id,
             format!("{}:{}", source.ip(), packet.origin_port),
+            packet.origin_transport_public_key.clone(),
+            packet.origin_protocol_version,
             Some(Duration::from_secs(3)),
         );
     }
@@ -844,6 +793,18 @@ fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer
 
 fn decode_input_packet(payload: &[u8]) -> Option<InputPacket> {
     rmp_serde::from_slice::<InputPacket>(payload).ok()
+}
+
+fn default_protocol_version() -> u16 {
+    quic_transport::PROTOCOL_VERSION
+}
+
+fn normalize_quic_port(transport_port: u16, quic_port: u16) -> u16 {
+    if quic_port == 0 {
+        transport_port
+    } else {
+        quic_port
+    }
 }
 
 fn local_device(layout: &LayoutState) -> Option<&Device> {
@@ -939,7 +900,7 @@ fn inject_input_event(layout: &LayoutState, event: InputEvent) -> bool {
 
 #[cfg(target_os = "macos")]
 struct MacCaptureContext {
-    socket: UdpSocket,
+    quic_transport: quic_transport::TransportHandle,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
     active: Mutex<Option<ActiveTarget>>,
@@ -959,7 +920,7 @@ static WINDOWS_CAPTURE_CONTEXT: Mutex<Option<Arc<WindowsCaptureContext>>> = Mute
 
 #[cfg(target_os = "windows")]
 struct WindowsCaptureContext {
-    socket: UdpSocket,
+    quic_transport: quic_transport::TransportHandle,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
     active: Mutex<Option<ActiveTarget>>,
@@ -1067,12 +1028,16 @@ fn set_clipboard_target(
     target: &Arc<Mutex<Option<ClipboardTarget>>>,
     device_id: String,
     addr: String,
+    transport_public_key: String,
+    protocol_version: u16,
     expires_in: Option<Duration>,
 ) {
     if let Ok(mut target) = target.lock() {
         *target = Some(ClipboardTarget {
             device_id,
             addr,
+            transport_public_key,
+            protocol_version,
             expires_at: expires_in.map(|duration| Instant::now() + duration),
         });
     }
@@ -1083,8 +1048,15 @@ fn set_control_clipboard_target(
     active: &ActiveTarget,
     layout_state: &Arc<Mutex<LayoutState>>,
 ) {
-    if let Some((addr, _port)) = live_target_endpoint(&active.target, layout_state) {
-        set_clipboard_target(target, active.target.device_id.clone(), addr, None);
+    if let Some(peer) = live_target_endpoint(&active.target, layout_state) {
+        set_clipboard_target(
+            target,
+            active.target.device_id.clone(),
+            peer.addr,
+            peer.public_key,
+            peer.protocol_version,
+            None,
+        );
     }
 }
 
@@ -1145,7 +1117,7 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     let message = wparam as u32;
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
         if send_packet(
-            &context.socket,
+            &context.quic_transport,
             &target,
             InputEvent::Key {
                 key_code: event.vkCode as u16,
@@ -1209,7 +1181,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         let dragging = remote_button_is_down(&context.remote_button_mask);
         if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
             if !send_remote_mouse_move(
-                &context.socket,
+                &context.quic_transport,
                 active_target,
                 &context.layout_state,
                 &context.input_events,
@@ -1250,7 +1222,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         hide_windows_cursor_if_needed(context);
         set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
         if !send_remote_mouse_move(
-            &context.socket,
+            &context.quic_transport,
             &active_target,
             &context.layout_state,
             &context.input_events,
@@ -1303,7 +1275,7 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
     };
 
     if !send_remote_mouse_move(
-        &context.socket,
+        &context.quic_transport,
         &active_target,
         &context.layout_state,
         &context.input_events,
@@ -1313,7 +1285,7 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
     mark_mouse_move_sent(&context.last_mouse_move_sent);
 
     let sent = send_packet(
-        &context.socket,
+        &context.quic_transport,
         &active_target.target,
         InputEvent::MouseButton { button, down },
         &context.layout_state,
@@ -1347,7 +1319,7 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
     };
 
     if !send_remote_mouse_move(
-        &context.socket,
+        &context.quic_transport,
         &active_target,
         &context.layout_state,
         &context.input_events,
@@ -1357,7 +1329,7 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
     mark_mouse_move_sent(&context.last_mouse_move_sent);
 
     send_packet(
-        &context.socket,
+        &context.quic_transport,
         &active_target.target,
         InputEvent::Scroll { delta_x, delta_y },
         &context.layout_state,
@@ -1412,7 +1384,7 @@ fn send_macos_mouse_button(
     down: bool,
 ) -> bool {
     if !send_remote_mouse_move(
-        &context.socket,
+        &context.quic_transport,
         active_target,
         &context.layout_state,
         &context.input_events,
@@ -1422,7 +1394,7 @@ fn send_macos_mouse_button(
     mark_mouse_move_sent(&context.last_mouse_move_sent);
 
     let sent = send_packet(
-        &context.socket,
+        &context.quic_transport,
         &active_target.target,
         InputEvent::MouseButton { button, down },
         &context.layout_state,
@@ -1497,7 +1469,7 @@ fn handle_macos_event(
             let delta_x =
                 event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32;
             if !send_remote_mouse_move(
-                &context.socket,
+                &context.quic_transport,
                 &active_target,
                 &context.layout_state,
                 &context.input_events,
@@ -1506,7 +1478,7 @@ fn handle_macos_event(
             }
             mark_mouse_move_sent(&context.last_mouse_move_sent);
             send_packet(
-                &context.socket,
+                &context.quic_transport,
                 &target,
                 InputEvent::Scroll { delta_x, delta_y },
                 &context.layout_state,
@@ -1517,7 +1489,7 @@ fn handle_macos_event(
             let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
             if let Some(key_code) = mac_key_to_windows_vk(mac_code) {
                 send_packet(
-                    &context.socket,
+                    &context.quic_transport,
                     &target,
                     InputEvent::Key {
                         key_code,
@@ -1585,7 +1557,7 @@ fn handle_macos_mouse_move(
             let dragging = remote_button_is_down(&context.remote_button_mask);
             if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
                 if !send_remote_mouse_move(
-                    &context.socket,
+                    &context.quic_transport,
                     active_target,
                     &context.layout_state,
                     &context.input_events,
@@ -1622,7 +1594,7 @@ fn handle_macos_mouse_move(
         );
         hide_macos_cursor_if_needed(context);
         if !send_remote_mouse_move(
-            &context.socket,
+            &context.quic_transport,
             &active_target,
             &context.layout_state,
             &context.input_events,
@@ -1887,13 +1859,13 @@ fn local_return_point(active: &ActiveTarget) -> (f64, f64) {
 }
 
 fn send_remote_mouse_move(
-    socket: &UdpSocket,
+    quic_transport: &quic_transport::TransportHandle,
     active: &ActiveTarget,
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
     send_packet(
-        socket,
+        quic_transport,
         &active.target,
         InputEvent::MouseMove {
             screen_id: active.target.screen_id.clone(),
@@ -1975,7 +1947,7 @@ fn send_modifier_changes(
 
     for key_code in next.iter().filter(|key_code| !previous.contains(key_code)) {
         send_packet(
-            &context.socket,
+            &context.quic_transport,
             target,
             InputEvent::Key {
                 key_code: *key_code,
@@ -1988,7 +1960,7 @@ fn send_modifier_changes(
 
     for key_code in previous.iter().filter(|key_code| !next.contains(key_code)) {
         send_packet(
-            &context.socket,
+            &context.quic_transport,
             target,
             InputEvent::Key {
                 key_code: *key_code,
@@ -2472,7 +2444,8 @@ mod tests {
         InputTarget {
             device_id: "peer-device".into(),
             target_addr: "10.0.0.2:47833".into(),
-            target_port: 47833,
+            transport_public_key: "test-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_id: "local-display-1".into(),
             local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
             layout_local_screen: screen(
@@ -2504,6 +2477,9 @@ mod tests {
                     platform: "macos".into(),
                     host: "192.168.66.92".into(),
                     transport_port: 47833,
+                    quic_port: 47834,
+                    transport_public_key: "local-public-key".into(),
+                    protocol_version: quic_transport::PROTOCOL_VERSION,
                     color: "#2f7af8".into(),
                     online: true,
                     input_ready: false,
@@ -2517,6 +2493,9 @@ mod tests {
                     platform: "windows".into(),
                     host: "10.0.0.2".into(),
                     transport_port: 52000,
+                    quic_port: 52001,
+                    transport_public_key: "peer-public-key".into(),
+                    protocol_version: quic_transport::PROTOCOL_VERSION,
                     color: "#0f766e".into(),
                     online: true,
                     input_ready: true,
@@ -2542,6 +2521,7 @@ mod tests {
             performance_monitor: false,
             transport_port_mode: "auto".into(),
             transport_port: 47833,
+            quic_port: 47834,
         }
     }
 
@@ -2552,6 +2532,8 @@ mod tests {
             target_device_id: "peer-device".into(),
             origin_device_id: "local-device".into(),
             origin_port: 47833,
+            origin_transport_public_key: "local-public-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
             event: InputEvent::MouseMove {
                 screen_id: "display-1".into(),
                 x: 320,
@@ -2580,6 +2562,8 @@ mod tests {
         let target = Arc::new(Mutex::new(Some(ClipboardTarget {
             device_id: "peer-device".into(),
             addr: "10.0.0.2:47833".into(),
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
             expires_at: Some(Instant::now() - Duration::from_millis(1)),
         })));
 
@@ -2609,12 +2593,12 @@ mod tests {
     }
 
     #[test]
-    fn input_targets_use_peer_transport_port() {
+    fn input_targets_use_peer_quic_port() {
         let layout = layout_for_target_tests();
         let targets = build_input_targets(&layout, &layout);
 
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].target_addr, "10.0.0.2:52000");
+        assert_eq!(targets[0].target_addr, "10.0.0.2:52001");
     }
 
     #[test]

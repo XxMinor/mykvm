@@ -13,9 +13,11 @@ import {
   checkForAppUpdate,
   hideMainWindow,
   installAppUpdate,
+  isPortableMode,
   loadAppState,
   minimizeMainWindow,
   openRepositoryUrl,
+  openUpdateReleasePage,
   probeLanPeer,
   readClipboardText,
   readPerformanceSample,
@@ -90,6 +92,7 @@ type WorkspaceTab = (typeof WORKSPACE_TABS)[number]["id"];
 
 const CLIENT_TABS: WorkspaceTab[] = ["settings"];
 const PERFORMANCE_SAMPLE_LIMIT = 32;
+const UPDATE_DISMISSED_VERSION_KEY = "mykvm:update:dismissedVersion";
 type UpdateStatus =
   | "idle"
   | "checking"
@@ -143,12 +146,17 @@ function App() {
   const [availableUpdate, setAvailableUpdate] =
     useState<AppUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<
+    string | null
+  >(() => localStorage.getItem(UPDATE_DISMISSED_VERSION_KEY));
+  const [isPortable, setIsPortable] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
     () => getSystemTheme(),
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
+  const startupUpdateCheckStarted = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -200,6 +208,24 @@ function App() {
             error instanceof Error ? error.message : TEXT.cn.errors.loadState,
           );
         }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    isPortableMode()
+      .then((portable) => {
+        if (active) {
+          setIsPortable(portable);
+        }
+      })
+      .catch(() => {
+        // Portable detection is a convenience for update flow, not startup-critical.
       });
 
     return () => {
@@ -357,6 +383,10 @@ function App() {
   const themeMode = layout?.themeMode ?? "system";
   const resolvedTheme = resolveTheme(themeMode, systemTheme);
   const ui = TEXT[language];
+  const hasLoadedSnapshot = Boolean(snapshot);
+  const isAvailableUpdateDismissed =
+    Boolean(availableUpdate) &&
+    dismissedUpdateVersion === availableUpdate?.version;
   const visibleTabs = useMemo(
     () =>
       machineRole === "client"
@@ -492,6 +522,45 @@ function App() {
         });
     }
   }, [resolvedTheme, themeMode]);
+
+  useEffect(() => {
+    if (!hasLoadedSnapshot || !isTauri() || startupUpdateCheckStarted.current) {
+      return;
+    }
+
+    let active = true;
+    const timerId = window.setTimeout(() => {
+      if (!active || startupUpdateCheckStarted.current) {
+        return;
+      }
+
+      startupUpdateCheckStarted.current = true;
+      checkForAppUpdate()
+        .then((result) => {
+          if (!active || !result.available || !result.update) {
+            return;
+          }
+
+          setAvailableUpdate(result.update);
+          if (dismissedUpdateVersion === result.update.version) {
+            setUpdateStatus("idle");
+            setUpdateMessage(ui.settings.updateDismissed);
+            return;
+          }
+
+          setUpdateStatus("available");
+          setUpdateMessage(`${ui.settings.updateAvailable}: v${result.update.version}`);
+        })
+        .catch(() => {
+          // Startup checks should not interrupt normal app startup.
+        });
+    }, 1200);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timerId);
+    };
+  }, [dismissedUpdateVersion, hasLoadedSnapshot, ui]);
 
   useEffect(() => {
     if (!isPerformanceActive) {
@@ -803,9 +872,11 @@ function App() {
   }
 
   function setTransportPort(transportPort: number) {
+    const normalizedPort = normalizePort(transportPort);
     updateLayout((layoutState) => ({
       ...layoutState,
-      transportPort: normalizePort(transportPort),
+      transportPort: normalizedPort,
+      quicPort: normalizePort(normalizedPort + 1),
       transportPortMode: "fixed",
     }));
   }
@@ -968,6 +1039,8 @@ function App() {
       const result = await checkForAppUpdate();
 
       if (result.available && result.update) {
+        localStorage.removeItem(UPDATE_DISMISSED_VERSION_KEY);
+        setDismissedUpdateVersion(null);
         setAvailableUpdate(result.update);
         setUpdateStatus("available");
         setUpdateMessage(`${ui.settings.updateAvailable}: v${result.update.version}`);
@@ -994,13 +1067,38 @@ function App() {
     setUpdateMessage(`${ui.settings.updateInstalling}: v${availableUpdate.version}`);
 
     try {
+      if (isPortable) {
+        await openUpdateReleasePage();
+        setUpdateStatus("available");
+        setUpdateMessage(ui.settings.portableUpdateCopy);
+        return;
+      }
+
       await installAppUpdate();
     } catch (error: unknown) {
+      await openUpdateReleasePage().catch(() => {
+        // The original update error is more useful than a secondary browser error.
+      });
+      const errorText =
+        error instanceof Error ? error.message : ui.errors.installUpdate;
       setUpdateStatus("error");
-      setUpdateMessage(
-        error instanceof Error ? error.message : ui.errors.installUpdate,
-      );
+      setUpdateMessage(`${errorText} ${ui.settings.updateFallback}`);
     }
+  }
+
+  function dismissDesktopUpdate() {
+    if (!availableUpdate) {
+      return;
+    }
+
+    localStorage.setItem(UPDATE_DISMISSED_VERSION_KEY, availableUpdate.version);
+    setDismissedUpdateVersion(availableUpdate.version);
+    setUpdateStatus("idle");
+    setUpdateMessage(ui.settings.updateDismissed);
+  }
+
+  function openUpdateDownloads() {
+    void openUpdateReleasePage();
   }
 
   if (!snapshot || !layout || !runtime || !displayLayout) {
@@ -1555,7 +1653,10 @@ function App() {
                   </div>
                   <div>
                     <dt>{ui.settings.ports}</dt>
-                    <dd>UDP {runtime.discovery.port}</dd>
+                    <dd>
+                      UDP {runtime.discovery.port} · QUIC{" "}
+                      {runtime.discovery.localPeer.quicPort}
+                    </dd>
                   </div>
                   <div>
                     <dt>{ui.settings.activeDevice}</dt>
@@ -1596,7 +1697,9 @@ function App() {
                 </div>
                 <p className="muted-copy">
                   {isTauri()
-                    ? ui.settings.updatesCopy
+                    ? isPortable
+                      ? ui.settings.portableUpdateCopy
+                      : ui.settings.updatesCopy
                     : ui.settings.updatesBrowserCopy}
                 </p>
                 <dl className="network-meta compact-meta">
@@ -1643,6 +1746,28 @@ function App() {
                     {updateStatus === "installing"
                       ? ui.settings.installingUpdate
                       : ui.settings.installUpdate}
+                  </button>
+                  {availableUpdate ? (
+                    <button
+                      type="button"
+                      className="secondary-button compact-button"
+                      onClick={dismissDesktopUpdate}
+                      disabled={
+                        isAvailableUpdateDismissed ||
+                        updateStatus === "checking" ||
+                        updateStatus === "installing"
+                      }
+                    >
+                      {ui.settings.dismissUpdate}
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={openUpdateDownloads}
+                    disabled={updateStatus === "installing"}
+                  >
+                    {ui.settings.openReleases}
                   </button>
                 </div>
               </section>
@@ -1984,6 +2109,8 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
           online: true,
           inputReady: false,
           transportPort: layout.transportPort,
+          quicPort: layout.quicPort,
+          protocolVersion: 1,
         };
       }
 
@@ -2004,6 +2131,9 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
         inputReady: peer.inputReady,
         host: peer.ip || peer.host || device.host,
         transportPort: peer.transportPort,
+        quicPort: peer.quicPort,
+        transportPublicKey: peer.transportPublicKey,
+        protocolVersion: peer.protocolVersion,
         platform: normalizePlatform(peer.platform),
       };
     }),
@@ -2067,6 +2197,9 @@ function createDeviceFromPeer(
     platform: normalizePlatform(peer.platform),
     host: peer.ip || peer.host,
     transportPort: peer.transportPort,
+    quicPort: peer.quicPort,
+    transportPublicKey: peer.transportPublicKey,
+    protocolVersion: peer.protocolVersion,
     color: existingDevice?.color ?? nextDeviceColor(layout),
     online: peer.inputReady,
     inputReady: peer.inputReady,

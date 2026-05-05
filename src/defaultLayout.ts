@@ -24,6 +24,7 @@ export const defaultLayout: LayoutState = {
   performanceMonitor: false,
   transportPortMode: 'auto',
   transportPort: 47833,
+  quicPort: 47834,
   devices: [
     {
       id: 'local-device',
@@ -31,6 +32,9 @@ export const defaultLayout: LayoutState = {
       platform: browserPlatform,
       host: window.location.hostname || 'localhost',
       transportPort: 47833,
+      quicPort: 47834,
+      transportPublicKey: '',
+      protocolVersion: 1,
       color: '#2f7af8',
       online: true,
       inputReady: false,

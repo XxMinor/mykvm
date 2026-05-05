@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
-import { REPOSITORY_URL } from './constants'
+import type { Update } from '@tauri-apps/plugin-updater'
+import { RELEASES_URL, REPOSITORY_URL } from './constants'
 import { defaultLayout } from './defaultLayout'
 import type { AppStateSnapshot, DiscoveryStatus, PerformanceSample, RuntimeStatus } from './runtime'
 import type { LayoutState } from './types'
@@ -50,6 +51,9 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
       host: window.location.hostname || 'localhost',
       ip: '127.0.0.1',
       transportPort: defaultLayout.transportPort,
+      quicPort: defaultLayout.quicPort,
+      transportPublicKey: '',
+      protocolVersion: 1,
       screenCount: 1,
       inputReady: false,
       screens: [
@@ -73,6 +77,7 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
 
 let browserRuntime = FALLBACK_RUNTIME
 let browserClipboardText = ''
+let pendingAppUpdate: Update | null = null
 
 export async function loadAppState(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
@@ -262,6 +267,23 @@ export async function openRepositoryUrl(): Promise<void> {
   await invoke('open_repository_url')
 }
 
+export async function openUpdateReleasePage(): Promise<void> {
+  if (!isTauri()) {
+    window.open(RELEASES_URL, '_blank', 'noopener,noreferrer')
+    return
+  }
+
+  await invoke('open_releases_url')
+}
+
+export async function isPortableMode(): Promise<boolean> {
+  if (!isTauri()) {
+    return false
+  }
+
+  return invoke<boolean>('is_portable_mode')
+}
+
 export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
   if (!isTauri()) {
     return { available: false }
@@ -269,6 +291,7 @@ export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
 
   const { check } = await import('@tauri-apps/plugin-updater')
   const update = await check()
+  pendingAppUpdate = update
 
   if (!update) {
     return { available: false }
@@ -294,12 +317,13 @@ export async function installAppUpdate(): Promise<void> {
     import('@tauri-apps/plugin-updater'),
     import('@tauri-apps/plugin-process'),
   ])
-  const update = await check()
+  const update = pendingAppUpdate ?? (await check())
 
   if (!update) {
     return
   }
 
   await update.downloadAndInstall()
+  pendingAppUpdate = null
   await relaunch()
 }

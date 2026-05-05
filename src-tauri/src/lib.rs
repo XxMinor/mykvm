@@ -20,11 +20,13 @@ use tauri::{
 };
 
 mod input;
+mod quic_transport;
 
 const DISCOVERY_PORT: u16 = 47833;
 const TRANSPORT_PORT_MIN: u16 = 1024;
 const TRANSPORT_PORT_MAX: u16 = 65_535;
 const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
+const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 const PEER_TTL_MS: u64 = 30_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
@@ -70,6 +72,12 @@ struct Device {
     host: String,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
+    #[serde(default)]
+    quic_port: u16,
+    #[serde(default)]
+    transport_public_key: String,
+    #[serde(default = "default_protocol_version")]
+    protocol_version: u16,
     color: String,
     online: bool,
     #[serde(default)]
@@ -102,6 +110,8 @@ struct LayoutState {
     transport_port_mode: String,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
+    #[serde(default)]
+    quic_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +130,12 @@ struct LanPeer {
     ip: String,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
+    #[serde(default)]
+    quic_port: u16,
+    #[serde(default)]
+    transport_public_key: String,
+    #[serde(default = "default_protocol_version")]
+    protocol_version: u16,
     screen_count: usize,
     #[serde(default)]
     input_ready: bool,
@@ -194,6 +210,7 @@ struct AppRuntime {
     native_layout: Mutex<LayoutState>,
     runtime: Mutex<RuntimeStatus>,
     peers: Arc<Mutex<Vec<LanPeer>>>,
+    quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
     clipboard_stop: Mutex<Option<Arc<AtomicBool>>>,
@@ -218,6 +235,7 @@ impl AppRuntime {
             native_layout: Mutex::new(detected_layout.clone()),
             runtime: Mutex::new(default_runtime(&detected_layout)),
             peers: Arc::new(Mutex::new(Vec::new())),
+            quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
             input_stop: Mutex::new(None),
             clipboard_stop: Mutex::new(None),
@@ -262,6 +280,9 @@ impl AppRuntime {
 
     fn discovery_status_for_layout(&self, layout: &LayoutState) -> DiscoveryStatus {
         let mut local_peer = local_peer_from_layout(layout);
+        if let Some(transport) = self.quic_transport_handle() {
+            apply_transport_to_peer(&mut local_peer, &transport);
+        }
         local_peer.input_ready = self.input_receive_enabled.load(Ordering::Relaxed);
         let peers = active_peers(&self.peers, &local_peer.id);
         let state = if self.discovery_stop.lock().unwrap().is_some() {
@@ -277,6 +298,75 @@ impl AppRuntime {
             local_peer,
             peers,
         }
+    }
+
+    fn quic_transport_handle(&self) -> Option<quic_transport::TransportHandle> {
+        self.quic_transport
+            .lock()
+            .ok()
+            .and_then(|transport| transport.clone())
+    }
+
+    fn start_quic_transport(
+        &self,
+        preferred_port: u16,
+    ) -> Result<quic_transport::TransportHandle, String> {
+        if let Some(transport) = self.quic_transport_handle() {
+            return Ok(transport);
+        }
+
+        let layout_for_input = Arc::clone(&self.layout);
+        let layout_for_clipboard = Arc::clone(&self.layout);
+        let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
+        let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
+        let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
+        let clipboard_target = Arc::clone(&self.clipboard_target);
+        let transport_packets_for_input = Arc::clone(&self.transport_packets);
+        let transport_packets_for_clipboard = Arc::clone(&self.transport_packets);
+        let input_events = Arc::clone(&self.input_events);
+        let clipboard_packets = Arc::clone(&self.clipboard_packets);
+
+        let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
+            if !input_receive_enabled.load(Ordering::Relaxed) {
+                return;
+            }
+            let Ok(layout) = layout_for_input.lock() else {
+                return;
+            };
+            let current_peer = local_peer_from_layout(&layout);
+            if input::try_inject_packet_from_source(
+                &layout,
+                &payload,
+                source,
+                &input_events,
+                &current_peer.id,
+                &clipboard_target,
+            ) {
+                transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let on_stream = Arc::new(move |payload: Vec<u8>, _source| {
+            if !clipboard_receive_enabled.load(Ordering::Relaxed) {
+                return;
+            }
+            let Ok(layout) = layout_for_clipboard.lock() else {
+                return;
+            };
+            let current_peer = local_peer_from_layout(&layout);
+            if handle_clipboard_packet(&payload, &current_peer.id, &clipboard_seen_text) {
+                transport_packets_for_clipboard.fetch_add(1, Ordering::Relaxed);
+                clipboard_packets.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let transport = quic_transport::start(preferred_port, on_datagram, on_stream)?;
+        let mut stored = self
+            .quic_transport
+            .lock()
+            .map_err(|_| "QUIC transport lock poisoned".to_string())?;
+        *stored = Some(transport.clone());
+        Ok(transport)
     }
 
     fn start_discovery(&self) -> Result<(), String> {
@@ -300,27 +390,29 @@ impl AppRuntime {
             layout.transport_port
         };
         let (socket, actual_port) = bind_available_udp_port(desired_port)?;
+        let quic_transport = self.start_quic_transport(preferred_quic_port(actual_port))?;
         layout.transport_port = actual_port;
+        layout.quic_port = quic_transport.port();
         if let Ok(mut stored_layout) = self.layout.lock() {
             stored_layout.transport_port = actual_port;
+            stored_layout.quic_port = quic_transport.port();
             for device in &mut stored_layout.devices {
                 if device.role == "local" {
                     device.transport_port = actual_port;
+                    device.quic_port = quic_transport.port();
+                    device.transport_public_key = quic_transport.public_key().to_string();
+                    device.protocol_version = quic_transport::PROTOCOL_VERSION;
                 }
             }
         }
 
         let mut local_peer = local_peer_from_layout(&layout);
+        apply_transport_to_peer(&mut local_peer, &quic_transport);
         local_peer.input_ready = self.input_receive_enabled.load(Ordering::Relaxed);
         let peers = Arc::clone(&self.peers);
         let layout_state = Arc::clone(&self.layout);
-        let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
-        let clipboard_target = Arc::clone(&self.clipboard_target);
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
-        let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
         let transport_packets = Arc::clone(&self.transport_packets);
-        let input_events = Arc::clone(&self.input_events);
-        let clipboard_packets = Arc::clone(&self.clipboard_packets);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         socket
@@ -346,6 +438,7 @@ impl AppRuntime {
                         .lock()
                         .map(|layout| {
                             let mut peer = local_peer_from_layout(&layout);
+                            apply_transport_to_peer(&mut peer, &quic_transport);
                             peer.input_ready = current_input_ready;
                             peer
                         })
@@ -371,6 +464,7 @@ impl AppRuntime {
                             .lock()
                             .map(|layout| {
                                 let mut peer = local_peer_from_layout(&layout);
+                                apply_transport_to_peer(&mut peer, &quic_transport);
                                 peer.input_ready = input_receive_enabled.load(Ordering::Relaxed);
                                 peer
                             })
@@ -388,27 +482,6 @@ impl AppRuntime {
                                 let _ =
                                     send_discovery_packet(&socket, "reply", &current_peer, source);
                             }
-                        }
-                    } else if let Ok(layout) = layout_state.lock() {
-                        let current_peer = local_peer_from_layout(&layout);
-                        let handled_input = input_receive_enabled.load(Ordering::Relaxed)
-                            && input::try_inject_packet_from_source(
-                                &layout,
-                                payload,
-                                source,
-                                &input_events,
-                                &current_peer.id,
-                                &clipboard_target,
-                            );
-                        if !handled_input
-                            && clipboard_receive_enabled.load(Ordering::Relaxed)
-                            && handle_clipboard_packet(
-                                payload,
-                                &current_peer.id,
-                                &clipboard_seen_text,
-                            )
-                        {
-                            clipboard_packets.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -444,11 +517,22 @@ impl AppRuntime {
             return input::input_runtime_status(&layout, &native_layout);
         }
 
+        let Some(quic_transport) = self.quic_transport_handle() else {
+            return (
+                NativeStageStatus {
+                    state: "error".into(),
+                    detail: "QUIC transport is not ready.".into(),
+                },
+                input::input_runtime_status(&layout, &native_layout).1,
+            );
+        };
+
         let stop = Arc::new(AtomicBool::new(false));
         let statuses = input::start_input_runtime(
             layout,
             Arc::clone(&self.layout),
             native_layout,
+            quic_transport,
             Arc::clone(&stop),
             Arc::clone(&self.remote_input_active),
             Arc::clone(&self.clipboard_target),
@@ -482,19 +566,16 @@ impl AppRuntime {
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let transport_packets = Arc::clone(&self.transport_packets);
         let clipboard_packets = Arc::clone(&self.clipboard_packets);
-        let socket = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(socket) => socket,
-            Err(error) => {
-                return NativeStageStatus {
-                    state: "error".into(),
-                    detail: format!("failed to open clipboard transport socket: {error}"),
-                };
-            }
+        let Some(quic_transport) = self.quic_transport_handle() else {
+            return NativeStageStatus {
+                state: "error".into(),
+                detail: "QUIC transport is not ready.".into(),
+            };
         };
 
         thread::spawn(move || {
             run_clipboard_sync(
-                socket,
+                quic_transport,
                 local_peer.id,
                 clipboard_seen_text,
                 clipboard_target,
@@ -549,6 +630,11 @@ impl AppRuntime {
         if let Ok(mut stop) = self.discovery_stop.lock() {
             if let Some(signal) = stop.take() {
                 signal.store(true, Ordering::Relaxed);
+            }
+        }
+        if let Ok(mut transport) = self.quic_transport.lock() {
+            if let Some(handle) = transport.take() {
+                handle.shutdown();
             }
         }
     }
@@ -686,8 +772,8 @@ fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, S
         transport: NativeStageStatus {
             state: "ready".into(),
             detail: format!(
-                "Transport is ready on UDP {}; discovery, input, and clipboard share this MessagePack port.",
-                discovery.port
+                "UDP discovery is ready on {}; QUIC is ready on {} for input datagrams and clipboard streams.",
+                discovery.port, discovery.local_peer.quic_port
             ),
         },
         capture,
@@ -817,7 +903,10 @@ fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus
         .lock()
         .map_err(|_| "layout state lock poisoned".to_string())?
         .clone();
-    let local_peer = local_peer_from_layout(&layout);
+    let mut local_peer = local_peer_from_layout(&layout);
+    if let Some(transport) = state.quic_transport_handle() {
+        apply_transport_to_peer(&mut local_peer, &transport);
+    }
     let discovered = scan_for_peers(&local_peer)?;
 
     for peer in discovered {
@@ -837,7 +926,10 @@ fn probe_lan_peer(host: String, state: tauri::State<'_, AppRuntime>) -> Result<L
         .lock()
         .map_err(|_| "layout state lock poisoned".to_string())?
         .clone();
-    let local_peer = local_peer_from_layout(&layout);
+    let mut local_peer = local_peer_from_layout(&layout);
+    if let Some(transport) = state.quic_transport_handle() {
+        apply_transport_to_peer(&mut local_peer, &transport);
+    }
     let peer = probe_for_peer(&local_peer, &host)?;
     merge_peer(&state.peers, peer.clone());
     sync_layout_peer_presence(&state.layout, &state.peers);
@@ -849,10 +941,24 @@ fn open_repository_url() -> Result<(), String> {
     open_external_url(REPOSITORY_URL)
 }
 
+#[tauri::command]
+fn open_releases_url() -> Result<(), String> {
+    open_external_url(RELEASES_URL)
+}
+
+#[tauri::command]
+fn is_portable_mode() -> Result<bool, String> {
+    let exe_path =
+        env::current_exe().map_err(|error| format!("failed to read current exe path: {error}"))?;
+    Ok(exe_path
+        .parent()
+        .map(|directory| directory.join("portable.ini").is_file())
+        .unwrap_or(false))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -861,6 +967,12 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            if let Err(error) = app
+                .handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())
+            {
+                eprintln!("failed to initialize updater plugin: {error}");
+            }
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .level(log::LevelFilter::Info)
@@ -905,7 +1017,9 @@ pub fn run() {
             hide_main_window,
             toggle_maximize_main_window,
             start_window_drag,
-            open_repository_url
+            open_repository_url,
+            open_releases_url,
+            is_portable_mode
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1007,7 +1121,7 @@ fn open_external_url(url: &str) -> Result<(), String> {
     command
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("failed to open repository URL: {error}"))
+        .map_err(|error| format!("failed to open URL: {error}"))
 }
 
 fn load_layout_from_disk(path: &PathBuf) -> Option<LayoutState> {
@@ -1192,6 +1306,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
     let device_id = "local-device".to_string();
     let screens = detect_local_screens(app, &device_id);
     let transport_port = choose_available_transport_port(default_transport_port());
+    let quic_port = preferred_quic_port(transport_port);
     let selected_screen_id = screens
         .iter()
         .find(|screen| screen.is_primary)
@@ -1210,12 +1325,16 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         performance_monitor: default_performance_monitor(),
         transport_port_mode: default_transport_port_mode(),
         transport_port,
+        quic_port,
         devices: vec![Device {
             id: device_id,
             name: local_device_name(),
             platform: current_platform().into(),
             host: local_host_label(),
             transport_port,
+            quic_port,
+            transport_public_key: String::new(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
             color: "#2f7af8".into(),
             online: true,
             input_ready: false,
@@ -1239,6 +1358,7 @@ fn detect_fallback_layout() -> LayoutState {
         performance_monitor: default_performance_monitor(),
         transport_port_mode: default_transport_port_mode(),
         transport_port: default_transport_port(),
+        quic_port: preferred_quic_port(default_transport_port()),
     }
 }
 
@@ -1329,6 +1449,8 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         detected_layout.selected_screen_id
     };
 
+    let transport_port = normalize_transport_port(saved_layout.transport_port);
+
     LayoutState {
         devices,
         active_device_id,
@@ -1340,7 +1462,8 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
         performance_monitor: saved_layout.performance_monitor,
         transport_port_mode: normalize_transport_port_mode(&saved_layout.transport_port_mode),
-        transport_port: normalize_transport_port(saved_layout.transport_port),
+        transport_port,
+        quic_port: normalize_quic_port(transport_port, saved_layout.quic_port),
     }
 }
 
@@ -1500,6 +1623,16 @@ fn default_transport_port() -> u16 {
     DISCOVERY_PORT
 }
 
+fn default_protocol_version() -> u16 {
+    quic_transport::PROTOCOL_VERSION
+}
+
+fn preferred_quic_port(discovery_port: u16) -> u16 {
+    discovery_port
+        .saturating_add(1)
+        .clamp(TRANSPORT_PORT_MIN, TRANSPORT_PORT_MAX)
+}
+
 fn normalize_input_mode(mode: &str) -> String {
     if mode == "receive" {
         "receive".into()
@@ -1538,6 +1671,14 @@ fn normalize_transport_port_mode(mode: &str) -> String {
 
 fn normalize_transport_port(port: u16) -> u16 {
     port.clamp(TRANSPORT_PORT_MIN, TRANSPORT_PORT_MAX)
+}
+
+fn normalize_quic_port(discovery_port: u16, quic_port: u16) -> u16 {
+    if quic_port == 0 {
+        preferred_quic_port(discovery_port)
+    } else {
+        normalize_transport_port(quic_port)
+    }
 }
 
 fn choose_available_transport_port(preferred: u16) -> u16 {
@@ -1596,7 +1737,7 @@ struct ClipboardPacket {
 }
 
 fn run_clipboard_sync(
-    socket: UdpSocket,
+    quic_transport: quic_transport::TransportHandle,
     local_peer_id: String,
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
@@ -1662,7 +1803,12 @@ fn run_clipboard_sync(
         };
 
         if let Ok(payload) = encode_wire_packet(&packet) {
-            if socket.send_to(&payload, target.addr.as_str()).is_ok() {
+            let peer = quic_transport.peer(
+                target.addr.clone(),
+                target.transport_public_key.clone(),
+                target.protocol_version,
+            );
+            if quic_transport.send_stream(peer, payload).is_ok() {
                 transport_packets.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
                 last_sent = Some((target.device_id, target.addr, packet.text));
@@ -1732,11 +1878,14 @@ fn active_peer_snapshot(peers: &Arc<Mutex<Vec<LanPeer>>>) -> Vec<LanPeer> {
 
 fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
     let local_transport_port = layout.transport_port;
+    let local_quic_port = layout.quic_port;
     for device in &mut layout.devices {
         if device.role == "local" {
             device.online = true;
             device.input_ready = false;
             device.transport_port = local_transport_port;
+            device.quic_port = local_quic_port;
+            device.protocol_version = quic_transport::PROTOCOL_VERSION;
             continue;
         }
 
@@ -1824,6 +1973,9 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
         peer.ip.clone()
     };
     device.transport_port = peer.transport_port;
+    device.quic_port = normalize_quic_port(peer.transport_port, peer.quic_port);
+    device.transport_public_key = peer.transport_public_key.clone();
+    device.protocol_version = peer.protocol_version;
     if !peer.platform.trim().is_empty() {
         device.platform = normalize_peer_platform(&peer.platform).into();
     }
@@ -1854,6 +2006,9 @@ fn create_device_from_peer(layout: &LayoutState, peer: &LanPeer) -> Device {
             peer.ip.clone()
         },
         transport_port: peer.transport_port,
+        quic_port: normalize_quic_port(peer.transport_port, peer.quic_port),
+        transport_public_key: peer.transport_public_key.clone(),
+        protocol_version: peer.protocol_version,
         color,
         online: peer.input_ready,
         input_ready: peer.input_ready,
@@ -2291,6 +2446,13 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         host,
         ip,
         transport_port: layout.transport_port,
+        quic_port: normalize_quic_port(layout.transport_port, layout.quic_port),
+        transport_public_key: local_device
+            .map(|device| device.transport_public_key.clone())
+            .unwrap_or_default(),
+        protocol_version: local_device
+            .map(|device| device.protocol_version)
+            .unwrap_or_else(default_protocol_version),
         screen_count: local_device.map(|device| device.screens.len()).unwrap_or(0),
         input_ready: false,
         screens: local_device
@@ -2299,6 +2461,12 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         app_version: env!("CARGO_PKG_VERSION").into(),
         last_seen_ms: now_ms(),
     }
+}
+
+fn apply_transport_to_peer(peer: &mut LanPeer, transport: &quic_transport::TransportHandle) {
+    peer.quic_port = transport.port();
+    peer.transport_public_key = transport.public_key().to_string();
+    peer.protocol_version = quic_transport::PROTOCOL_VERSION;
 }
 
 fn screen_to_peer_screen(screen: &Screen) -> LanPeerScreen {
@@ -2436,6 +2604,17 @@ fn peer_from_discovery_packet(
 
     let mut peer = packet.peer;
     peer.ip = source_ip;
+    if peer.quic_port == 0 {
+        peer.quic_port = peer.transport_port;
+    }
+    if peer.protocol_version == 0 {
+        peer.protocol_version = default_protocol_version();
+    }
+    if peer.transport_public_key.trim().is_empty()
+        || peer.protocol_version != quic_transport::PROTOCOL_VERSION
+    {
+        peer.input_ready = false;
+    }
     peer.last_seen_ms = now_ms();
     Some((packet.kind, peer))
 }
@@ -2552,6 +2731,9 @@ mod tests {
                     platform: "macos".into(),
                     host: "local / 10.0.0.1".into(),
                     transport_port: 47833,
+                    quic_port: 47834,
+                    transport_public_key: "local-public-key".into(),
+                    protocol_version: quic_transport::PROTOCOL_VERSION,
                     color: "#2f7af8".into(),
                     online: true,
                     input_ready: false,
@@ -2565,6 +2747,9 @@ mod tests {
                     platform: "windows".into(),
                     host: "client / 10.0.0.2".into(),
                     transport_port: 47833,
+                    quic_port: 47834,
+                    transport_public_key: "peer-public-key".into(),
+                    protocol_version: quic_transport::PROTOCOL_VERSION,
                     color: "#0f766e".into(),
                     online: true,
                     input_ready: true,
@@ -2583,6 +2768,7 @@ mod tests {
             performance_monitor: false,
             transport_port_mode: "auto".into(),
             transport_port: 49152,
+            quic_port: 49153,
         }
     }
 
@@ -2594,6 +2780,9 @@ mod tests {
             host: "client".into(),
             ip: "10.0.0.2".into(),
             transport_port: 52000,
+            quic_port: 52001,
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_count: 1,
             input_ready: true,
             screens: vec![LanPeerScreen {

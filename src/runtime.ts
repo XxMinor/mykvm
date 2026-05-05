@@ -12,6 +12,9 @@ export interface LanPeer {
   host: string
   ip: string
   transportPort: number
+  quicPort: number
+  transportPublicKey: string
+  protocolVersion: number
   screenCount: number
   inputReady: boolean
   screens: LanPeerScreen[]
