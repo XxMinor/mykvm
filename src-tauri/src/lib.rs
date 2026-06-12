@@ -34,6 +34,15 @@ const PEER_TTL_MS: u64 = 30_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
 const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 const CLIPBOARD_MAX_TEXT_BYTES: usize = 256 * 1024;
+// Raw RGBA can be large (a 2560x1440 frame is ~14 MB); cap it so a stray huge
+// copy never floods the LAN transport. Images above this are skipped.
+const CLIPBOARD_MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+// After we write clipboard content received from a peer, ignore our own
+// clipboard for a short grace window. Reading an image back through the OS
+// pasteboard is not always byte-identical to what we wrote (macOS re-encodes
+// it), so a pure content-signature check can ping-pong; this window guarantees
+// we never echo received content straight back.
+const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
 
 #[cfg(target_os = "windows")]
@@ -44,6 +53,9 @@ const ACTIVATE_INSTANCE_EVENT_NAME: &str = "Local\\MyKVM_ActivateWindow";
 const QUIT_INSTANCE_EVENT_NAME: &str = "Local\\MyKVM_QuitExisting";
 
 static HOSTNAME_CACHE: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static WINDOWS_FIREWALL_ENSURED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 static SINGLE_INSTANCE_MUTEX: OnceLock<Mutex<Option<SingleInstanceGuard>>> = OnceLock::new();
@@ -270,6 +282,7 @@ struct AppRuntime {
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
     clipboard_stop: Mutex<Option<Arc<AtomicBool>>>,
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
     remote_input_active: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     input_receive_enabled: Arc<AtomicBool>,
@@ -295,6 +308,7 @@ impl AppRuntime {
             input_stop: Mutex::new(None),
             clipboard_stop: Mutex::new(None),
             clipboard_seen_text: Arc::new(Mutex::new(None)),
+            clipboard_echo_until: Arc::new(Mutex::new(None)),
             remote_input_active: Arc::new(AtomicBool::new(false)),
             clipboard_target: Arc::new(Mutex::new(None)),
             input_receive_enabled: Arc::new(AtomicBool::new(false)),
@@ -376,6 +390,7 @@ impl AppRuntime {
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
+        let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let transport_packets_for_input = Arc::clone(&self.transport_packets);
         let transport_packets_for_clipboard = Arc::clone(&self.transport_packets);
@@ -411,7 +426,12 @@ impl AppRuntime {
                 return;
             };
             let current_peer = local_peer_from_layout(&layout);
-            if handle_clipboard_packet(&payload, &current_peer.id, &clipboard_seen_text) {
+            if handle_clipboard_packet(
+                &payload,
+                &current_peer.id,
+                &clipboard_seen_text,
+                &clipboard_echo_until,
+            ) {
                 transport_packets_for_clipboard.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
             }
@@ -435,6 +455,12 @@ impl AppRuntime {
         if discovery_stop.is_some() {
             return Ok(());
         }
+
+        // Best-effort: make sure inbound UDP to this binary is allowed through
+        // Windows Defender Firewall, which is the usual reason a Windows client
+        // is invisible to (and unreachable from) a peer on the LAN.
+        #[cfg(target_os = "windows")]
+        ensure_windows_firewall_rule();
 
         let mut layout = self
             .layout
@@ -620,6 +646,7 @@ impl AppRuntime {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
+        let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let transport_packets = Arc::clone(&self.transport_packets);
         let clipboard_packets = Arc::clone(&self.clipboard_packets);
@@ -635,6 +662,7 @@ impl AppRuntime {
                 quic_transport,
                 local_peer.id,
                 clipboard_seen_text,
+                clipboard_echo_until,
                 clipboard_target,
                 transport_packets,
                 clipboard_packets,
@@ -663,7 +691,7 @@ impl AppRuntime {
         } else {
             NativeStageStatus {
                 state: "idle".into(),
-                detail: "剪贴板同步已开启，仅在鼠标切到远端设备后惰性发送文本剪贴板。".into(),
+                detail: "剪贴板同步已开启，仅在鼠标切到远端设备后惰性发送文本/图片剪贴板。".into(),
             }
         }
     }
@@ -2006,14 +2034,87 @@ fn clipboard_ready_status() -> NativeStageStatus {
 struct ClipboardPacket {
     protocol: String,
     origin_id: String,
+    // Empty when the payload is an image. Defaulted so packets from older peers
+    // (text-only) still decode.
+    #[serde(default)]
     text: String,
+    // Present only for image copies. Skipped on the wire for text packets, and
+    // defaulted so text-only peers still decode image-capable packets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<ClipboardImage>,
     sequence: u64,
 }
 
+/// A bitmap copied to the clipboard, carried as base64-encoded RGBA8 plus its
+/// dimensions. RGBA is what `arboard` hands us and expects back, so no image
+/// codec is needed on either end.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardImage {
+    width: u32,
+    height: u32,
+    rgba_base64: String,
+}
+
+/// One unit of clipboard content read from (or written to) the local system.
+enum ClipboardContent {
+    Text(String),
+    Image(ClipboardImage),
+}
+
+impl ClipboardContent {
+    fn is_oversized(&self) -> bool {
+        match self {
+            ClipboardContent::Text(text) => text.len() > CLIPBOARD_MAX_TEXT_BYTES,
+            ClipboardContent::Image(image) => {
+                // base64 inflates ~4/3; compare against the decoded RGBA budget.
+                image.rgba_base64.len() / 4 * 3 > CLIPBOARD_MAX_IMAGE_BYTES
+            }
+        }
+    }
+
+    /// A stable, cheap fingerprint used to detect "did the clipboard change"
+    /// and to suppress echoing content we just received from a peer.
+    fn signature(&self) -> String {
+        match self {
+            ClipboardContent::Text(text) => format!("text:{text}"),
+            ClipboardContent::Image(image) => {
+                format!(
+                    "image:{}x{}:{}",
+                    image.width,
+                    image.height,
+                    image.rgba_base64.len()
+                )
+            }
+        }
+    }
+
+    fn into_packet(self, origin_id: String, sequence: u64) -> ClipboardPacket {
+        match self {
+            ClipboardContent::Text(text) => ClipboardPacket {
+                protocol: CLIPBOARD_PROTOCOL.into(),
+                origin_id,
+                text,
+                image: None,
+                sequence,
+            },
+            ClipboardContent::Image(image) => ClipboardPacket {
+                protocol: CLIPBOARD_PROTOCOL.into(),
+                origin_id,
+                text: String::new(),
+                image: Some(image),
+                sequence,
+            },
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_clipboard_sync(
     quic_transport: quic_transport::TransportHandle,
     local_peer_id: String,
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     transport_packets: Arc<AtomicU64>,
     clipboard_packets: Arc<AtomicU64>,
@@ -2036,26 +2137,43 @@ fn run_clipboard_sync(
         }
         last_poll = Instant::now();
 
-        let Ok(text) = read_system_clipboard() else {
+        // Within the grace window after writing peer content, don't send. We do
+        // read once and record the signature: the OS can hand a bitmap back with
+        // slightly different bytes than we wrote, so learning the actual
+        // read-back signature here lets the echo check below recognize it once
+        // the window lifts instead of bouncing it back to the peer.
+        if clipboard_echo_active(&clipboard_echo_until) {
+            if let Some(content) = read_clipboard_content() {
+                if let Ok(mut seen) = clipboard_seen_text.lock() {
+                    *seen = Some(content.signature());
+                }
+            }
+            continue;
+        }
+
+        let Some(content) = read_clipboard_content() else {
             continue;
         };
+        if content.is_oversized() {
+            continue;
+        }
+        let signature = content.signature();
 
-        if text.len() > CLIPBOARD_MAX_TEXT_BYTES
-            || last_sent
-                .as_ref()
-                .map(|(device_id, addr, previous_text)| {
-                    device_id == &target.device_id && addr == &target.addr && previous_text == &text
-                })
-                .unwrap_or(false)
+        if last_sent
+            .as_ref()
+            .map(|(device_id, addr, previous)| {
+                device_id == &target.device_id && addr == &target.addr && previous == &signature
+            })
+            .unwrap_or(false)
         {
             continue;
         }
 
         let should_send = clipboard_seen_text
             .lock()
-            .map(|mut seen_text| {
-                if seen_text.as_deref() == Some(text.as_str()) {
-                    *seen_text = None;
+            .map(|mut seen| {
+                if seen.as_deref() == Some(signature.as_str()) {
+                    *seen = None;
                     false
                 } else {
                     true
@@ -2064,17 +2182,12 @@ fn run_clipboard_sync(
             .unwrap_or(true);
 
         if !should_send {
-            last_sent = Some((target.device_id.clone(), target.addr.clone(), text));
+            last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
             continue;
         }
 
         sequence = sequence.saturating_add(1);
-        let packet = ClipboardPacket {
-            protocol: CLIPBOARD_PROTOCOL.into(),
-            origin_id: local_peer_id.clone(),
-            text,
-            sequence,
-        };
+        let packet = content.into_packet(local_peer_id.clone(), sequence);
 
         if let Ok(payload) = encode_wire_packet(&packet) {
             let peer = quic_transport.peer(
@@ -2088,10 +2201,25 @@ fn run_clipboard_sync(
             }
             // Record the attempt regardless of the result. If the peer is
             // unreachable this stops us re-encoding and re-blocking on the same
-            // unchanged text every poll; a genuinely new copy still differs and
-            // will be retried.
-            last_sent = Some((target.device_id, target.addr, packet.text));
+            // unchanged content every poll; a genuinely new copy still differs
+            // and will be retried.
+            last_sent = Some((target.device_id, target.addr, signature));
         }
+    }
+}
+
+/// True while we are inside the post-write grace window (see
+/// `CLIPBOARD_ECHO_GRACE_MS`).
+fn clipboard_echo_active(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) -> bool {
+    clipboard_echo_until
+        .lock()
+        .map(|until| until.map(|deadline| Instant::now() < deadline).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+fn arm_clipboard_echo_guard(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) {
+    if let Ok(mut until) = clipboard_echo_until.lock() {
+        *until = Some(Instant::now() + Duration::from_millis(CLIPBOARD_ECHO_GRACE_MS));
     }
 }
 
@@ -2099,6 +2227,7 @@ fn handle_clipboard_packet(
     payload: &[u8],
     local_peer_id: &str,
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
 ) -> bool {
     let Some(packet) = decode_wire_packet::<ClipboardPacket>(payload) else {
         return false;
@@ -2112,11 +2241,35 @@ fn handle_clipboard_packet(
         return true;
     }
 
-    if packet.text.len() <= CLIPBOARD_MAX_TEXT_BYTES && write_system_clipboard(&packet.text).is_ok()
-    {
-        if let Ok(mut seen_text) = clipboard_seen_text.lock() {
-            *seen_text = Some(packet.text);
+    let content = if let Some(image) = packet.image {
+        Some(ClipboardContent::Image(image))
+    } else if !packet.text.is_empty() {
+        Some(ClipboardContent::Text(packet.text))
+    } else {
+        None
+    };
+
+    let Some(content) = content else {
+        return true;
+    };
+    if content.is_oversized() {
+        return true;
+    }
+
+    let signature = content.signature();
+    let written = match &content {
+        ClipboardContent::Text(text) => write_system_clipboard(text).is_ok(),
+        ClipboardContent::Image(image) => write_clipboard_image(image).is_ok(),
+    };
+
+    if written {
+        // Remember what we just wrote so our own poll loop recognizes it as an
+        // echo (signature match) and arm the time-based guard as a backstop in
+        // case the OS hands the bitmap back to us with slightly different bytes.
+        if let Ok(mut seen) = clipboard_seen_text.lock() {
+            *seen = Some(signature);
         }
+        arm_clipboard_echo_guard(clipboard_echo_until);
     }
 
     true
@@ -2392,6 +2545,65 @@ fn write_system_clipboard(text: &str) -> Result<(), String> {
     } else {
         Err(format!("clipboard command exited with status {status}"))
     }
+}
+
+/// Reads whatever is currently on the clipboard, preferring an image when one
+/// is present and otherwise falling back to text. Returns `None` when the
+/// clipboard is empty or unreadable.
+fn read_clipboard_content() -> Option<ClipboardContent> {
+    if let Some(image) = read_clipboard_image() {
+        return Some(ClipboardContent::Image(image));
+    }
+    match read_system_clipboard() {
+        Ok(text) if !text.is_empty() => Some(ClipboardContent::Text(text)),
+        _ => None,
+    }
+}
+
+/// Reads a bitmap from the system clipboard via `arboard`. `get_image` returns
+/// an error (not an image) when the clipboard holds text, so callers should try
+/// this first and fall back to text.
+fn read_clipboard_image() -> Option<ClipboardImage> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let image = clipboard.get_image().ok()?;
+    if image.width == 0 || image.height == 0 || image.bytes.is_empty() {
+        return None;
+    }
+    if image.bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES {
+        return None;
+    }
+
+    Some(ClipboardImage {
+        width: image.width as u32,
+        height: image.height as u32,
+        rgba_base64: BASE64.encode(image.bytes.as_ref()),
+    })
+}
+
+/// Writes a received bitmap to the system clipboard via `arboard`.
+fn write_clipboard_image(image: &ClipboardImage) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    let bytes = BASE64
+        .decode(image.rgba_base64.as_bytes())
+        .map_err(|error| format!("failed to decode clipboard image: {error}"))?;
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if width == 0 || height == 0 || bytes.len() != width.saturating_mul(height).saturating_mul(4) {
+        return Err("clipboard image has invalid dimensions".into());
+    }
+
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width,
+            height,
+            bytes: std::borrow::Cow::Owned(bytes),
+        })
+        .map_err(|error| format!("failed to write clipboard image: {error}"))
 }
 
 fn read_system_performance_sample(state: &AppRuntime) -> PerformanceSample {
@@ -2729,6 +2941,10 @@ fn scan_for_peers(local_peer: &LanPeer) -> Result<Vec<LanPeer>, String> {
     for target in broadcast_addrs(local_peer.transport_port) {
         let _ = send_discovery_packet(&socket, "announce", local_peer, target);
     }
+    // Fallback for networks that drop broadcast but forward unicast.
+    for target in unicast_sweep_targets(local_peer.transport_port) {
+        let _ = send_discovery_packet(&socket, "announce", local_peer, target.as_str());
+    }
 
     let started = Instant::now();
     let mut buffer = [0_u8; 4096];
@@ -2907,6 +3123,85 @@ pub(crate) fn broadcast_addrs(port: u16) -> Vec<String> {
     addresses.sort();
     addresses.dedup();
     addresses
+}
+
+/// Every other host address in our local /24, used as a fallback when a network
+/// drops broadcast traffic (common with Wi-Fi "AP/client isolation" and some
+/// managed switches) but still forwards unicast between clients.
+pub(crate) fn unicast_sweep_targets(port: u16) -> Vec<String> {
+    let Some(ip) = local_ip_address() else {
+        return Vec::new();
+    };
+    let parts = ip.split('.').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Vec::new();
+    }
+    let self_host = parts[3].parse::<u8>().unwrap_or(0);
+    (1..=254u8)
+        .filter(|host| *host != self_host)
+        .map(|host| format!("{}.{}.{}.{}:{}", parts[0], parts[1], parts[2], host, port))
+        .collect()
+}
+
+/// Adds (once per process) an inbound UDP allow rule for this binary to Windows
+/// Defender Firewall so LAN peers can reach our discovery and QUIC sockets.
+/// Requires elevation; when we are not elevated the `netsh` calls fail
+/// harmlessly and we just log a hint.
+#[cfg(target_os = "windows")]
+fn ensure_windows_firewall_rule() {
+    if WINDOWS_FIREWALL_ENSURED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let exe = exe.to_string_lossy().to_string();
+    let rule_name = "MyKVM (UDP-In)";
+
+    // Drop any stale rule first so re-installs/path changes don't pile up.
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={rule_name}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let status = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={rule_name}"),
+            "dir=in",
+            "action=allow",
+            &format!("program={exe}"),
+            "protocol=udp",
+            "profile=any",
+            "enable=yes",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match status {
+        Ok(status) if status.success() => {
+            log::info!("ensured Windows Defender Firewall inbound UDP rule for MyKVM");
+        }
+        _ => {
+            log::warn!(
+                "could not add Windows Defender Firewall rule (administrator rights required); \
+                 if LAN peers cannot find this device, allow MyKVM through the firewall for all \
+                 networks or relaunch MyKVM as administrator"
+            );
+        }
+    }
 }
 
 fn now_ms() -> u64 {

@@ -55,6 +55,12 @@ struct InputTarget {
 #[derive(Debug, Clone)]
 struct ActiveTarget {
     target: InputTarget,
+    // The remote screen the cursor is currently over and the wire id we send for
+    // it. These start as the screen we crossed into and change as the cursor
+    // roams across the remote device's other screens. `x`/`y` are coordinates
+    // local to `current_screen`.
+    current_screen: Screen,
+    current_screen_id: String,
     x: f64,
     y: f64,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -190,6 +196,18 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
         };
     }
 
+    // When Secure Keyboard Entry is active anywhere on the system, macOS silently
+    // drops *every* synthetic key event while still delivering synthetic mouse
+    // events. That is exactly the "clicks work but the keyboard does nothing"
+    // symptom, so we surface it instead of failing silently.
+    #[cfg(target_os = "macos")]
+    if macos_secure_input_enabled() {
+        return NativeStageStatus {
+            state: "error".into(),
+            detail: "检测到 macOS 安全键盘输入(Secure Keyboard Entry)已开启，系统会拦截所有注入的键盘事件（鼠标点击不受影响）。请退出正在占用安全输入的应用——常见来源：终端里勾选的“安全键盘输入”、聚焦中的密码输入框、部分密码管理器；必要时注销重新登录，然后重试。".into(),
+        };
+    }
+
     NativeStageStatus {
         state: "ready".into(),
         detail: format!(
@@ -221,6 +239,21 @@ fn macos_accessibility_trusted(request_permission: bool) -> bool {
     let value = CFBoolean::true_value();
     let options = CFDictionary::from_CFType_pairs(&[(key, value)]);
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) }
+}
+
+/// Reports whether macOS Secure Keyboard Entry is currently enabled by any
+/// process. While it is on, synthetic keyboard events posted via CGEvent are
+/// discarded by the window server (mouse events are unaffected).
+#[cfg(target_os = "macos")]
+fn macos_secure_input_enabled() -> bool {
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        // Returns a Carbon `Boolean` (unsigned char); read it as u8 to avoid
+        // relying on a non-0/1 value being a valid Rust bool.
+        fn IsSecureEventInputEnabled() -> u8;
+    }
+
+    unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
 fn start_input_capture(
@@ -1463,7 +1496,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         active_target.x += dx;
         active_target.y += dy;
 
-        if should_return_to_local(active_target, dx, dy) {
+        if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
             let point = local_return_point(active_target);
             let target = active_target.target.clone();
             *active = None;
@@ -1488,10 +1521,10 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
 
         active_target.x = active_target
             .x
-            .clamp(0.0, (active_target.target.remote_screen.width - 1) as f64);
+            .clamp(0.0, (active_target.current_screen.width - 1) as f64);
         active_target.y = active_target
             .y
-            .clamp(0.0, (active_target.target.remote_screen.height - 1) as f64);
+            .clamp(0.0, (active_target.current_screen.height - 1) as f64);
         let dragging = remote_button_is_down(&context.remote_button_mask);
         if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
             if !send_remote_mouse_move(
@@ -1851,7 +1884,7 @@ fn handle_macos_mouse_move(
             active_target.x += dx;
             active_target.y += dy;
 
-            if should_return_to_local(active_target, dx, dy) {
+            if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
                 let point = local_return_point(active_target);
                 let invert_y = active_target.invert_y;
                 let target = active_target.target.clone();
@@ -1873,10 +1906,10 @@ fn handle_macos_mouse_move(
 
             active_target.x = active_target
                 .x
-                .clamp(0.0, (active_target.target.remote_screen.width - 1) as f64);
+                .clamp(0.0, (active_target.current_screen.width - 1) as f64);
             active_target.y = active_target
                 .y
-                .clamp(0.0, (active_target.target.remote_screen.height - 1) as f64);
+                .clamp(0.0, (active_target.current_screen.height - 1) as f64);
             let dragging = remote_button_is_down(&context.remote_button_mask);
             if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
                 if !send_remote_mouse_move(
@@ -1999,8 +2032,16 @@ fn crossing_target_with_transform(
                     .clamp(0.0, (target.remote_screen.height - 1) as f64),
             };
 
+            // The screen we cross into is the entry screen; carry it (with its
+            // wire id) as the initial "current" screen so the cursor can later
+            // roam onto the remote device's other screens.
+            let mut current_screen = target.remote_screen.clone();
+            current_screen.id = target.screen_id.clone();
+
             ActiveTarget {
                 target: target.clone(),
+                current_screen,
+                current_screen_id: target.screen_id.clone(),
                 x: remote_x,
                 y: remote_y,
                 invert_y,
@@ -2187,13 +2228,103 @@ fn mac_cursor_point(context: &MacCaptureContext, point: (f64, f64), invert_y: bo
     .unwrap_or(point)
 }
 
-fn should_return_to_local(active: &ActiveTarget, dx: f64, dy: f64) -> bool {
-    match active.target.edge {
-        Edge::Right => active.x <= 0.0 && dx < 0.0,
-        Edge::Left => active.x >= (active.target.remote_screen.width - 1) as f64 && dx > 0.0,
-        Edge::Bottom => active.y <= 0.0 && dy < 0.0,
-        Edge::Top => active.y >= (active.target.remote_screen.height - 1) as f64 && dy > 0.0,
+/// After a raw delta has been applied to `active.x`/`active.y`, reconcile which
+/// remote screen the cursor is on. If it has crossed onto another screen of the
+/// same remote device, switch to it so control roams across the remote's whole
+/// desktop (e.g. onto a client's secondary monitor). Returns `true` when the
+/// cursor has left the remote desktop back toward the local machine, in which
+/// case the caller should hand control back.
+fn update_active_remote_screen(
+    active: &mut ActiveTarget,
+    dx: f64,
+    dy: f64,
+    layout_state: &Arc<Mutex<LayoutState>>,
+) -> bool {
+    // Still within the screen we're already on: nothing to reconcile.
+    if point_in_local_bounds(&active.current_screen, active.x, active.y) {
+        return false;
     }
+
+    let screens = layout_state
+        .lock()
+        .map(|layout| remote_device_screens(&layout, &active.target.device_id))
+        .unwrap_or_default();
+
+    // Position of the cursor in the remote device's shared layout space.
+    let global_x = active.current_screen.x as f64 + active.x;
+    let global_y = active.current_screen.y as f64 + active.y;
+
+    // Roam onto an adjacent screen of the same device that holds this point.
+    if let Some(screen) = screens
+        .iter()
+        .find(|screen| screen.id != active.current_screen.id && point_in_screen(screen, global_x, global_y))
+    {
+        active.x = global_x - screen.x as f64;
+        active.y = global_y - screen.y as f64;
+        active.current_screen_id = screen.id.clone();
+        active.current_screen = screen.clone();
+        return false;
+    }
+
+    // Off the edge with no neighbor there. Only the entry screen borders the
+    // local machine, so only it can hand control back; every other outer edge
+    // just clamps the cursor in place.
+    active.current_screen_id == active.target.screen_id
+        && exited_entry_edge(
+            active.target.edge,
+            &active.current_screen,
+            active.x,
+            active.y,
+            dx,
+            dy,
+        )
+}
+
+/// True when local coordinates `x`/`y` are inside `screen`'s bounds.
+fn point_in_local_bounds(screen: &Screen, x: f64, y: f64) -> bool {
+    x >= 0.0 && x <= (screen.width - 1) as f64 && y >= 0.0 && y <= (screen.height - 1) as f64
+}
+
+/// True when a point in shared layout space falls on `screen`.
+fn point_in_screen(screen: &Screen, global_x: f64, global_y: f64) -> bool {
+    global_x >= screen.x as f64
+        && global_x <= (screen.x + screen.width - 1) as f64
+        && global_y >= screen.y as f64
+        && global_y <= (screen.y + screen.height - 1) as f64
+}
+
+/// Whether the cursor has crossed back over the edge it originally entered from
+/// (the side bordering the local machine). Mirrors the classic single-screen
+/// return-to-local test, applied to the entry screen.
+fn exited_entry_edge(edge: Edge, screen: &Screen, x: f64, y: f64, dx: f64, dy: f64) -> bool {
+    match edge {
+        Edge::Right => x <= 0.0 && dx < 0.0,
+        Edge::Left => x >= (screen.width - 1) as f64 && dx > 0.0,
+        Edge::Bottom => y <= 0.0 && dy < 0.0,
+        Edge::Top => y >= (screen.height - 1) as f64 && dy > 0.0,
+    }
+}
+
+/// The remote device's screens, each carrying the wire screen id that the
+/// receiving side matches against (the device-prefixed layout id stripped back
+/// to the peer's own screen id).
+fn remote_device_screens(layout: &LayoutState, device_id: &str) -> Vec<Screen> {
+    layout
+        .devices
+        .iter()
+        .find(|device| device.id == device_id)
+        .map(|device| {
+            device
+                .screens
+                .iter()
+                .map(|screen| {
+                    let mut copy = screen.clone();
+                    copy.id = peer_screen_id(device, screen);
+                    copy
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn local_return_point(active: &ActiveTarget) -> (f64, f64) {
@@ -2237,7 +2368,7 @@ fn send_remote_mouse_move(
         quic_transport,
         &active.target,
         InputEvent::MouseMove {
-            screen_id: active.target.screen_id.clone(),
+            screen_id: active.current_screen_id.clone(),
             x: active.x.round() as i32,
             y: active.y.round() as i32,
         },
@@ -2731,13 +2862,16 @@ fn inject_key(key_code: u16, down: bool) {
     };
 
     let Some(mac_code) = windows_vk_to_mac_key(key_code) else {
+        log::debug!("inject_key: no mac keycode for windows vk {key_code:#04x}; dropping");
         return;
     };
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        log::warn!("inject_key: failed to create CGEventSource");
         return;
     };
-    if let Ok(event) = CGEvent::new_keyboard_event(source, mac_code, down) {
-        event.post(CGEventTapLocation::HID);
+    match CGEvent::new_keyboard_event(source, mac_code, down) {
+        Ok(event) => event.post(CGEventTapLocation::HID),
+        Err(_) => log::warn!("inject_key: failed to build keyboard event for mac code {mac_code}"),
     }
 }
 
@@ -3013,6 +3147,106 @@ mod tests {
             modifier_remap: true,
             modifier_map: crate::default_modifier_map(),
         }
+    }
+
+    #[test]
+    fn cursor_roams_across_remote_device_screens() {
+        // Remote device with two stacked screens: a primary and a secondary
+        // directly below it (the screenshot's #10086 / #41039 arrangement).
+        let device = Device {
+            id: "peer-device".into(),
+            name: "Client".into(),
+            platform: "windows".into(),
+            host: "10.0.0.2".into(),
+            transport_port: 47833,
+            quic_port: 47834,
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            color: "#0f766e".into(),
+            online: true,
+            input_ready: true,
+            role: "client".into(),
+            source: "detected".into(),
+            screens: vec![
+                screen("peer-device", "peer-device-scr-1", 1920, 0, 1920, 1080),
+                screen("peer-device", "peer-device-scr-2", 1920, 1080, 1920, 1080),
+            ],
+        };
+        let mut layout = layout_for_target_tests();
+        layout.devices.retain(|device| device.id != "peer-device");
+        layout.devices.push(device);
+        let layout_state = Arc::new(Mutex::new(layout));
+
+        let entry = screen("peer-device", "peer-device-scr-1", 1920, 0, 1920, 1080);
+        let target = InputTarget {
+            device_id: "peer-device".into(),
+            target_addr: "10.0.0.2:47834".into(),
+            target_platform: "windows".into(),
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            screen_id: "scr-1".into(),
+            local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            remote_screen: entry.clone(),
+            edge: Edge::Right,
+        };
+        let mut current_screen = entry.clone();
+        current_screen.id = "scr-1".into();
+        let mut active = ActiveTarget {
+            target,
+            current_screen,
+            current_screen_id: "scr-1".into(),
+            x: 100.0,
+            y: 1079.0,
+            invert_y: false,
+        };
+
+        // Pushing down past the primary's bottom edge roams onto the secondary.
+        active.y += 5.0;
+        let returned = update_active_remote_screen(&mut active, 0.0, 5.0, &layout_state);
+        assert!(!returned, "crossing onto a sibling screen must not return to local");
+        assert_eq!(active.current_screen_id, "scr-2");
+        assert!((0.0..1080.0).contains(&active.y));
+        assert_eq!(active.x, 100.0);
+
+        // Moving back up crosses back onto the primary screen.
+        active.y -= 6.0;
+        let returned = update_active_remote_screen(&mut active, 0.0, -6.0, &layout_state);
+        assert!(!returned);
+        assert_eq!(active.current_screen_id, "scr-1");
+    }
+
+    #[test]
+    fn cursor_returns_to_local_only_from_entry_edge() {
+        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
+        let entry = screen("peer-device", "peer-device-local-display-1", 1920, 0, 1920, 1080);
+        let target = InputTarget {
+            device_id: "peer-device".into(),
+            target_addr: "10.0.0.2:47834".into(),
+            target_platform: "windows".into(),
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            screen_id: "local-display-1".into(),
+            local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            remote_screen: entry.clone(),
+            edge: Edge::Right,
+        };
+        let mut current_screen = entry.clone();
+        current_screen.id = "local-display-1".into();
+        let mut active = ActiveTarget {
+            target,
+            current_screen,
+            current_screen_id: "local-display-1".into(),
+            x: 0.0,
+            y: 500.0,
+            invert_y: false,
+        };
+
+        // Crossed in via the right edge; moving back left off the entry edge
+        // hands control back to the local machine.
+        active.x -= 2.0;
+        assert!(update_active_remote_screen(&mut active, -2.0, 0.0, &layout_state));
     }
 
     #[test]

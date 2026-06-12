@@ -10,6 +10,19 @@
   !insertmacro MYKVM_CLOSE_RUNNING_INSTANCES
 !macroend
 
+!macro NSIS_HOOK_POSTINSTALL
+  ; Allow inbound UDP to mykvm.exe so LAN peers can discover and reach this
+  ; device. Best-effort: only succeeds when the installer runs elevated.
+  DetailPrint "Configuring Windows Defender Firewall for mykvm..."
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="MyKVM (UDP-In)"'
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="MyKVM (UDP-In)" dir=in action=allow program="$INSTDIR\mykvm.exe" protocol=udp profile=any enable=yes'
+!macroend
+
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro MYKVM_CLOSE_RUNNING_INSTANCES
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  ; Remove the firewall rule we added during install.
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="MyKVM (UDP-In)"'
 !macroend
