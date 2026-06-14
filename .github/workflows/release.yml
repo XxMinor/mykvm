@@ -251,16 +251,39 @@ jobs:
 
           exit "$missing"
 
-      - name: Write Apple notarization API key
+      - name: Configure Apple notarization
         if: matrix.name == 'macos'
         shell: bash
         env:
           APPLE_API_KEY_PRIVATE_KEY: ${{ secrets.APPLE_API_KEY_PRIVATE_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -n "$APPLE_API_KEY_PRIVATE_KEY" ]; then
+          set -euo pipefail
+          # Tauri's notarize_auth() reads these with var_os(), which treats an
+          # empty string the same as "set". Wiring blank secrets straight into
+          # tauri-action's env therefore makes the bundler ATTEMPT notarization
+          # with empty credentials and die ("Team ID must be at least 3
+          # characters"). So export notarization vars to $GITHUB_ENV only when a
+          # real value is present; a free self-signed release leaves them unset
+          # and is code-signed but not notarized.
+          if [ -n "$APPLE_API_KEY_PRIVATE_KEY" ] && [ -n "$APPLE_API_KEY_ID" ] && [ -n "$APPLE_API_ISSUER" ]; then
             mkdir -p "$RUNNER_TEMP/apple-notary"
             printf '%s' "$APPLE_API_KEY_PRIVATE_KEY" > "$RUNNER_TEMP/apple-notary/AuthKey.p8"
             echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/apple-notary/AuthKey.p8" >> "$GITHUB_ENV"
+            echo "APPLE_API_KEY=$APPLE_API_KEY_ID" >> "$GITHUB_ENV"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER" >> "$GITHUB_ENV"
+            echo "Apple notarization: App Store Connect API key detected."
+          elif [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            echo "APPLE_ID=$APPLE_ID" >> "$GITHUB_ENV"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD" >> "$GITHUB_ENV"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID" >> "$GITHUB_ENV"
+            echo "Apple notarization: Apple ID credentials detected."
+          else
+            echo "Apple notarization: no credentials; build will be signed but NOT notarized."
           fi
 
       - name: Build web app
@@ -324,11 +347,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Notarization credentials are NOT wired in here: passing unset secrets
+          # injects empty strings, which Tauri reads as "present" and tries to
+          # notarize with blank creds. The "Configure Apple notarization" step
+          # exports them to $GITHUB_ENV only when real, so they reach the bundler
+          # only when notarization is actually configured.
         with:
           tauriScript: npm run tauri
           args: ${{ matrix.args }}
