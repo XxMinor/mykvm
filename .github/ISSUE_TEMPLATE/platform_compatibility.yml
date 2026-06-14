@@ -1,0 +1,54 @@
+name: 🖥️ Platform compatibility
+description: A specific OS, version, or hardware combo where MyKVM behaves differently.
+labels: ["platform"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for "works on X but not on Y" reports — OS versions, architectures, multi-monitor setups, etc.
+  - type: input
+    id: server-os
+    attributes:
+      label: Server machine OS + version + arch
+      placeholder: macOS 15.3, Apple Silicon (arm64)
+    validations:
+      required: true
+  - type: input
+    id: client-os
+    attributes:
+      label: Client machine OS + version + arch
+      placeholder: Windows 11 23H2, x64
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: MyKVM version
+      placeholder: v0.3.4
+    validations:
+      required: true
+  - type: checkboxes
+    id: working
+    attributes:
+      label: What works?
+      options:
+        - label: LAN discovery / manual connection
+        - label: Mouse crossing between machines
+        - label: Keyboard input
+        - label: Clipboard text sync
+        - label: Clipboard image sync
+        - label: Multi-monitor layout
+  - type: textarea
+    id: broken
+    attributes:
+      label: What's broken or different?
+      description: Describe the behavior on this platform, and how it differs from what you expected or saw elsewhere.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Hardware / display notes
+      description: Monitor count and resolutions, scaling/DPI, KVM hardware, multiple network interfaces, VPN, etc.
+    validations:
+      required: false

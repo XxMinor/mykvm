@@ -1,0 +1,62 @@
+name: 🐞 Bug report
+description: Something works incorrectly or crashes.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please check existing issues first, and include enough detail to reproduce.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, and what went wrong?
+      placeholder: I moved the cursor to the right edge to cross to the Windows client, but…
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start MyKVM on the Mac in Server mode
+        2. Start MyKVM on Windows in Client mode
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: MyKVM version
+      description: See Settings → App update, or the version in the title/footer.
+      placeholder: v0.3.4
+    validations:
+      required: true
+  - type: input
+    id: server-os
+    attributes:
+      label: Server machine OS (the one with the keyboard/mouse)
+      placeholder: macOS 15.3 (Apple Silicon)
+    validations:
+      required: true
+  - type: input
+    id: client-os
+    attributes:
+      label: Client machine OS
+      placeholder: Windows 11 23H2 (x64)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Console output, the in-app performance monitor, or screenshots. Logs are automatically formatted.
+      render: text
+    validations:
+      required: false

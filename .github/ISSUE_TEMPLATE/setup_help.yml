@@ -1,0 +1,57 @@
+name: 🛠️ Setup help
+description: Trouble installing, connecting, or granting permissions.
+labels: ["help wanted", "question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For general "how do I…" questions, the [Discussions board](https://github.com/XxMinor/mykvm/discussions) is often faster. Use this template when setup isn't working and you want help debugging.
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to set up?
+      placeholder: Control my Windows desktop from my MacBook keyboard/mouse.
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where are you stuck?
+      options:
+        - Installing / first launch
+        - Devices don't discover each other
+        - Connected, but mouse won't cross
+        - Keyboard or clipboard not working
+        - Permissions (Accessibility / Input Monitoring)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: machines
+    attributes:
+      label: The two machines (OS + version)
+      placeholder: macOS 15.3 (server) ↔ Windows 11 (client)
+    validations:
+      required: true
+  - type: checkboxes
+    id: permissions
+    attributes:
+      label: macOS permissions granted (if a Mac is the server)
+      options:
+        - label: Accessibility
+        - label: Input Monitoring
+        - label: Not applicable (no Mac involved)
+  - type: textarea
+    id: network
+    attributes:
+      label: Network setup
+      description: Same Wi-Fi/LAN? Subnet, VPN, firewall, multiple network interfaces? Did "扫描局域网 / Scan LAN" find anything?
+    validations:
+      required: false
+  - type: textarea
+    id: observed
+    attributes:
+      label: What do you see?
+      description: Error messages, the device list state, screenshots, etc.
+    validations:
+      required: false
