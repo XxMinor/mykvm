@@ -9,6 +9,9 @@ export interface LanPeer {
   id: string
   name: string
   platform: string
+  machineRole: string
+  clusterId: string
+  pairingRequired: boolean
   host: string
   ip: string
   transportPort: number
@@ -41,6 +44,15 @@ export interface DiscoveryStatus {
   peers: LanPeer[]
 }
 
+export interface PairingStatus {
+  state: 'idle' | 'available' | 'requested' | 'paired'
+  code: string
+  requesterName: string
+  requesterIp: string
+  expiresAtMs: number
+  detail: string
+}
+
 export interface RuntimeStatus {
   started: boolean
   transport: NativeStageStatus
@@ -48,6 +60,7 @@ export interface RuntimeStatus {
   inject: NativeStageStatus
   clipboard: NativeStageStatus
   discovery: DiscoveryStatus
+  pairing: PairingStatus
   privilege: PrivilegeStatus
 }
 

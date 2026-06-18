@@ -1,5 +1,6 @@
 import {
   type CSSProperties,
+  type FormEvent,
   useEffect,
   useEffectEvent,
   useMemo,
@@ -11,6 +12,8 @@ import type { Theme } from "@tauri-apps/api/window";
 import "./App.css";
 import {
   checkForAppUpdate,
+  confirmLanPairing,
+  dismissPairingRequest,
   hideMainWindow,
   installAppUpdate,
   isPortableMode,
@@ -23,6 +26,7 @@ import {
   readPerformanceSample,
   readRuntimeStatus,
   relaunchApp,
+  requestLanPairing,
   restartAsAdmin,
   saveLayout,
   scanLanPeers,
@@ -104,6 +108,11 @@ type UpdateStatus =
   | "installing"
   | "error";
 
+interface ServerPairingState {
+  peer: LanPeer;
+  host: string;
+}
+
 interface DragState {
   pointerId: number;
   screenId: string;
@@ -136,12 +145,17 @@ function App() {
   const [isRuntimePending, setIsRuntimePending] = useState(false);
   const [isScanningLan, setIsScanningLan] = useState(false);
   const [isAddingDevice, setIsAddingDevice] = useState(false);
+  const [isPairingDevice, setIsPairingDevice] = useState(false);
+  const [isDismissingPairing, setIsDismissingPairing] = useState(false);
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
   const [isClipboardPending, setIsClipboardPending] = useState(false);
   const [boardZoom, setBoardZoom] = useState(1);
   const [manualDeviceName, setManualDeviceName] = useState("");
   const [manualDeviceHost, setManualDeviceHost] = useState("");
+  const [serverPairing, setServerPairing] =
+    useState<ServerPairingState | null>(null);
+  const [serverPairingCode, setServerPairingCode] = useState("");
   const [clipboardText, setClipboardText] = useState("");
   const [performanceSamples, setPerformanceSamples] = useState<
     PerformanceSample[]
@@ -962,7 +976,7 @@ function App() {
   }
 
   async function handleAddManualDevice(
-    event: React.FormEvent<HTMLFormElement>,
+    event: FormEvent<HTMLFormElement>,
   ) {
     event.preventDefault();
     const host = manualDeviceHost.trim();
@@ -978,6 +992,11 @@ function App() {
       const peer = await probeLanPeer(host);
       if (peer.screens.length === 0) {
         setErrorMessage(`${host}: ${ui.errors.connectedWithoutScreens}`);
+        return;
+      }
+
+      if (peer.pairingRequired) {
+        await beginPairing(peer, host);
         return;
       }
 
@@ -1003,9 +1022,93 @@ function App() {
       return;
     }
 
+    if (peer.pairingRequired) {
+      void beginPairing(peer);
+      return;
+    }
+
     updateLayout((layoutState) => {
       return upsertPeerDevice(layoutState, peer);
     });
+  }
+
+  async function beginPairing(peer: LanPeer, hostOverride = "") {
+    const host = hostOverride || peer.ip || peer.host;
+    if (!host) {
+      setErrorMessage(ui.errors.manualHostRequired);
+      return;
+    }
+
+    setIsPairingDevice(true);
+    setErrorMessage(null);
+
+    try {
+      const challengePeer = await requestLanPairing(host);
+      setServerPairing({ peer: challengePeer, host });
+      setServerPairingCode("");
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.pairingFailed,
+      );
+    } finally {
+      setIsPairingDevice(false);
+    }
+  }
+
+  async function confirmPairing(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!serverPairing) {
+      return;
+    }
+
+    const code = serverPairingCode.trim();
+    if (!code) {
+      setErrorMessage(ui.errors.pairingCodeRequired);
+      return;
+    }
+
+    setIsPairingDevice(true);
+    setErrorMessage(null);
+
+    try {
+      const pairedPeer = await confirmLanPairing(serverPairing.host, code);
+      if (pairedPeer.screens.length === 0) {
+        setErrorMessage(`${pairedPeer.name}: ${ui.errors.connectedWithoutScreens}`);
+        return;
+      }
+      updateLayout((layoutState) => upsertPeerDevice(layoutState, pairedPeer));
+      setServerPairing(null);
+      setServerPairingCode("");
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.pairingFailed,
+      );
+    } finally {
+      setIsPairingDevice(false);
+    }
+  }
+
+  async function dismissClientPairing() {
+    setIsDismissingPairing(true);
+    setErrorMessage(null);
+
+    try {
+      const nextRuntime = await dismissPairingRequest();
+      setSnapshot((current) =>
+        current
+          ? {
+              ...current,
+              runtime: nextRuntime,
+            }
+          : current,
+      );
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.pairingFailed,
+      );
+    } finally {
+      setIsDismissingPairing(false);
+    }
   }
 
   function handleRemoveDevice(deviceId: string) {
@@ -1434,9 +1537,11 @@ function App() {
                 <button
                   type="submit"
                   className="primary-button"
-                  disabled={isAddingDevice}
+                  disabled={isAddingDevice || isPairingDevice}
                 >
-                  {isAddingDevice ? ui.common.connecting : ui.common.add}
+                  {isAddingDevice || isPairingDevice
+                    ? ui.common.connecting
+                    : ui.common.add}
                 </button>
               </form>
             </section>
@@ -1484,11 +1589,13 @@ function App() {
                             type="button"
                             className="secondary-button compact-button"
                             onClick={() => handleAddPeer(peer)}
-                            disabled={peer.screens.length === 0}
+                            disabled={peer.screens.length === 0 || isPairingDevice}
                           >
                             {peer.screens.length === 0
                               ? ui.devices.noScreens
-                              : ui.common.add}
+                              : peer.pairingRequired
+                                ? ui.devices.pair
+                                : ui.common.add}
                           </button>
                         )}
                       </div>
@@ -1933,6 +2040,97 @@ function App() {
         </section>
       ) : null}
 
+      {serverPairing ? (
+        <div className="pairing-modal-backdrop" role="presentation">
+          <form className="pairing-modal" onSubmit={confirmPairing}>
+            <div>
+              <p className="eyebrow">{ui.devices.pairingEyebrow}</p>
+              <h2>{ui.devices.serverPairingTitle}</h2>
+              <p>
+                {ui.devices.serverPairingCopy} {serverPairing.peer.name} ·{" "}
+                {serverPairing.peer.ip || serverPairing.peer.host}
+              </p>
+            </div>
+            <input
+              className="pairing-code-input"
+              value={serverPairingCode}
+              onChange={(event) =>
+                setServerPairingCode(
+                  event.target.value.replace(/\D/g, "").slice(0, 6),
+                )
+              }
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              placeholder={ui.devices.pairingCodePlaceholder}
+              autoFocus
+            />
+            <div className="pairing-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  setServerPairing(null);
+                  setServerPairingCode("");
+                }}
+                disabled={isPairingDevice}
+              >
+                {ui.common.cancel}
+              </button>
+              <button
+                type="submit"
+                className="primary-button"
+                disabled={isPairingDevice || serverPairingCode.length < 6}
+              >
+                {isPairingDevice
+                  ? ui.common.connecting
+                  : ui.devices.confirmPairing}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
+      {machineRole === "client" && runtime.pairing.state === "requested" ? (
+        <div className="pairing-modal-backdrop" role="presentation">
+          <div className="pairing-modal pairing-modal-client">
+            <button
+              type="button"
+              className="pairing-close-button"
+              onClick={dismissClientPairing}
+              disabled={isDismissingPairing}
+              title={ui.devices.closePairing}
+              aria-label={ui.devices.closePairing}
+            >
+              <WindowCloseIcon />
+            </button>
+            <div>
+              <p className="eyebrow">{ui.devices.pairingEyebrow}</p>
+              <h2>{ui.devices.clientPairingTitle}</h2>
+              <p>
+                {runtime.pairing.requesterName || ui.roles.server} ·{" "}
+                {runtime.pairing.requesterIp}
+              </p>
+            </div>
+            <strong className="pairing-code-display">
+              {runtime.pairing.code}
+            </strong>
+            <p>{ui.devices.clientPairingCopy}</p>
+            <div className="pairing-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={dismissClientPairing}
+                disabled={isDismissingPairing}
+              >
+                {isDismissingPairing
+                  ? ui.devices.dismissingPairing
+                  : ui.devices.dismissPairing}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <footer className="app-footer">
         <span className="footer-copy">
           <span>
@@ -2282,8 +2480,8 @@ function upsertPeerDevice(
   const existingIndex = layout.devices.findIndex(
     (device) =>
       device.id === peerDeviceId(peer) ||
-      sameHost(device.host, peer.ip) ||
-      sameHost(device.host, peer.host),
+      (device.transportPublicKey.trim().length > 0 &&
+        device.transportPublicKey === peer.transportPublicKey),
   );
   const existingDevice =
     existingIndex >= 0 ? layout.devices[existingIndex] : undefined;
@@ -2415,8 +2613,8 @@ function findPeerDevice(layout: LayoutState, peer: LanPeer) {
 function deviceMatchesPeer(device: Device, peer: LanPeer) {
   return (
     device.id === peerDeviceId(peer) ||
-    sameHost(device.host, peer.ip) ||
-    sameHost(device.host, peer.host)
+    (device.transportPublicKey.trim().length > 0 &&
+      device.transportPublicKey === peer.transportPublicKey)
   );
 }
 
@@ -2450,18 +2648,6 @@ function deviceSourceTagClass(device: Device) {
   }
 
   return "tag-pill-manual";
-}
-
-function sameHost(value: string, host: string) {
-  if (!value.trim() || !host.trim()) {
-    return false;
-  }
-
-  const normalizedHost = host.trim().toLowerCase();
-
-  return value
-    .split("/")
-    .some((part) => part.trim().toLowerCase() === normalizedHost);
 }
 
 function sanitizeId(value: string) {

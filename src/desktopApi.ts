@@ -48,6 +48,9 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
       id: 'browser-preview',
       name: 'Desktop fallback',
       platform: navigator.platform,
+      machineRole: defaultLayout.machineRole,
+      clusterId: defaultLayout.clusterId,
+      pairingRequired: false,
       host: window.location.hostname || 'localhost',
       ip: '127.0.0.1',
       transportPort: defaultLayout.transportPort,
@@ -72,6 +75,14 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
       lastSeenMs: Date.now(),
     },
     peers: [],
+  },
+  pairing: {
+    state: 'idle',
+    code: '',
+    requesterName: '',
+    requesterIp: '',
+    expiresAtMs: 0,
+    detail: '',
   },
 }
 
@@ -113,6 +124,7 @@ export async function startRuntime(): Promise<RuntimeStatus> {
       inject: FALLBACK_RUNTIME.inject,
       clipboard: FALLBACK_RUNTIME.clipboard,
       privilege: FALLBACK_RUNTIME.privilege,
+      pairing: FALLBACK_RUNTIME.pairing,
       discovery: {
         ...FALLBACK_RUNTIME.discovery,
         detail: 'Desktop fallback cannot scan the LAN. Start the Tauri desktop app to use UDP discovery.',
@@ -171,6 +183,33 @@ export async function probeLanPeer(host: string) {
   }
 
   return invoke<DiscoveryStatus['localPeer']>('probe_lan_peer', { host })
+}
+
+export async function requestLanPairing(host: string) {
+  if (!isTauri()) {
+    throw new Error('LAN pairing is available only in the Tauri desktop runtime.')
+  }
+
+  return invoke<DiscoveryStatus['localPeer']>('request_lan_pairing', { host })
+}
+
+export async function confirmLanPairing(host: string, code: string) {
+  if (!isTauri()) {
+    throw new Error('LAN pairing is available only in the Tauri desktop runtime.')
+  }
+
+  return invoke<DiscoveryStatus['localPeer']>('confirm_lan_pairing', {
+    host,
+    code,
+  })
+}
+
+export async function dismissPairingRequest(): Promise<RuntimeStatus> {
+  if (!isTauri()) {
+    return browserRuntime
+  }
+
+  return invoke<RuntimeStatus>('dismiss_pairing_request')
 }
 
 export async function readClipboardText(): Promise<string> {

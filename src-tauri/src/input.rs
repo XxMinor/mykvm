@@ -76,6 +76,8 @@ pub struct ClipboardTarget {
     pub addr: String,
     pub transport_public_key: String,
     pub protocol_version: u16,
+    pub cluster_id: String,
+    pub pair_secret: String,
     pub expires_at: Option<Instant>,
 }
 
@@ -93,6 +95,10 @@ struct InputPacket {
     origin_transport_public_key: String,
     #[serde(default = "default_protocol_version")]
     origin_protocol_version: u16,
+    #[serde(default)]
+    cluster_id: String,
+    #[serde(default)]
+    pair_secret: String,
     event: InputEvent,
 }
 
@@ -726,6 +732,7 @@ fn send_packet(
     input_events: &Arc<AtomicU64>,
 ) -> bool {
     let (origin_device_id, origin_port) = input_origin(layout_state, quic_transport);
+    let (cluster_id, pair_secret) = pair_credentials(layout_state);
     let event = remap_event_for_target(event, target, layout_state);
     let packet = InputPacket {
         protocol: INPUT_PROTOCOL.into(),
@@ -734,6 +741,8 @@ fn send_packet(
         origin_port,
         origin_transport_public_key: quic_transport.public_key().to_string(),
         origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+        cluster_id,
+        pair_secret,
         event,
     };
     let Some(peer) = live_target_endpoint(target, layout_state) else {
@@ -850,6 +859,13 @@ fn input_origin(
     (device_id, quic_transport.port())
 }
 
+fn pair_credentials(layout_state: &Arc<Mutex<LayoutState>>) -> (String, String) {
+    layout_state
+        .lock()
+        .map(|layout| (layout.cluster_id.clone(), layout.pair_secret.clone()))
+        .unwrap_or_default()
+}
+
 fn mark_target_offline(
     layout_state: &Arc<Mutex<LayoutState>>,
     target: &InputTarget,
@@ -932,6 +948,10 @@ pub fn try_inject_packet_from_source(
         return false;
     }
 
+    if !packet_authorized(layout, &packet) {
+        return true;
+    }
+
     if !packet_targets_local(layout, &packet.target_device_id, local_peer_id) {
         return true;
     }
@@ -952,6 +972,8 @@ pub fn try_inject_packet_from_source(
             format!("{}:{}", source.ip(), packet.origin_port),
             packet.origin_transport_public_key.clone(),
             packet.origin_protocol_version,
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
             None,
         );
     }
@@ -962,6 +984,22 @@ pub fn try_inject_packet_from_source(
     }
 
     true
+}
+
+fn packet_authorized(layout: &LayoutState, packet: &InputPacket) -> bool {
+    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        return false;
+    }
+    if packet.cluster_id != layout.cluster_id || packet.pair_secret != layout.pair_secret {
+        return false;
+    }
+
+    layout.paired_controllers.iter().any(|controller| {
+        (!packet.origin_transport_public_key.trim().is_empty()
+            && controller.transport_public_key == packet.origin_transport_public_key)
+            || (!packet.origin_device_id.trim().is_empty()
+                && controller.id == packet.origin_device_id)
+    })
 }
 
 fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer_id: &str) -> bool {
@@ -1376,6 +1414,8 @@ fn set_clipboard_target(
     addr: String,
     transport_public_key: String,
     protocol_version: u16,
+    cluster_id: String,
+    pair_secret: String,
     expires_in: Option<Duration>,
 ) {
     if let Ok(mut target) = target.lock() {
@@ -1384,6 +1424,8 @@ fn set_clipboard_target(
             addr,
             transport_public_key,
             protocol_version,
+            cluster_id,
+            pair_secret,
             expires_at: expires_in.map(|duration| Instant::now() + duration),
         });
     }
@@ -1395,12 +1437,15 @@ fn set_control_clipboard_target(
     layout_state: &Arc<Mutex<LayoutState>>,
 ) {
     if let Some(peer) = live_target_endpoint(&active.target, layout_state) {
+        let (cluster_id, pair_secret) = pair_credentials(layout_state);
         set_clipboard_target(
             target,
             active.target.device_id.clone(),
             peer.addr,
             peer.public_key,
             peer.protocol_version,
+            cluster_id,
+            pair_secret,
             None,
         );
     }
@@ -2552,11 +2597,8 @@ fn set_macos_app_nap_suppressed(suppress: bool) {
             }
             let string_class = objc_getClass(b"NSString\0".as_ptr() as *const c_char);
             let string_sel = sel_registerName(b"stringWithUTF8String:\0".as_ptr() as *const c_char);
-            let make_string: extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *const c_char,
-            ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+            let make_string: extern "C" fn(*mut c_void, *mut c_void, *const c_char) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
             let reason = make_string(
                 string_class,
                 string_sel,
@@ -3605,6 +3647,9 @@ mod tests {
             selected_screen_id: "local-display-1".into(),
             input_mode: "control".into(),
             machine_role: "server".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            paired_controllers: Vec::new(),
             clipboard_sync: false,
             language: "cn".into(),
             theme_mode: "system".into(),
@@ -3793,6 +3838,8 @@ mod tests {
             origin_port: 47833,
             origin_transport_public_key: "local-public-key".into(),
             origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
             event: InputEvent::MouseMove {
                 screen_id: "display-1".into(),
                 x: 320,
@@ -3817,12 +3864,55 @@ mod tests {
     }
 
     #[test]
+    fn input_packet_requires_pair_secret() {
+        let mut layout = layout_for_target_tests();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![crate::PairedController {
+            id: "server".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let mut packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            target_device_id: "local-device".into(),
+            origin_device_id: "server".into(),
+            origin_port: 47834,
+            origin_transport_public_key: "server-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: "wrong".into(),
+            event: InputEvent::MouseMove {
+                screen_id: "local-display-1".into(),
+                x: 1,
+                y: 1,
+            },
+        };
+
+        assert!(!packet_authorized(&layout, &packet));
+        packet.pair_secret = layout.pair_secret.clone();
+        assert!(packet_authorized(&layout, &packet));
+        packet.origin_transport_public_key = "attacker-key".into();
+        packet.origin_device_id = "attacker".into();
+        assert!(!packet_authorized(&layout, &packet));
+        packet.origin_transport_public_key.clear();
+        packet.origin_device_id = "server".into();
+        assert!(packet_authorized(&layout, &packet));
+    }
+
+    #[test]
     fn clipboard_target_expires() {
         let target = Arc::new(Mutex::new(Some(ClipboardTarget {
             device_id: "peer-device".into(),
             addr: "10.0.0.2:47833".into(),
             transport_public_key: "peer-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
             expires_at: Some(Instant::now() - Duration::from_millis(1)),
         })));
 

@@ -18,6 +18,17 @@ export interface ModifierMap {
   meta: ModifierTarget
 }
 
+export interface PairedController {
+  id: string
+  name: string
+  host: string
+  ip: string
+  transportPublicKey: string
+  protocolVersion: number
+  clusterId: string
+  pairedAtMs: number
+}
+
 export interface Screen {
   id: string
   deviceId: string
@@ -53,6 +64,9 @@ export interface LayoutState {
   selectedScreenId: string
   inputMode: 'control' | 'receive'
   machineRole: MachineRole
+  clusterId: string
+  pairSecret: string
+  pairedControllers: PairedController[]
   clipboardSync: boolean
   language: AppLanguage
   themeMode: ThemeMode

@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    net::UdpSocket,
+    net::{SocketAddr, UdpSocket},
     path::PathBuf,
     process::Command,
     sync::{
@@ -14,6 +14,7 @@ use std::{
 #[cfg(not(target_os = "windows"))]
 use std::{io::Write, process::Stdio};
 
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -37,6 +38,8 @@ const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 const PEER_TTL_MS: u64 = 30_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
+const PAIRING_CODE_TTL_MS: u64 = 60_000;
+const PAIRING_MAX_ATTEMPTS: u8 = 5;
 const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 const CLIPBOARD_MAX_TEXT_BYTES: usize = 256 * 1024;
 // Raw RGBA can be large (a 2560x1440 frame is ~14 MB); cap it so a stray huge
@@ -151,6 +154,12 @@ struct LayoutState {
     input_mode: String,
     #[serde(default = "default_machine_role")]
     machine_role: String,
+    #[serde(default = "default_cluster_id")]
+    cluster_id: String,
+    #[serde(default = "default_pair_secret")]
+    pair_secret: String,
+    #[serde(default)]
+    paired_controllers: Vec<PairedController>,
     #[serde(default = "default_clipboard_sync")]
     clipboard_sync: bool,
     #[serde(default = "default_language")]
@@ -187,6 +196,20 @@ struct ModifierMap {
     meta: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairedController {
+    id: String,
+    name: String,
+    host: String,
+    ip: String,
+    transport_public_key: String,
+    #[serde(default = "default_protocol_version")]
+    protocol_version: u16,
+    cluster_id: String,
+    paired_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NativeStageStatus {
     state: String,
@@ -199,6 +222,12 @@ struct LanPeer {
     id: String,
     name: String,
     platform: String,
+    #[serde(default)]
+    machine_role: String,
+    #[serde(default)]
+    cluster_id: String,
+    #[serde(default)]
+    pairing_required: bool,
     host: String,
     ip: String,
     #[serde(default = "default_transport_port")]
@@ -242,6 +271,17 @@ struct DiscoveryStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingStatus {
+    state: String,
+    code: String,
+    requester_name: String,
+    requester_ip: String,
+    expires_at_ms: u64,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeStatus {
     started: bool,
     transport: NativeStageStatus,
@@ -249,6 +289,7 @@ struct RuntimeStatus {
     inject: NativeStageStatus,
     clipboard: NativeStageStatus,
     discovery: DiscoveryStatus,
+    pairing: PairingStatus,
     privilege: PrivilegeStatus,
 }
 
@@ -278,11 +319,26 @@ struct PerformanceSample {
     clipboard_packets: u64,
 }
 
+struct PairingChallenge {
+    code: String,
+    requester_id: String,
+    requester_name: String,
+    requester_ip: String,
+    requester_host: String,
+    requester_public_key: String,
+    requester_protocol_version: u16,
+    expires_at: Instant,
+    expires_at_ms: u64,
+    attempts: u8,
+}
+
 struct AppRuntime {
+    app_handle: AppHandle,
     layout: Arc<Mutex<LayoutState>>,
     native_layout: Mutex<LayoutState>,
     runtime: Mutex<RuntimeStatus>,
     peers: Arc<Mutex<Vec<LanPeer>>>,
+    pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
@@ -302,15 +358,17 @@ struct AppRuntime {
 }
 
 impl AppRuntime {
-    fn new(config_path: PathBuf, detected_layout: LayoutState) -> Self {
+    fn new(app_handle: AppHandle, config_path: PathBuf, detected_layout: LayoutState) -> Self {
         let layout = load_layout_from_disk(&config_path)
             .map(|saved_layout| normalize_saved_layout(saved_layout, detected_layout.clone()))
             .unwrap_or_else(|| detected_layout.clone());
         Self {
+            app_handle,
             layout: Arc::new(Mutex::new(layout)),
             native_layout: Mutex::new(detected_layout.clone()),
             runtime: Mutex::new(default_runtime(&detected_layout)),
             peers: Arc::new(Mutex::new(Vec::new())),
+            pairing_challenge: Arc::new(Mutex::new(None)),
             quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
             input_stop: Mutex::new(None),
@@ -347,6 +405,7 @@ impl AppRuntime {
         let mut runtime = self.runtime.lock().unwrap().clone();
         runtime.discovery = self.discovery_status_for_layout(layout);
         runtime.clipboard = self.clipboard_status(layout);
+        runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
 
         runtime
@@ -362,7 +421,8 @@ impl AppRuntime {
         if let Some(transport) = self.quic_transport_handle() {
             apply_transport_to_peer(&mut local_peer, &transport);
         }
-        local_peer.input_ready = self.input_receive_enabled.load(Ordering::Relaxed);
+        local_peer.input_ready =
+            advertised_input_ready(layout, self.input_receive_enabled.load(Ordering::Relaxed));
         let peers = active_peers(&self.peers, &local_peer.id);
         let state = if self.discovery_stop.lock().unwrap().is_some() {
             "ready"
@@ -376,6 +436,54 @@ impl AppRuntime {
             port: layout.transport_port,
             local_peer,
             peers,
+        }
+    }
+
+    fn pairing_status_for_layout(&self, layout: &LayoutState) -> PairingStatus {
+        if layout.machine_role != "client" {
+            return idle_pairing_status();
+        }
+
+        if !layout.paired_controllers.is_empty() {
+            return PairingStatus {
+                state: "paired".into(),
+                code: String::new(),
+                requester_name: String::new(),
+                requester_ip: String::new(),
+                expires_at_ms: 0,
+                detail: "客户端已配对，只对白名单服务端响应。".into(),
+            };
+        }
+
+        let now = Instant::now();
+        if let Ok(mut challenge) = self.pairing_challenge.lock() {
+            if challenge
+                .as_ref()
+                .map(|challenge| challenge.expires_at <= now)
+                .unwrap_or(false)
+            {
+                *challenge = None;
+            }
+
+            if let Some(challenge) = challenge.as_ref() {
+                return PairingStatus {
+                    state: "requested".into(),
+                    code: challenge.code.clone(),
+                    requester_name: challenge.requester_name.clone(),
+                    requester_ip: challenge.requester_ip.clone(),
+                    expires_at_ms: challenge.expires_at_ms,
+                    detail: "服务端正在请求配对，请在服务端输入此验证码。".into(),
+                };
+            }
+        }
+
+        PairingStatus {
+            state: "available".into(),
+            code: String::new(),
+            requester_name: String::new(),
+            requester_ip: String::new(),
+            expires_at_ms: 0,
+            detail: "客户端等待服务端发起配对。".into(),
         }
     }
 
@@ -396,6 +504,7 @@ impl AppRuntime {
 
         let layout_for_input = Arc::clone(&self.layout);
         let layout_for_clipboard = Arc::clone(&self.layout);
+        let layout_for_pairing = Arc::clone(&self.layout);
         let native_layout_for_input = self.native_layout();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
@@ -403,9 +512,12 @@ impl AppRuntime {
         let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let transport_packets_for_input = Arc::clone(&self.transport_packets);
-        let transport_packets_for_clipboard = Arc::clone(&self.transport_packets);
+        let transport_packets_for_stream = Arc::clone(&self.transport_packets);
         let input_events = Arc::clone(&self.input_events);
         let clipboard_packets = Arc::clone(&self.clipboard_packets);
+        let pairing_challenge_for_stream = Arc::clone(&self.pairing_challenge);
+        let config_path_for_pairing = self.config_path.clone();
+        let peers_for_pairing = Arc::clone(&self.peers);
 
         let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
             if !input_receive_enabled.load(Ordering::Relaxed) {
@@ -428,7 +540,19 @@ impl AppRuntime {
             }
         });
 
-        let on_stream = Arc::new(move |payload: Vec<u8>, _source| {
+        let on_stream = Arc::new(move |payload: Vec<u8>, source| {
+            if handle_pairing_stream_packet(
+                &payload,
+                source,
+                &layout_for_pairing,
+                &pairing_challenge_for_stream,
+                &config_path_for_pairing,
+                &peers_for_pairing,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
                 return;
             }
@@ -438,11 +562,12 @@ impl AppRuntime {
             let current_peer = local_peer_from_layout(&layout);
             if handle_clipboard_packet(
                 &payload,
+                &layout,
                 &current_peer.id,
                 &clipboard_seen_text,
                 &clipboard_echo_until,
             ) {
-                transport_packets_for_clipboard.fetch_add(1, Ordering::Relaxed);
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -501,9 +626,12 @@ impl AppRuntime {
 
         let mut local_peer = local_peer_from_layout(&layout);
         apply_transport_to_peer(&mut local_peer, &quic_transport);
-        local_peer.input_ready = self.input_receive_enabled.load(Ordering::Relaxed);
+        local_peer.input_ready =
+            advertised_input_ready(&layout, self.input_receive_enabled.load(Ordering::Relaxed));
         let peers = Arc::clone(&self.peers);
         let layout_state = Arc::clone(&self.layout);
+        let pairing_challenge = Arc::clone(&self.pairing_challenge);
+        let app_handle = self.app_handle.clone();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let transport_packets = Arc::clone(&self.transport_packets);
         let stop = Arc::new(AtomicBool::new(false));
@@ -533,19 +661,24 @@ impl AppRuntime {
                     let local_peer = layout_state
                         .lock()
                         .map(|layout| {
+                            if !should_send_public_announce(&layout) {
+                                return None;
+                            }
                             let mut peer = local_peer_from_layout(&layout);
                             apply_transport_to_peer(&mut peer, &quic_transport);
-                            peer.input_ready = current_input_ready;
-                            peer
+                            peer.input_ready = advertised_input_ready(&layout, current_input_ready);
+                            Some(peer)
                         })
-                        .unwrap_or_else(|_| local_peer.clone());
-                    for target in &broadcast_targets {
-                        let _ = send_discovery_packet(
-                            &socket,
-                            "announce",
-                            &local_peer,
-                            target.as_str(),
-                        );
+                        .unwrap_or_else(|_| Some(local_peer.clone()));
+                    if let Some(local_peer) = local_peer {
+                        for target in &broadcast_targets {
+                            let _ = send_discovery_packet(
+                                &socket,
+                                "announce",
+                                &local_peer,
+                                target.as_str(),
+                            );
+                        }
                     }
                     last_announce = Instant::now();
                     last_input_ready = current_input_ready;
@@ -556,25 +689,58 @@ impl AppRuntime {
                     let payload = &buffer[..length];
 
                     if let Some(packet) = decode_discovery_packet(payload) {
-                        let current_peer = layout_state
+                        let current = layout_state
                             .lock()
                             .map(|layout| {
                                 let mut peer = local_peer_from_layout(&layout);
                                 apply_transport_to_peer(&mut peer, &quic_transport);
-                                peer.input_ready = input_receive_enabled.load(Ordering::Relaxed);
-                                peer
+                                peer.input_ready = advertised_input_ready(
+                                    &layout,
+                                    input_receive_enabled.load(Ordering::Relaxed),
+                                );
+                                (layout.clone(), peer)
                             })
-                            .unwrap_or_else(|_| local_peer.clone());
+                            .unwrap_or_else(|_| (detect_fallback_layout(), local_peer.clone()));
+                        let (current_layout, current_peer) = current;
 
-                        if let Some((kind, peer)) = peer_from_discovery_packet(
+                        if let Some(incoming) = peer_from_discovery_packet(
                             packet,
                             source.ip().to_string(),
                             &current_peer.id,
                         ) {
-                            merge_peer(&peers, peer);
-                            sync_layout_peer_presence(&layout_state, &peers);
+                            if incoming.kind == "pair-request" {
+                                if begin_pairing_challenge(
+                                    &pairing_challenge,
+                                    &current_layout,
+                                    &incoming.peer,
+                                    source.ip().to_string(),
+                                ) {
+                                    let handle = app_handle.clone();
+                                    let _ = app_handle.run_on_main_thread(move || {
+                                        let _ = show_main_window_handle(&handle);
+                                    });
+                                    let _ = send_discovery_packet(
+                                        &socket,
+                                        "pair-challenge",
+                                        &current_peer,
+                                        source,
+                                    );
+                                }
+                                continue;
+                            }
 
-                            if matches!(kind.as_str(), "announce" | "probe") {
+                            if incoming.kind == "pair-confirm" {
+                                continue;
+                            }
+
+                            if peer_visible_to_layout(&current_layout, &incoming.peer) {
+                                merge_peer(&peers, incoming.peer.clone());
+                                sync_layout_peer_presence(&layout_state, &peers);
+                            }
+
+                            if matches!(incoming.kind.as_str(), "announce" | "probe")
+                                && should_reply_to_discovery(&current_layout, &incoming.peer)
+                            {
                                 let _ =
                                     send_discovery_packet(&socket, "reply", &current_peer, source);
                             }
@@ -853,6 +1019,7 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
     runtime.inject = inject;
     runtime.clipboard = clipboard;
     runtime.discovery = discovery;
+    runtime.pairing = state.pairing_status_for_layout(&layout);
     Ok(())
 }
 
@@ -866,7 +1033,7 @@ fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, S
         discovery.detail = error;
     }
     let (capture, inject) = state.start_input(layout.clone());
-    let clipboard = state.start_clipboard(layout);
+    let clipboard = state.start_clipboard(layout.clone());
 
     let mut runtime = state
         .runtime
@@ -880,6 +1047,7 @@ fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, S
         inject,
         clipboard,
         discovery,
+        pairing: state.pairing_status_for_layout(&layout),
         privilege: current_privilege_status(),
     };
 
@@ -909,6 +1077,7 @@ fn stop_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, St
     let layout = state.layout_snapshot();
     let mut stopped_runtime = default_runtime(&layout);
     stopped_runtime.discovery = state.discovery_status_for_layout(&layout);
+    stopped_runtime.pairing = state.pairing_status_for_layout(&layout);
     *runtime = stopped_runtime;
     Ok(runtime.clone())
 }
@@ -1058,6 +1227,77 @@ fn probe_lan_peer(host: String, state: tauri::State<'_, AppRuntime>) -> Result<L
     merge_peer(&state.peers, peer.clone());
     sync_layout_peer_presence(&state.layout, &state.peers);
     Ok(peer)
+}
+
+#[tauri::command]
+fn request_lan_pairing(
+    host: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<LanPeer, String> {
+    state.start_discovery()?;
+    let layout = state
+        .layout
+        .lock()
+        .map_err(|_| "layout state lock poisoned".to_string())?
+        .clone();
+    if layout.machine_role != "server" {
+        return Err("只有服务端可以发起配对。".into());
+    }
+
+    let mut local_peer = local_peer_from_layout(&layout);
+    if let Some(transport) = state.quic_transport_handle() {
+        apply_transport_to_peer(&mut local_peer, &transport);
+    }
+    let peer = request_pairing_for_peer(&local_peer, &host, discovery_base_port(&layout))?;
+    merge_peer(&state.peers, peer.clone());
+    Ok(peer)
+}
+
+#[tauri::command]
+fn confirm_lan_pairing(
+    host: String,
+    code: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<LanPeer, String> {
+    state.start_discovery()?;
+    let layout = state
+        .layout
+        .lock()
+        .map_err(|_| "layout state lock poisoned".to_string())?
+        .clone();
+    if layout.machine_role != "server" {
+        return Err("只有服务端可以确认配对。".into());
+    }
+
+    let mut local_peer = local_peer_from_layout(&layout);
+    let transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC 传输未启动，无法安全确认配对。".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &transport);
+    let peer = confirm_pairing_for_peer(
+        &local_peer,
+        &transport,
+        &layout.pair_secret,
+        &host,
+        &code,
+        discovery_base_port(&layout),
+    )?;
+    merge_peer(&state.peers, peer.clone());
+    sync_layout_peer_presence(&state.layout, &state.peers);
+    Ok(peer)
+}
+
+#[tauri::command]
+fn dismiss_pairing_request(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, String> {
+    {
+        let mut challenge = state
+            .pairing_challenge
+            .lock()
+            .map_err(|_| "pairing challenge lock poisoned".to_string())?;
+        *challenge = None;
+    }
+
+    Ok(state.runtime_status())
 }
 
 #[tauri::command]
@@ -1477,6 +1717,7 @@ pub fn run() {
 
             let detected_layout = detect_local_layout(app.handle());
             app.manage(AppRuntime::new(
+                app.handle().clone(),
                 config_dir.join("layout.json"),
                 detected_layout,
             ));
@@ -1501,6 +1742,9 @@ pub fn run() {
             read_performance_sample,
             scan_lan_peers,
             probe_lan_peer,
+            request_lan_pairing,
+            confirm_lan_pairing,
+            dismiss_pairing_request,
             restart_as_admin,
             sync_window_chrome,
             minimize_main_window,
@@ -1699,6 +1943,18 @@ fn default_runtime(layout: &LayoutState) -> RuntimeStatus {
             local_peer: local_peer_from_layout(layout),
             peers: Vec::new(),
         },
+        pairing: idle_pairing_status(),
+    }
+}
+
+fn idle_pairing_status() -> PairingStatus {
+    PairingStatus {
+        state: "idle".into(),
+        code: String::new(),
+        requester_name: String::new(),
+        requester_ip: String::new(),
+        expires_at_ms: 0,
+        detail: String::new(),
     }
 }
 
@@ -1852,6 +2108,9 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         selected_screen_id,
         input_mode: default_input_mode(),
         machine_role: default_machine_role(),
+        cluster_id: default_cluster_id(),
+        pair_secret: default_pair_secret(),
+        paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
         language: default_language(),
         theme_mode: default_theme_mode(),
@@ -1887,6 +2146,9 @@ fn detect_fallback_layout() -> LayoutState {
         selected_screen_id: String::new(),
         input_mode: default_input_mode(),
         machine_role: default_machine_role(),
+        cluster_id: default_cluster_id(),
+        pair_secret: default_pair_secret(),
+        paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
         language: default_language(),
         theme_mode: default_theme_mode(),
@@ -1994,6 +2256,9 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         selected_screen_id,
         input_mode: normalize_input_mode(&saved_layout.input_mode),
         machine_role: normalize_machine_role(&saved_layout.machine_role),
+        cluster_id: normalize_cluster_id(&saved_layout.cluster_id),
+        pair_secret: normalize_pair_secret(&saved_layout.pair_secret),
+        paired_controllers: normalize_paired_controllers(saved_layout.paired_controllers),
         clipboard_sync: saved_layout.clipboard_sync,
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
@@ -2138,6 +2403,14 @@ fn default_machine_role() -> String {
     "unset".into()
 }
 
+fn default_cluster_id() -> String {
+    format!("cluster-{}", random_hex(16))
+}
+
+fn default_pair_secret() -> String {
+    random_hex(32)
+}
+
 fn default_clipboard_sync() -> bool {
     false
 }
@@ -2224,6 +2497,35 @@ fn normalize_machine_role(role: &str) -> String {
         "server" | "client" => role.into(),
         _ => "unset".into(),
     }
+}
+
+fn normalize_cluster_id(cluster_id: &str) -> String {
+    let cluster_id = cluster_id.trim();
+    if cluster_id.is_empty() {
+        default_cluster_id()
+    } else {
+        cluster_id.into()
+    }
+}
+
+fn normalize_pair_secret(pair_secret: &str) -> String {
+    let pair_secret = pair_secret.trim();
+    if pair_secret.is_empty() {
+        default_pair_secret()
+    } else {
+        pair_secret.into()
+    }
+}
+
+fn normalize_paired_controllers(controllers: Vec<PairedController>) -> Vec<PairedController> {
+    controllers
+        .into_iter()
+        .filter(|controller| {
+            !controller.id.trim().is_empty()
+                && !controller.transport_public_key.trim().is_empty()
+                && !controller.cluster_id.trim().is_empty()
+        })
+        .collect()
 }
 
 fn normalize_language(language: &str) -> String {
@@ -2328,6 +2630,10 @@ fn clipboard_ready_status() -> NativeStageStatus {
 struct ClipboardPacket {
     protocol: String,
     origin_id: String,
+    #[serde(default)]
+    cluster_id: String,
+    #[serde(default)]
+    pair_secret: String,
     // Empty when the payload is an image. Defaulted so packets from older peers
     // (text-only) still decode.
     #[serde(default)]
@@ -2383,11 +2689,19 @@ impl ClipboardContent {
         }
     }
 
-    fn into_packet(self, origin_id: String, sequence: u64) -> ClipboardPacket {
+    fn into_packet(
+        self,
+        origin_id: String,
+        cluster_id: String,
+        pair_secret: String,
+        sequence: u64,
+    ) -> ClipboardPacket {
         match self {
             ClipboardContent::Text(text) => ClipboardPacket {
                 protocol: CLIPBOARD_PROTOCOL.into(),
                 origin_id,
+                cluster_id,
+                pair_secret,
                 text,
                 image: None,
                 sequence,
@@ -2395,6 +2709,8 @@ impl ClipboardContent {
             ClipboardContent::Image(image) => ClipboardPacket {
                 protocol: CLIPBOARD_PROTOCOL.into(),
                 origin_id,
+                cluster_id,
+                pair_secret,
                 text: String::new(),
                 image: Some(image),
                 sequence,
@@ -2494,7 +2810,12 @@ fn run_clipboard_sync(
         }
 
         sequence = sequence.saturating_add(1);
-        let packet = content.into_packet(local_peer_id.clone(), sequence);
+        let packet = content.into_packet(
+            local_peer_id.clone(),
+            target.cluster_id.clone(),
+            target.pair_secret.clone(),
+            sequence,
+        );
 
         if let Ok(payload) = encode_wire_packet(&packet) {
             let peer = quic_transport.peer(
@@ -2540,6 +2861,7 @@ fn arm_clipboard_echo_guard(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) 
 
 fn handle_clipboard_packet(
     payload: &[u8],
+    layout: &LayoutState,
     local_peer_id: &str,
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
@@ -2550,6 +2872,10 @@ fn handle_clipboard_packet(
 
     if packet.protocol != CLIPBOARD_PROTOCOL {
         return false;
+    }
+
+    if !clipboard_packet_authorized(layout, &packet) {
+        return true;
     }
 
     if packet.origin_id == local_peer_id {
@@ -2585,6 +2911,25 @@ fn handle_clipboard_packet(
             *seen = Some(signature);
         }
         arm_clipboard_echo_guard(clipboard_echo_until);
+    }
+
+    true
+}
+
+fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -> bool {
+    if layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || packet.pair_secret != layout.pair_secret
+    {
+        return false;
+    }
+
+    if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
+        return layout
+            .paired_controllers
+            .iter()
+            .any(|controller| controller.id == packet.origin_id);
     }
 
     true
@@ -2647,10 +2992,11 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
 
 fn device_matches_peer(device: &Device, peer: &LanPeer) -> bool {
     device.id == peer_device_id(peer)
-        || same_host(&device.host, &peer.ip)
-        || same_host(&device.host, &peer.host)
+        || (!device.transport_public_key.trim().is_empty()
+            && device.transport_public_key == peer.transport_public_key)
 }
 
+#[allow(dead_code)]
 fn same_host(value: &str, host: &str) -> bool {
     let host = host.trim().to_ascii_lowercase();
     if host.is_empty() {
@@ -3163,6 +3509,30 @@ struct DiscoveryPacket {
     protocol: String,
     kind: String,
     peer: LanPeer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pairing_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pair_cluster_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pair_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pairing_error: Option<String>,
+}
+
+#[derive(Default)]
+struct DiscoveryPairingFields {
+    code: Option<String>,
+    cluster_id: Option<String>,
+    secret: Option<String>,
+    error: Option<String>,
+}
+
+struct IncomingDiscovery {
+    kind: String,
+    peer: LanPeer,
+    pairing_code: Option<String>,
+    pair_cluster_id: Option<String>,
+    pair_secret: Option<String>,
 }
 
 fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
@@ -3182,6 +3552,9 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(fallback_name),
         platform: current_platform().into(),
+        machine_role: layout.machine_role.clone(),
+        cluster_id: advertised_cluster_id(layout),
+        pairing_required: pairing_required(layout),
         host,
         ip,
         transport_port: layout.transport_port,
@@ -3206,6 +3579,26 @@ fn apply_transport_to_peer(peer: &mut LanPeer, transport: &quic_transport::Trans
     peer.quic_port = transport.port();
     peer.transport_public_key = transport.public_key().to_string();
     peer.protocol_version = quic_transport::PROTOCOL_VERSION;
+}
+
+fn pairing_required(layout: &LayoutState) -> bool {
+    layout.machine_role == "client" && layout.paired_controllers.is_empty()
+}
+
+fn advertised_cluster_id(layout: &LayoutState) -> String {
+    if pairing_required(layout) {
+        String::new()
+    } else {
+        layout.cluster_id.clone()
+    }
+}
+
+fn advertised_input_ready(layout: &LayoutState, input_ready: bool) -> bool {
+    input_ready && !pairing_required(layout) && !layout.cluster_id.trim().is_empty()
+}
+
+fn should_send_public_announce(layout: &LayoutState) -> bool {
+    !(layout.machine_role == "client" && !layout.paired_controllers.is_empty())
 }
 
 fn screen_to_peer_screen(screen: &Screen) -> LanPeerScreen {
@@ -3268,10 +3661,12 @@ fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, 
     while started.elapsed() < Duration::from_millis(1400) {
         if let Ok((length, source)) = socket.recv_from(&mut buffer) {
             if let Some(packet) = decode_discovery_packet(&buffer[..length]) {
-                if let Some((_kind, peer)) =
+                if let Some(incoming) =
                     peer_from_discovery_packet(packet, source.ip().to_string(), &local_peer.id)
                 {
-                    merge_peer_entry(&mut peers, peer);
+                    if peer_visible_to_local_peer(local_peer, &incoming.peer) {
+                        merge_peer_entry(&mut peers, incoming.peer);
+                    }
                 }
             }
         }
@@ -3305,10 +3700,12 @@ fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<La
     while started.elapsed() < Duration::from_millis(1800) {
         if let Ok((length, source)) = socket.recv_from(&mut buffer) {
             if let Some(packet) = decode_discovery_packet(&buffer[..length]) {
-                if let Some((_kind, peer)) =
+                if let Some(incoming) =
                     peer_from_discovery_packet(packet, source.ip().to_string(), &local_peer.id)
                 {
-                    return Ok(peer);
+                    if peer_visible_to_local_peer(local_peer, &incoming.peer) {
+                        return Ok(incoming.peer);
+                    }
                 }
             }
         }
@@ -3323,6 +3720,94 @@ fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<La
         "no mykvm peer answered at {host} ({port_hint}); \
          make sure mykvm is running on that device and UDP is allowed"
     ))
+}
+
+fn request_pairing_for_peer(
+    local_peer: &LanPeer,
+    host: &str,
+    base_port: u16,
+) -> Result<LanPeer, String> {
+    let (host, ports) = pairing_probe_targets(host, base_port);
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|error| format!("failed to open UDP pairing socket: {error}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|error| format!("failed to set UDP pairing timeout: {error}"))?;
+
+    for port in &ports {
+        let target = format!("{host}:{port}");
+        let _ = send_discovery_packet(&socket, "pair-request", local_peer, target.as_str());
+    }
+
+    let started = Instant::now();
+    let mut buffer = [0_u8; 4096];
+    while started.elapsed() < Duration::from_millis(1800) {
+        if let Ok((length, source)) = socket.recv_from(&mut buffer) {
+            if let Some(packet) = decode_discovery_packet(&buffer[..length]) {
+                if let Some(incoming) =
+                    peer_from_discovery_packet(packet, source.ip().to_string(), &local_peer.id)
+                {
+                    if incoming.kind == "pair-challenge" && incoming.peer.pairing_required {
+                        return Ok(incoming.peer);
+                    }
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "no pairing challenge received from {host}; make sure the client is running and not already paired"
+    ))
+}
+
+fn confirm_pairing_for_peer(
+    local_peer: &LanPeer,
+    quic_transport: &quic_transport::TransportHandle,
+    pair_secret: &str,
+    host: &str,
+    code: &str,
+    base_port: u16,
+) -> Result<LanPeer, String> {
+    let challenge_peer = request_pairing_for_peer(local_peer, host, base_port)?;
+    if challenge_peer.transport_public_key.trim().is_empty()
+        || challenge_peer.protocol_version != quic_transport::PROTOCOL_VERSION
+        || challenge_peer.quic_port == 0
+    {
+        return Err("客户端暂不支持安全配对确认，请升级客户端后重试。".into());
+    }
+
+    let fields = DiscoveryPairingFields {
+        code: Some(code.trim().into()),
+        cluster_id: Some(local_peer.cluster_id.clone()),
+        secret: Some(pair_secret.trim().into()),
+        error: None,
+    };
+    let payload = encode_discovery_payload("pair-confirm", local_peer, fields)?;
+    let target_addr = format!("{}:{}", challenge_peer.ip, challenge_peer.quic_port);
+    let endpoint = quic_transport.peer(
+        target_addr,
+        challenge_peer.transport_public_key.clone(),
+        challenge_peer.protocol_version,
+    );
+    quic_transport
+        .send_stream(endpoint, payload)
+        .map_err(|error| format!("failed to send encrypted pairing confirmation: {error}"))?;
+
+    let paired_peer = probe_for_peer(local_peer, host, base_port)?;
+    if paired_peer.pairing_required {
+        return Err("配对未被客户端接受，请检查验证码后重试。".into());
+    }
+
+    Ok(paired_peer)
+}
+
+fn pairing_probe_targets(host: &str, base_port: u16) -> (String, Vec<u16>) {
+    let (host, explicit_port) = split_host_port(host.trim());
+    let ports = match explicit_port {
+        Some(port) => vec![port],
+        None => discovery_target_ports(base_port),
+    };
+    (host, ports)
 }
 
 /// Splits a manual `host` entry into a host and an optional explicit port. A
@@ -3347,19 +3832,47 @@ fn send_discovery_packet(
     local_peer: &LanPeer,
     target: impl std::net::ToSocketAddrs,
 ) -> Result<(), String> {
+    send_discovery_packet_with_pairing(
+        socket,
+        kind,
+        local_peer,
+        target,
+        DiscoveryPairingFields::default(),
+    )
+}
+
+fn send_discovery_packet_with_pairing(
+    socket: &UdpSocket,
+    kind: &str,
+    local_peer: &LanPeer,
+    target: impl std::net::ToSocketAddrs,
+    pairing: DiscoveryPairingFields,
+) -> Result<(), String> {
+    let payload = encode_discovery_payload(kind, local_peer, pairing)?;
+    socket
+        .send_to(&payload, target)
+        .map(|_| ())
+        .map_err(|error| format!("failed to send discovery packet: {error}"))
+}
+
+fn encode_discovery_payload(
+    kind: &str,
+    local_peer: &LanPeer,
+    pairing: DiscoveryPairingFields,
+) -> Result<Vec<u8>, String> {
     let mut peer = local_peer.clone();
     peer.last_seen_ms = now_ms();
     let packet = DiscoveryPacket {
         protocol: DISCOVERY_PROTOCOL.into(),
         kind: kind.into(),
         peer,
+        pairing_code: pairing.code,
+        pair_cluster_id: pairing.cluster_id,
+        pair_secret: pairing.secret,
+        pairing_error: pairing.error,
     };
-    let payload = encode_wire_packet(&packet)
-        .map_err(|error| format!("failed to encode discovery packet: {error}"))?;
-    socket
-        .send_to(&payload, target)
-        .map(|_| ())
-        .map_err(|error| format!("failed to send discovery packet: {error}"))
+    encode_wire_packet(&packet)
+        .map_err(|error| format!("failed to encode discovery packet: {error}"))
 }
 
 fn decode_discovery_packet(payload: &[u8]) -> Option<DiscoveryPacket> {
@@ -3371,7 +3884,7 @@ fn peer_from_discovery_packet(
     packet: DiscoveryPacket,
     source_ip: String,
     local_peer_id: &str,
-) -> Option<(String, LanPeer)> {
+) -> Option<IncomingDiscovery> {
     if packet.peer.id == local_peer_id {
         return None;
     }
@@ -3390,7 +3903,13 @@ fn peer_from_discovery_packet(
         peer.input_ready = false;
     }
     peer.last_seen_ms = now_ms();
-    Some((packet.kind, peer))
+    Some(IncomingDiscovery {
+        kind: packet.kind,
+        peer,
+        pairing_code: packet.pairing_code,
+        pair_cluster_id: packet.pair_cluster_id,
+        pair_secret: packet.pair_secret,
+    })
 }
 
 fn merge_peer(peers: &Arc<Mutex<Vec<LanPeer>>>, next_peer: LanPeer) {
@@ -3435,6 +3954,209 @@ fn active_peers(peers: &Arc<Mutex<Vec<LanPeer>>>, local_peer_id: &str) -> Vec<La
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn peer_visible_to_layout(layout: &LayoutState, peer: &LanPeer) -> bool {
+    if peer.pairing_required {
+        return layout.machine_role == "server";
+    }
+
+    let cluster_id = layout.cluster_id.trim();
+    !cluster_id.is_empty() && peer.cluster_id == cluster_id
+}
+
+fn peer_visible_to_local_peer(local_peer: &LanPeer, peer: &LanPeer) -> bool {
+    if peer.pairing_required {
+        return local_peer.machine_role == "server";
+    }
+
+    let cluster_id = local_peer.cluster_id.trim();
+    !cluster_id.is_empty() && peer.cluster_id == cluster_id
+}
+
+fn should_reply_to_discovery(layout: &LayoutState, peer: &LanPeer) -> bool {
+    if peer_visible_to_layout(layout, peer) {
+        return true;
+    }
+
+    if layout.machine_role == "client" && pairing_required(layout) {
+        return peer.machine_role == "server";
+    }
+
+    layout.machine_role == "client" && is_paired_controller(layout, peer)
+}
+
+fn is_paired_controller(layout: &LayoutState, peer: &LanPeer) -> bool {
+    layout.paired_controllers.iter().any(|controller| {
+        controller.id == peer.id
+            || (!controller.transport_public_key.trim().is_empty()
+                && controller.transport_public_key == peer.transport_public_key)
+    })
+}
+
+fn handle_pairing_stream_packet(
+    payload: &[u8],
+    source: SocketAddr,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    pairing_challenge: &Arc<Mutex<Option<PairingChallenge>>>,
+    config_path: &PathBuf,
+    peers: &Arc<Mutex<Vec<LanPeer>>>,
+) -> bool {
+    let Some(packet) = decode_discovery_packet(payload) else {
+        return false;
+    };
+    if packet.kind != "pair-confirm" {
+        return false;
+    }
+
+    let local_peer_id = layout_state
+        .lock()
+        .map(|layout| local_peer_from_layout(&layout).id)
+        .unwrap_or_default();
+    let Some(incoming) =
+        peer_from_discovery_packet(packet, source.ip().to_string(), &local_peer_id)
+    else {
+        return true;
+    };
+
+    match complete_pairing_from_confirm(
+        layout_state,
+        pairing_challenge,
+        config_path,
+        &incoming.peer,
+        incoming.pairing_code,
+        incoming.pair_cluster_id,
+        incoming.pair_secret,
+    ) {
+        Ok(()) => {
+            merge_peer(peers, incoming.peer);
+            sync_layout_peer_presence(layout_state, peers);
+        }
+        Err(error) => {
+            log::warn!("pairing confirmation rejected: {error}");
+        }
+    }
+
+    true
+}
+
+fn begin_pairing_challenge(
+    pairing_challenge: &Arc<Mutex<Option<PairingChallenge>>>,
+    layout: &LayoutState,
+    requester: &LanPeer,
+    requester_ip: String,
+) -> bool {
+    if layout.machine_role != "client" || !pairing_required(layout) {
+        return false;
+    }
+    if requester.machine_role != "server" {
+        return false;
+    }
+
+    let now = Instant::now();
+    let expires_at = now + Duration::from_millis(PAIRING_CODE_TTL_MS);
+    let expires_at_ms = now_ms().saturating_add(PAIRING_CODE_TTL_MS);
+
+    if let Ok(mut challenge) = pairing_challenge.lock() {
+        if let Some(existing) = challenge.as_mut() {
+            if existing.expires_at > now {
+                if existing.requester_id == requester.id {
+                    existing.requester_ip = requester_ip;
+                    existing.requester_host = requester.host.clone();
+                    existing.requester_public_key = requester.transport_public_key.clone();
+                    existing.requester_protocol_version = requester.protocol_version;
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        *challenge = Some(PairingChallenge {
+            code: random_pairing_code(),
+            requester_id: requester.id.clone(),
+            requester_name: requester.name.clone(),
+            requester_ip,
+            requester_host: requester.host.clone(),
+            requester_public_key: requester.transport_public_key.clone(),
+            requester_protocol_version: requester.protocol_version,
+            expires_at,
+            expires_at_ms,
+            attempts: 0,
+        });
+        return true;
+    }
+
+    false
+}
+
+fn complete_pairing_from_confirm(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    pairing_challenge: &Arc<Mutex<Option<PairingChallenge>>>,
+    config_path: &PathBuf,
+    requester: &LanPeer,
+    code: Option<String>,
+    cluster_id: Option<String>,
+    pair_secret: Option<String>,
+) -> Result<(), String> {
+    let code = code.unwrap_or_default();
+    let cluster_id = cluster_id.unwrap_or_default();
+    let pair_secret = pair_secret.unwrap_or_default();
+    if code.trim().is_empty() || cluster_id.trim().is_empty() || pair_secret.trim().is_empty() {
+        return Err("配对请求缺少验证码或组信息。".into());
+    }
+
+    {
+        let mut challenge = pairing_challenge
+            .lock()
+            .map_err(|_| "pairing challenge lock poisoned".to_string())?;
+        let Some(existing) = challenge.as_mut() else {
+            return Err("验证码已过期，请重新发起配对。".into());
+        };
+        if existing.expires_at <= Instant::now() {
+            *challenge = None;
+            return Err("验证码已过期，请重新发起配对。".into());
+        }
+        if existing.requester_id != requester.id
+            || (!existing.requester_public_key.trim().is_empty()
+                && existing.requester_public_key != requester.transport_public_key)
+        {
+            return Err("配对请求来源不一致，请重新发起配对。".into());
+        }
+        if existing.code != code.trim() {
+            existing.attempts = existing.attempts.saturating_add(1);
+            if existing.attempts >= PAIRING_MAX_ATTEMPTS {
+                *challenge = None;
+            }
+            return Err("验证码不正确。".into());
+        }
+        *challenge = None;
+    }
+
+    let snapshot = {
+        let mut layout = layout_state
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        if layout.machine_role != "client" {
+            return Err("只有客户端可以接受服务端配对。".into());
+        }
+
+        layout.cluster_id = cluster_id.trim().into();
+        layout.pair_secret = pair_secret.trim().into();
+        layout.input_mode = "receive".into();
+        layout.paired_controllers = vec![PairedController {
+            id: requester.id.clone(),
+            name: requester.name.clone(),
+            host: requester.host.clone(),
+            ip: requester.ip.clone(),
+            transport_public_key: requester.transport_public_key.clone(),
+            protocol_version: requester.protocol_version,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+        layout.clone()
+    };
+
+    write_layout_to_disk(config_path, &snapshot)
 }
 
 fn prune_stale_peers(peers: &Arc<Mutex<Vec<LanPeer>>>) {
@@ -3602,6 +4324,32 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn random_hex(byte_count: usize) -> String {
+    let rng = SystemRandom::new();
+    let mut bytes = vec![0_u8; byte_count];
+    if rng.fill(&mut bytes).is_err() {
+        let fallback = now_ms().to_le_bytes();
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = fallback[index % fallback.len()] ^ (index as u8).wrapping_mul(31);
+        }
+    }
+
+    let mut output = String::with_capacity(byte_count * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn random_pairing_code() -> String {
+    let rng = SystemRandom::new();
+    let mut bytes = [0_u8; 4];
+    if rng.fill(&mut bytes).is_err() {
+        bytes = now_ms().to_le_bytes()[..4].try_into().unwrap_or([0; 4]);
+    }
+    format!("{:06}", u32::from_le_bytes(bytes) % 1_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3660,6 +4408,9 @@ mod tests {
             selected_screen_id: "local-device-display-1".into(),
             input_mode: "control".into(),
             machine_role: "server".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            paired_controllers: Vec::new(),
             clipboard_sync: false,
             language: "cn".into(),
             theme_mode: "system".into(),
@@ -3677,6 +4428,9 @@ mod tests {
             id: "peer-client-10-0-0-2".into(),
             name: "Client".into(),
             platform: "windows".into(),
+            machine_role: "client".into(),
+            cluster_id: "cluster-test".into(),
+            pairing_required: false,
             host: "client".into(),
             ip: "10.0.0.2".into(),
             transport_port: 52000,
@@ -3748,6 +4502,174 @@ mod tests {
 
         assert_eq!(layout.devices.len(), 1);
         assert_eq!(layout.devices[0].id, "local-device");
+    }
+
+    #[test]
+    fn discovery_hides_other_clusters() {
+        let layout = test_layout();
+        let mut peer = test_peer();
+        peer.cluster_id = "cluster-other".into();
+
+        assert!(!peer_visible_to_layout(&layout, &peer));
+    }
+
+    #[test]
+    fn discovery_shows_unpaired_clients_to_servers() {
+        let layout = test_layout();
+        let mut peer = test_peer();
+        peer.cluster_id.clear();
+        peer.pairing_required = true;
+
+        assert!(peer_visible_to_layout(&layout, &peer));
+    }
+
+    #[test]
+    fn pairing_challenge_rejects_second_requester_while_active() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers.clear();
+        let challenge = Arc::new(Mutex::new(None));
+        let mut first = test_peer();
+        first.id = "server-one".into();
+        first.machine_role = "server".into();
+        let mut second = first.clone();
+        second.id = "server-two".into();
+        second.transport_public_key = "server-two-key".into();
+
+        assert!(begin_pairing_challenge(
+            &challenge,
+            &layout,
+            &first,
+            "10.0.0.1".into(),
+        ));
+        assert!(!begin_pairing_challenge(
+            &challenge,
+            &layout,
+            &second,
+            "10.0.0.2".into(),
+        ));
+
+        let stored = challenge.lock().expect("challenge lock");
+        assert_eq!(stored.as_ref().expect("challenge").requester_id, first.id);
+    }
+
+    #[test]
+    fn paired_client_stops_public_announces() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "server".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+
+        assert!(!should_send_public_announce(&layout));
+    }
+
+    #[test]
+    fn pairing_confirm_stream_saves_paired_controller() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.cluster_id = "client-old-cluster".into();
+        layout.pair_secret = "client-old-secret".into();
+        layout.paired_controllers.clear();
+
+        let mut server = test_peer();
+        server.id = "server-10-0-0-1".into();
+        server.name = "Server".into();
+        server.machine_role = "server".into();
+        server.ip = "10.0.0.1".into();
+        server.transport_public_key = "server-public-key".into();
+
+        let layout_state = Arc::new(Mutex::new(layout));
+        let pairing_challenge = Arc::new(Mutex::new(Some(PairingChallenge {
+            code: "123456".into(),
+            requester_id: server.id.clone(),
+            requester_name: server.name.clone(),
+            requester_ip: server.ip.clone(),
+            requester_host: server.host.clone(),
+            requester_public_key: server.transport_public_key.clone(),
+            requester_protocol_version: server.protocol_version,
+            expires_at: Instant::now() + Duration::from_secs(60),
+            expires_at_ms: now_ms() + 60_000,
+            attempts: 0,
+        })));
+        let config_path =
+            std::env::temp_dir().join(format!("mykvm-pairing-stream-test-{}.json", now_ms()));
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let payload = encode_discovery_payload(
+            "pair-confirm",
+            &server,
+            DiscoveryPairingFields {
+                code: Some("123456".into()),
+                cluster_id: Some("server-cluster".into()),
+                secret: Some("server-secret".into()),
+                error: None,
+            },
+        )
+        .expect("pair-confirm should encode");
+
+        assert!(handle_pairing_stream_packet(
+            &payload,
+            SocketAddr::from(([10, 0, 0, 1], 52001)),
+            &layout_state,
+            &pairing_challenge,
+            &config_path,
+            &peers,
+        ));
+
+        let saved = layout_state.lock().expect("layout lock").clone();
+        assert_eq!(saved.cluster_id, "server-cluster");
+        assert_eq!(saved.pair_secret, "server-secret");
+        assert_eq!(saved.paired_controllers.len(), 1);
+        assert_eq!(saved.paired_controllers[0].id, server.id);
+        assert!(pairing_challenge.lock().expect("challenge lock").is_none());
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn clipboard_packet_requires_paired_controller_on_client() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "server-10-0-0-1".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+        let mut packet = ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            origin_id: "attacker".into(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            text: "hello".into(),
+            image: None,
+            sequence: 1,
+        };
+
+        assert!(!clipboard_packet_authorized(&layout, &packet));
+        packet.origin_id = "server-10-0-0-1".into();
+        assert!(clipboard_packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn device_matching_rejects_same_host_with_different_identity() {
+        let layout = test_layout();
+        let device = &layout.devices[1];
+        let mut peer = test_peer();
+        peer.id = "peer-other".into();
+        peer.transport_public_key = "different-key".into();
+
+        assert!(!device_matches_peer(device, &peer));
     }
 
     #[test]

@@ -1942,6 +1942,136 @@
   padding: 20px;
 }
 
+.pairing-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(5, 8, 14, 0.66);
+  backdrop-filter: blur(6px);
+}
+
+.pairing-modal {
+  position: relative;
+  width: min(420px, 100%);
+  display: grid;
+  gap: 16px;
+  padding: 22px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  background: #191a1f;
+  box-shadow: 0 22px 54px rgba(0, 0, 0, 0.38);
+}
+
+.pairing-modal-client {
+  padding-top: 28px;
+}
+
+.pairing-close-button {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #d4d4d8;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    transform 160ms ease;
+}
+
+.pairing-close-button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(148, 163, 184, 0.3);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.pairing-close-button:disabled {
+  cursor: progress;
+  opacity: 0.55;
+}
+
+.pairing-modal h2 {
+  margin: 4px 0 8px;
+  font-size: 1.2rem;
+}
+
+.pairing-modal p {
+  margin: 0;
+  color: #a1a1aa;
+  line-height: 1.7;
+}
+
+.pairing-code-input {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #f8fafc;
+  font-size: 1.35rem;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-align: center;
+}
+
+.pairing-code-display {
+  display: block;
+  padding: 16px;
+  border-radius: 8px;
+  background: rgba(37, 99, 235, 0.16);
+  color: #bfdbfe;
+  font-size: 2rem;
+  letter-spacing: 0;
+  text-align: center;
+}
+
+.pairing-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.theme-light .pairing-modal {
+  border-color: #d7deea;
+  background: #ffffff;
+  color: #172033;
+  box-shadow: 0 22px 54px rgba(31, 41, 55, 0.18);
+}
+
+.theme-light .pairing-modal p {
+  color: #5f6b7d;
+}
+
+.theme-light .pairing-close-button {
+  border-color: #d7deea;
+  background: #f8fbff;
+  color: #334155;
+}
+
+.theme-light .pairing-close-button:hover {
+  border-color: #cbd5e1;
+  background: #eef4ff;
+}
+
+.theme-light .pairing-code-input {
+  border-color: #cbd5e1;
+  background: #f8fbff;
+  color: #172033;
+}
+
+.theme-light .pairing-code-display {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
 @media (max-width: 1100px) {
   .app-header {
     grid-template-columns: minmax(140px, 1fr) auto;
