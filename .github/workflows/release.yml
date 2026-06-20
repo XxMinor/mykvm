@@ -206,12 +206,55 @@ jobs:
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is required to create signed updater artifacts."
             exit 1
           fi
+
+          probe="$(mktemp)"
+          printf 'mykvm updater signing key check' > "$probe"
+          npm exec tauri signer sign "$probe" --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" >/dev/null
+
+          PROBE="$probe" node <<'NODE'
+          const fs = require('fs');
+
+          const config = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+          const pubkey = config?.plugins?.updater?.pubkey;
+          if (!pubkey) {
+            console.error('::error::plugins.updater.pubkey is required.');
+            process.exit(1);
+          }
+
+          const decodeTauriSignatureText = (value) =>
+            Buffer.from(value.trim(), 'base64').toString('utf8').trim().split(/\r?\n/);
+
+          const keyIdFromPayload = (payload) => {
+            const bytes = Buffer.from(payload.trim(), 'base64');
+            if (bytes.length < 10) {
+              throw new Error('minisign payload is too short to contain a key id');
+            }
+            return Buffer.from(bytes.subarray(2, 10)).reverse().toString('hex').toUpperCase();
+          };
+
+          const publicLines = decodeTauriSignatureText(pubkey);
+          const signatureLines = decodeTauriSignatureText(
+            fs.readFileSync(`${process.env.PROBE}.sig`, 'utf8'),
+          );
+          const configuredKeyId = keyIdFromPayload(publicLines[1]);
+          const signingKeyId = keyIdFromPayload(signatureLines[1]);
+
+          if (configuredKeyId !== signingKeyId) {
+            console.error(
+              `::error::TAURI_SIGNING_PRIVATE_KEY key id ${signingKeyId} does not match src-tauri/tauri.conf.json updater pubkey id ${configuredKeyId}. Existing apps will reject updater artifacts signed by this key.`,
+            );
+            process.exit(1);
+          }
+
+          console.log(`Updater signing key matches configured pubkey (${configuredKeyId}).`);
+          NODE
 
       - name: Apply release version
         shell: bash

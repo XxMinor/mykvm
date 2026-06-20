@@ -1171,9 +1171,7 @@ function App() {
       setUpdateMessage(ui.settings.updateCurrent);
     } catch (error: unknown) {
       setUpdateStatus("error");
-      setUpdateMessage(
-        error instanceof Error ? error.message : ui.errors.checkUpdate,
-      );
+      setUpdateMessage(formatUnknownError(error, ui.errors.checkUpdate));
     }
   }
 
@@ -1198,8 +1196,11 @@ function App() {
       await openUpdateReleasePage().catch(() => {
         // The original update error is more useful than a secondary browser error.
       });
-      const errorText =
-        error instanceof Error ? error.message : ui.errors.installUpdate;
+      const errorText = formatUpdaterError(
+        error,
+        ui.errors.installUpdate,
+        ui.errors.updateSignatureMismatch,
+      );
       setUpdateStatus("error");
       setUpdateMessage(`${errorText} ${ui.settings.updateFallback}`);
     }
@@ -2588,6 +2589,33 @@ function updateStatusLabel(status: UpdateStatus, ui: AppText) {
     default:
       return ui.settings.updateIdle;
   }
+}
+
+function formatUnknownError(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  try {
+    const text = JSON.stringify(error);
+    return text && text !== "null" ? text : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function formatUpdaterError(
+  error: unknown,
+  fallback: string,
+  signatureMismatch: string,
+) {
+  const message = formatUnknownError(error, fallback);
+  return /different key|signature.*key/i.test(message)
+    ? signatureMismatch
+    : message;
 }
 
 function uniqueScreenId(

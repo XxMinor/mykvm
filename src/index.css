@@ -5,11 +5,12 @@
   line-height: 1.5;
   font-weight: 400;
   color: #f4f4f5;
-  background: transparent;
+  background: #18181b;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  color-scheme: dark;
 }
 
 * {
@@ -36,6 +37,7 @@
 html,
 body {
   height: 100vh;
+  background: #18181b;
   overscroll-behavior: none;
 }
 
@@ -46,13 +48,13 @@ body {
    and restores trackpad scrolling on tall pages like Settings. */
 #root {
   height: 100vh;
+  background: #18181b;
   overflow-y: auto;
   overscroll-behavior: none;
 }
 
 body {
   margin: 0;
-  background: transparent;
   /* pan-y keeps two-finger vertical scrolling working on tall pages (e.g. the
      settings page); a blanket `none` here disabled it everywhere. */
   touch-action: pan-y;
@@ -60,8 +62,10 @@ body {
 }
 
 :root[data-theme='light'],
-:root[data-theme='light'] body {
-  background: transparent;
+:root[data-theme='light'] body,
+:root[data-theme='light'] #root {
+  background: #f2f5fa;
+  color-scheme: light;
 }
 
 button,

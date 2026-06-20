@@ -506,7 +506,14 @@ fn start_platform_capture(
 
         let _ = ready_tx.send(Ok(()));
         let mut message = MSG::default();
+        let mut last_desktop_check = Instant::now() - Duration::from_millis(200);
         while !stop.load(Ordering::Relaxed) {
+            if last_desktop_check.elapsed() >= Duration::from_millis(100) {
+                last_desktop_check = Instant::now();
+                if !windows_input_desktop_is_default() {
+                    release_windows_remote_control(&context, true);
+                }
+            }
             unsafe {
                 while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
             }
@@ -1465,6 +1472,11 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
+    if !windows_input_desktop_is_default() {
+        release_windows_remote_control(&context, true);
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
     let message = wparam as u32;
     let handled = match message {
@@ -1495,6 +1507,11 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
+    if !windows_input_desktop_is_default() {
+        release_windows_remote_control(&context, true);
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
     let active = context
         .active
         .lock()
@@ -1563,6 +1580,82 @@ fn release_forwarded_keys_windows(context: &WindowsCaptureContext, target: &Inpu
     }
     if let Ok(mut pressed) = context.pressed_keys.lock() {
         pressed.clear();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboard: bool) {
+    let target = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|mut active| active.take().map(|active| active.target));
+
+    if let Some(target) = target {
+        release_forwarded_keys_windows(context, &target);
+        release_remote_buttons(
+            &context.quic_transport,
+            &target,
+            &context.remote_button_mask,
+            &context.layout_state,
+            &context.input_events,
+        );
+    } else {
+        reset_remote_button_mask(&context.remote_button_mask);
+        if let Ok(mut pressed) = context.pressed_keys.lock() {
+            pressed.clear();
+        }
+    }
+
+    context.remote_active.store(false, Ordering::Relaxed);
+    context.just_crossed.store(false, Ordering::Relaxed);
+    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    show_windows_cursor_if_needed(context);
+    if let Ok(mut anchor) = context.anchor.lock() {
+        *anchor = None;
+    }
+    if let Ok(mut last_point) = context.last_point.lock() {
+        *last_point = None;
+    }
+    if clear_clipboard {
+        clear_clipboard_target(&context.clipboard_target);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_desktop_is_default() -> bool {
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS, UOI_NAME,
+    };
+
+    unsafe {
+        let desktop = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+        if desktop.is_null() {
+            return false;
+        }
+
+        let mut needed = 0_u32;
+        let mut buffer = [0_u16; 256];
+        let ok = GetUserObjectInformationW(
+            desktop as _,
+            UOI_NAME,
+            buffer.as_mut_ptr() as *mut _,
+            (buffer.len() * std::mem::size_of::<u16>()) as u32,
+            &mut needed,
+        ) != 0;
+        let _ = CloseDesktop(desktop);
+
+        if !ok || needed == 0 {
+            return false;
+        }
+
+        let mut units = ((needed as usize) / std::mem::size_of::<u16>()).min(buffer.len());
+        if units > 0 && buffer[units - 1] == 0 {
+            units -= 1;
+        }
+        let name = String::from_utf16_lossy(&buffer[..units]);
+
+        name.eq_ignore_ascii_case("default")
     }
 }
 
