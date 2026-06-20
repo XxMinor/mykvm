@@ -156,6 +156,9 @@ function App() {
   const [serverPairing, setServerPairing] =
     useState<ServerPairingState | null>(null);
   const [serverPairingCode, setServerPairingCode] = useState("");
+  const [serverPairingError, setServerPairingError] = useState<string | null>(
+    null,
+  );
   const [clipboardText, setClipboardText] = useState("");
   const [performanceSamples, setPerformanceSamples] = useState<
     PerformanceSample[]
@@ -1046,6 +1049,7 @@ function App() {
       const challengePeer = await requestLanPairing(host);
       setServerPairing({ peer: challengePeer, host });
       setServerPairingCode("");
+      setServerPairingError(null);
     } catch (error: unknown) {
       setErrorMessage(
         error instanceof Error ? error.message : ui.errors.pairingFailed,
@@ -1063,24 +1067,27 @@ function App() {
 
     const code = serverPairingCode.trim();
     if (!code) {
-      setErrorMessage(ui.errors.pairingCodeRequired);
+      setServerPairingError(ui.errors.pairingCodeRequired);
       return;
     }
 
     setIsPairingDevice(true);
-    setErrorMessage(null);
+    setServerPairingError(null);
 
     try {
       const pairedPeer = await confirmLanPairing(serverPairing.host, code);
       if (pairedPeer.screens.length === 0) {
-        setErrorMessage(`${pairedPeer.name}: ${ui.errors.connectedWithoutScreens}`);
+        setServerPairingError(
+          `${pairedPeer.name}: ${ui.errors.connectedWithoutScreens}`,
+        );
         return;
       }
       updateLayout((layoutState) => upsertPeerDevice(layoutState, pairedPeer));
       setServerPairing(null);
       setServerPairingCode("");
+      setServerPairingError(null);
     } catch (error: unknown) {
-      setErrorMessage(
+      setServerPairingError(
         error instanceof Error ? error.message : ui.errors.pairingFailed,
       );
     } finally {
@@ -2055,16 +2062,32 @@ function App() {
             <input
               className="pairing-code-input"
               value={serverPairingCode}
-              onChange={(event) =>
+              aria-invalid={serverPairingError ? "true" : undefined}
+              aria-describedby={
+                serverPairingError ? "server-pairing-error" : undefined
+              }
+              onChange={(event) => {
+                if (serverPairingError) {
+                  setServerPairingError(null);
+                }
                 setServerPairingCode(
                   event.target.value.replace(/\D/g, "").slice(0, 6),
-                )
-              }
+                );
+              }}
               inputMode="numeric"
               autoComplete="one-time-code"
               placeholder={ui.devices.pairingCodePlaceholder}
               autoFocus
             />
+            {serverPairingError ? (
+              <p
+                id="server-pairing-error"
+                className="pairing-inline-error"
+                role="alert"
+              >
+                {serverPairingError}
+              </p>
+            ) : null}
             <div className="pairing-actions">
               <button
                 type="button"
@@ -2072,6 +2095,7 @@ function App() {
                 onClick={() => {
                   setServerPairing(null);
                   setServerPairingCode("");
+                  setServerPairingError(null);
                 }}
                 disabled={isPairingDevice}
               >

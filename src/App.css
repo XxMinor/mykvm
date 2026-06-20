@@ -2022,6 +2022,23 @@
   text-align: center;
 }
 
+.pairing-code-input[aria-invalid="true"] {
+  border-color: rgba(248, 113, 113, 0.78);
+  background: rgba(127, 29, 29, 0.16);
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.12);
+}
+
+.pairing-inline-error {
+  margin: -6px 0 0;
+  padding: 9px 11px;
+  border: 1px solid rgba(248, 113, 113, 0.24);
+  border-radius: 8px;
+  background: rgba(127, 29, 29, 0.16);
+  color: #fecaca;
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+
 .pairing-code-display {
   display: block;
   padding: 16px;
@@ -2065,6 +2082,18 @@
   border-color: #cbd5e1;
   background: #f8fbff;
   color: #172033;
+}
+
+.theme-light .pairing-code-input[aria-invalid="true"] {
+  border-color: #f87171;
+  background: #fff7f7;
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.16);
+}
+
+.theme-light .pairing-inline-error {
+  border-color: #fecaca;
+  background: #fff1f2;
+  color: #b91c1c;
 }
 
 .theme-light .pairing-code-display {
