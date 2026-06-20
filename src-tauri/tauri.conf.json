@@ -49,7 +49,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDczRkM0ODZGQTQzNDQyQzQKUldURVFqU2tiMGo4YzVXTmFsNW92bi9HNkc4SU5rVGtwUFRqd1hrWGtHd3FQRlJmdVllUXhsdzQK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY4NTQyMTlDMkRCREIxQ0EKUldUS3NiMHRuQ0ZVK0pQK3pnV3ZkcnJxUjMzclVoQUh6Vk5lVlNyRzVvRFdWcVF6OWlOUmpEMFIK",
       "endpoints": [
         "https://github.com/XxMinor/mykvm/releases/latest/download/latest.json"
       ],
