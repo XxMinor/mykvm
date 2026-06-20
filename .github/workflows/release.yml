@@ -216,7 +216,11 @@ jobs:
 
           probe="$(mktemp)"
           printf 'mykvm updater signing key check' > "$probe"
-          npm exec tauri signer sign "$probe" --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" >/dev/null
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            npm exec -- tauri signer sign "$probe" --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >/dev/null
+          else
+            npm exec -- tauri signer sign "$probe" >/dev/null
+          fi
 
           PROBE="$probe" node <<'NODE'
           const fs = require('fs');
