@@ -16,6 +16,7 @@ import {
   dismissPairingRequest,
   hideMainWindow,
   installAppUpdate,
+  isAutostartEnabled,
   isPortableMode,
   loadAppState,
   minimizeMainWindow,
@@ -30,6 +31,7 @@ import {
   resetPairing,
   restartAsAdmin,
   saveLayout,
+  setAutostart,
   scanLanPeers,
   startRuntime,
   startWindowDrag,
@@ -172,6 +174,7 @@ function App() {
     string | null
   >(() => localStorage.getItem(UPDATE_DISMISSED_VERSION_KEY));
   const [isPortable, setIsPortable] = useState(false);
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
@@ -248,6 +251,24 @@ function App() {
       })
       .catch(() => {
         // Portable detection is a convenience for update flow, not startup-critical.
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    isAutostartEnabled()
+      .then((enabled) => {
+        if (active) {
+          setAutostartEnabled(enabled);
+        }
+      })
+      .catch(() => {
+        // Launch-at-startup state is best-effort; ignore if unavailable.
       });
 
     return () => {
@@ -991,6 +1012,21 @@ function App() {
     }
   }
 
+  async function handleSetAutostart(enabled: boolean) {
+    if (enabled === autostartEnabled) {
+      return;
+    }
+    setErrorMessage(null);
+    try {
+      const next = await setAutostart(enabled);
+      setAutostartEnabled(next);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    }
+  }
+
   async function handleAddManualDevice(
     event: FormEvent<HTMLFormElement>,
   ) {
@@ -1012,7 +1048,7 @@ function App() {
       }
 
       if (peer.pairingRequired) {
-        await beginPairing(peer, host);
+        await beginPairing(host);
         return;
       }
 
@@ -1039,7 +1075,7 @@ function App() {
     }
 
     if (peer.pairingRequired) {
-      void beginPairing(peer);
+      void beginPairing(peer.ip || peer.host);
       return;
     }
 
@@ -1048,8 +1084,8 @@ function App() {
     });
   }
 
-  async function beginPairing(peer: LanPeer, hostOverride = "") {
-    const host = hostOverride || peer.ip || peer.host;
+  async function beginPairing(hostInput: string) {
+    const host = hostInput.trim();
     if (!host) {
       setErrorMessage(ui.errors.manualHostRequired);
       return;
@@ -1070,6 +1106,18 @@ function App() {
     } finally {
       setIsPairingDevice(false);
     }
+  }
+
+  // Re-pair an already-added device (server side). The client shows the code
+  // on its own screen, so this works even when the client has no keyboard or
+  // mouse and the cursor can no longer cross to it.
+  async function handleRepairDevice(device: Device) {
+    const host = (device.host || "").split("/").pop()?.trim() || "";
+    if (!host) {
+      setErrorMessage(ui.errors.manualHostRequired);
+      return;
+    }
+    await beginPairing(host);
   }
 
   async function confirmPairing(event: FormEvent<HTMLFormElement>) {
@@ -1335,13 +1383,23 @@ function App() {
     }
 
     return (
-      <button
-        type="button"
-        className="secondary-button compact-button danger-button"
-        onClick={() => handleRemoveDevice(device.id)}
-      >
-        {ui.common.remove}
-      </button>
+      <>
+        <button
+          type="button"
+          className="secondary-button compact-button"
+          onClick={() => void handleRepairDevice(device)}
+          disabled={isPairingDevice}
+        >
+          {ui.devices.repair}
+        </button>
+        <button
+          type="button"
+          className="secondary-button compact-button danger-button"
+          onClick={() => handleRemoveDevice(device.id)}
+        >
+          {ui.common.remove}
+        </button>
+      </>
     );
   }
 
@@ -1695,33 +1753,6 @@ function App() {
                 <p className="muted-copy">{ui.settings.roleCopy}</p>
               </section>
 
-              {machineRole === "client" ? (
-                <section className="surface-card settings-card">
-                  <h2>{ui.settings.pairingTitle}</h2>
-                  <p className="muted-copy">
-                    {layout.pairedControllers.length > 0
-                      ? `${ui.settings.pairedWith}: ${layout.pairedControllers
-                          .map(
-                            (controller) =>
-                              controller.name ||
-                              controller.ip ||
-                              controller.id,
-                          )
-                          .join("、")}`
-                      : ui.settings.notPaired}
-                  </p>
-                  <button
-                    type="button"
-                    className="secondary-button compact-button danger-button"
-                    disabled={layout.pairedControllers.length === 0}
-                    onClick={() => void handleResetPairing()}
-                  >
-                    {ui.settings.resetPairing}
-                  </button>
-                  <p className="muted-copy">{ui.settings.resetPairingCopy}</p>
-                </section>
-              ) : null}
-
               <section className="surface-card settings-card">
                 <h2>{ui.settings.transport}</h2>
                 <p className="muted-copy">{ui.settings.transportCopy}</p>
@@ -1802,6 +1833,49 @@ function App() {
                     )}
                   </div>
                 </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.autostart}</span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={autostartEnabled ? "active" : ""}
+                      onClick={() => void handleSetAutostart(true)}
+                    >
+                      {ui.settings.autostartOn}
+                    </button>
+                    <button
+                      type="button"
+                      className={!autostartEnabled ? "active" : ""}
+                      onClick={() => void handleSetAutostart(false)}
+                    >
+                      {ui.settings.autostartOff}
+                    </button>
+                  </div>
+                </div>
+                {machineRole === "client" ? (
+                  <div className="settings-control-row">
+                    <span>
+                      {layout.pairedControllers.length > 0
+                        ? `${ui.settings.pairedWith}: ${layout.pairedControllers
+                            .map(
+                              (controller) =>
+                                controller.name ||
+                                controller.ip ||
+                                controller.id,
+                            )
+                            .join("、")}`
+                        : ui.settings.notPaired}
+                    </span>
+                    <button
+                      type="button"
+                      className="secondary-button compact-button danger-button"
+                      disabled={layout.pairedControllers.length === 0}
+                      onClick={() => void handleResetPairing()}
+                    >
+                      {ui.settings.resetPairing}
+                    </button>
+                  </div>
+                ) : null}
               </section>
 
               <section className="surface-card clipboard-card">

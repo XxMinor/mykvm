@@ -123,6 +123,22 @@ export async function resetPairing(): Promise<AppStateSnapshot> {
   return invoke<AppStateSnapshot>('reset_pairing')
 }
 
+export async function isAutostartEnabled(): Promise<boolean> {
+  if (!isTauri()) {
+    return false
+  }
+
+  return invoke<boolean>('is_autostart_enabled')
+}
+
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  if (!isTauri()) {
+    return enabled
+  }
+
+  return invoke<boolean>('set_autostart', { enabled })
+}
+
 export async function startRuntime(): Promise<RuntimeStatus> {
   if (!isTauri()) {
     browserRuntime = {
