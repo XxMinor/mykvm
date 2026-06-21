@@ -1335,6 +1335,32 @@ fn reset_pairing(state: tauri::State<'_, AppRuntime>) -> Result<AppStateSnapshot
 }
 
 #[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    if enabled {
+        manager
+            .enable()
+            .map_err(|error| format!("failed to enable launch at startup: {error}"))?;
+    } else {
+        manager
+            .disable()
+            .map_err(|error| format!("failed to disable launch at startup: {error}"))?;
+    }
+    manager
+        .is_enabled()
+        .map_err(|error| format!("failed to read launch-at-startup state: {error}"))
+}
+
+#[tauri::command]
+fn is_autostart_enabled(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| format!("failed to read launch-at-startup state: {error}"))
+}
+
+#[tauri::command]
 fn open_repository_url() -> Result<(), String> {
     open_external_url(REPOSITORY_URL)
 }
@@ -1718,6 +1744,10 @@ fn setup_macos_window_visibility_watcher(app: &tauri::App) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None::<Vec<&str>>,
+        ))
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -1780,6 +1810,8 @@ pub fn run() {
             confirm_lan_pairing,
             dismiss_pairing_request,
             reset_pairing,
+            set_autostart,
+            is_autostart_enabled,
             restart_as_admin,
             sync_window_chrome,
             minimize_main_window,
@@ -4081,10 +4113,24 @@ fn begin_pairing_challenge(
     requester: &LanPeer,
     requester_ip: String,
 ) -> bool {
-    if layout.machine_role != "client" || !pairing_required(layout) {
+    if layout.machine_role != "client" {
         return false;
     }
     if requester.machine_role != "server" {
+        return false;
+    }
+    // Accept a fresh handshake when we have no pairing yet, OR when the
+    // requester is a controller we were already paired with (matched by the
+    // stable device id / transport key). The latter lets a server re-initiate
+    // pairing on a client that has no keyboard/mouse of its own — the client
+    // just shows the code on its own screen — instead of being stuck
+    // "already paired" with credentials that no longer match.
+    let requester_already_known = layout.paired_controllers.iter().any(|controller| {
+        (!requester.id.trim().is_empty() && controller.id == requester.id)
+            || (!requester.transport_public_key.trim().is_empty()
+                && controller.transport_public_key == requester.transport_public_key)
+    });
+    if !pairing_required(layout) && !requester_already_known {
         return false;
     }
 
