@@ -102,28 +102,41 @@ impl DesktopAttachment {
     pub fn attach_current_input_desktop(&mut self) -> Result<String, String> {
         use windows_sys::Win32::System::StationsAndDesktops::{
             CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_CREATEWINDOW,
-            DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS,
+            DESKTOP_JOURNALPLAYBACK, DESKTOP_JOURNALRECORD, DESKTOP_READOBJECTS,
+            DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS,
         };
 
         unsafe {
+            // DESKTOP_JOURNALPLAYBACK is REQUIRED for SendInput to be accepted on
+            // the attached desktop: without it the worker's synthetic clicks/keys
+            // are refused with ERROR_ACCESS_DENIED (only mouse-move, which uses a
+            // different path, slips through). This is why the SYSTEM worker could
+            // move the cursor on the lock screen but not click or type.
             let desktop = OpenInputDesktop(
                 0,
                 0,
                 DESKTOP_READOBJECTS
                     | DESKTOP_WRITEOBJECTS
                     | DESKTOP_SWITCHDESKTOP
-                    | DESKTOP_CREATEWINDOW,
+                    | DESKTOP_CREATEWINDOW
+                    | DESKTOP_JOURNALPLAYBACK
+                    | DESKTOP_JOURNALRECORD,
             );
             if desktop.is_null() {
                 return Err("OpenInputDesktop failed".into());
             }
 
             let name = desktop_name(desktop).unwrap_or_else(|| "<unknown>".into());
-            if name == self.name {
-                let _ = CloseDesktop(desktop);
-                return Ok(name);
-            }
 
+            // Always re-attach to the freshly opened input desktop. Caching by
+            // name is unsafe: a secure-desktop transition (e.g. clicking
+            // "I forgot my PIN" / "Reset password" on the lock screen) switches
+            // to a DIFFERENT desktop object that often carries the SAME name
+            // ("Winlogon"). A name-equality cache would then skip SetThreadDesktop
+            // and leave the worker bound to the old, now-inactive desktop, so
+            // clicks/keys silently stop until the worker restarts. OpenInputDesktop
+            // is already called every time here, so re-attaching is essentially
+            // free.
             if SetThreadDesktop(desktop) == 0 {
                 let _ = CloseDesktop(desktop);
                 return Err(format!("SetThreadDesktop failed for {name}"));
