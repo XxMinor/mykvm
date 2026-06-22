@@ -434,6 +434,11 @@ export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
   }
 }
 
+export async function setAppUpgrading(enabled: boolean): Promise<void> {
+  if (!isTauri()) return
+  await invoke('set_app_upgrading', { enabled })
+}
+
 export async function installAppUpdate(): Promise<void> {
   if (!isTauri()) {
     return
@@ -449,7 +454,13 @@ export async function installAppUpdate(): Promise<void> {
     return
   }
 
-  await update.downloadAndInstall()
+  await setAppUpgrading(true).catch(() => {})
+  try {
+    await update.downloadAndInstall()
+  } catch (error) {
+    await setAppUpgrading(false).catch(() => {})
+    throw error
+  }
   pendingAppUpdate = null
   await relaunch()
 }

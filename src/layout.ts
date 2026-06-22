@@ -9,6 +9,7 @@ export interface FlattenedScreen extends Screen {
   platform: Device['platform']
   online: boolean
   inputReady: boolean
+  upgrading?: boolean
   role: Device['role']
 }
 
@@ -35,6 +36,7 @@ export function flattenScreens(layout: LayoutState): FlattenedScreen[] {
       platform: device.platform,
       online: device.online,
       inputReady: device.inputReady,
+      upgrading: device.upgrading,
       role: device.role,
     })),
   )

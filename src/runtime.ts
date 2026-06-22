@@ -20,6 +20,7 @@ export interface LanPeer {
   protocolVersion: number
   screenCount: number
   inputReady: boolean
+  upgrading?: boolean
   screens: LanPeerScreen[]
   appVersion: string
   lastSeenMs: number

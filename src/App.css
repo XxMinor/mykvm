@@ -249,6 +249,11 @@
   color: #9a5a00;
 }
 
+.theme-light .tag-pill-upgrading {
+  background: #ede9fe;
+  color: #6d28d9;
+}
+
 .theme-light .status-pill {
   background: #dff7f2;
   color: #08796f;
@@ -1174,6 +1179,11 @@
 .tag-pill-manual {
   background: rgba(245, 158, 11, 0.14);
   color: #fbbf24;
+}
+
+.tag-pill-upgrading {
+  background: rgba(139, 92, 246, 0.18);
+  color: #a78bfa;
 }
 
 .onboarding-shell {

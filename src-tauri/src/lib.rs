@@ -144,6 +144,10 @@ struct Device {
     online: bool,
     #[serde(default)]
     input_ready: bool,
+    #[serde(default)]
+    upgrading: bool,
+    #[serde(default, skip_serializing)]
+    upgrading_until_ms: u64,
     role: String,
     #[serde(default = "default_device_source")]
     source: String,
@@ -247,6 +251,8 @@ struct LanPeer {
     screen_count: usize,
     #[serde(default)]
     input_ready: bool,
+    #[serde(default)]
+    upgrading: bool,
     #[serde(default)]
     screens: Vec<LanPeerScreen>,
     app_version: String,
@@ -369,6 +375,7 @@ struct AppRuntime {
     allow_explicit_quit: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     input_receive_enabled: Arc<AtomicBool>,
+    upgrading: Arc<AtomicBool>,
     clipboard_receive_enabled: Arc<AtomicBool>,
     transport_packets: Arc<AtomicU64>,
     input_events: Arc<AtomicU64>,
@@ -399,6 +406,7 @@ impl AppRuntime {
             allow_explicit_quit: Arc::new(AtomicBool::new(false)),
             clipboard_target: Arc::new(Mutex::new(None)),
             input_receive_enabled: Arc::new(AtomicBool::new(false)),
+            upgrading: Arc::new(AtomicBool::new(false)),
             clipboard_receive_enabled: Arc::new(AtomicBool::new(false)),
             transport_packets: Arc::new(AtomicU64::new(0)),
             input_events: Arc::new(AtomicU64::new(0)),
@@ -683,6 +691,7 @@ impl AppRuntime {
         let pairing_challenge = Arc::clone(&self.pairing_challenge);
         let app_handle = self.app_handle.clone();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
+        let upgrading = Arc::clone(&self.upgrading);
         let transport_packets = Arc::clone(&self.transport_packets);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -702,11 +711,14 @@ impl AppRuntime {
             let mut buffer = [0_u8; 4096];
             let mut last_announce = Instant::now() - Duration::from_secs(10);
             let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
+            let mut last_upgrading = upgrading.load(Ordering::Relaxed);
 
             while !thread_stop.load(Ordering::Relaxed) {
                 let current_input_ready = input_receive_enabled.load(Ordering::Relaxed);
+                let current_upgrading = upgrading.load(Ordering::Relaxed);
                 if last_announce.elapsed() >= Duration::from_secs(3)
                     || current_input_ready != last_input_ready
+                    || current_upgrading != last_upgrading
                 {
                     let local_peer = layout_state
                         .lock()
@@ -717,6 +729,7 @@ impl AppRuntime {
                             let mut peer = local_peer_from_layout(&layout);
                             apply_transport_to_peer(&mut peer, &quic_transport);
                             peer.input_ready = advertised_input_ready(&layout, current_input_ready);
+                            peer.upgrading = upgrading.load(Ordering::Relaxed);
                             Some(peer)
                         })
                         .unwrap_or_else(|_| Some(local_peer.clone()));
@@ -732,6 +745,7 @@ impl AppRuntime {
                     }
                     last_announce = Instant::now();
                     last_input_ready = current_input_ready;
+                    last_upgrading = current_upgrading;
                 }
 
                 if let Ok((length, source)) = socket.recv_from(&mut buffer) {
@@ -748,6 +762,7 @@ impl AppRuntime {
                                     &layout,
                                     input_receive_enabled.load(Ordering::Relaxed),
                                 );
+                                peer.upgrading = upgrading.load(Ordering::Relaxed);
                                 (layout.clone(), peer)
                             })
                             .unwrap_or_else(|_| (detect_fallback_layout(), local_peer.clone()));
@@ -1058,7 +1073,30 @@ fn merge_runtime_owned_layout_fields(
     }
 
     merge_local_runtime_device_fields(&mut incoming, current);
+    merge_remote_upgrading_fields(&mut incoming, current);
     incoming
+}
+
+/// A remote device's "upgrading" state is determined entirely by the backend
+/// (discovery announces + the grace timer), and the frontend never carries the
+/// internal `upgrading_until_ms`. So a whole-layout save from the frontend must
+/// not clobber it — otherwise saving while a client is mid-upgrade resets
+/// `upgrading_until_ms` to 0 and the very next presence pass clears the badge
+/// early. Treat both fields as backend-owned for matching remote devices.
+fn merge_remote_upgrading_fields(incoming: &mut LayoutState, current: &LayoutState) {
+    for incoming_device in incoming.devices.iter_mut() {
+        if incoming_device.role == "local" {
+            continue;
+        }
+        if let Some(current_device) = current
+            .devices
+            .iter()
+            .find(|device| device.id == incoming_device.id)
+        {
+            incoming_device.upgrading = current_device.upgrading;
+            incoming_device.upgrading_until_ms = current_device.upgrading_until_ms;
+        }
+    }
 }
 
 fn merge_disk_layout_into_runtime(mut disk: LayoutState, current: &LayoutState) -> LayoutState {
@@ -1387,6 +1425,11 @@ fn write_clipboard_text(text: String) -> Result<(), String> {
 #[tauri::command]
 fn read_performance_sample(state: tauri::State<'_, AppRuntime>) -> PerformanceSample {
     read_system_performance_sample(&state)
+}
+
+#[tauri::command]
+fn set_app_upgrading(state: tauri::State<'_, AppRuntime>, enabled: bool) {
+    state.upgrading.store(enabled, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -2069,6 +2112,7 @@ pub fn run() {
             read_clipboard_text,
             write_clipboard_text,
             read_performance_sample,
+            set_app_upgrading,
             scan_lan_peers,
             probe_lan_peer,
             request_lan_pairing,
@@ -2929,6 +2973,8 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
             color: "#2f7af8".into(),
             online: true,
             input_ready: false,
+            upgrading: false,
+            upgrading_until_ms: 0,
             role: "local".into(),
             source: "detected".into(),
             screens,
@@ -3783,6 +3829,9 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
         } else {
             device.online = false;
             device.input_ready = false;
+            if device.upgrading && now_ms() > device.upgrading_until_ms {
+                device.upgrading = false;
+            }
         }
     }
 
@@ -3912,6 +3961,10 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     if !peer.screens.is_empty() {
         device.screens = screens_from_peer(peer, &device.id, &device.screens);
     }
+    if peer.upgrading && !device.upgrading {
+        device.upgrading_until_ms = now_ms() + 120_000;
+    }
+    device.upgrading = peer.upgrading;
 }
 
 fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen]) -> Vec<Screen> {
@@ -4415,6 +4468,7 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
             .unwrap_or_else(default_protocol_version),
         screen_count: local_device.map(|device| device.screens.len()).unwrap_or(0),
         input_ready: false,
+        upgrading: false,
         screens: local_device
             .map(|device| device.screens.iter().map(screen_to_peer_screen).collect())
             .unwrap_or_default(),
@@ -5297,6 +5351,8 @@ mod tests {
                     color: "#2f7af8".into(),
                     online: true,
                     input_ready: false,
+                    upgrading: false,
+                    upgrading_until_ms: 0,
                     role: "local".into(),
                     source: "detected".into(),
                     screens: vec![test_screen("local-device")],
@@ -5313,6 +5369,8 @@ mod tests {
                     color: "#0f766e".into(),
                     online: true,
                     input_ready: true,
+                    upgrading: false,
+                    upgrading_until_ms: 0,
                     role: "client".into(),
                     source: "detected".into(),
                     screens: vec![test_screen("peer-client-10-0-0-2")],
@@ -5353,6 +5411,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_count: 1,
             input_ready: true,
+            upgrading: false,
             screens: vec![LanPeerScreen {
                 id: "local-display-1".into(),
                 name: "Display".into(),

@@ -1683,6 +1683,11 @@ function App() {
                               <span className="tag-pill tag-pill-lan">
                                 {ui.devices.lan}
                               </span>
+                              {addedDevice?.upgrading ? (
+                                <span className="tag-pill tag-pill-upgrading">
+                                  {ui.common.upgrading}
+                                </span>
+                              ) : null}
                             </div>
                           </div>
                           <p className="connection-meta">
@@ -1734,6 +1739,11 @@ function App() {
                             >
                               {deviceSourceLabel(device, language)}
                             </span>
+                            {device.upgrading ? (
+                              <span className="tag-pill tag-pill-upgrading">
+                                {ui.common.upgrading}
+                              </span>
+                            ) : null}
                           </div>
                         </div>
                         <p className="connection-meta">

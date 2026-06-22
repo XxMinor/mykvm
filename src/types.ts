@@ -53,6 +53,7 @@ export interface Device {
   color: string
   online: boolean
   inputReady: boolean
+  upgrading?: boolean
   role: 'local' | 'server' | 'client'
   source?: 'detected' | 'manual'
   screens: Screen[]
