@@ -62,6 +62,7 @@ export interface RuntimeStatus {
   discovery: DiscoveryStatus
   pairing: PairingStatus
   privilege: PrivilegeStatus
+  inputService: InputServiceStatus
 }
 
 export interface AppStateSnapshot {
@@ -72,6 +73,15 @@ export interface AppStateSnapshot {
 export interface PrivilegeStatus {
   isElevated: boolean
   canElevate: boolean
+  detail: string
+}
+
+export interface InputServiceStatus {
+  installed: boolean
+  running: boolean
+  workerSessionId?: number | null
+  pipeAvailable: boolean
+  sasAvailable: boolean
   detail: string
 }
 

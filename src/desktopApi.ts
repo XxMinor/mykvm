@@ -2,7 +2,13 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import type { Update } from '@tauri-apps/plugin-updater'
 import { RELEASES_URL, REPOSITORY_URL } from './constants'
 import { defaultLayout } from './defaultLayout'
-import type { AppStateSnapshot, DiscoveryStatus, PerformanceSample, RuntimeStatus } from './runtime'
+import type {
+  AppStateSnapshot,
+  DiscoveryStatus,
+  InputServiceStatus,
+  PerformanceSample,
+  RuntimeStatus,
+} from './runtime'
 import type { LayoutState } from './types'
 
 export interface AppUpdateInfo {
@@ -39,6 +45,14 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
     isElevated: false,
     canElevate: false,
     detail: 'Administrator restart is available only in the Windows desktop runtime.',
+  },
+  inputService: {
+    installed: false,
+    running: false,
+    workerSessionId: null,
+    pipeAvailable: false,
+    sasAvailable: false,
+    detail: 'Windows lock screen input service is available only in the Windows desktop runtime.',
   },
   discovery: {
     state: 'idle',
@@ -151,6 +165,7 @@ export async function startRuntime(): Promise<RuntimeStatus> {
       inject: FALLBACK_RUNTIME.inject,
       clipboard: FALLBACK_RUNTIME.clipboard,
       privilege: FALLBACK_RUNTIME.privilege,
+      inputService: FALLBACK_RUNTIME.inputService,
       pairing: FALLBACK_RUNTIME.pairing,
       discovery: {
         ...FALLBACK_RUNTIME.discovery,
@@ -285,6 +300,38 @@ export async function restartAsAdmin(): Promise<void> {
   }
 
   await invoke('restart_as_admin')
+}
+
+export async function readInputServiceStatus(): Promise<InputServiceStatus> {
+  if (!isTauri()) {
+    return browserRuntime.inputService
+  }
+
+  return invoke<InputServiceStatus>('read_input_service_status')
+}
+
+export async function installInputService(): Promise<InputServiceStatus> {
+  if (!isTauri()) {
+    return browserRuntime.inputService
+  }
+
+  return invoke<InputServiceStatus>('install_input_service')
+}
+
+export async function uninstallInputService(): Promise<InputServiceStatus> {
+  if (!isTauri()) {
+    return browserRuntime.inputService
+  }
+
+  return invoke<InputServiceStatus>('uninstall_input_service')
+}
+
+export async function sendSecureAttention(deviceId: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('send_secure_attention', { deviceId })
 }
 
 export async function relaunchApp(): Promise<void> {

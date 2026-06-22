@@ -10,22 +10,28 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{quic_transport, Device, LayoutState, NativeStageStatus, Screen};
+use crate::{
+    quic_transport,
+    shared_input::{
+        button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton,
+        LEFT_BUTTON_MASK, MIDDLE_BUTTON_MASK, RIGHT_BUTTON_MASK,
+    },
+    Device, LayoutState, NativeStageStatus, Screen,
+};
 
 const INPUT_PROTOCOL: &str = "mykvm.input.v1";
+const INPUT_CONTROL_PROTOCOL: &str = "mykvm.input-control.v1";
 const EDGE_TOLERANCE: i32 = 80;
 const CROSSING_MARGIN: f64 = 4.0;
 const MIN_CROSSING_DELTA: f64 = 1.0;
 const CROSSING_AXIS_DOMINANCE: f64 = 0.5;
+const CROSSING_ACTIVATION_BAND: f64 = EDGE_TOLERANCE as f64 * 2.0;
 // On return to the local machine, drop the cursor this many pixels inside the
 // entry edge instead of flush against it. Clears CROSSING_MARGIN so a fast
 // return flick can't immediately bounce back across into the remote.
 const RETURN_EDGE_INSET: f64 = 12.0;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
-const LEFT_BUTTON_MASK: u64 = 1;
-const RIGHT_BUTTON_MASK: u64 = 1 << 1;
-const MIDDLE_BUTTON_MASK: u64 = 1 << 2;
 
 static INPUT_TX_FAILURES: AtomicU64 = AtomicU64::new(0);
 static INPUT_TX_SKIPS: AtomicU64 = AtomicU64::new(0);
@@ -103,20 +109,28 @@ struct InputPacket {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-enum InputEvent {
-    MouseMove { screen_id: String, x: i32, y: i32 },
-    MouseButton { button: MouseButton, down: bool },
-    Scroll { delta_x: i32, delta_y: i32 },
-    Key { key_code: u16, down: bool },
+#[serde(rename_all = "camelCase")]
+struct InputControlPacket {
+    protocol: String,
+    #[serde(default)]
+    target_device_id: String,
+    #[serde(default)]
+    origin_device_id: String,
+    #[serde(default)]
+    origin_transport_public_key: String,
+    #[serde(default = "default_protocol_version")]
+    origin_protocol_version: u16,
+    #[serde(default)]
+    cluster_id: String,
+    #[serde(default)]
+    pair_secret: String,
+    command: InputControlCommand,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-enum MouseButton {
-    Left,
-    Right,
-    Middle,
+enum InputControlCommand {
+    SecureAttention,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -199,6 +213,8 @@ pub fn input_runtime_status(
 }
 
 fn input_receive_status(layout: &LayoutState, request_permission: bool) -> NativeStageStatus {
+    let _ = request_permission;
+
     #[cfg(target_os = "macos")]
     if !macos_accessibility_trusted(request_permission) {
         return NativeStageStatus {
@@ -738,21 +754,20 @@ fn send_packet(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
-    let (origin_device_id, origin_port) = input_origin(layout_state, quic_transport);
-    let (cluster_id, pair_secret) = pair_credentials(layout_state);
-    let event = remap_event_for_target(event, target, layout_state);
+    let packet_context = input_packet_context(target, event, layout_state);
+    let event = packet_context.event;
     let packet = InputPacket {
         protocol: INPUT_PROTOCOL.into(),
         target_device_id: target.device_id.clone(),
-        origin_device_id,
-        origin_port,
+        origin_device_id: packet_context.origin_device_id,
+        origin_port: quic_transport.port(),
         origin_transport_public_key: quic_transport.public_key().to_string(),
         origin_protocol_version: quic_transport::PROTOCOL_VERSION,
-        cluster_id,
-        pair_secret,
+        cluster_id: packet_context.cluster_id,
+        pair_secret: packet_context.pair_secret,
         event,
     };
-    let Some(peer) = live_target_endpoint(target, layout_state) else {
+    let Some(peer) = packet_context.peer else {
         INPUT_TX_SKIPS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
@@ -782,14 +797,121 @@ fn send_packet(
     }
 }
 
+pub fn send_secure_attention_control(
+    layout: &LayoutState,
+    quic_transport: &quic_transport::TransportHandle,
+    device_id: &str,
+) -> Result<(), String> {
+    let Some(target) = layout
+        .devices
+        .iter()
+        .find(|device| device.id == device_id && device.role != "local")
+    else {
+        return Err("target device is not in the layout".into());
+    };
+    if target.platform != "windows" {
+        return Err("Ctrl+Alt+Del control is only available for Windows targets.".into());
+    }
+    if !target.online || !target.input_ready {
+        return Err("target device is not online and input-ready".into());
+    }
+    if target.transport_public_key.trim().is_empty() {
+        return Err("target device has no QUIC transport key; re-pair it first".into());
+    }
+    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        return Err("this device is not paired with the target".into());
+    }
+
+    let origin_device_id = origin_peer_id(layout);
+    let packet = InputControlPacket {
+        protocol: INPUT_CONTROL_PROTOCOL.into(),
+        target_device_id: target.id.clone(),
+        origin_device_id,
+        origin_transport_public_key: quic_transport.public_key().to_string(),
+        origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+        cluster_id: layout.cluster_id.clone(),
+        pair_secret: layout.pair_secret.clone(),
+        command: InputControlCommand::SecureAttention,
+    };
+    let payload = rmp_serde::to_vec_named(&packet)
+        .map_err(|error| format!("encode input control packet: {error}"))?;
+    let peer = quic_transport.peer(
+        format!(
+            "{}:{}",
+            target.host,
+            normalize_quic_port(target.transport_port, target.quic_port)
+        ),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+
+    quic_transport.send_datagram(peer, payload)
+}
+
+struct InputPacketContext {
+    origin_device_id: String,
+    cluster_id: String,
+    pair_secret: String,
+    peer: Option<quic_transport::PeerEndpoint>,
+    event: InputEvent,
+}
+
+fn input_packet_context(
+    target: &InputTarget,
+    event: InputEvent,
+    layout_state: &Arc<Mutex<LayoutState>>,
+) -> InputPacketContext {
+    let fallback_peer = || quic_transport::PeerEndpoint {
+        addr: target.target_addr.clone(),
+        public_key: target.transport_public_key.clone(),
+        protocol_version: target.protocol_version,
+    };
+
+    let Ok(layout) = layout_state.lock() else {
+        return InputPacketContext {
+            origin_device_id: String::new(),
+            cluster_id: String::new(),
+            pair_secret: String::new(),
+            peer: Some(fallback_peer()),
+            event,
+        };
+    };
+
+    let origin_device_id = origin_peer_id(&layout);
+    let peer = layout
+        .devices
+        .iter()
+        .find(|device| device.id == target.device_id)
+        .and_then(|device| {
+            (device.online && device.input_ready).then(|| quic_transport::PeerEndpoint {
+                addr: format!(
+                    "{}:{}",
+                    device.host,
+                    normalize_quic_port(device.transport_port, device.quic_port)
+                ),
+                public_key: device.transport_public_key.clone(),
+                protocol_version: device.protocol_version,
+            })
+        });
+    let event = remap_event_for_target_layout(event, target, &layout);
+
+    InputPacketContext {
+        origin_device_id,
+        cluster_id: layout.cluster_id.clone(),
+        pair_secret: layout.pair_secret.clone(),
+        peer,
+        event,
+    }
+}
+
 /// Rewrites modifier keys on key events when the controlling machine and the
 /// target run different operating systems, so platform shortcut conventions
 /// line up (default: Ctrl <-> Cmd). Non-key events and same-platform targets
 /// pass through untouched. The wire format is always Windows virtual-key codes.
-fn remap_event_for_target(
+fn remap_event_for_target_layout(
     event: InputEvent,
     target: &InputTarget,
-    layout_state: &Arc<Mutex<LayoutState>>,
+    layout: &LayoutState,
 ) -> InputEvent {
     let InputEvent::Key { key_code, down } = event else {
         return event;
@@ -803,19 +925,32 @@ fn remap_event_for_target(
         return InputEvent::Key { key_code, down };
     }
 
-    let remapped = match layout_state.lock() {
-        Ok(layout) if layout.modifier_remap => remap_modifier_vk(
+    let remapped = if layout.modifier_remap {
+        remap_modifier_vk(
             key_code,
             &layout.modifier_map.control,
             &layout.modifier_map.alt,
             &layout.modifier_map.meta,
-        ),
-        _ => key_code,
+        )
+    } else {
+        key_code
     };
 
     InputEvent::Key {
         key_code: remapped,
         down,
+    }
+}
+
+#[cfg(test)]
+fn remap_event_for_target(
+    event: InputEvent,
+    target: &InputTarget,
+    layout_state: &Arc<Mutex<LayoutState>>,
+) -> InputEvent {
+    match layout_state.lock() {
+        Ok(layout) => remap_event_for_target_layout(event, target, &layout),
+        Err(_) => event,
     }
 }
 
@@ -852,27 +987,6 @@ fn remap_modifier_vk(vk: u16, control: &str, alt: &str, meta: &str) -> u16 {
     logical_target_vk(target).unwrap_or(vk)
 }
 
-fn input_origin(
-    layout_state: &Arc<Mutex<LayoutState>>,
-    quic_transport: &quic_transport::TransportHandle,
-) -> (String, u16) {
-    let Ok(layout) = layout_state.lock() else {
-        return (String::new(), quic_transport.port());
-    };
-    let device_id = local_device(&layout)
-        .map(|device| device.id.clone())
-        .unwrap_or_default();
-
-    (device_id, quic_transport.port())
-}
-
-fn pair_credentials(layout_state: &Arc<Mutex<LayoutState>>) -> (String, String) {
-    layout_state
-        .lock()
-        .map(|layout| (layout.cluster_id.clone(), layout.pair_secret.clone()))
-        .unwrap_or_default()
-}
-
 fn mark_target_offline(
     layout_state: &Arc<Mutex<LayoutState>>,
     target: &InputTarget,
@@ -893,35 +1007,6 @@ fn mark_target_offline(
     }
 
     device.online = false;
-}
-
-fn live_target_endpoint(
-    target: &InputTarget,
-    layout_state: &Arc<Mutex<LayoutState>>,
-) -> Option<quic_transport::PeerEndpoint> {
-    let Ok(layout) = layout_state.lock() else {
-        return Some(quic_transport::PeerEndpoint {
-            addr: target.target_addr.clone(),
-            public_key: target.transport_public_key.clone(),
-            protocol_version: target.protocol_version,
-        });
-    };
-
-    layout
-        .devices
-        .iter()
-        .find(|device| device.id == target.device_id)
-        .and_then(|device| {
-            (device.online && device.input_ready).then(|| quic_transport::PeerEndpoint {
-                addr: format!(
-                    "{}:{}",
-                    device.host,
-                    normalize_quic_port(device.transport_port, device.quic_port)
-                ),
-                public_key: device.transport_public_key.clone(),
-                protocol_version: device.protocol_version,
-            })
-        })
 }
 
 fn target_is_online(target: &InputTarget, layout_state: &Arc<Mutex<LayoutState>>) -> bool {
@@ -994,20 +1079,109 @@ pub fn try_inject_packet_from_source(
     true
 }
 
-fn packet_authorized(layout: &LayoutState, packet: &InputPacket) -> bool {
-    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+pub fn try_handle_control_packet_from_source(
+    layout: &LayoutState,
+    payload: &[u8],
+    source: SocketAddr,
+    local_peer_id: &str,
+) -> bool {
+    let Some(packet) = decode_input_control_packet(payload) else {
         return false;
-    }
-    if packet.cluster_id != layout.cluster_id || packet.pair_secret != layout.pair_secret {
+    };
+
+    if packet.protocol != INPUT_CONTROL_PROTOCOL {
         return false;
     }
 
-    layout.paired_controllers.iter().any(|controller| {
-        (!packet.origin_transport_public_key.trim().is_empty()
-            && controller.transport_public_key == packet.origin_transport_public_key)
-            || (!packet.origin_device_id.trim().is_empty()
-                && controller.id == packet.origin_device_id)
-    })
+    if !control_packet_authorized(layout, &packet) {
+        warn_unauthorized_control_packet(layout, &packet);
+        return true;
+    }
+
+    if !packet_targets_local(layout, &packet.target_device_id, local_peer_id) {
+        return true;
+    }
+
+    match packet.command {
+        InputControlCommand::SecureAttention => {
+            #[cfg(target_os = "windows")]
+            if let Err(error) = send_secure_attention_to_helper() {
+                log::warn!(
+                    "SecureAttention control from {} could not reach input service: {}",
+                    source,
+                    error
+                );
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            log::warn!(
+                "SecureAttention control from {} ignored on non-Windows target",
+                source
+            );
+        }
+    }
+
+    true
+}
+
+fn packet_authorized(layout: &LayoutState, packet: &InputPacket) -> bool {
+    packet_authorized_fields(
+        layout,
+        &packet.cluster_id,
+        &packet.pair_secret,
+        &packet.origin_transport_public_key,
+        &packet.origin_device_id,
+    )
+}
+
+fn control_packet_authorized(layout: &LayoutState, packet: &InputControlPacket) -> bool {
+    packet_authorized_fields(
+        layout,
+        &packet.cluster_id,
+        &packet.pair_secret,
+        &packet.origin_transport_public_key,
+        &packet.origin_device_id,
+    )
+}
+
+fn packet_authorized_fields(
+    layout: &LayoutState,
+    cluster_id: &str,
+    pair_secret: &str,
+    origin_transport_public_key: &str,
+    origin_device_id: &str,
+) -> bool {
+    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        return false;
+    }
+    if cluster_id != layout.cluster_id || pair_secret != layout.pair_secret {
+        return false;
+    }
+
+    if layout.paired_controllers.iter().any(|controller| {
+        (!origin_transport_public_key.trim().is_empty()
+            && controller.transport_public_key == origin_transport_public_key)
+            || (!origin_device_id.trim().is_empty() && controller.id == origin_device_id)
+    }) {
+        return true;
+    }
+
+    legacy_local_device_origin_allowed(layout, origin_device_id, origin_transport_public_key)
+}
+
+fn legacy_local_device_origin_allowed(
+    layout: &LayoutState,
+    origin_device_id: &str,
+    origin_transport_public_key: &str,
+) -> bool {
+    layout.machine_role == "client"
+        && layout.paired_controllers.len() == 1
+        && origin_device_id == "local-device"
+        && !origin_transport_public_key.trim().is_empty()
+}
+
+fn origin_peer_id(layout: &LayoutState) -> String {
+    crate::local_peer_from_layout(layout).id
 }
 
 static LAST_UNAUTHORIZED_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
@@ -1026,8 +1200,8 @@ fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
         "controller is not in this device's paired-controllers list (likely a rotated transport key) — re-pair"
     };
 
-    let cell = LAST_UNAUTHORIZED_WARN
-        .get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
+    let cell =
+        LAST_UNAUTHORIZED_WARN.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
     if let Ok(mut last) = cell.lock() {
         if last.elapsed() < Duration::from_secs(3) {
             return;
@@ -1037,6 +1211,31 @@ fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
 
     log::warn!(
         "rejected input from controller id={} key={}: {}",
+        if packet.origin_device_id.trim().is_empty() {
+            "<none>"
+        } else {
+            packet.origin_device_id.as_str()
+        },
+        if packet.origin_transport_public_key.trim().is_empty() {
+            "<none>"
+        } else {
+            "<set>"
+        },
+        reason
+    );
+}
+
+fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlPacket) {
+    let reason = if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        "this device has no pairing configured"
+    } else if packet.cluster_id != layout.cluster_id || packet.pair_secret != layout.pair_secret {
+        "pairing secret/cluster mismatch"
+    } else {
+        "controller is not in this device's paired-controllers list"
+    };
+
+    log::warn!(
+        "rejected input control from controller id={} key={}: {}",
         if packet.origin_device_id.trim().is_empty() {
             "<none>"
         } else {
@@ -1067,6 +1266,10 @@ fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer
 
 fn decode_input_packet(payload: &[u8]) -> Option<InputPacket> {
     rmp_serde::from_slice::<InputPacket>(payload).ok()
+}
+
+fn decode_input_control_packet(payload: &[u8]) -> Option<InputControlPacket> {
+    rmp_serde::from_slice::<InputControlPacket>(payload).ok()
 }
 
 fn default_protocol_version() -> u16 {
@@ -1170,24 +1373,8 @@ fn update_remote_mouse_button(button: MouseButton, down: bool) -> (i32, i32) {
     (state.x, state.y)
 }
 
-fn mouse_button_mask(button: MouseButton) -> u64 {
-    match button {
-        MouseButton::Left => LEFT_BUTTON_MASK,
-        MouseButton::Right => RIGHT_BUTTON_MASK,
-        MouseButton::Middle => MIDDLE_BUTTON_MASK,
-    }
-}
-
 fn primary_button_from_mask(mask: u64) -> Option<MouseButton> {
-    if mask & LEFT_BUTTON_MASK != 0 {
-        Some(MouseButton::Left)
-    } else if mask & RIGHT_BUTTON_MASK != 0 {
-        Some(MouseButton::Right)
-    } else if mask & MIDDLE_BUTTON_MASK != 0 {
-        Some(MouseButton::Middle)
-    } else {
-        None
-    }
+    button_from_mask(mask)
 }
 
 fn inject_input_event(
@@ -1195,6 +1382,109 @@ fn inject_input_event(
     native_layout: &LayoutState,
     event: InputEvent,
 ) -> bool {
+    let Some(command) = input_event_to_command(layout, native_layout, event) else {
+        return false;
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        // Inject locally on the normal desktop; hand off to the privileged SYSTEM
+        // helper only for the secure desktop (lock screen / UAC) or Ctrl+Alt+Del.
+        //
+        // The helper is REQUIRED on the secure desktop — the user-mode app has no
+        // access to the Winlogon desktop — but it must NOT be used on the normal
+        // desktop: the helper's worker runs as SYSTEM, and Windows rejects a
+        // SYSTEM-integrity process's synthetic button/key events with
+        // ERROR_ACCESS_DENIED when the foreground window is a normal
+        // Medium-integrity app (cursor MOVE still lands because it only
+        // repositions the window-station-global cursor). That is the "cursor
+        // slides but can't click or type" symptom. Local injection runs as the
+        // logged-in user at the foreground window's own integrity, so it clicks
+        // and types normally. On the secure desktop the foreground is LogonUI
+        // (System integrity), so the worker's equal-integrity injection works.
+        if should_route_to_windows_helper(&command) {
+            match windows_pipe_dispatcher().send(&command) {
+                Ok(()) => return true,
+                Err(error) => note_windows_helper_unavailable(&error),
+            }
+        }
+        inject_input_command(command);
+        return true;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        inject_input_command(command);
+        true
+    }
+}
+
+/// Logs (at most once every 10s, since a single mouse move floods many packets)
+/// that the privileged input helper could not be reached, so injection fell back
+/// to the user-mode path. On the normal desktop the local fallback works; on the
+/// secure desktop (lock screen / UAC) it cannot deliver clicks or keystrokes, so
+/// this is the breadcrumb that explains a dead lock screen.
+#[cfg(target_os = "windows")]
+fn note_windows_helper_unavailable(error: &str) {
+    static LAST_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let cell = LAST_WARN.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
+    if let Ok(mut last) = cell.lock() {
+        if last.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        *last = Instant::now();
+    }
+    log::info!(
+        "input helper unavailable ({error}); injecting locally. Lock-screen / UAC \
+         input needs the MyKVM input service — install it from Settings if clicks \
+         and keys stop working while the screen is locked."
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn should_route_to_windows_helper(command: &InputCommand) -> bool {
+    // SecureAttention (Ctrl+Alt+Del) always needs the privileged helper —
+    // SendSAS requires SYSTEM context and cannot be issued from the user app.
+    if matches!(command, InputCommand::SecureAttention) {
+        return true;
+    }
+    // Otherwise only the secure desktop (lock screen / UAC) needs the helper.
+    // On the normal "Default" desktop we inject locally as the logged-in user,
+    // which is the only path that can click/type into Medium-integrity windows
+    // (the SYSTEM helper is denied there with ERROR_ACCESS_DENIED).
+    !windows_inject_desktop_is_default()
+}
+
+/// Cached check of whether the current input desktop is "Default", for the
+/// inject path. Probing `OpenInputDesktop` on every input datagram is too
+/// expensive for high-frequency mouse moves, so the result is cached for a short
+/// TTL. When the workstation locks, the user-mode app can no longer open the
+/// secure input desktop, so `windows_input_desktop_is_default()` returns false
+/// and we route to the helper.
+#[cfg(target_os = "windows")]
+fn windows_inject_desktop_is_default() -> bool {
+    const DESKTOP_PROBE_TTL: Duration = Duration::from_millis(100);
+
+    static CACHE: OnceLock<Mutex<(Instant, bool)>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new((Instant::now() - DESKTOP_PROBE_TTL, true)));
+
+    if let Ok(mut guard) = cell.lock() {
+        if guard.0.elapsed() < DESKTOP_PROBE_TTL {
+            return guard.1;
+        }
+        let value = windows_input_desktop_is_default();
+        *guard = (Instant::now(), value);
+        value
+    } else {
+        windows_input_desktop_is_default()
+    }
+}
+
+fn input_event_to_command(
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+    event: InputEvent,
+) -> Option<InputCommand> {
     match event {
         InputEvent::MouseMove { screen_id, x, y } => {
             if let Some(screen) = local_screen_for_event(layout, &screen_id) {
@@ -1214,24 +1504,148 @@ fn inject_input_event(
                     native_screen.height,
                 );
                 let drag_button = update_remote_mouse_position(absolute_x, absolute_y);
-                inject_mouse_move(absolute_x, absolute_y, drag_button);
-                return true;
+                return Some(InputCommand::MouseMove {
+                    x: absolute_x,
+                    y: absolute_y,
+                    drag_button,
+                });
             }
-            false
+            None
         }
         InputEvent::MouseButton { button, down } => {
             let (x, y) = update_remote_mouse_button(button, down);
-            inject_mouse_button(button, down, x, y);
-            true
+            Some(InputCommand::MouseButton { button, down, x, y })
         }
-        InputEvent::Scroll { delta_x, delta_y } => {
-            inject_scroll(delta_x, delta_y);
-            true
+        InputEvent::Scroll { delta_x, delta_y } => Some(InputCommand::Scroll { delta_x, delta_y }),
+        InputEvent::Key { key_code, down } => Some(InputCommand::Key { key_code, down }),
+    }
+}
+
+fn inject_input_command(command: InputCommand) {
+    match command {
+        InputCommand::MouseMove { x, y, drag_button } => inject_mouse_move(x, y, drag_button),
+        InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
+        InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
+        InputCommand::Key { key_code, down } => inject_key(key_code, down),
+        InputCommand::ReleaseAll | InputCommand::SecureAttention => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_pipe_dispatcher() -> &'static WindowsInputDispatcher {
+    static DISPATCHER: OnceLock<WindowsInputDispatcher> = OnceLock::new();
+    DISPATCHER.get_or_init(WindowsInputDispatcher::new)
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_input_pipe_available() -> bool {
+    open_current_session_input_pipe().is_ok()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn windows_input_pipe_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub fn send_secure_attention_to_helper() -> Result<(), String> {
+    windows_pipe_dispatcher().send(&InputCommand::SecureAttention)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn send_secure_attention_to_helper() -> Result<(), String> {
+    Err("Secure Attention Sequence is only available through the Windows input service.".into())
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsInputDispatcher {
+    pipe: Mutex<Option<std::fs::File>>,
+    retry_after: Mutex<Instant>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsInputDispatcher {
+    fn new() -> Self {
+        Self {
+            pipe: Mutex::new(None),
+            retry_after: Mutex::new(Instant::now()),
         }
-        InputEvent::Key { key_code, down } => {
-            inject_key(key_code, down);
-            true
+    }
+
+    fn send(&self, command: &InputCommand) -> Result<(), String> {
+        use std::io::Write;
+
+        let framed = crate::shared_input::encode_input_command(command)?;
+        let mut pipe_guard = self
+            .pipe
+            .lock()
+            .map_err(|_| "input helper pipe lock poisoned".to_string())?;
+
+        if pipe_guard.is_none() {
+            *pipe_guard = Some(self.open_pipe_with_backoff()?);
         }
+
+        let Some(pipe) = pipe_guard.as_mut() else {
+            return Err("input helper pipe unavailable".into());
+        };
+
+        if let Err(error) = pipe.write_all(&framed).and_then(|_| pipe.flush()) {
+            *pipe_guard = None;
+            return Err(format!("write input helper pipe: {error}"));
+        }
+
+        Ok(())
+    }
+
+    fn open_pipe_with_backoff(&self) -> Result<std::fs::File, String> {
+        let now = Instant::now();
+        {
+            let retry_after = self
+                .retry_after
+                .lock()
+                .map_err(|_| "input helper retry lock poisoned".to_string())?;
+            if now < *retry_after {
+                return Err("input helper pipe retry is cooling down".into());
+            }
+        }
+
+        match open_current_session_input_pipe() {
+            Ok(file) => Ok(file),
+            Err(error) => {
+                if let Ok(mut retry_after) = self.retry_after.lock() {
+                    *retry_after = Instant::now() + Duration::from_secs(1);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_current_session_input_pipe() -> Result<std::fs::File, String> {
+    use std::fs::OpenOptions;
+
+    let session_id = current_windows_session_id()?;
+
+    let pipe_name = crate::shared_input::input_pipe_name(session_id);
+    OpenOptions::new()
+        .write(true)
+        .open(&pipe_name)
+        .map_err(|error| format!("open input helper pipe {pipe_name}: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_session_id() -> Result<u32, String> {
+    use windows_sys::Win32::System::{
+        RemoteDesktop::ProcessIdToSessionId, Threading::GetCurrentProcessId,
+    };
+
+    let mut session_id = 0_u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) } != 0;
+    if ok {
+        Ok(session_id)
+    } else {
+        Err("failed to resolve current Windows session id".into())
     }
 }
 
@@ -1485,19 +1899,31 @@ fn set_control_clipboard_target(
     active: &ActiveTarget,
     layout_state: &Arc<Mutex<LayoutState>>,
 ) {
-    if let Some(peer) = live_target_endpoint(&active.target, layout_state) {
-        let (cluster_id, pair_secret) = pair_credentials(layout_state);
-        set_clipboard_target(
-            target,
-            active.target.device_id.clone(),
-            peer.addr,
-            peer.public_key,
-            peer.protocol_version,
-            cluster_id,
-            pair_secret,
-            None,
-        );
-    }
+    let Ok(layout) = layout_state.lock() else {
+        return;
+    };
+    let Some(device) = layout
+        .devices
+        .iter()
+        .find(|device| device.id == active.target.device_id && device.online && device.input_ready)
+    else {
+        return;
+    };
+
+    set_clipboard_target(
+        target,
+        active.target.device_id.clone(),
+        format!(
+            "{}:{}",
+            device.host,
+            normalize_quic_port(device.transport_port, device.quic_port)
+        ),
+        device.transport_public_key.clone(),
+        device.protocol_version,
+        layout.cluster_id.clone(),
+        layout.pair_secret.clone(),
+        None,
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -2356,19 +2782,17 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
     let right = (screen.x + screen.width) as f64;
     let top = screen.y as f64;
     let bottom = (screen.y + screen.height) as f64;
+    let previous_x = x - dx;
+    let previous_y = y - dy;
 
-    // The OS clamps the cursor against the physical screen boundary, so "within
-    // CROSSING_MARGIN of the edge and still pushing outward" is already strong
-    // evidence of intent. We deliberately do NOT gate on a reconstructed previous
-    // position (x - dx): a fast flick produces a large single-frame delta, which
-    // shoved that reconstructed point outside the old activation band and made
-    // flicks fail to cross — the "had to slow down / push twice" stickiness. The
-    // band never protected against resting-at-edge false triggers anyway (the
-    // reconstructed point sits in the band there too), so dropping it is pure win.
+    // Require the previous reconstructed point to already be near the shared
+    // edge. This still permits fast edge flicks, but rejects a single huge jump
+    // from the middle of the screen that merely lands near the boundary.
     match edge {
         Edge::Right => {
             dx >= MIN_CROSSING_DELTA
                 && dx.abs() >= dy.abs() * CROSSING_AXIS_DOMINANCE
+                && previous_x >= right - CROSSING_ACTIVATION_BAND
                 && x >= right - CROSSING_MARGIN
                 && y >= top - CROSSING_MARGIN
                 && y <= bottom + CROSSING_MARGIN
@@ -2376,6 +2800,7 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
         Edge::Left => {
             dx <= -MIN_CROSSING_DELTA
                 && dx.abs() >= dy.abs() * CROSSING_AXIS_DOMINANCE
+                && previous_x <= left + CROSSING_ACTIVATION_BAND
                 && x <= left + CROSSING_MARGIN
                 && y >= top - CROSSING_MARGIN
                 && y <= bottom + CROSSING_MARGIN
@@ -2383,6 +2808,7 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
         Edge::Bottom => {
             dy >= MIN_CROSSING_DELTA
                 && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE
+                && previous_y >= bottom - CROSSING_ACTIVATION_BAND
                 && y >= bottom - CROSSING_MARGIN
                 && x >= left - CROSSING_MARGIN
                 && x <= right + CROSSING_MARGIN
@@ -2390,6 +2816,7 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
         Edge::Top => {
             dy <= -MIN_CROSSING_DELTA
                 && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE
+                && previous_y <= top + CROSSING_ACTIVATION_BAND
                 && y <= top + CROSSING_MARGIN
                 && x >= left - CROSSING_MARGIN
                 && x <= right + CROSSING_MARGIN
@@ -3493,172 +3920,23 @@ fn inject_key(key_code: u16, down: bool) {
 }
 
 #[cfg(target_os = "windows")]
-fn inject_mouse_move(x: i32, y: i32, _drag_button: Option<MouseButton>) {
-    use windows_sys::Win32::UI::{
-        Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
-            MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
-        },
-        WindowsAndMessaging::{
-            GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-        },
-    };
-
-    unsafe {
-        let virtual_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let virtual_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
-        let virtual_height = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
-        let normalized_x =
-            ((x - virtual_x) as i64 * 65_535 / (virtual_width - 1).max(1) as i64) as i32;
-        let normalized_y =
-            ((y - virtual_y) as i64 * 65_535 / (virtual_height - 1).max(1) as i64) as i32;
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: normalized_x.clamp(0, 65_535),
-                    dy: normalized_y.clamp(0, 65_535),
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-        if SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 0 {
-            let _ = SetCursorPos(x, y);
-        }
-    }
+fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
+    crate::windows_input::inject_mouse_move(x, y, drag_button);
 }
 
 #[cfg(target_os = "windows")]
-fn inject_mouse_button(button: MouseButton, down: bool, _x: i32, _y: i32) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-        MOUSEINPUT,
-    };
-
-    let flag = match (button, down) {
-        (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
-        (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
-        (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
-        (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
-        (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
-        (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
-    };
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: 0,
-                dy: 0,
-                mouseData: 0,
-                dwFlags: flag,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-
-    unsafe {
-        let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-    }
+fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
+    crate::windows_input::inject_mouse_button(button, down, x, y);
 }
 
 #[cfg(target_os = "windows")]
 fn inject_scroll(delta_x: i32, delta_y: i32) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT,
-    };
-
-    for (flag, delta) in [(MOUSEEVENTF_WHEEL, delta_y), (MOUSEEVENTF_HWHEEL, delta_x)] {
-        if delta == 0 {
-            continue;
-        }
-
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: 0,
-                    dy: 0,
-                    mouseData: (delta * 120) as u32,
-                    dwFlags: flag,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-
-        unsafe {
-            let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-        }
-    }
+    crate::windows_input::inject_scroll(delta_x, delta_y);
 }
 
 #[cfg(target_os = "windows")]
 fn inject_key(key_code: u16, down: bool) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC,
-    };
-
-    let mut dw_flags = if down { 0 } else { KEYEVENTF_KEYUP };
-    if is_extended_key_vk(key_code) {
-        dw_flags |= KEYEVENTF_EXTENDEDKEY;
-    }
-
-    // Prefer scan-code injection. Apps and games that read hardware scan codes
-    // (and browser key testers that key off `event.code`) ignore a virtual-key-
-    // only SendInput, which is why some keys looked dead. Translate the VK to its
-    // scan code; for extended keys the 0xE0 prefix is carried by the EXTENDEDKEY
-    // flag set above. Fall back to the virtual key if no scan code is available.
-    let scan = unsafe { MapVirtualKeyW(key_code as u32, MAPVK_VK_TO_VSC) } as u16;
-    let (w_vk, w_scan) = if scan != 0 {
-        dw_flags |= KEYEVENTF_SCANCODE;
-        (0, scan)
-    } else {
-        (key_code, 0)
-    };
-
-    let input = INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: w_vk,
-                wScan: w_scan,
-                dwFlags: dw_flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-
-    unsafe {
-        let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-    }
-}
-
-/// Keys that Windows treats as "extended" (their scan code is prefixed with
-/// 0xE0). Without `KEYEVENTF_EXTENDEDKEY`, injecting these via a virtual-key
-/// code can land on the numpad twin or the wrong side, so navigation keys,
-/// arrows, right-hand modifiers and a few others must set the flag.
-#[cfg(target_os = "windows")]
-fn is_extended_key_vk(vk: u16) -> bool {
-    matches!(
-        vk,
-        0x21 | 0x22 // PageUp / PageDown
-            | 0x23 | 0x24 // End / Home
-            | 0x25 | 0x26 | 0x27 | 0x28 // arrows
-            | 0x2C | 0x2D | 0x2E // PrintScreen / Insert / Delete
-            | 0x5B | 0x5C | 0x5D // LWin / RWin / Apps
-            | 0x6F // numpad divide
-            | 0x90 // NumLock
-            | 0xA3 | 0xA5 // Right Control / Right Alt
-    )
+    crate::windows_input::inject_key(key_code, down);
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -3999,6 +4277,27 @@ mod tests {
     }
 
     #[test]
+    fn input_packet_context_uses_stable_peer_origin_id() {
+        let layout = layout_for_target_tests();
+        let expected_origin_id = crate::local_peer_from_layout(&layout).id;
+        let layout_state = Arc::new(Mutex::new(layout));
+        let target = target_for_coordinate_tests();
+
+        let context = input_packet_context(
+            &target,
+            InputEvent::MouseMove {
+                screen_id: "local-display-1".into(),
+                x: 10,
+                y: 20,
+            },
+            &layout_state,
+        );
+
+        assert_ne!(expected_origin_id, "local-device");
+        assert_eq!(context.origin_device_id, expected_origin_id);
+    }
+
+    #[test]
     fn input_packet_requires_pair_secret() {
         let mut layout = layout_for_target_tests();
         layout.machine_role = "client".into();
@@ -4037,6 +4336,132 @@ mod tests {
         packet.origin_transport_public_key.clear();
         packet.origin_device_id = "server".into();
         assert!(packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn input_packet_accepts_legacy_origin_after_transport_key_rotation() {
+        let mut layout = layout_for_target_tests();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![crate::PairedController {
+            id: "peer-server-local-10-0-0-1".into(),
+            name: "Server".into(),
+            host: "server.local".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-old-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            target_device_id: "local-device".into(),
+            origin_device_id: "local-device".into(),
+            origin_port: 47834,
+            origin_transport_public_key: "server-rotated-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            event: InputEvent::MouseMove {
+                screen_id: "local-display-1".into(),
+                x: 1,
+                y: 1,
+            },
+        };
+
+        assert!(packet_authorized(&layout, &packet));
+
+        layout.paired_controllers.push(crate::PairedController {
+            id: "peer-other-server".into(),
+            name: "Other".into(),
+            host: "other.local".into(),
+            ip: "10.0.0.3".into(),
+            transport_public_key: "other-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 2,
+        });
+        assert!(!packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn input_event_maps_relative_coordinates_to_native_command() {
+        let layout = layout_for_target_tests();
+        let mut native_layout = layout.clone();
+        native_layout.devices[0].screens[0].width = 3840;
+        native_layout.devices[0].screens[0].height = 2160;
+
+        let command = input_event_to_command(
+            &layout,
+            &native_layout,
+            InputEvent::MouseMove {
+                screen_id: "local-display-1".into(),
+                x: 960,
+                y: 540,
+            },
+        )
+        .expect("mouse move should map to command");
+
+        assert_eq!(
+            command,
+            InputCommand::MouseMove {
+                x: 1920,
+                y: 1080,
+                drag_button: None,
+            }
+        );
+    }
+
+    #[test]
+    fn input_control_packet_round_trips_as_messagepack() {
+        let packet = InputControlPacket {
+            protocol: INPUT_CONTROL_PROTOCOL.into(),
+            target_device_id: "local-device".into(),
+            origin_device_id: "server".into(),
+            origin_transport_public_key: "server-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            command: InputControlCommand::SecureAttention,
+        };
+        let payload = rmp_serde::to_vec_named(&packet).expect("encode input control packet");
+        let decoded = decode_input_control_packet(&payload).expect("decode input control packet");
+
+        assert_eq!(decoded.protocol, INPUT_CONTROL_PROTOCOL);
+        assert_eq!(decoded.target_device_id, "local-device");
+        assert_eq!(decoded.command, InputControlCommand::SecureAttention);
+    }
+
+    #[test]
+    fn input_control_packet_uses_pairing_authorization() {
+        let mut layout = layout_for_target_tests();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![crate::PairedController {
+            id: "server".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let mut packet = InputControlPacket {
+            protocol: INPUT_CONTROL_PROTOCOL.into(),
+            target_device_id: "local-device".into(),
+            origin_device_id: "server".into(),
+            origin_transport_public_key: "server-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: "wrong".into(),
+            command: InputControlCommand::SecureAttention,
+        };
+
+        assert!(!control_packet_authorized(&layout, &packet));
+        packet.pair_secret = layout.pair_secret.clone();
+        assert!(control_packet_authorized(&layout, &packet));
+        packet.origin_transport_public_key = "attacker-key".into();
+        packet.origin_device_id = "attacker".into();
+        assert!(!control_packet_authorized(&layout, &packet));
     }
 
     #[test]

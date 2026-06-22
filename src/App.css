@@ -1616,6 +1616,21 @@
   font-weight: 800;
 }
 
+.paired-controller-row {
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 180px);
+  align-items: start;
+}
+
+.settings-control-row > .paired-controller-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+.paired-controller-row .compact-button {
+  width: 100%;
+}
+
 .segmented-control {
   min-width: 0;
   padding: 4px;

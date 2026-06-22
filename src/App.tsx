@@ -182,6 +182,11 @@ function App() {
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
   const startupUpdateCheckStarted = useRef(false);
+  const snapshotRef = useRef<AppStateSnapshot | null>(null);
+
+  useEffect(() => {
+    snapshotRef.current = snapshot;
+  }, [snapshot]);
 
   useEffect(() => {
     let active = true;
@@ -352,6 +357,23 @@ function App() {
         .then((nextRuntime) => {
           if (!active) {
             return;
+          }
+
+          const currentSnapshot = snapshotRef.current;
+          if (
+            currentSnapshot?.layout.machineRole === "client" &&
+            currentSnapshot.layout.pairedControllers.length === 0 &&
+            nextRuntime.pairing.state === "paired"
+          ) {
+            void loadAppState()
+              .then((nextSnapshot) => {
+                if (active) {
+                  setSnapshot(nextSnapshot);
+                }
+              })
+              .catch(() => {
+                // Keep the runtime-only refresh below if the full snapshot read fails.
+              });
           }
 
           setSnapshot((current) =>
@@ -1853,8 +1875,8 @@ function App() {
                   </div>
                 </div>
                 {machineRole === "client" ? (
-                  <div className="settings-control-row">
-                    <span>
+                  <div className="settings-control-row paired-controller-row">
+                    <span className="paired-controller-label">
                       {layout.pairedControllers.length > 0
                         ? `${ui.settings.pairedWith}: ${layout.pairedControllers
                             .map(

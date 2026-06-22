@@ -237,12 +237,27 @@ fn bind_endpoint(
     preferred_port: u16,
     identity: &TransportIdentity,
 ) -> Result<(Endpoint, String), String> {
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| "no async runtime available for QUIC endpoint".to_string())?;
     let mut last_error = None;
 
     for port in candidate_ports(preferred_port) {
         let server_config = server_config(identity)?;
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        match Endpoint::server(server_config, addr) {
+        let socket = match bind_reusable_quic_socket(port) {
+            Ok(socket) => socket,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        // Build the endpoint from our own reuse-enabled socket instead of
+        // Endpoint::server (which binds a plain socket without SO_REUSEADDR).
+        match Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime.clone(),
+        ) {
             Ok(endpoint) => return Ok((endpoint, identity.public_key.clone())),
             Err(error) => last_error = Some(error.to_string()),
         }
@@ -252,6 +267,25 @@ fn bind_endpoint(
         "failed to bind QUIC port: {}",
         last_error.unwrap_or_else(|| "no candidate ports available".into())
     ))
+}
+
+/// Bind the QUIC endpoint's UDP socket with address reuse enabled, mirroring the
+/// discovery socket. Without `SO_REUSEADDR` a fresh endpoint cannot re-grab the
+/// same QUIC port while the previous process's socket is still tearing down — on
+/// an admin-restart, app relaunch, or runtime restart the port silently drifts
+/// upward (47834 -> 47835 ...) and the controller keeps targeting the stale port
+/// until re-discovery propagates the new one, which is the intermittent "shows
+/// online but the cursor won't cross" symptom.
+fn bind_reusable_quic_socket(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    let address = SocketAddr::from(([0, 0, 0, 0], port));
+    socket.bind(&address.into())?;
+    Ok(socket.into())
 }
 
 /// This machine's persisted QUIC transport identity. The advertised
@@ -285,13 +319,17 @@ fn load_or_create_identity(dir: &Path) -> Result<TransportIdentity, String> {
         }
     }
 
-    let generated = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into(), "localhost".into()])
-        .map_err(|error| format!("failed to generate QUIC certificate: {error}"))?;
+    let generated =
+        rcgen::generate_simple_self_signed(vec![SERVER_NAME.into(), "localhost".into()])
+            .map_err(|error| format!("failed to generate QUIC certificate: {error}"))?;
     let cert_der = generated.cert.der().to_vec();
     let key_der = generated.key_pair.serialize_der();
 
     if let Err(error) = fs::create_dir_all(dir) {
-        log::warn!("failed to create QUIC identity dir {}: {error}", dir.display());
+        log::warn!(
+            "failed to create QUIC identity dir {}: {error}",
+            dir.display()
+        );
     }
     if let Err(error) = fs::write(&cert_path, &cert_der) {
         log::warn!("failed to persist QUIC certificate: {error}");

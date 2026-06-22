@@ -24,6 +24,9 @@ use tauri::{
 
 mod input;
 mod quic_transport;
+pub mod shared_input;
+#[cfg(target_os = "windows")]
+pub mod windows_input;
 
 const DISCOVERY_PORT: u16 = 47833;
 const TRANSPORT_PORT_MIN: u16 = 1024;
@@ -53,6 +56,9 @@ const CLIPBOARD_MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
+const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
+const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
+const HELPER_PATH_ARG: &str = "--helper-path";
 
 #[cfg(target_os = "windows")]
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\MyKVM_SingleInstance";
@@ -282,6 +288,7 @@ struct PairingStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RuntimeStatus {
     started: bool,
     transport: NativeStageStatus,
@@ -291,6 +298,7 @@ struct RuntimeStatus {
     discovery: DiscoveryStatus,
     pairing: PairingStatus,
     privilege: PrivilegeStatus,
+    input_service: InputServiceStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +313,17 @@ struct AppStateSnapshot {
 struct PrivilegeStatus {
     is_elevated: bool,
     can_elevate: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InputServiceStatus {
+    installed: bool,
+    running: bool,
+    worker_session_id: Option<u32>,
+    pipe_available: bool,
+    sas_available: bool,
     detail: String,
 }
 
@@ -395,6 +414,21 @@ impl AppRuntime {
         AppStateSnapshot { layout, runtime }
     }
 
+    fn refresh_layout_from_disk(&self) {
+        let native_layout = self
+            .native_layout
+            .lock()
+            .map(|layout| layout.clone())
+            .unwrap_or_else(|_| detect_fallback_layout());
+        let Some(saved_layout) = load_layout_from_disk(&self.config_path) else {
+            return;
+        };
+        let disk_layout = normalize_saved_layout(saved_layout, native_layout);
+        if let Ok(mut current) = self.layout.lock() {
+            *current = merge_disk_layout_into_runtime(disk_layout, &current);
+        }
+    }
+
     fn runtime_status(&self) -> RuntimeStatus {
         let layout = self.layout_snapshot();
 
@@ -407,6 +441,7 @@ impl AppRuntime {
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
+        runtime.input_service = current_input_service_status();
 
         runtime
     }
@@ -527,6 +562,15 @@ impl AppRuntime {
                 return;
             };
             let current_peer = local_peer_from_layout(&layout);
+            if input::try_handle_control_packet_from_source(
+                &layout,
+                &payload,
+                source,
+                &current_peer.id,
+            ) {
+                transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if input::try_inject_packet_from_source(
                 &layout,
                 &native_layout_for_input,
@@ -577,7 +621,8 @@ impl AppRuntime {
             .parent()
             .map(|parent| parent.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        let transport = quic_transport::start(preferred_port, identity_dir, on_datagram, on_stream)?;
+        let transport =
+            quic_transport::start(preferred_port, identity_dir, on_datagram, on_stream)?;
         let mut stored = self
             .quic_transport
             .lock()
@@ -743,11 +788,22 @@ impl AppRuntime {
                                 sync_layout_peer_presence(&layout_state, &peers);
                             }
 
-                            if matches!(incoming.kind.as_str(), "announce" | "probe")
-                                && should_reply_to_discovery(&current_layout, &incoming.peer)
-                            {
-                                let _ =
-                                    send_discovery_packet(&socket, "reply", &current_peer, source);
+                            if matches!(incoming.kind.as_str(), "announce" | "probe") {
+                                let reply = should_reply_to_discovery(&current_layout, &incoming.peer);
+                                log::info!(
+                                    "discovery {} from {} id={} key={} cluster={} pairing_required={} -> reply={}",
+                                    incoming.kind,
+                                    source,
+                                    incoming.peer.id,
+                                    if incoming.peer.transport_public_key.is_empty() { "empty" } else { "set" },
+                                    incoming.peer.cluster_id,
+                                    incoming.peer.pairing_required,
+                                    reply
+                                );
+                                if reply {
+                                    let _ =
+                                        send_discovery_packet(&socket, "reply", &current_peer, source);
+                                }
                             }
                         }
                     }
@@ -937,6 +993,7 @@ impl AppRuntime {
 
 #[tauri::command]
 fn load_app_state(state: tauri::State<'_, AppRuntime>) -> AppStateSnapshot {
+    state.refresh_layout_from_disk();
     state.snapshot()
 }
 
@@ -950,20 +1007,21 @@ fn save_layout(
     layout: LayoutState,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<AppStateSnapshot, String> {
-    write_layout_to_disk(&state.config_path, &layout)?;
-    let previous_layout = {
+    let (previous_layout, saved_layout) = {
         let mut stored_layout = state
             .layout
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
         let previous_layout = stored_layout.clone();
-        *stored_layout = layout.clone();
-        previous_layout
+        let saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
+        write_layout_to_disk(&state.config_path, &saved_layout)?;
+        *stored_layout = saved_layout.clone();
+        (previous_layout, saved_layout)
     };
 
-    if runtime_relevant_layout_changed(&previous_layout, &layout) {
-        if previous_layout.transport_port_mode != layout.transport_port_mode
-            || previous_layout.transport_port != layout.transport_port
+    if runtime_relevant_layout_changed(&previous_layout, &saved_layout) {
+        if previous_layout.transport_port_mode != saved_layout.transport_port_mode
+            || previous_layout.transport_port != saved_layout.transport_port
         {
             state.stop_discovery();
             thread::sleep(Duration::from_millis(200));
@@ -979,6 +1037,61 @@ fn save_layout(
         }
     }
     Ok(state.snapshot())
+}
+
+fn merge_runtime_owned_layout_fields(
+    mut incoming: LayoutState,
+    current: &LayoutState,
+) -> LayoutState {
+    // The frontend saves whole LayoutState snapshots, but pairing can complete
+    // asynchronously in the backend through an encrypted QUIC stream. Treat the
+    // pairing credentials as backend-owned so a stale settings snapshot cannot
+    // clear them and force the client to be paired again.
+    incoming.cluster_id = current.cluster_id.clone();
+    incoming.pair_secret = current.pair_secret.clone();
+
+    if current.machine_role == "client"
+        && incoming.machine_role == "client"
+        && !current.paired_controllers.is_empty()
+    {
+        incoming.paired_controllers = current.paired_controllers.clone();
+    }
+
+    merge_local_runtime_device_fields(&mut incoming, current);
+    incoming
+}
+
+fn merge_disk_layout_into_runtime(mut disk: LayoutState, current: &LayoutState) -> LayoutState {
+    if current.machine_role == "client"
+        && disk.machine_role == "client"
+        && disk.paired_controllers.is_empty()
+        && !current.paired_controllers.is_empty()
+    {
+        disk.cluster_id = current.cluster_id.clone();
+        disk.pair_secret = current.pair_secret.clone();
+        disk.paired_controllers = current.paired_controllers.clone();
+    }
+
+    merge_local_runtime_device_fields(&mut disk, current);
+    disk
+}
+
+fn merge_local_runtime_device_fields(incoming: &mut LayoutState, current: &LayoutState) {
+    let Some(current_local) = current.devices.iter().find(|device| device.role == "local") else {
+        return;
+    };
+    if current_local.transport_public_key.trim().is_empty() {
+        return;
+    }
+
+    if let Some(incoming_local) = incoming
+        .devices
+        .iter_mut()
+        .find(|device| device.role == "local" || device.id == current_local.id)
+    {
+        incoming_local.transport_public_key = current_local.transport_public_key.clone();
+        incoming_local.protocol_version = current_local.protocol_version;
+    }
 }
 
 fn runtime_relevant_layout_changed(previous: &LayoutState, next: &LayoutState) -> bool {
@@ -1030,6 +1143,7 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
 
 #[tauri::command]
 fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, String> {
+    state.refresh_layout_from_disk();
     let discovery_error = state.start_discovery().err();
     let layout = state.layout_snapshot();
     let mut discovery = state.discovery_status();
@@ -1054,6 +1168,7 @@ fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, S
         discovery,
         pairing: state.pairing_status_for_layout(&layout),
         privilege: current_privilege_status(),
+        input_service: current_input_service_status(),
     };
 
     Ok(runtime.clone())
@@ -1088,12 +1203,23 @@ fn stop_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, St
 }
 
 #[tauri::command]
-fn restart_as_admin(app: AppHandle) -> Result<(), String> {
+fn restart_as_admin(app: AppHandle, state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         if is_windows_process_elevated().unwrap_or(false) {
             return Ok(());
         }
+
+        // Release our UDP discovery + QUIC sockets before handing off so the
+        // elevated instance can rebind the SAME ports instead of racing this
+        // dying process for them. When that race is lost the QUIC port drifts
+        // upward (the discovery port is protected by SO_REUSEADDR, the QUIC port
+        // is not) and the controller keeps targeting the stale endpoint — the
+        // intermittent "device shows online after an admin-restart but the cursor
+        // won't cross until you re-pair" symptom. The elevated copy starts its
+        // own runtime on launch, so we are only tearing down, not restarting.
+        state.stop_input();
+        state.stop_discovery();
 
         release_single_instance();
         restart_current_process_as_admin()?;
@@ -1103,9 +1229,79 @@ fn restart_as_admin(app: AppHandle) -> Result<(), String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = app;
+        let _ = (app, state);
         Err("Administrator restart is only available on Windows.".into())
     }
+}
+
+#[tauri::command]
+fn read_input_service_status() -> InputServiceStatus {
+    current_input_service_status()
+}
+
+#[tauri::command]
+fn install_input_service() -> Result<InputServiceStatus, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let helper_path = resolve_input_helper_path()?;
+        if is_windows_process_elevated().unwrap_or(false) {
+            install_windows_input_service(&helper_path)?;
+            start_windows_input_service()?;
+            return Ok(current_input_service_status());
+        }
+
+        launch_current_process_as_admin(&[
+            INSTALL_INPUT_SERVICE_ARG.into(),
+            HELPER_PATH_ARG.into(),
+            helper_path.to_string_lossy().into_owned(),
+        ])?;
+        Ok(InputServiceStatus {
+            detail: "Administrator approval requested to install the input service.".into(),
+            ..current_input_service_status()
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Windows input service is only available on Windows.".into())
+    }
+}
+
+#[tauri::command]
+fn uninstall_input_service() -> Result<InputServiceStatus, String> {
+    #[cfg(target_os = "windows")]
+    {
+        if is_windows_process_elevated().unwrap_or(false) {
+            uninstall_windows_input_service()?;
+            return Ok(current_input_service_status());
+        }
+
+        launch_current_process_as_admin(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
+        Ok(InputServiceStatus {
+            detail: "Administrator approval requested to uninstall the input service.".into(),
+            ..current_input_service_status()
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Windows input service is only available on Windows.".into())
+    }
+}
+
+#[tauri::command]
+fn send_secure_attention(
+    device_id: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    let layout = state.layout_snapshot();
+    let Some(quic_transport) = state.quic_transport_handle() else {
+        return Err("QUIC transport is not ready; start the runtime first.".into());
+    };
+
+    input::send_secure_attention_control(&layout, &quic_transport, &device_id)?;
+    state.transport_packets.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1381,12 +1577,45 @@ fn is_portable_mode() -> Result<bool, String> {
 }
 
 pub fn handle_process_control_args() -> bool {
-    if env::args().any(|arg| arg == QUIT_EXISTING_ARG) {
+    let args = env::args().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == QUIT_EXISTING_ARG) {
         request_existing_instance_quit();
         return true;
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        if args.iter().any(|arg| arg == INSTALL_INPUT_SERVICE_ARG) {
+            let helper_path = arg_value(&args, HELPER_PATH_ARG)
+                .map(PathBuf::from)
+                .or_else(|| resolve_input_helper_path().ok());
+            match helper_path {
+                Some(path) => {
+                    if let Err(error) = install_windows_input_service(&path)
+                        .and_then(|_| start_windows_input_service())
+                    {
+                        eprintln!("{error}");
+                    }
+                }
+                None => eprintln!("failed to resolve mykvm-input-helper path"),
+            }
+            return true;
+        }
+
+        if args.iter().any(|arg| arg == UNINSTALL_INPUT_SERVICE_ARG) {
+            if let Err(error) = uninstall_windows_input_service() {
+                eprintln!("{error}");
+            }
+            return true;
+        }
+    }
+
     false
+}
+
+fn arg_value(args: &[String], key: &str) -> Option<String> {
+    args.windows(2)
+        .find_map(|window| (window[0] == key).then(|| window[1].clone()))
 }
 
 #[cfg(target_os = "windows")]
@@ -1780,11 +2009,47 @@ pub fn run() {
             })?;
 
             let detected_layout = detect_local_layout(app.handle());
-            app.manage(AppRuntime::new(
+            let runtime = AppRuntime::new(
                 app.handle().clone(),
                 config_dir.join("layout.json"),
                 detected_layout,
-            ));
+            );
+            app.manage(runtime);
+
+            // Eagerly start discovery + input BEFORE the WebView2/frontend is
+            // ready. The old flow waited for the frontend to call
+            // `start_runtime`, which only happens after WebView2 initializes
+            // (3-5 s on Windows). That window is exactly the "admin-restart
+            // dead time" where the peer can't see us. Starting discovery here
+            // binds the UDP socket and begins announcing within ~1 s of process
+            // launch, so the peer picks us back up in one announce cycle.
+            {
+                let state = app.state::<AppRuntime>();
+                let runtime_ref = state.inner();
+                let layout = runtime_ref.layout_snapshot();
+                let _ = runtime_ref.start_discovery();
+                let (capture, inject) = runtime_ref.start_input(layout.clone());
+                let clipboard = runtime_ref.start_clipboard(layout.clone());
+                let discovery = runtime_ref.discovery_status_for_layout(&layout);
+                let pairing = runtime_ref.pairing_status_for_layout(&layout);
+                let privilege = current_privilege_status();
+                let input_service = current_input_service_status();
+                let transport = ready_transport_status(&discovery);
+                if let Ok(mut runtime) = runtime_ref.runtime.lock() {
+                    *runtime = RuntimeStatus {
+                        started: true,
+                        transport,
+                        capture,
+                        inject,
+                        clipboard,
+                        discovery,
+                        pairing,
+                        privilege,
+                        input_service,
+                    };
+                }
+            }
+
             #[cfg(target_os = "macos")]
             setup_macos_cursor_hider(app);
             #[cfg(target_os = "macos")]
@@ -1813,6 +2078,10 @@ pub fn run() {
             set_autostart,
             is_autostart_enabled,
             restart_as_admin,
+            read_input_service_status,
+            install_input_service,
+            uninstall_input_service,
+            send_secure_attention,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -2003,6 +2272,7 @@ fn default_runtime(layout: &LayoutState) -> RuntimeStatus {
             clipboard_disabled_status()
         },
         privilege: current_privilege_status(),
+        input_service: current_input_service_status(),
         discovery: DiscoveryStatus {
             state: "idle".into(),
             detail: "LAN discovery is stopped. Start runtime or scan the LAN to find peers.".into(),
@@ -2053,6 +2323,436 @@ fn current_privilege_status() -> PrivilegeStatus {
 }
 
 #[cfg(target_os = "windows")]
+fn current_input_service_status() -> InputServiceStatus {
+    match query_windows_input_service_status() {
+        Ok(status) => status,
+        Err(error) => InputServiceStatus {
+            installed: false,
+            running: false,
+            worker_session_id: None,
+            pipe_available: false,
+            sas_available: false,
+            detail: error,
+        },
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_input_service_status() -> InputServiceStatus {
+    InputServiceStatus {
+        installed: false,
+        running: false,
+        worker_session_id: None,
+        pipe_available: false,
+        sas_available: false,
+        detail: "Windows lock-screen input service is only available on Windows.".into(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST},
+        System::{
+            RemoteDesktop::WTSGetActiveConsoleSessionId,
+            Services::{
+                OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
+                SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+                SERVICE_STATUS_PROCESS,
+            },
+        },
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW"));
+        }
+        let _scm = ServiceHandleGuard(scm);
+
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let code = GetLastError();
+            if code == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Ok(InputServiceStatus {
+                    installed: false,
+                    running: false,
+                    worker_session_id: None,
+                    pipe_available: false,
+                    sas_available: false,
+                    detail: "Lock-screen input service is not installed.".into(),
+                });
+            }
+            return Err(windows_last_error("OpenServiceW"));
+        }
+        let _service = ServiceHandleGuard(service);
+
+        let service_status = query_service_status_process(service)?;
+        let running = service_status.dwCurrentState == SERVICE_RUNNING;
+        let pipe_available = running && input::windows_input_pipe_available();
+        let active_session = WTSGetActiveConsoleSessionId();
+        let worker_session_id = (running && active_session != u32::MAX).then_some(active_session);
+        let sas_available = running && sas_dll_available() && software_sas_allows_services();
+        let detail = if running {
+            if pipe_available {
+                "Lock-screen input service is running and the worker pipe is available."
+            } else {
+                "Lock-screen input service is running; waiting for the session worker pipe."
+            }
+        } else {
+            "Lock-screen input service is installed but not running."
+        };
+
+        return Ok(InputServiceStatus {
+            installed: true,
+            running,
+            worker_session_id,
+            pipe_available,
+            sas_available,
+            detail: detail.into(),
+        });
+    }
+
+    unsafe fn query_service_status_process(
+        service: windows_sys::Win32::System::Services::SC_HANDLE,
+    ) -> Result<SERVICE_STATUS_PROCESS, String> {
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0_u32;
+        let ok = QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
+            std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+            &mut needed,
+        ) != 0;
+        if ok {
+            Ok(status)
+        } else {
+            Err(windows_last_error("QueryServiceStatusEx"))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_SERVICE_EXISTS},
+        System::Services::{
+            ChangeServiceConfigW, CreateServiceW, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+            SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL, SERVICE_WIN32_OWN_PROCESS,
+        },
+    };
+
+    if !helper_path.is_file() {
+        return Err(format!(
+            "input helper binary does not exist: {}",
+            helper_path.display()
+        ));
+    }
+
+    unsafe {
+        let scm = OpenSCManagerW(
+            std::ptr::null(),
+            std::ptr::null(),
+            SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE,
+        );
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW"));
+        }
+        let _scm = ServiceHandleGuard(scm);
+
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let display_name = wide_null(shared_input::INPUT_SERVICE_DISPLAY_NAME);
+        let binary = wide_null(&format!("{} --service", quote_windows_arg(helper_path)));
+        let mut service = CreateServiceW(
+            scm,
+            service_name.as_ptr(),
+            display_name.as_ptr(),
+            SERVICE_ALL_ACCESS,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL,
+            binary.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+
+        if service.is_null() {
+            let code = GetLastError();
+            if code != ERROR_SERVICE_EXISTS {
+                return Err(windows_last_error("CreateServiceW"));
+            }
+            service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_ALL_ACCESS);
+            if service.is_null() {
+                return Err(windows_last_error("OpenServiceW(existing)"));
+            }
+            if ChangeServiceConfigW(
+                service,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_NORMAL,
+                binary.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                display_name.as_ptr(),
+            ) == 0
+            {
+                let _service = ServiceHandleGuard(service);
+                return Err(windows_last_error("ChangeServiceConfigW"));
+            }
+        }
+
+        let _service = ServiceHandleGuard(service);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows_input_service() -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_SERVICE_ALREADY_RUNNING},
+        System::Services::{
+            OpenSCManagerW, OpenServiceW, StartServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
+            SERVICE_START,
+        },
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW"));
+        }
+        let _scm = ServiceHandleGuard(scm);
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(
+            scm,
+            service_name.as_ptr(),
+            SERVICE_START | SERVICE_QUERY_STATUS,
+        );
+        if service.is_null() {
+            return Err(windows_last_error("OpenServiceW(start)"));
+        }
+        let _service = ServiceHandleGuard(service);
+        if StartServiceW(service, 0, std::ptr::null()) == 0 {
+            let code = GetLastError();
+            if code != ERROR_SERVICE_ALREADY_RUNNING {
+                return Err(windows_last_error("StartServiceW"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_windows_input_service() -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST},
+        Storage::FileSystem::DELETE,
+        System::Services::{
+            ControlService, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+            SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
+            SERVICE_STOPPED,
+        },
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW"));
+        }
+        let _scm = ServiceHandleGuard(scm);
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(
+            scm,
+            service_name.as_ptr(),
+            SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE,
+        );
+        if service.is_null() {
+            let code = GetLastError();
+            if code == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Ok(());
+            }
+            return Err(windows_last_error("OpenServiceW(uninstall)"));
+        }
+        let _service = ServiceHandleGuard(service);
+
+        if let Ok(status) = query_service_status_process_for_uninstall(service) {
+            if status.dwCurrentState != SERVICE_STOPPED {
+                let mut stop_status = SERVICE_STATUS::default();
+                let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status);
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while Instant::now() < deadline {
+                    if let Ok(status) = query_service_status_process_for_uninstall(service) {
+                        if status.dwCurrentState == SERVICE_STOPPED {
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+
+        if DeleteService(service) == 0 {
+            return Err(windows_last_error("DeleteService"));
+        }
+        return Ok(());
+    }
+
+    unsafe fn query_service_status_process_for_uninstall(
+        service: windows_sys::Win32::System::Services::SC_HANDLE,
+    ) -> Result<windows_sys::Win32::System::Services::SERVICE_STATUS_PROCESS, String> {
+        use windows_sys::Win32::System::Services::{
+            QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+        };
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0_u32;
+        let ok = QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
+            std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+            &mut needed,
+        ) != 0;
+        if ok {
+            Ok(status)
+        } else {
+            Err(windows_last_error("QueryServiceStatusEx"))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_input_helper_path() -> Result<PathBuf, String> {
+    let exe =
+        env::current_exe().map_err(|error| format!("failed to locate current exe: {error}"))?;
+    let exe_dir = exe
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| "current exe has no parent directory".to_string())?;
+    let candidates = [
+        exe_dir.join("mykvm-input-helper.exe"),
+        exe_dir.join("mykvm-input-helper-x86_64-pc-windows-msvc.exe"),
+        exe_dir
+            .join("resources")
+            .join("mykvm-input-helper-x86_64-pc-windows-msvc.exe"),
+        exe_dir.join("resources").join("mykvm-input-helper.exe"),
+    ];
+
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .or_else(|| candidates.first().cloned())
+        .ok_or_else(|| "failed to build input helper path candidates".into())
+}
+
+#[cfg(target_os = "windows")]
+struct ServiceHandleGuard(windows_sys::Win32::System::Services::SC_HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for ServiceHandleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = windows_sys::Win32::System::Services::CloseServiceHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn software_sas_allows_services() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD,
+    };
+
+    unsafe {
+        let subkey = wide_null(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System");
+        let mut key = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+            return false;
+        }
+        let _key = RegistryKeyGuard(key);
+
+        let value_name = wide_null("SoftwareSASGeneration");
+        let mut value_type = 0_u32;
+        let mut value = 0_u32;
+        let mut value_len = std::mem::size_of::<u32>() as u32;
+        let ok = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            &mut value as *mut u32 as *mut u8,
+            &mut value_len,
+        ) == 0;
+        return ok && value_type == REG_DWORD && matches!(value, 1 | 3);
+    }
+
+    struct RegistryKeyGuard(windows_sys::Win32::System::Registry::HKEY);
+    impl Drop for RegistryKeyGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn sas_dll_available() -> bool {
+    use windows_sys::Win32::{
+        Foundation::FreeLibrary,
+        System::LibraryLoader::{GetProcAddress, LoadLibraryW},
+    };
+
+    unsafe {
+        let dll = LoadLibraryW(wide_null("sas.dll").as_ptr());
+        if dll.is_null() {
+            return false;
+        }
+        let available = GetProcAddress(dll, c"SendSAS".as_ptr() as *const u8).is_some();
+        let _ = FreeLibrary(dll);
+        available
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn quote_windows_arg(value: &PathBuf) -> String {
+    quote_windows_arg_str(&value.to_string_lossy())
+}
+
+#[cfg(target_os = "windows")]
+fn quote_windows_arg_str(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for ch in value.chars() {
+        if ch == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(target_os = "windows")]
+fn windows_last_error(context: &str) -> String {
+    let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    format!("{context} failed with Windows error {code}")
+}
+
+#[cfg(target_os = "windows")]
 fn is_windows_process_elevated() -> Result<bool, String> {
     use windows_sys::Win32::{
         Foundation::CloseHandle,
@@ -2087,18 +2787,34 @@ fn is_windows_process_elevated() -> Result<bool, String> {
 
 #[cfg(target_os = "windows")]
 fn restart_current_process_as_admin() -> Result<(), String> {
+    launch_current_process_as_admin(&[])
+}
+
+#[cfg(target_os = "windows")]
+fn launch_current_process_as_admin(args: &[String]) -> Result<(), String> {
     use windows_sys::Win32::{UI::Shell::ShellExecuteW, UI::WindowsAndMessaging::SW_SHOWNORMAL};
 
     let exe =
         env::current_exe().map_err(|error| format!("failed to locate current exe: {error}"))?;
     let operation = wide_null("runas");
     let file = wide_null(&exe.to_string_lossy());
+    let params = args
+        .iter()
+        .map(|arg| quote_windows_arg_str(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let params_w = wide_null(&params);
+    let params_ptr = if params.is_empty() {
+        std::ptr::null()
+    } else {
+        params_w.as_ptr()
+    };
     let result = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             operation.as_ptr(),
             file.as_ptr(),
-            std::ptr::null(),
+            params_ptr,
             std::ptr::null(),
             SW_SHOWNORMAL,
         )
@@ -3055,6 +3771,57 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
             device.input_ready = false;
         }
     }
+
+    refresh_paired_controller_keys(layout, peers);
+}
+
+/// Keeps each paired controller's transport_public_key (and id/host/ip) in sync
+/// with the peer it was paired with. A peer's QUIC transport identity is
+/// regenerated whenever its self-signed cert/key file is missing — app updates,
+/// reinstalls, or the file being cleared all rotate the advertised
+/// transport_public_key while the pairing credentials (cluster_id/pair_secret)
+/// stay the same. Without this sync the controller's stored key goes stale, the
+/// input path rejects every packet with "controller not in paired-controllers
+/// list", and the user is forced to re-pair even though the pairing is still
+/// valid. The security premise is unchanged: input packets still have to match
+/// cluster_id/pair_secret, which only the two paired endpoints know.
+fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
+    if layout.paired_controllers.is_empty() {
+        return;
+    }
+
+    for controller in &mut layout.paired_controllers {
+        let Some(peer) = peers
+            .iter()
+            .find(|peer| paired_controller_can_repair_with_peer(controller, peer))
+        else {
+            continue;
+        };
+
+        let new_key = peer.transport_public_key.trim();
+        if !new_key.is_empty() && controller.transport_public_key != new_key {
+            log::info!(
+                "paired controller {} rotated transport key; updating stored key",
+                controller.id
+            );
+            controller.transport_public_key = new_key.to_string();
+        }
+
+        let new_id = peer_device_id(peer);
+        if !new_id.is_empty() && controller.id != new_id {
+            controller.id = new_id;
+        }
+        if !peer.host.trim().is_empty() {
+            controller.host = peer.host.clone();
+        }
+        if !peer.ip.trim().is_empty() {
+            controller.ip = peer.ip.clone();
+        }
+        if !peer.name.trim().is_empty() {
+            controller.name = peer.name.clone();
+        }
+        controller.protocol_version = peer.protocol_version;
+    }
 }
 
 fn device_matches_peer(device: &Device, peer: &LanPeer) -> bool {
@@ -3665,7 +4432,20 @@ fn advertised_input_ready(layout: &LayoutState, input_ready: bool) -> bool {
 }
 
 fn should_send_public_announce(layout: &LayoutState) -> bool {
-    !(layout.machine_role == "client" && !layout.paired_controllers.is_empty())
+    // Paired clients used to stay silent on public announces and only reply
+    // to their paired server's probes. But if the reply path ever fails (the
+    // server's announce arrives while the client is still starting up after an
+    // admin-restart, or the cluster_id the server broadcasts momentarily
+    // differs), the server never sees the client come back online and the
+    // cursor can't cross — the "paired but shows online and nothing happens"
+    // trap that forces a re-pair. Letting a paired client also announce means
+    // the server's apply_peer_presence picks it up within one announce cycle
+    // (3 s) without relying solely on the reply path. The announce only
+    // carries public fields (cluster_id, transport_public_key, host, screens)
+    // — never the pair_secret — and MyKVM is designed for trusted LANs, so
+    // this does not lower the security posture.
+    let _ = layout;
+    true
 }
 
 fn screen_to_peer_screen(screen: &Screen) -> LanPeerScreen {
@@ -3814,7 +4594,9 @@ fn request_pairing_for_peer(
                 if let Some(incoming) =
                     peer_from_discovery_packet(packet, source.ip().to_string(), &local_peer.id)
                 {
-                    if incoming.kind == "pair-challenge" && incoming.peer.pairing_required {
+                    if incoming.kind == "pair-challenge"
+                        && pair_challenge_usable_for_local_peer(local_peer, &incoming.peer)
+                    {
                         return Ok(incoming.peer);
                     }
                 }
@@ -3823,7 +4605,7 @@ fn request_pairing_for_peer(
     }
 
     Err(format!(
-        "no pairing challenge received from {host}; make sure the client is running and not already paired"
+        "no pairing challenge received from {host}; make sure the client is running and reachable"
     ))
 }
 
@@ -4054,11 +4836,45 @@ fn should_reply_to_discovery(layout: &LayoutState, peer: &LanPeer) -> bool {
 }
 
 fn is_paired_controller(layout: &LayoutState, peer: &LanPeer) -> bool {
-    layout.paired_controllers.iter().any(|controller| {
-        controller.id == peer.id
-            || (!controller.transport_public_key.trim().is_empty()
-                && controller.transport_public_key == peer.transport_public_key)
-    })
+    layout
+        .paired_controllers
+        .iter()
+        .any(|controller| paired_controller_identity_matches_peer(controller, peer))
+}
+
+fn paired_controller_identity_matches_peer(controller: &PairedController, peer: &LanPeer) -> bool {
+    (!peer.id.trim().is_empty() && controller.id == peer.id)
+        || controller.id == peer_device_id(peer)
+        || (!peer.transport_public_key.trim().is_empty()
+            && controller.transport_public_key == peer.transport_public_key)
+}
+
+fn paired_controller_can_repair_with_peer(controller: &PairedController, peer: &LanPeer) -> bool {
+    if paired_controller_identity_matches_peer(controller, peer) {
+        return true;
+    }
+
+    text_matches(&controller.name, &peer.name)
+        || same_host(&controller.host, &peer.host)
+        || same_host(&peer.host, &controller.host)
+        || text_matches(&controller.ip, &peer.ip)
+}
+
+fn text_matches(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    !left.is_empty() && !right.is_empty() && left.eq_ignore_ascii_case(right)
+}
+
+fn pair_challenge_usable_for_local_peer(local_peer: &LanPeer, peer: &LanPeer) -> bool {
+    if !peer.machine_role.trim().is_empty() && peer.machine_role != "client" {
+        return false;
+    }
+    if peer.pairing_required {
+        return true;
+    }
+
+    peer_visible_to_local_peer(local_peer, peer) || !peer.transport_public_key.trim().is_empty()
 }
 
 fn handle_pairing_stream_packet(
@@ -4120,16 +4936,13 @@ fn begin_pairing_challenge(
         return false;
     }
     // Accept a fresh handshake when we have no pairing yet, OR when the
-    // requester is a controller we were already paired with (matched by the
-    // stable device id / transport key). The latter lets a server re-initiate
-    // pairing on a client that has no keyboard/mouse of its own — the client
-    // just shows the code on its own screen — instead of being stuck
-    // "already paired" with credentials that no longer match.
-    let requester_already_known = layout.paired_controllers.iter().any(|controller| {
-        (!requester.id.trim().is_empty() && controller.id == requester.id)
-            || (!requester.transport_public_key.trim().is_empty()
-                && controller.transport_public_key == requester.transport_public_key)
-    });
+    // requester looks like a controller we were already paired with. Repair
+    // matching intentionally includes host/name/IP so a rotated transport
+    // certificate does not trap a headless client behind its old controller key.
+    let requester_already_known = layout
+        .paired_controllers
+        .iter()
+        .any(|controller| paired_controller_can_repair_with_peer(controller, requester));
     if !pairing_required(layout) && !requester_already_known {
         return false;
     }
@@ -4142,6 +4955,12 @@ fn begin_pairing_challenge(
         if let Some(existing) = challenge.as_mut() {
             if existing.expires_at > now {
                 if existing.requester_id == requester.id {
+                    if existing.attempts > 0 {
+                        existing.code = random_pairing_code();
+                        existing.expires_at = expires_at;
+                        existing.expires_at_ms = expires_at_ms;
+                        existing.attempts = 0;
+                    }
                     existing.requester_ip = requester_ip;
                     existing.requester_host = requester.host.clone();
                     existing.requester_public_key = requester.transport_public_key.clone();
@@ -4635,7 +5454,101 @@ mod tests {
     }
 
     #[test]
-    fn paired_client_stops_public_announces() {
+    fn pairing_challenge_accepts_known_requester_after_identity_rotation() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "server-old-id".into(),
+            name: "Server".into(),
+            host: "server.local".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-old-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+        let challenge = Arc::new(Mutex::new(None));
+        let mut requester = test_peer();
+        requester.id = "server-new-id".into();
+        requester.name = "Server".into();
+        requester.machine_role = "server".into();
+        requester.host = "server.local".into();
+        requester.ip = "10.0.0.1".into();
+        requester.transport_public_key = "server-new-key".into();
+
+        assert!(begin_pairing_challenge(
+            &challenge,
+            &layout,
+            &requester,
+            requester.ip.clone(),
+        ));
+
+        let stored = challenge.lock().expect("challenge lock");
+        assert_eq!(
+            stored.as_ref().expect("challenge").requester_id,
+            requester.id
+        );
+    }
+
+    #[test]
+    fn pairing_challenge_refreshes_code_after_failed_attempt() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers.clear();
+        let challenge = Arc::new(Mutex::new(None));
+        let mut requester = test_peer();
+        requester.id = "server-one".into();
+        requester.machine_role = "server".into();
+
+        assert!(begin_pairing_challenge(
+            &challenge,
+            &layout,
+            &requester,
+            "10.0.0.1".into(),
+        ));
+
+        {
+            let mut stored = challenge.lock().expect("challenge lock");
+            let stored = stored.as_mut().expect("challenge");
+            stored.code = "000000".into();
+            stored.expires_at_ms = 42;
+            stored.attempts = 1;
+        }
+
+        assert!(begin_pairing_challenge(
+            &challenge,
+            &layout,
+            &requester,
+            "10.0.0.1".into(),
+        ));
+
+        let stored = challenge.lock().expect("challenge lock");
+        let stored = stored.as_ref().expect("challenge");
+        assert_eq!(stored.attempts, 0);
+        assert_ne!(stored.expires_at_ms, 42);
+    }
+
+    #[test]
+    fn pair_challenge_accepts_paired_client_for_repair() {
+        let local_peer = local_peer_from_layout(&test_layout());
+        let mut client = test_peer();
+        client.machine_role = "client".into();
+        client.pairing_required = false;
+        client.cluster_id = "cluster-before-repair".into();
+        client.transport_public_key = "client-public-key".into();
+
+        assert!(pair_challenge_usable_for_local_peer(&local_peer, &client));
+
+        client.machine_role = "server".into();
+        assert!(!pair_challenge_usable_for_local_peer(&local_peer, &client));
+    }
+
+    #[test]
+    fn paired_client_still_announces_publicly() {
+        // A paired client keeps sending public announces so the server can pick
+        // it back up within one announce cycle after the client restarts (e.g. an
+        // admin-restart), instead of depending solely on the reply path. The
+        // announce only carries public fields, never the pair_secret.
         let mut layout = test_layout();
         layout.machine_role = "client".into();
         layout.paired_controllers = vec![PairedController {
@@ -4649,7 +5562,86 @@ mod tests {
             paired_at_ms: now_ms(),
         }];
 
-        assert!(!should_send_public_announce(&layout));
+        assert!(should_send_public_announce(&layout));
+    }
+
+    #[test]
+    fn save_merge_preserves_backend_pairing_from_stale_settings_snapshot() {
+        let mut current = test_layout();
+        current.machine_role = "client".into();
+        current.input_mode = "receive".into();
+        current.cluster_id = "paired-cluster".into();
+        current.pair_secret = "paired-secret".into();
+        current.paired_controllers = vec![PairedController {
+            id: "server".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: current.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+
+        let mut stale_settings = current.clone();
+        stale_settings.cluster_id = "old-cluster".into();
+        stale_settings.pair_secret = "old-secret".into();
+        stale_settings.paired_controllers.clear();
+        stale_settings.performance_monitor = true;
+
+        let merged = merge_runtime_owned_layout_fields(stale_settings, &current);
+
+        assert_eq!(merged.cluster_id, "paired-cluster");
+        assert_eq!(merged.pair_secret, "paired-secret");
+        assert_eq!(merged.paired_controllers, current.paired_controllers);
+        assert!(merged.performance_monitor);
+    }
+
+    #[test]
+    fn save_merge_preserves_local_transport_identity() {
+        let mut current = test_layout();
+        current.devices[0].transport_public_key = "runtime-key".into();
+        current.devices[0].protocol_version = quic_transport::PROTOCOL_VERSION;
+
+        let mut stale_settings = current.clone();
+        stale_settings.devices[0].transport_public_key.clear();
+        stale_settings.devices[0].protocol_version = 0;
+
+        let merged = merge_runtime_owned_layout_fields(stale_settings, &current);
+
+        assert_eq!(merged.devices[0].transport_public_key, "runtime-key");
+        assert_eq!(
+            merged.devices[0].protocol_version,
+            quic_transport::PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn disk_refresh_preserves_runtime_pairing_when_disk_snapshot_is_empty() {
+        let mut current = test_layout();
+        current.machine_role = "client".into();
+        current.cluster_id = "runtime-cluster".into();
+        current.pair_secret = "runtime-secret".into();
+        current.paired_controllers = vec![PairedController {
+            id: "server".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: current.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+        let mut disk = current.clone();
+        disk.cluster_id = "empty-disk-cluster".into();
+        disk.pair_secret = "empty-disk-secret".into();
+        disk.paired_controllers.clear();
+
+        let merged = merge_disk_layout_into_runtime(disk, &current);
+
+        assert_eq!(merged.cluster_id, "runtime-cluster");
+        assert_eq!(merged.pair_secret, "runtime-secret");
+        assert_eq!(merged.paired_controllers, current.paired_controllers);
     }
 
     #[test]
