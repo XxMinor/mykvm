@@ -15,6 +15,19 @@ default-run = "mykvm"
 name = "mykvm_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# The lock-screen input helper is a Windows-only sidecar built separately (see
+# scripts/build-tauri-assets.mjs) and bundled via externalBin. Gate it behind a
+# feature so the normal `cargo build` / `tauri build` (incl. the macOS universal
+# build) does NOT auto-compile it — otherwise the macOS universal build tries to
+# lipo/copy a binary that has no business existing there and fails to bundle.
+[[bin]]
+name = "mykvm-input-helper"
+path = "src/bin/mykvm-input-helper.rs"
+required-features = ["input-helper"]
+
+[features]
+input-helper = []
+
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
 

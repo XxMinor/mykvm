@@ -44,6 +44,8 @@ run('cargo', [
   'src-tauri/Cargo.toml',
   '--bin',
   'mykvm-input-helper',
+  '--features',
+  'input-helper',
   '--release',
   '--target',
   target,
