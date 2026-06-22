@@ -138,7 +138,7 @@ jobs:
             echo "## Downloads"
             echo ""
             echo "- macOS: download the .dmg, then drag MyKVM to Applications. The .app.tar.gz file is for automatic updates only."
-            echo "- Windows: download the .exe or .msi installer."
+            echo "- Windows: download the .exe installer."
             echo "- Linux: download the AppImage, .deb, or .rpm package."
             echo ""
             echo "EOF"
