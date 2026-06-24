@@ -11,9 +11,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(not(target_os = "windows"))]
-use std::{io::Write, process::Stdio};
-
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -22,11 +19,16 @@ use tauri::{
     AppHandle, Manager, Monitor, WindowEvent,
 };
 
+mod clipboard;
 mod input;
+mod performance;
 mod quic_transport;
 pub mod shared_input;
 #[cfg(target_os = "windows")]
 pub mod windows_input;
+
+use clipboard::{ClipboardContent, ClipboardImage};
+use performance::PerformanceSample;
 
 const DISCOVERY_PORT: u16 = 47833;
 const TRANSPORT_PORT_MIN: u16 = 1024;
@@ -44,10 +46,6 @@ const MAX_DISCOVERY_PEERS: usize = 128;
 const PAIRING_CODE_TTL_MS: u64 = 60_000;
 const PAIRING_MAX_ATTEMPTS: u8 = 5;
 const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
-const CLIPBOARD_MAX_TEXT_BYTES: usize = 256 * 1024;
-// Raw RGBA can be large (a 2560x1440 frame is ~14 MB); cap it so a stray huge
-// copy never floods the LAN transport. Images above this are skipped.
-const CLIPBOARD_MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 // After we write clipboard content received from a peer, ignore our own
 // clipboard for a short grace window. Reading an image back through the OS
 // pasteboard is not always byte-identical to what we wrote (macOS re-encodes
@@ -75,16 +73,6 @@ static WINDOWS_FIREWALL_ENSURED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 static SINGLE_INSTANCE_MUTEX: OnceLock<Mutex<Option<SingleInstanceGuard>>> = OnceLock::new();
-
-#[cfg(target_os = "windows")]
-static WINDOWS_PROCESS_SAMPLE: OnceLock<Mutex<Option<WindowsProcessSample>>> = OnceLock::new();
-
-#[cfg(target_os = "windows")]
-#[derive(Clone, Copy)]
-struct WindowsProcessSample {
-    instant: Instant,
-    process_time_100ns: u64,
-}
 
 #[cfg(target_os = "windows")]
 struct SingleInstanceGuard {
@@ -365,17 +353,6 @@ struct InputServiceStatus {
     pipe_available: bool,
     sas_available: bool,
     detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PerformanceSample {
-    timestamp_ms: u64,
-    app_cpu_percent: f64,
-    app_memory_mb: f64,
-    transport_packets: u64,
-    input_events: u64,
-    clipboard_packets: u64,
 }
 
 struct PairingChallenge {
@@ -1646,17 +1623,21 @@ fn start_window_drag(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn read_clipboard_text() -> Result<String, String> {
-    read_system_clipboard()
+    clipboard::read_text()
 }
 
 #[tauri::command]
 fn write_clipboard_text(text: String) -> Result<(), String> {
-    write_system_clipboard(&text)
+    clipboard::write_text(&text)
 }
 
 #[tauri::command]
 fn read_performance_sample(state: tauri::State<'_, AppRuntime>) -> PerformanceSample {
-    read_system_performance_sample(&state)
+    performance::read_process_sample(
+        state.transport_packets.load(Ordering::Relaxed),
+        state.input_events.load(Ordering::Relaxed),
+        state.clipboard_packets.load(Ordering::Relaxed),
+    )
 }
 
 #[tauri::command]
@@ -3748,91 +3729,32 @@ struct ClipboardPacket {
     sequence: u64,
 }
 
-/// A bitmap copied to the clipboard, carried as base64-encoded RGBA8 plus its
-/// dimensions. RGBA is what `arboard` hands us and expects back, so no image
-/// codec is needed on either end.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ClipboardImage {
-    width: u32,
-    height: u32,
-    rgba_base64: String,
-}
-
-/// One unit of clipboard content read from (or written to) the local system.
-enum ClipboardContent {
-    Text(String),
-    Image(ClipboardImage),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClipboardContentHint {
-    Image,
-    Text,
-    Unknown,
-}
-
-fn clipboard_signature_hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    })
-}
-
-impl ClipboardContent {
-    fn is_oversized(&self) -> bool {
-        match self {
-            ClipboardContent::Text(text) => text.len() > CLIPBOARD_MAX_TEXT_BYTES,
-            ClipboardContent::Image(image) => {
-                // base64 inflates ~4/3; compare against the decoded RGBA budget.
-                image.rgba_base64.len() / 4 * 3 > CLIPBOARD_MAX_IMAGE_BYTES
-            }
-        }
-    }
-
-    /// A stable, cheap fingerprint used to detect "did the clipboard change"
-    /// and to suppress echoing content we just received from a peer.
-    fn signature(&self) -> String {
-        match self {
-            ClipboardContent::Text(text) => format!("text:{text}"),
-            ClipboardContent::Image(image) => {
-                format!(
-                    "image:{}x{}:{}:{:016x}",
-                    image.width,
-                    image.height,
-                    image.rgba_base64.len(),
-                    clipboard_signature_hash(image.rgba_base64.as_bytes())
-                )
-            }
-        }
-    }
-
-    fn into_packet(
-        self,
-        origin_id: String,
-        cluster_id: String,
-        pair_secret: String,
-        sequence: u64,
-    ) -> ClipboardPacket {
-        match self {
-            ClipboardContent::Text(text) => ClipboardPacket {
-                protocol: CLIPBOARD_PROTOCOL.into(),
-                origin_id,
-                cluster_id,
-                pair_secret,
-                text,
-                image: None,
-                sequence,
-            },
-            ClipboardContent::Image(image) => ClipboardPacket {
-                protocol: CLIPBOARD_PROTOCOL.into(),
-                origin_id,
-                cluster_id,
-                pair_secret,
-                text: String::new(),
-                image: Some(image),
-                sequence,
-            },
-        }
+fn clipboard_packet_from_content(
+    content: ClipboardContent,
+    origin_id: String,
+    cluster_id: String,
+    pair_secret: String,
+    sequence: u64,
+) -> ClipboardPacket {
+    match content {
+        ClipboardContent::Text(text) => ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            origin_id,
+            cluster_id,
+            pair_secret,
+            text,
+            image: None,
+            sequence,
+        },
+        ClipboardContent::Image(image) => ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            origin_id,
+            cluster_id,
+            pair_secret,
+            text: String::new(),
+            image: Some(image),
+            sequence,
+        },
     }
 }
 
@@ -3871,7 +3793,7 @@ fn run_clipboard_sync(
         // read-back signature here lets the echo check below recognize it once
         // the window lifts instead of bouncing it back to the peer.
         if clipboard_echo_active(&clipboard_echo_until) {
-            if let Some(content) = read_clipboard_content() {
+            if let Some(content) = clipboard::read_content() {
                 if let Ok(mut seen) = clipboard_seen_text.lock() {
                     *seen = Some(content.signature());
                 }
@@ -3879,7 +3801,7 @@ fn run_clipboard_sync(
             continue;
         }
 
-        let Some(content) = read_clipboard_content() else {
+        let Some(content) = clipboard::read_content() else {
             continue;
         };
         if content.is_oversized() {
@@ -3927,7 +3849,8 @@ fn run_clipboard_sync(
         }
 
         sequence = sequence.saturating_add(1);
-        let packet = content.into_packet(
+        let packet = clipboard_packet_from_content(
+            content,
             local_peer_id.clone(),
             target.cluster_id.clone(),
             target.pair_secret.clone(),
@@ -4015,10 +3938,7 @@ fn handle_clipboard_packet(
     }
 
     let signature = content.signature();
-    let written = match &content {
-        ClipboardContent::Text(text) => write_system_clipboard(text).is_ok(),
-        ClipboardContent::Image(image) => write_clipboard_image(image).is_ok(),
-    };
+    let written = clipboard::write_content(&content).is_ok();
 
     if written {
         // Remember what we just wrote so our own poll loop recognizes it as an
@@ -4313,491 +4233,6 @@ fn normalize_peer_platform(platform: &str) -> &'static str {
     } else {
         "unknown"
     }
-}
-
-#[cfg(target_os = "windows")]
-fn read_system_clipboard() -> Result<String, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
-    clipboard
-        .get_text()
-        .map_err(|error| format!("failed to read clipboard text: {error}"))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn read_system_clipboard() -> Result<String, String> {
-    let output = if cfg!(target_os = "macos") {
-        Command::new("pbpaste").output()
-    } else {
-        Command::new("sh")
-            .args([
-                "-c",
-                "wl-paste -n 2>/dev/null || xclip -selection clipboard -out",
-            ])
-            .output()
-    }
-    .map_err(|error| format!("failed to read clipboard: {error}"))?;
-
-    if output.status.success() {
-        String::from_utf8(output.stdout)
-            .map_err(|error| format!("clipboard text is not valid UTF-8: {error}"))
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn write_system_clipboard(text: &str) -> Result<(), String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
-    clipboard
-        .set_text(text.to_string())
-        .map_err(|error| format!("failed to write clipboard text: {error}"))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn write_system_clipboard(text: &str) -> Result<(), String> {
-    let mut child = if cfg!(target_os = "macos") {
-        Command::new("pbcopy").stdin(Stdio::piped()).spawn()
-    } else {
-        Command::new("sh")
-            .args(["-c", "wl-copy 2>/dev/null || xclip -selection clipboard"])
-            .stdin(Stdio::piped())
-            .spawn()
-    }
-    .map_err(|error| format!("failed to write clipboard: {error}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|error| format!("failed to send clipboard text: {error}"))?;
-    }
-
-    let status = child
-        .wait()
-        .map_err(|error| format!("failed to finish clipboard write: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("clipboard command exited with status {status}"))
-    }
-}
-
-/// Reads whatever is currently on the clipboard, preferring an image when one
-/// is present and otherwise falling back to text. Returns `None` when the
-/// clipboard is empty or unreadable.
-fn read_clipboard_content() -> Option<ClipboardContent> {
-    match clipboard_content_hint() {
-        ClipboardContentHint::Image => read_clipboard_image().map(ClipboardContent::Image),
-        ClipboardContentHint::Text => read_system_clipboard()
-            .ok()
-            .filter(|text| !text.is_empty())
-            .map(ClipboardContent::Text),
-        ClipboardContentHint::Unknown => {
-            if let Some(image) = read_clipboard_image() {
-                return Some(ClipboardContent::Image(image));
-            }
-            read_system_clipboard()
-                .ok()
-                .filter(|text| !text.is_empty())
-                .map(ClipboardContent::Text)
-        }
-    }
-}
-
-/// Reads a bitmap from the system clipboard via `arboard`. `get_image` returns
-/// an error (not an image) when the clipboard holds text, so callers should try
-/// this first and fall back to text.
-fn read_clipboard_image() -> Option<ClipboardImage> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-
-    let arboard_image = arboard::Clipboard::new().ok().and_then(|mut clipboard| {
-        let image = clipboard.get_image().ok()?;
-        if image.width == 0 || image.height == 0 || image.bytes.is_empty() {
-            return None;
-        }
-        if image.bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES {
-            return None;
-        }
-
-        Some(ClipboardImage {
-            width: image.width as u32,
-            height: image.height as u32,
-            rgba_base64: BASE64.encode(image.bytes.as_ref()),
-        })
-    });
-
-    arboard_image.or_else(|| {
-        #[cfg(target_os = "windows")]
-        {
-            read_windows_clipboard_dib_image()
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            None
-        }
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn clipboard_content_hint() -> ClipboardContentHint {
-    use windows_sys::Win32::System::DataExchange::{
-        IsClipboardFormatAvailable, RegisterClipboardFormatW,
-    };
-    use windows_sys::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_UNICODETEXT};
-
-    let png_format = unsafe { RegisterClipboardFormatW(wide_null("PNG").as_ptr()) };
-    let image_formats = [
-        png_format,
-        u32::from(CF_DIBV5),
-        u32::from(CF_DIB),
-        u32::from(CF_BITMAP),
-    ];
-    if image_formats
-        .iter()
-        .any(|format| *format != 0 && unsafe { IsClipboardFormatAvailable(*format) } != 0)
-    {
-        return ClipboardContentHint::Image;
-    }
-    if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT)) } != 0 {
-        ClipboardContentHint::Text
-    } else {
-        ClipboardContentHint::Unknown
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn clipboard_content_hint() -> ClipboardContentHint {
-    ClipboardContentHint::Unknown
-}
-
-#[cfg(target_os = "windows")]
-fn read_windows_clipboard_dib_image() -> Option<ClipboardImage> {
-    use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, OpenClipboard,
-    };
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
-    use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5};
-
-    struct ClipboardGuard;
-    impl Drop for ClipboardGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = CloseClipboard();
-            }
-        }
-    }
-
-    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
-        return None;
-    }
-    let _guard = ClipboardGuard;
-
-    for format in [u32::from(CF_DIBV5), u32::from(CF_DIB)] {
-        let handle = unsafe { GetClipboardData(format) };
-        if handle.is_null() {
-            continue;
-        }
-        let len = unsafe { GlobalSize(handle) };
-        if len == 0 || len > CLIPBOARD_MAX_IMAGE_BYTES.saturating_add(256) {
-            continue;
-        }
-        let ptr = unsafe { GlobalLock(handle) };
-        if ptr.is_null() {
-            continue;
-        }
-        let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
-        let decoded = decode_windows_dib_to_clipboard_image(data);
-        unsafe {
-            let _ = GlobalUnlock(handle);
-        }
-        if decoded.is_some() {
-            return decoded;
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn decode_windows_dib_to_clipboard_image(data: &[u8]) -> Option<ClipboardImage> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-    use image::{codecs::bmp::BmpDecoder, DynamicImage, ImageDecoder};
-
-    let decoder = BmpDecoder::new_without_file_header(std::io::Cursor::new(data)).ok()?;
-    let (width, height) = decoder.dimensions();
-    let rgba = DynamicImage::from_decoder(decoder).ok()?.into_rgba8();
-    let bytes = rgba.into_raw();
-    if width == 0 || height == 0 || bytes.is_empty() || bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES {
-        return None;
-    }
-
-    Some(ClipboardImage {
-        width,
-        height,
-        rgba_base64: BASE64.encode(bytes),
-    })
-}
-
-/// Writes a received bitmap to the system clipboard via `arboard`.
-fn write_clipboard_image(image: &ClipboardImage) -> Result<(), String> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-
-    let bytes = BASE64
-        .decode(image.rgba_base64.as_bytes())
-        .map_err(|error| format!("failed to decode clipboard image: {error}"))?;
-    let width = image.width as usize;
-    let height = image.height as usize;
-    if width == 0 || height == 0 || bytes.len() != width.saturating_mul(height).saturating_mul(4) {
-        return Err("clipboard image has invalid dimensions".into());
-    }
-
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
-    clipboard
-        .set_image(arboard::ImageData {
-            width,
-            height,
-            bytes: std::borrow::Cow::Owned(bytes),
-        })
-        .map_err(|error| format!("failed to write clipboard image: {error}"))
-}
-
-fn read_system_performance_sample(state: &AppRuntime) -> PerformanceSample {
-    let (app_cpu_percent, app_memory_mb) = if cfg!(target_os = "windows") {
-        read_windows_process_performance().unwrap_or((0.0, 0.0))
-    } else {
-        read_unix_process_performance().unwrap_or((0.0, 0.0))
-    };
-
-    PerformanceSample {
-        timestamp_ms: now_ms(),
-        app_cpu_percent: app_cpu_percent.clamp(0.0, 100.0),
-        app_memory_mb: app_memory_mb.max(0.0),
-        transport_packets: state.transport_packets.load(Ordering::Relaxed),
-        input_events: state.input_events.load(Ordering::Relaxed),
-        clipboard_packets: state.clipboard_packets.load(Ordering::Relaxed),
-    }
-}
-
-fn read_unix_process_performance() -> Result<(f64, f64), String> {
-    let pid = std::process::id().to_string();
-    let output = command_stdout(Command::new("ps").args(["-p", &pid, "-o", "%cpu=,rss="]))?;
-    parse_process_metrics(&output)
-}
-
-#[cfg(target_os = "windows")]
-fn read_windows_process_performance() -> Result<(f64, f64), String> {
-    use windows_sys::Win32::{
-        Foundation::FILETIME,
-        System::{
-            ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
-            Threading::{GetCurrentProcess, GetProcessTimes},
-        },
-    };
-
-    let process = unsafe { GetCurrentProcess() };
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    let memory_ok = unsafe { GetProcessMemoryInfo(process, &mut counters, counters.cb) };
-    if memory_ok == 0 {
-        return Err("failed to read process memory counters".into());
-    }
-
-    let mut creation_time = FILETIME::default();
-    let mut exit_time = FILETIME::default();
-    let mut kernel_time = FILETIME::default();
-    let mut user_time = FILETIME::default();
-    let time_ok = unsafe {
-        GetProcessTimes(
-            process,
-            &mut creation_time,
-            &mut exit_time,
-            &mut kernel_time,
-            &mut user_time,
-        )
-    };
-    if time_ok == 0 {
-        return Err("failed to read process cpu counters".into());
-    }
-
-    let now = Instant::now();
-    let process_time_100ns = filetime_to_u64(&kernel_time) + filetime_to_u64(&user_time);
-    let cpu_percent = {
-        let sample = WINDOWS_PROCESS_SAMPLE.get_or_init(|| Mutex::new(None));
-        let mut previous = sample
-            .lock()
-            .map_err(|_| "windows process sample lock poisoned".to_string())?;
-        let cpu_percent = previous
-            .map(|previous_sample| {
-                let process_delta =
-                    process_time_100ns.saturating_sub(previous_sample.process_time_100ns);
-                let elapsed_100ns =
-                    now.duration_since(previous_sample.instant).as_secs_f64() * 10_000_000.0;
-                let cpu_count = std::thread::available_parallelism()
-                    .map(|count| count.get())
-                    .unwrap_or(1) as f64;
-
-                if elapsed_100ns > 0.0 {
-                    (process_delta as f64 / elapsed_100ns / cpu_count) * 100.0
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
-        *previous = Some(WindowsProcessSample {
-            instant: now,
-            process_time_100ns,
-        });
-        cpu_percent
-    };
-
-    Ok((
-        cpu_percent,
-        counters.WorkingSetSize as f64 / 1024.0 / 1024.0,
-    ))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn read_windows_process_performance() -> Result<(f64, f64), String> {
-    Err("windows process performance is unavailable on this platform".into())
-}
-
-fn parse_process_metrics(output: &str) -> Result<(f64, f64), String> {
-    let values = output
-        .trim()
-        .split(|character: char| character == ',' || character.is_whitespace())
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| value.trim().parse::<f64>().unwrap_or(0.0))
-        .collect::<Vec<_>>();
-
-    if values.len() >= 2 {
-        Ok((
-            values[0],
-            values[1]
-                / if cfg!(target_os = "windows") {
-                    1.0
-                } else {
-                    1024.0
-                },
-        ))
-    } else {
-        Err("performance command did not return process cpu and memory".into())
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn filetime_to_u64(filetime: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
-    ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64
-}
-
-#[allow(dead_code)]
-fn read_system_overview_performance() -> PerformanceSample {
-    let (app_cpu_percent, app_memory_mb, _memory_total_mb) = if cfg!(target_os = "macos") {
-        read_macos_performance().unwrap_or((0.0, 0.0, 0.0))
-    } else if cfg!(target_os = "windows") {
-        read_windows_performance().unwrap_or((0.0, 0.0, 0.0))
-    } else {
-        read_linux_performance().unwrap_or((0.0, 0.0, 0.0))
-    };
-
-    PerformanceSample {
-        timestamp_ms: now_ms(),
-        app_cpu_percent: app_cpu_percent.clamp(0.0, 100.0),
-        app_memory_mb,
-        transport_packets: 0,
-        input_events: 0,
-        clipboard_packets: 0,
-    }
-}
-
-fn read_macos_performance() -> Result<(f64, f64, f64), String> {
-    let cpu_total = command_stdout(
-        Command::new("sh").args(["-c", "ps -A -o %cpu= | awk '{s+=$1} END{print s+0}'"]),
-    )?
-    .trim()
-    .parse::<f64>()
-    .unwrap_or(0.0);
-    let cpu_count = command_stdout(Command::new("sysctl").args(["-n", "hw.logicalcpu"]))?
-        .trim()
-        .parse::<f64>()
-        .unwrap_or(1.0)
-        .max(1.0);
-    let total_bytes = command_stdout(Command::new("sysctl").args(["-n", "hw.memsize"]))?
-        .trim()
-        .parse::<f64>()
-        .unwrap_or(0.0);
-    let vm_stat = command_stdout(&mut Command::new("vm_stat"))?;
-    let page_size = vm_stat
-        .lines()
-        .next()
-        .and_then(|line| line.split("page size of ").nth(1))
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(4096.0);
-    let free_pages = vm_stat_pages(&vm_stat, "Pages free")
-        + vm_stat_pages(&vm_stat, "Pages inactive")
-        + vm_stat_pages(&vm_stat, "Pages speculative");
-    let total_mb = total_bytes / 1024.0 / 1024.0;
-    let free_mb = free_pages * page_size / 1024.0 / 1024.0;
-    let used_mb = (total_mb - free_mb).max(0.0);
-
-    Ok((cpu_total / cpu_count, used_mb, total_mb))
-}
-
-fn read_windows_performance() -> Result<(f64, f64, f64), String> {
-    let output = command_stdout(Command::new("powershell").args([
-    "-NoProfile",
-    "-Command",
-    "$cpu=(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average; $os=Get-CimInstance Win32_OperatingSystem; $total=[math]::Round($os.TotalVisibleMemorySize/1024,2); $free=[math]::Round($os.FreePhysicalMemory/1024,2); Write-Output \"$cpu,$($total-$free),$total\"",
-  ]))?;
-    parse_metric_triplet(&output)
-}
-
-fn read_linux_performance() -> Result<(f64, f64, f64), String> {
-    let output = command_stdout(Command::new("sh").args([
-    "-c",
-    "cpu=$(top -bn1 | awk '/Cpu\\(s\\)/ {print 100-$8; exit}'); mem=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf \"%.2f,%.2f\", (t-a)/1024, t/1024}' /proc/meminfo); echo \"$cpu,$mem\"",
-  ]))?;
-    parse_metric_triplet(&output)
-}
-
-fn command_stdout(command: &mut Command) -> Result<String, String> {
-    let output = command
-        .output()
-        .map_err(|error| format!("failed to run performance command: {error}"))?;
-    if output.status.success() {
-        String::from_utf8(output.stdout)
-            .map_err(|error| format!("performance command returned invalid UTF-8: {error}"))
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
-fn parse_metric_triplet(output: &str) -> Result<(f64, f64, f64), String> {
-    let values = output
-        .trim()
-        .split(',')
-        .map(|value| value.trim().parse::<f64>().unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    if values.len() >= 3 {
-        Ok((values[0], values[1], values[2]))
-    } else {
-        Err("performance command did not return cpu, memory used, memory total".into())
-    }
-}
-
-fn vm_stat_pages(vm_stat: &str, label: &str) -> f64 {
-    vm_stat
-        .lines()
-        .find(|line| line.trim_start().starts_with(label))
-        .and_then(|line| line.split(':').nth(1))
-        .map(|value| value.trim().trim_end_matches('.').replace('.', ""))
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.0)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
