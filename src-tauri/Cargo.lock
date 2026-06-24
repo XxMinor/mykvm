@@ -2308,6 +2308,7 @@ dependencies = [
  "base64 0.22.1",
  "core-foundation",
  "core-graphics",
+ "image",
  "log",
  "quinn",
  "rcgen",

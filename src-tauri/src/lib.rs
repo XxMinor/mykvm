@@ -3765,6 +3765,19 @@ enum ClipboardContent {
     Image(ClipboardImage),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardContentHint {
+    Image,
+    Text,
+    Unknown,
+}
+
+fn clipboard_signature_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
 impl ClipboardContent {
     fn is_oversized(&self) -> bool {
         match self {
@@ -3783,10 +3796,11 @@ impl ClipboardContent {
             ClipboardContent::Text(text) => format!("text:{text}"),
             ClipboardContent::Image(image) => {
                 format!(
-                    "image:{}x{}:{}",
+                    "image:{}x{}:{}:{:016x}",
                     image.width,
                     image.height,
-                    image.rgba_base64.len()
+                    image.rgba_base64.len(),
+                    clipboard_signature_hash(image.rgba_base64.as_bytes())
                 )
             }
         }
@@ -4373,12 +4387,21 @@ fn write_system_clipboard(text: &str) -> Result<(), String> {
 /// is present and otherwise falling back to text. Returns `None` when the
 /// clipboard is empty or unreadable.
 fn read_clipboard_content() -> Option<ClipboardContent> {
-    if let Some(image) = read_clipboard_image() {
-        return Some(ClipboardContent::Image(image));
-    }
-    match read_system_clipboard() {
-        Ok(text) if !text.is_empty() => Some(ClipboardContent::Text(text)),
-        _ => None,
+    match clipboard_content_hint() {
+        ClipboardContentHint::Image => read_clipboard_image().map(ClipboardContent::Image),
+        ClipboardContentHint::Text => read_system_clipboard()
+            .ok()
+            .filter(|text| !text.is_empty())
+            .map(ClipboardContent::Text),
+        ClipboardContentHint::Unknown => {
+            if let Some(image) = read_clipboard_image() {
+                return Some(ClipboardContent::Image(image));
+            }
+            read_system_clipboard()
+                .ok()
+                .filter(|text| !text.is_empty())
+                .map(ClipboardContent::Text)
+        }
     }
 }
 
@@ -4388,19 +4411,132 @@ fn read_clipboard_content() -> Option<ClipboardContent> {
 fn read_clipboard_image() -> Option<ClipboardImage> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    let image = clipboard.get_image().ok()?;
-    if image.width == 0 || image.height == 0 || image.bytes.is_empty() {
+    let arboard_image = arboard::Clipboard::new().ok().and_then(|mut clipboard| {
+        let image = clipboard.get_image().ok()?;
+        if image.width == 0 || image.height == 0 || image.bytes.is_empty() {
+            return None;
+        }
+        if image.bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES {
+            return None;
+        }
+
+        Some(ClipboardImage {
+            width: image.width as u32,
+            height: image.height as u32,
+            rgba_base64: BASE64.encode(image.bytes.as_ref()),
+        })
+    });
+
+    arboard_image.or_else(|| {
+        #[cfg(target_os = "windows")]
+        {
+            read_windows_clipboard_dib_image()
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_content_hint() -> ClipboardContentHint {
+    use windows_sys::Win32::System::DataExchange::{
+        IsClipboardFormatAvailable, RegisterClipboardFormatW,
+    };
+    use windows_sys::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_UNICODETEXT};
+
+    let png_format = unsafe { RegisterClipboardFormatW(wide_null("PNG").as_ptr()) };
+    let image_formats = [
+        png_format,
+        u32::from(CF_DIBV5),
+        u32::from(CF_DIB),
+        u32::from(CF_BITMAP),
+    ];
+    if image_formats
+        .iter()
+        .any(|format| *format != 0 && unsafe { IsClipboardFormatAvailable(*format) } != 0)
+    {
+        return ClipboardContentHint::Image;
+    }
+    if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT)) } != 0 {
+        ClipboardContentHint::Text
+    } else {
+        ClipboardContentHint::Unknown
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_content_hint() -> ClipboardContentHint {
+    ClipboardContentHint::Unknown
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_clipboard_dib_image() -> Option<ClipboardImage> {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5};
+
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseClipboard();
+            }
+        }
+    }
+
+    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
         return None;
     }
-    if image.bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES {
+    let _guard = ClipboardGuard;
+
+    for format in [u32::from(CF_DIBV5), u32::from(CF_DIB)] {
+        let handle = unsafe { GetClipboardData(format) };
+        if handle.is_null() {
+            continue;
+        }
+        let len = unsafe { GlobalSize(handle) };
+        if len == 0 || len > CLIPBOARD_MAX_IMAGE_BYTES.saturating_add(256) {
+            continue;
+        }
+        let ptr = unsafe { GlobalLock(handle) };
+        if ptr.is_null() {
+            continue;
+        }
+        let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+        let decoded = decode_windows_dib_to_clipboard_image(data);
+        unsafe {
+            let _ = GlobalUnlock(handle);
+        }
+        if decoded.is_some() {
+            return decoded;
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn decode_windows_dib_to_clipboard_image(data: &[u8]) -> Option<ClipboardImage> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use image::{codecs::bmp::BmpDecoder, DynamicImage, ImageDecoder};
+
+    let decoder = BmpDecoder::new_without_file_header(std::io::Cursor::new(data)).ok()?;
+    let (width, height) = decoder.dimensions();
+    let rgba = DynamicImage::from_decoder(decoder).ok()?.into_rgba8();
+    let bytes = rgba.into_raw();
+    if width == 0 || height == 0 || bytes.is_empty() || bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES {
         return None;
     }
 
     Some(ClipboardImage {
-        width: image.width as u32,
-        height: image.height as u32,
-        rgba_base64: BASE64.encode(image.bytes.as_ref()),
+        width,
+        height,
+        rgba_base64: BASE64.encode(bytes),
     })
 }
 
@@ -6182,6 +6318,22 @@ mod tests {
         assert!(!clipboard_packet_authorized(&layout, &packet));
         packet.origin_id = "server-10-0-0-1".into();
         assert!(clipboard_packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn clipboard_image_signature_includes_content_hash() {
+        let first = ClipboardContent::Image(ClipboardImage {
+            width: 2,
+            height: 1,
+            rgba_base64: "AAAAAAAAAAA=".into(),
+        });
+        let second = ClipboardContent::Image(ClipboardImage {
+            width: 2,
+            height: 1,
+            rgba_base64: "AQEBAQEBAQE=".into(),
+        });
+
+        assert_ne!(first.signature(), second.signature());
     }
 
     #[test]
