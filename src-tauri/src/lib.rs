@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env, fs,
+    hash::{Hash, Hasher},
     io::{Read, Write},
     net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, Monitor, WindowEvent,
+    AppHandle, DragDropEvent, Manager, Monitor, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
 mod clipboard;
@@ -62,6 +63,8 @@ const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const EDGE_DROP_LABEL_PREFIX: &str = "mykvm-edge-drop-";
+const EDGE_DROP_THICKNESS: i32 = 8;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
@@ -435,6 +438,35 @@ struct FileTransferPacket {
     data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EdgeDropSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl EdgeDropSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            EdgeDropSide::Left => "left",
+            EdgeDropSide::Right => "right",
+            EdgeDropSide::Top => "top",
+            EdgeDropSide::Bottom => "bottom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct EdgeDropWindowSpec {
+    label: String,
+    target_device_id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 struct AppRuntime {
     app_handle: AppHandle,
     layout: Arc<Mutex<LayoutState>>,
@@ -443,6 +475,7 @@ struct AppRuntime {
     peers: Arc<Mutex<Vec<LanPeer>>>,
     pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
     file_transfers: Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    edge_drop_targets: Arc<Mutex<HashMap<String, String>>>,
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
@@ -476,6 +509,7 @@ impl AppRuntime {
             peers: Arc::new(Mutex::new(Vec::new())),
             pairing_challenge: Arc::new(Mutex::new(None)),
             file_transfers: Arc::new(Mutex::new(HashMap::new())),
+            edge_drop_targets: Arc::new(Mutex::new(HashMap::new())),
             quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
             input_stop: Mutex::new(None),
@@ -1649,6 +1683,14 @@ fn send_files_to_device(
     paths: Vec<String>,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<FileTransferSummary, String> {
+    send_files_to_device_impl(state.inner(), &device_id, paths)
+}
+
+fn send_files_to_device_impl(
+    state: &AppRuntime,
+    device_id: &str,
+    paths: Vec<String>,
+) -> Result<FileTransferSummary, String> {
     if paths.is_empty() {
         return Err("请选择要传输的文件。".into());
     }
@@ -1665,7 +1707,7 @@ fn send_files_to_device(
     apply_transport_to_peer(&mut local_peer, &quic_transport);
 
     let peers = active_peer_snapshot(&state.peers);
-    let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
+    let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
     let files = collect_transfer_files(&paths)?;
     let mut file_count = 0_usize;
     let mut byte_count = 0_u64;
@@ -1684,6 +1726,426 @@ fn send_files_to_device(
         file_count,
         byte_count,
     })
+}
+
+fn start_edge_drop_window_sync(app_handle: AppHandle) {
+    thread::spawn(move || loop {
+        let state = app_handle.state::<AppRuntime>();
+        let runtime = state.inner();
+        let layout = runtime.layout_snapshot();
+        let peers = active_peer_snapshot(&runtime.peers);
+        let specs = edge_drop_specs_for_layout(&layout, &peers);
+        let next_labels = specs
+            .iter()
+            .map(|spec| spec.label.clone())
+            .collect::<HashSet<_>>();
+        let next_targets = specs
+            .iter()
+            .map(|spec| (spec.label.clone(), spec.target_device_id.clone()))
+            .collect::<HashMap<_, _>>();
+        let stale_labels = runtime
+            .edge_drop_targets
+            .lock()
+            .map(|mut targets| {
+                let stale = targets
+                    .keys()
+                    .filter(|label| !next_labels.contains(*label))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                *targets = next_targets;
+                stale
+            })
+            .unwrap_or_default();
+
+        let main_handle = app_handle.clone();
+        let _ = app_handle.run_on_main_thread(move || {
+            sync_edge_drop_windows_on_main(&main_handle, specs, stale_labels);
+        });
+
+        thread::sleep(Duration::from_millis(1500));
+    });
+}
+
+fn sync_edge_drop_windows_on_main(
+    app_handle: &AppHandle,
+    specs: Vec<EdgeDropWindowSpec>,
+    stale_labels: Vec<String>,
+) {
+    for label in stale_labels {
+        if let Some(window) = app_handle.get_webview_window(&label) {
+            let _ = window.hide();
+        }
+    }
+
+    for spec in specs {
+        if let Some(window) = app_handle.get_webview_window(&spec.label) {
+            let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+                spec.x, spec.y,
+            )));
+            let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+                spec.width,
+                spec.height,
+            )));
+            let _ = window.set_always_on_top(true);
+            let _ = window.show();
+            continue;
+        }
+
+        let build_result = WebviewWindowBuilder::new(
+            app_handle,
+            &spec.label,
+            WebviewUrl::App("edge-drop.html".into()),
+        )
+        .title("")
+        .position(spec.x, spec.y)
+        .inner_size(spec.width, spec.height)
+        .decorations(false)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .closable(false)
+        .shadow(false)
+        .transparent(true)
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .build();
+
+        if let Err(error) = build_result {
+            log::warn!("edge drop window {} failed: {error}", spec.label);
+        }
+    }
+}
+
+fn handle_edge_drop_window_event(window: &tauri::Window, event: &WindowEvent) -> bool {
+    let label = window.label();
+    if !label.starts_with(EDGE_DROP_LABEL_PREFIX) {
+        return false;
+    }
+
+    match event {
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = window.hide();
+        }
+        WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
+            if paths.is_empty() {
+                return true;
+            }
+            let app_handle = window.app_handle().clone();
+            let label = label.to_string();
+            let paths = paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            thread::spawn(move || {
+                let state = app_handle.state::<AppRuntime>();
+                let target_device_id = state
+                    .edge_drop_targets
+                    .lock()
+                    .ok()
+                    .and_then(|targets| targets.get(&label).cloned());
+                let Some(target_device_id) = target_device_id else {
+                    log::warn!("edge drop ignored: no target for {label}");
+                    return;
+                };
+
+                match send_files_to_device_impl(state.inner(), &target_device_id, paths) {
+                    Ok(summary) => log::info!(
+                        "edge drop sent {} file(s) to {} bytes={}",
+                        summary.file_count,
+                        summary.target_name,
+                        summary.byte_count
+                    ),
+                    Err(error) => log::warn!("edge drop transfer failed: {error}"),
+                }
+            });
+        }
+        _ => {}
+    }
+
+    true
+}
+
+fn edge_drop_specs_for_layout(layout: &LayoutState, peers: &[LanPeer]) -> Vec<EdgeDropWindowSpec> {
+    if !layout.file_transfer_enabled {
+        return Vec::new();
+    }
+
+    let Some(local_device) = layout.devices.iter().find(|device| device.role == "local") else {
+        return Vec::new();
+    };
+
+    let mut specs = match layout.machine_role.as_str() {
+        "server" => server_edge_drop_specs(layout, local_device),
+        "client" => client_edge_drop_specs(layout, local_device, peers),
+        _ => Vec::new(),
+    };
+    specs.sort_by(|left, right| left.label.cmp(&right.label));
+    specs
+}
+
+fn server_edge_drop_specs(layout: &LayoutState, local_device: &Device) -> Vec<EdgeDropWindowSpec> {
+    let mut specs = Vec::new();
+    for device in layout.devices.iter().filter(|device| {
+        device.role != "local"
+            && device.online
+            && device.input_ready
+            && device.protocol_version == quic_transport::PROTOCOL_VERSION
+            && !device.transport_public_key.trim().is_empty()
+    }) {
+        for local_screen in &local_device.screens {
+            for remote_screen in &device.screens {
+                if edge_screens_overlap(local_screen, remote_screen) {
+                    continue;
+                }
+                let Some(side) = edge_touching_side(local_screen, remote_screen) else {
+                    continue;
+                };
+                let Some((x, y, width, height)) =
+                    edge_drop_rect_between(local_screen, remote_screen, side)
+                else {
+                    continue;
+                };
+                specs.push(EdgeDropWindowSpec {
+                    label: edge_drop_label(&device.id, local_screen, Some(remote_screen), side),
+                    target_device_id: device.id.clone(),
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+        }
+    }
+    specs
+}
+
+fn client_edge_drop_specs(
+    layout: &LayoutState,
+    local_device: &Device,
+    peers: &[LanPeer],
+) -> Vec<EdgeDropWindowSpec> {
+    let Some(target_device_id) = online_paired_controller_id(layout, peers) else {
+        return Vec::new();
+    };
+
+    let mut specs = Vec::new();
+    for local_screen in &local_device.screens {
+        for side in [
+            EdgeDropSide::Left,
+            EdgeDropSide::Right,
+            EdgeDropSide::Top,
+            EdgeDropSide::Bottom,
+        ] {
+            if local_edge_has_neighbor(&local_device.screens, local_screen, side) {
+                continue;
+            }
+            let (x, y, width, height) = outer_edge_drop_rect(local_screen, side);
+            specs.push(EdgeDropWindowSpec {
+                label: edge_drop_label(&target_device_id, local_screen, None, side),
+                target_device_id: target_device_id.clone(),
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+    }
+
+    specs
+}
+
+fn online_paired_controller_id(layout: &LayoutState, peers: &[LanPeer]) -> Option<String> {
+    layout
+        .paired_controllers
+        .iter()
+        .find(|controller| {
+            peers.iter().any(|peer| {
+                (peer.id == controller.id
+                    || (!controller.transport_public_key.trim().is_empty()
+                        && peer.transport_public_key == controller.transport_public_key))
+                    && peer.protocol_version == quic_transport::PROTOCOL_VERSION
+                    && !peer.transport_public_key.trim().is_empty()
+                    && peer.quic_port != 0
+            })
+        })
+        .map(|controller| controller.id.clone())
+}
+
+fn edge_drop_label(
+    target_device_id: &str,
+    local_screen: &Screen,
+    remote_screen: Option<&Screen>,
+    side: EdgeDropSide,
+) -> String {
+    let remote = remote_screen
+        .map(|screen| edge_label_component(&screen.id))
+        .unwrap_or_else(|| "outer".into());
+    format!(
+        "{}{}-{}-{}-{}",
+        EDGE_DROP_LABEL_PREFIX,
+        edge_label_component(target_device_id),
+        edge_label_component(&local_screen.id),
+        remote,
+        side.as_str()
+    )
+}
+
+fn edge_label_component(value: &str) -> String {
+    let component = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let component = component
+        .trim_matches('-')
+        .chars()
+        .take(48)
+        .collect::<String>();
+    if !component.is_empty() {
+        return component;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("id-{:016x}", hasher.finish())
+}
+
+fn edge_drop_rect_between(
+    local: &Screen,
+    remote: &Screen,
+    side: EdgeDropSide,
+) -> Option<(f64, f64, f64, f64)> {
+    let thickness = EDGE_DROP_THICKNESS;
+    let (x, y, width, height) = match side {
+        EdgeDropSide::Left | EdgeDropSide::Right => {
+            let y = local.y.max(remote.y);
+            let height = (local.y + local.height).min(remote.y + remote.height) - y;
+            if height <= 0 {
+                return None;
+            }
+            let x = if side == EdgeDropSide::Right {
+                local.x + local.width - thickness
+            } else {
+                local.x
+            };
+            (x, y, thickness, height)
+        }
+        EdgeDropSide::Top | EdgeDropSide::Bottom => {
+            let x = local.x.max(remote.x);
+            let width = (local.x + local.width).min(remote.x + remote.width) - x;
+            if width <= 0 {
+                return None;
+            }
+            let y = if side == EdgeDropSide::Bottom {
+                local.y + local.height - thickness
+            } else {
+                local.y
+            };
+            (x, y, width, thickness)
+        }
+    };
+
+    Some((x as f64, y as f64, width as f64, height as f64))
+}
+
+fn outer_edge_drop_rect(screen: &Screen, side: EdgeDropSide) -> (f64, f64, f64, f64) {
+    let thickness = EDGE_DROP_THICKNESS;
+    let (x, y, width, height) = match side {
+        EdgeDropSide::Left => (screen.x, screen.y, thickness, screen.height),
+        EdgeDropSide::Right => (
+            screen.x + screen.width - thickness,
+            screen.y,
+            thickness,
+            screen.height,
+        ),
+        EdgeDropSide::Top => (screen.x, screen.y, screen.width, thickness),
+        EdgeDropSide::Bottom => (
+            screen.x,
+            screen.y + screen.height - thickness,
+            screen.width,
+            thickness,
+        ),
+    };
+
+    (x as f64, y as f64, width as f64, height as f64)
+}
+
+fn local_edge_has_neighbor(screens: &[Screen], screen: &Screen, side: EdgeDropSide) -> bool {
+    screens
+        .iter()
+        .filter(|candidate| candidate.id != screen.id)
+        .any(|candidate| edge_touching_side(screen, candidate) == Some(side))
+}
+
+fn edge_touching_side(local: &Screen, remote: &Screen) -> Option<EdgeDropSide> {
+    if edge_near(local.x + local.width, remote.x)
+        && edge_ranges_overlap(
+            local.y,
+            local.y + local.height,
+            remote.y,
+            remote.y + remote.height,
+        )
+    {
+        return Some(EdgeDropSide::Right);
+    }
+
+    if edge_near(local.x, remote.x + remote.width)
+        && edge_ranges_overlap(
+            local.y,
+            local.y + local.height,
+            remote.y,
+            remote.y + remote.height,
+        )
+    {
+        return Some(EdgeDropSide::Left);
+    }
+
+    if edge_near(local.y + local.height, remote.y)
+        && edge_ranges_overlap(
+            local.x,
+            local.x + local.width,
+            remote.x,
+            remote.x + remote.width,
+        )
+    {
+        return Some(EdgeDropSide::Bottom);
+    }
+
+    if edge_near(local.y, remote.y + remote.height)
+        && edge_ranges_overlap(
+            local.x,
+            local.x + local.width,
+            remote.x,
+            remote.x + remote.width,
+        )
+    {
+        return Some(EdgeDropSide::Top);
+    }
+
+    None
+}
+
+fn edge_screens_overlap(local: &Screen, remote: &Screen) -> bool {
+    local.x < remote.x + remote.width
+        && local.x + local.width > remote.x
+        && local.y < remote.y + remote.height
+        && local.y + local.height > remote.y
+}
+
+fn edge_near(a: i32, b: i32) -> bool {
+    (a - b).abs() <= 80
+}
+
+fn edge_ranges_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> bool {
+    i32::min(a_end, b_end) - i32::max(a_start, b_start) > 80
 }
 
 #[tauri::command]
@@ -2369,6 +2831,9 @@ pub fn run() {
             None::<Vec<&str>>,
         ))
         .on_window_event(|window, event| {
+            if handle_edge_drop_window_event(window, event) {
+                return;
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 set_main_window_visible(window.app_handle(), false);
@@ -2450,6 +2915,7 @@ pub fn run() {
             setup_macos_cursor_hider(app);
             #[cfg(target_os = "macos")]
             setup_macos_window_visibility_watcher(app);
+            start_edge_drop_window_sync(app.handle().clone());
             setup_tray(app)?;
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
@@ -6333,6 +6799,93 @@ mod tests {
         assert!(!layout.devices[1].online);
         assert!(!layout.devices[1].input_ready);
         assert_eq!(layout.devices[1].host, "10.0.0.2");
+    }
+
+    #[test]
+    fn edge_drop_specs_follow_server_screen_adjacency() {
+        let mut layout = test_layout();
+        layout.devices[1].screens[0].x = 1920;
+
+        let specs = edge_drop_specs_for_layout(&layout, &[]);
+
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert_eq!(spec.target_device_id, "peer-client-10-0-0-2");
+        assert_eq!(spec.x, 1912.0);
+        assert_eq!(spec.y, 0.0);
+        assert_eq!(spec.width, EDGE_DROP_THICKNESS as f64);
+        assert_eq!(spec.height, 1080.0);
+    }
+
+    #[test]
+    fn edge_drop_specs_respect_file_transfer_setting() {
+        let mut layout = test_layout();
+        layout.devices[1].screens[0].x = 1920;
+        layout.file_transfer_enabled = false;
+
+        let specs = edge_drop_specs_for_layout(&layout, &[]);
+
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn edge_drop_specs_skip_internal_client_monitor_edges() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.input_mode = "receive".into();
+        layout.devices.truncate(1);
+        let mut second_screen = test_screen("local-device");
+        second_screen.id = "local-device-display-2".into();
+        second_screen.x = 1920;
+        layout.devices[0].screens.push(second_screen);
+        layout.paired_controllers = vec![PairedController {
+            id: "peer-server-10-0-0-1".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+        let mut peer = test_peer();
+        peer.id = "peer-server-10-0-0-1".into();
+        peer.name = "Server".into();
+        peer.machine_role = "server".into();
+        peer.transport_public_key = "server-public-key".into();
+
+        let specs = edge_drop_specs_for_layout(&layout, &[peer]);
+
+        assert_eq!(specs.len(), 6);
+        assert!(specs.iter().all(|spec| {
+            spec.target_device_id == "peer-server-10-0-0-1" && spec.width > 0.0 && spec.height > 0.0
+        }));
+        assert!(!specs.iter().any(|spec| {
+            spec.x == (1920 - EDGE_DROP_THICKNESS) as f64
+                && spec.y == 0.0
+                && spec.width == EDGE_DROP_THICKNESS as f64
+                && spec.height == 1080.0
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.x == (3840 - EDGE_DROP_THICKNESS) as f64
+                && spec.y == 0.0
+                && spec.width == EDGE_DROP_THICKNESS as f64
+                && spec.height == 1080.0
+        }));
+    }
+
+    #[test]
+    fn edge_drop_label_handles_non_ascii_ids() {
+        let mut local = test_screen("local-device");
+        local.id = "显示器".into();
+        let mut remote = test_screen("remote-device");
+        remote.id = "远程".into();
+
+        let label = edge_drop_label("设备", &local, Some(&remote), EdgeDropSide::Right);
+
+        assert!(label.starts_with(EDGE_DROP_LABEL_PREFIX));
+        assert!(label.contains("id-"));
+        assert!(label.ends_with("-right"));
     }
 
     #[test]
