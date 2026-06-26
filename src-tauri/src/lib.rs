@@ -63,8 +63,12 @@ const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const FILE_TRANSFER_DESTINATION_POINTER: &str = "pointer";
 const EDGE_DROP_LABEL_PREFIX: &str = "mykvm-edge-drop-";
 const EDGE_DROP_THICKNESS: i32 = 8;
+const FILE_DROP_LANDING_LABEL: &str = "mykvm-file-drop-landing";
+const FILE_DROP_LANDING_WIDTH: f64 = 96.0;
+const FILE_DROP_LANDING_HEIGHT: f64 = 72.0;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
@@ -431,6 +435,8 @@ struct FileTransferPacket {
     cluster_id: String,
     pair_secret: String,
     file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_hint: Option<String>,
     total_bytes: u64,
     chunk_index: u64,
     offset: u64,
@@ -1691,6 +1697,15 @@ fn send_files_to_device_impl(
     device_id: &str,
     paths: Vec<String>,
 ) -> Result<FileTransferSummary, String> {
+    send_files_to_device_with_destination(state, device_id, paths, None)
+}
+
+fn send_files_to_device_with_destination(
+    state: &AppRuntime,
+    device_id: &str,
+    paths: Vec<String>,
+    destination_hint: Option<&str>,
+) -> Result<FileTransferSummary, String> {
     if paths.is_empty() {
         return Err("请选择要传输的文件。".into());
     }
@@ -1713,7 +1728,13 @@ fn send_files_to_device_impl(
     let mut byte_count = 0_u64;
 
     for file in files {
-        let packet_count = send_transfer_file(&quic_transport, &local_peer.id, &target, &file)?;
+        let packet_count = send_transfer_file(
+            &quic_transport,
+            &local_peer.id,
+            &target,
+            &file,
+            destination_hint,
+        )?;
         state
             .transport_packets
             .fetch_add(packet_count, Ordering::Relaxed);
@@ -1851,7 +1872,12 @@ fn handle_edge_drop_window_event(window: &tauri::Window, event: &WindowEvent) ->
                     return;
                 };
 
-                match send_files_to_device_impl(state.inner(), &target_device_id, paths) {
+                match send_files_to_device_with_destination(
+                    state.inner(),
+                    &target_device_id,
+                    paths,
+                    Some(FILE_TRANSFER_DESTINATION_POINTER),
+                ) {
                     Ok(summary) => log::info!(
                         "edge drop sent {} file(s) to {} bytes={}",
                         summary.file_count,
@@ -1863,6 +1889,19 @@ fn handle_edge_drop_window_event(window: &tauri::Window, event: &WindowEvent) ->
             });
         }
         _ => {}
+    }
+
+    true
+}
+
+fn handle_file_drop_landing_window_event(window: &tauri::Window, event: &WindowEvent) -> bool {
+    if window.label() != FILE_DROP_LANDING_LABEL {
+        return false;
+    }
+
+    if let WindowEvent::CloseRequested { api, .. } = event {
+        api.prevent_close();
+        let _ = window.hide();
     }
 
     true
@@ -2832,6 +2871,9 @@ pub fn run() {
         ))
         .on_window_event(|window, event| {
             if handle_edge_drop_window_event(window, event) {
+                return;
+            }
+            if handle_file_drop_landing_window_event(window, event) {
                 return;
             }
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -4914,6 +4956,7 @@ fn send_transfer_file(
     origin_id: &str,
     target: &FileTransferTarget,
     file: &TransferFile,
+    destination_hint: Option<&str>,
 ) -> Result<u64, String> {
     let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
     let mut packet_count = 0_u64;
@@ -4930,6 +4973,7 @@ fn send_transfer_file(
             file.total_bytes,
             0,
             0,
+            destination_hint,
             Vec::new(),
         ),
     )?;
@@ -4960,6 +5004,7 @@ fn send_transfer_file(
                 file.total_bytes,
                 chunk_index,
                 offset,
+                destination_hint,
                 data,
             ),
         )?;
@@ -4980,6 +5025,7 @@ fn send_transfer_file(
             file.total_bytes,
             chunk_index,
             offset,
+            destination_hint,
             Vec::new(),
         ),
     )?;
@@ -4998,6 +5044,7 @@ fn file_transfer_packet(
     total_bytes: u64,
     chunk_index: u64,
     offset: u64,
+    destination_hint: Option<&str>,
     data: Vec<u8>,
 ) -> FileTransferPacket {
     FileTransferPacket {
@@ -5009,6 +5056,7 @@ fn file_transfer_packet(
         cluster_id: target.cluster_id.clone(),
         pair_secret: target.pair_secret.clone(),
         file_name: file_name.into(),
+        destination_hint: destination_hint.map(str::to_string),
         total_bytes,
         chunk_index,
         offset,
@@ -5039,12 +5087,30 @@ fn handle_file_transfer_packet(
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     app: &AppHandle,
 ) -> bool {
+    let Some(packet) = decode_wire_packet::<FileTransferPacket>(payload) else {
+        return false;
+    };
     let Ok(receive_root) = file_transfer_receive_root(app) else {
         log::warn!("file transfer receive failed: could not resolve receive directory");
         return false;
     };
+    let pointer_receive_root = if packet.kind == "start"
+        && packet.destination_hint.as_deref() == Some(FILE_TRANSFER_DESTINATION_POINTER)
+    {
+        file_transfer_pointer_receive_root(app)
+    } else {
+        None
+    };
 
-    handle_file_transfer_packet_with_root(payload, layout, local_peer_id, transfers, &receive_root)
+    handle_decoded_file_transfer_packet(
+        packet,
+        layout,
+        local_peer_id,
+        transfers,
+        &receive_root,
+        pointer_receive_root.as_deref(),
+        Some(app),
+    )
 }
 
 fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -5058,6 +5124,64 @@ fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to resolve file transfer receive directory: {error}"))
 }
 
+fn file_transfer_pointer_receive_root(app: &AppHandle) -> Option<PathBuf> {
+    platform_pointer_receive_root(app).and_then(usable_existing_directory)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_pointer_receive_root(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .desktop_dir()
+        .ok()
+        .or_else(macos_finder_insertion_directory)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_pointer_receive_root(app: &AppHandle) -> Option<PathBuf> {
+    app.path().desktop_dir().ok()
+}
+
+fn usable_existing_directory(path: PathBuf) -> Option<PathBuf> {
+    if path.is_absolute() && path.is_dir() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_finder_insertion_directory() -> Option<PathBuf> {
+    let script = r#"
+tell application "Finder"
+  try
+    set targetFolder to insertion location as alias
+    return POSIX path of targetFolder
+  on error
+    return ""
+  end try
+end tell
+"#;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if path.is_empty() {
+        return None;
+    }
+
+    Some(PathBuf::from(path))
+}
+
+#[cfg(test)]
 fn handle_file_transfer_packet_with_root(
     payload: &[u8],
     layout: &LayoutState,
@@ -5065,10 +5189,51 @@ fn handle_file_transfer_packet_with_root(
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
 ) -> bool {
+    handle_file_transfer_packet_with_destination_root(
+        payload,
+        layout,
+        local_peer_id,
+        transfers,
+        receive_root,
+        None,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn handle_file_transfer_packet_with_destination_root(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    receive_root: &Path,
+    pointer_receive_root: Option<&Path>,
+    landing_app: Option<&AppHandle>,
+) -> bool {
     let Some(packet) = decode_wire_packet::<FileTransferPacket>(payload) else {
         return false;
     };
 
+    handle_decoded_file_transfer_packet(
+        packet,
+        layout,
+        local_peer_id,
+        transfers,
+        receive_root,
+        pointer_receive_root,
+        landing_app,
+    )
+}
+
+fn handle_decoded_file_transfer_packet(
+    packet: FileTransferPacket,
+    layout: &LayoutState,
+    local_peer_id: &str,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    receive_root: &Path,
+    pointer_receive_root: Option<&Path>,
+    landing_app: Option<&AppHandle>,
+) -> bool {
     if packet.protocol != FILE_TRANSFER_PROTOCOL {
         return false;
     }
@@ -5085,12 +5250,128 @@ fn handle_file_transfer_packet_with_root(
         return true;
     }
 
+    let destination_root =
+        file_transfer_destination_root(&packet, receive_root, pointer_receive_root);
     match packet.kind.as_str() {
-        "start" => start_incoming_file_transfer(packet, transfers, receive_root),
+        "start" => {
+            let show_landing =
+                packet.destination_hint.as_deref() == Some(FILE_TRANSFER_DESTINATION_POINTER);
+            let file_name = packet.file_name.clone();
+            let accepted = start_incoming_file_transfer(packet, transfers, destination_root);
+            if accepted && show_landing {
+                if let Some(app) = landing_app {
+                    show_file_drop_landing_window(app, &file_name);
+                }
+            }
+            accepted
+        }
         "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
         "finish" => finish_incoming_file_transfer(packet, transfers),
         _ => false,
     }
+}
+
+fn file_transfer_destination_root<'a>(
+    packet: &FileTransferPacket,
+    receive_root: &'a Path,
+    pointer_receive_root: Option<&'a Path>,
+) -> &'a Path {
+    if packet.destination_hint.as_deref() == Some(FILE_TRANSFER_DESTINATION_POINTER) {
+        return pointer_receive_root.unwrap_or(receive_root);
+    }
+
+    receive_root
+}
+
+fn show_file_drop_landing_window(app: &AppHandle, _file_name: &str) {
+    let Some((x, y)) = current_pointer_position() else {
+        return;
+    };
+    let x = x - FILE_DROP_LANDING_WIDTH / 2.0;
+    let y = y - FILE_DROP_LANDING_HEIGHT / 2.0;
+
+    if let Some(window) = app.get_webview_window(FILE_DROP_LANDING_LABEL) {
+        let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
+        let _ = window.set_always_on_top(true);
+        let _ = window.show();
+        schedule_file_drop_landing_hide(app.clone());
+        return;
+    }
+
+    let build_result = WebviewWindowBuilder::new(
+        app,
+        FILE_DROP_LANDING_LABEL,
+        WebviewUrl::App("file-drop-landing.html".into()),
+    )
+    .title("")
+    .position(x, y)
+    .inner_size(FILE_DROP_LANDING_WIDTH, FILE_DROP_LANDING_HEIGHT)
+    .decorations(false)
+    .resizable(false)
+    .maximizable(false)
+    .minimizable(false)
+    .closable(false)
+    .shadow(false)
+    .transparent(true)
+    .always_on_top(true)
+    .visible_on_all_workspaces(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .build();
+
+    if let Err(error) = build_result {
+        log::warn!("file drop landing window failed: {error}");
+        return;
+    }
+
+    schedule_file_drop_landing_hide(app.clone());
+}
+
+fn schedule_file_drop_landing_hide(app: AppHandle) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(2200));
+        let main_handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(window) = main_handle.get_webview_window(FILE_DROP_LANDING_LABEL) {
+                let _ = window.hide();
+            }
+        });
+    });
+}
+
+fn current_pointer_position() -> Option<(f64, f64)> {
+    platform_current_pointer_position()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_current_pointer_position() -> Option<(f64, f64)> {
+    use core_graphics::{
+        event::CGEvent,
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    let event = CGEvent::new(source).ok()?;
+    let point = event.location();
+    Some((point.x, point.y))
+}
+
+#[cfg(target_os = "windows")]
+fn platform_current_pointer_position() -> Option<(f64, f64)> {
+    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+
+    let mut point = POINT { x: 0, y: 0 };
+    let ok = unsafe { GetCursorPos(&mut point) };
+    if ok == 0 {
+        return None;
+    }
+
+    Some((point.x as f64, point.y as f64))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn platform_current_pointer_position() -> Option<(f64, f64)> {
+    None
 }
 
 fn start_incoming_file_transfer(
@@ -7562,6 +7843,66 @@ mod tests {
     }
 
     #[test]
+    fn file_transfer_pointer_hint_writes_to_drop_destination() {
+        let layout = test_layout();
+        let default_root = temp_test_dir("file-transfer-default-root");
+        let drop_root = temp_test_dir("file-transfer-pointer-root");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet_with_destination_hint(
+                "start",
+                "transfer-pointer",
+                "desktop.txt",
+                7,
+                0,
+                0,
+                b"",
+                Some(FILE_TRANSFER_DESTINATION_POINTER),
+            ),
+            test_file_transfer_packet_with_destination_hint(
+                "chunk",
+                "transfer-pointer",
+                "desktop.txt",
+                7,
+                0,
+                0,
+                b"desktop",
+                Some(FILE_TRANSFER_DESTINATION_POINTER),
+            ),
+            test_file_transfer_packet_with_destination_hint(
+                "finish",
+                "transfer-pointer",
+                "desktop.txt",
+                7,
+                1,
+                7,
+                b"",
+                Some(FILE_TRANSFER_DESTINATION_POINTER),
+            ),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_destination_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &default_root,
+                Some(&drop_root),
+                None,
+            ));
+        }
+
+        assert!(!default_root.join("desktop.txt").exists());
+        assert_eq!(
+            fs::read_to_string(drop_root.join("desktop.txt")).expect("received file"),
+            "desktop"
+        );
+        let _ = fs::remove_dir_all(default_root);
+        let _ = fs::remove_dir_all(drop_root);
+    }
+
+    #[test]
     fn file_transfer_rejects_out_of_order_chunks() {
         let layout = test_layout();
         let root = temp_test_dir("file-transfer-order");
@@ -7614,6 +7955,29 @@ mod tests {
         offset: u64,
         data: &[u8],
     ) -> FileTransferPacket {
+        test_file_transfer_packet_with_destination_hint(
+            kind,
+            transfer_id,
+            file_name,
+            total_bytes,
+            chunk_index,
+            offset,
+            data,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_file_transfer_packet_with_destination_hint(
+        kind: &str,
+        transfer_id: &str,
+        file_name: &str,
+        total_bytes: u64,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+        destination_hint: Option<&str>,
+    ) -> FileTransferPacket {
         FileTransferPacket {
             protocol: FILE_TRANSFER_PROTOCOL.into(),
             kind: kind.into(),
@@ -7623,6 +7987,7 @@ mod tests {
             cluster_id: "cluster-test".into(),
             pair_secret: "secret-test".into(),
             file_name: file_name.into(),
+            destination_hint: destination_hint.map(str::to_string),
             total_bytes,
             chunk_index,
             offset,
