@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     net::{SocketAddr, UdpSocket},
     path::PathBuf,
@@ -55,6 +56,8 @@ const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
+const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
+const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
@@ -383,6 +386,7 @@ struct AppRuntime {
     clipboard_stop: Mutex<Option<Arc<AtomicBool>>>,
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
     clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
+    clipboard_last_sequences: Arc<Mutex<HashMap<String, u64>>>,
     remote_input_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
     allow_explicit_quit: Arc<AtomicBool>,
@@ -414,6 +418,7 @@ impl AppRuntime {
             clipboard_stop: Mutex::new(None),
             clipboard_seen_text: Arc::new(Mutex::new(None)),
             clipboard_echo_until: Arc::new(Mutex::new(None)),
+            clipboard_last_sequences: Arc::new(Mutex::new(HashMap::new())),
             remote_input_active: Arc::new(AtomicBool::new(false)),
             main_window_visible: Arc::new(AtomicBool::new(true)),
             allow_explicit_quit: Arc::new(AtomicBool::new(false)),
@@ -566,6 +571,7 @@ impl AppRuntime {
         let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
         let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
+        let clipboard_last_sequences = Arc::clone(&self.clipboard_last_sequences);
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let transport_packets_for_input = Arc::clone(&self.transport_packets);
         let transport_packets_for_stream = Arc::clone(&self.transport_packets);
@@ -615,14 +621,14 @@ impl AppRuntime {
                 &peers_for_pairing,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                return;
+                return true;
             }
 
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
-                return;
+                return false;
             }
             let Ok(layout) = layout_for_clipboard.lock() else {
-                return;
+                return false;
             };
             let current_peer = local_peer_from_layout(&layout);
             if handle_clipboard_packet(
@@ -631,10 +637,13 @@ impl AppRuntime {
                 &current_peer.id,
                 &clipboard_seen_text,
                 &clipboard_echo_until,
+                &clipboard_last_sequences,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
+            false
         });
 
         let identity_dir = self
@@ -3717,9 +3726,15 @@ struct ClipboardPacket {
     protocol: String,
     origin_id: String,
     #[serde(default)]
+    target_id: String,
+    #[serde(default)]
     cluster_id: String,
     #[serde(default)]
     pair_secret: String,
+    #[serde(default)]
+    signature: String,
+    #[serde(default)]
+    formats: Vec<ClipboardFormat>,
     // Empty when the payload is an image. Defaulted so packets from older peers
     // (text-only) still decode.
     #[serde(default)]
@@ -3731,19 +3746,38 @@ struct ClipboardPacket {
     sequence: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardFormat {
+    kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<ClipboardImage>,
+}
+
 fn clipboard_packet_from_content(
     content: ClipboardContent,
     origin_id: String,
+    target_id: String,
     cluster_id: String,
     pair_secret: String,
     sequence: u64,
 ) -> ClipboardPacket {
+    let signature = content.signature();
     match content {
         ClipboardContent::Text(text) => ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id,
+            target_id,
             cluster_id,
             pair_secret,
+            signature,
+            formats: vec![ClipboardFormat {
+                kind: "plainText".into(),
+                text: text.clone(),
+                image: None,
+            }],
             text,
             image: None,
             sequence,
@@ -3751,8 +3785,15 @@ fn clipboard_packet_from_content(
         ClipboardContent::Image(image) => ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id,
+            target_id,
             cluster_id,
             pair_secret,
+            signature,
+            formats: vec![ClipboardFormat {
+                kind: "imageRgba".into(),
+                text: String::new(),
+                image: Some(image.clone()),
+            }],
             text: String::new(),
             image: Some(image),
             sequence,
@@ -3857,6 +3898,7 @@ fn run_clipboard_sync(
         let packet = clipboard_packet_from_content(
             content,
             local_peer_id.clone(),
+            target.device_id.clone(),
             target.cluster_id.clone(),
             target.pair_secret.clone(),
             sequence,
@@ -3868,7 +3910,7 @@ fn run_clipboard_sync(
                 target.transport_public_key.clone(),
                 target.protocol_version,
             );
-            if quic_transport.send_stream(peer, payload).is_ok() {
+            if quic_transport.send_stream_expect_ack(peer, payload).is_ok() {
                 transport_packets.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
                 last_failed = None;
@@ -3904,13 +3946,70 @@ fn arm_clipboard_echo_guard(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) 
     }
 }
 
+fn write_clipboard_content_with_retry(content: &ClipboardContent) -> Result<(), String> {
+    retry_clipboard_content_write(
+        content,
+        CLIPBOARD_WRITE_ATTEMPTS,
+        Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
+        clipboard::write_content,
+    )
+}
+
+fn retry_clipboard_content_write<F>(
+    content: &ClipboardContent,
+    attempts: usize,
+    retry_delay: Duration,
+    mut write_content: F,
+) -> Result<(), String>
+where
+    F: FnMut(&ClipboardContent) -> Result<(), String>,
+{
+    let attempts = attempts.max(1);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match write_content(content) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < attempts && !retry_delay.is_zero() {
+            thread::sleep(retry_delay);
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "failed to write clipboard content".into()))
+}
+
 fn handle_clipboard_packet(
     payload: &[u8],
     layout: &LayoutState,
     local_peer_id: &str,
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+    clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> bool {
+    handle_clipboard_packet_with_writer(
+        payload,
+        layout,
+        local_peer_id,
+        clipboard_seen_text,
+        clipboard_echo_until,
+        clipboard_last_sequences,
+        write_clipboard_content_with_retry,
+    )
+}
+
+fn handle_clipboard_packet_with_writer<F>(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    clipboard_seen_text: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+    clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    mut write_content: F,
+) -> bool
+where
+    F: FnMut(&ClipboardContent) -> Result<(), String>,
+{
     let Some(packet) = decode_wire_packet::<ClipboardPacket>(payload) else {
         return false;
     };
@@ -3920,32 +4019,44 @@ fn handle_clipboard_packet(
     }
 
     if !clipboard_packet_authorized(layout, &packet) {
-        return true;
+        return false;
+    }
+
+    if !clipboard_packet_targets_local(layout, &packet, local_peer_id) {
+        return false;
     }
 
     if packet.origin_id == local_peer_id {
         return true;
     }
 
-    let content = if let Some(image) = packet.image {
-        Some(ClipboardContent::Image(image))
-    } else if !packet.text.is_empty() {
-        Some(ClipboardContent::Text(packet.text))
-    } else {
-        None
-    };
+    if !clipboard_packet_sequence_is_current(&packet, clipboard_last_sequences) {
+        return false;
+    }
+
+    let accepted_sequence = clipboard_packet_sequence(&packet);
+    let content = clipboard_content_from_packet(packet);
 
     let Some(content) = content else {
-        return true;
+        return false;
     };
     if content.is_oversized() {
-        return true;
+        return false;
     }
 
     let signature = content.signature();
-    let written = clipboard::write_content(&content).is_ok();
+    let written = match write_content(&content) {
+        Ok(()) => true,
+        Err(error) => {
+            log::warn!("clipboard receive write failed: {error}");
+            false
+        }
+    };
 
     if written {
+        if let Some((origin_id, sequence)) = accepted_sequence {
+            remember_clipboard_packet_sequence(clipboard_last_sequences, origin_id, sequence);
+        }
         // Remember what we just wrote so our own poll loop recognizes it as an
         // echo (signature match) and arm the time-based guard as a backstop in
         // case the OS hands the bitmap back to us with slightly different bytes.
@@ -3955,7 +4066,88 @@ fn handle_clipboard_packet(
         arm_clipboard_echo_guard(clipboard_echo_until);
     }
 
-    true
+    written
+}
+
+fn clipboard_packet_sequence(packet: &ClipboardPacket) -> Option<(String, u64)> {
+    if packet.formats.is_empty() || packet.origin_id.trim().is_empty() {
+        None
+    } else {
+        Some((packet.origin_id.clone(), packet.sequence))
+    }
+}
+
+fn clipboard_packet_sequence_is_current(
+    packet: &ClipboardPacket,
+    clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+) -> bool {
+    let Some((origin_id, sequence)) = clipboard_packet_sequence(packet) else {
+        return true;
+    };
+
+    clipboard_last_sequences
+        .lock()
+        .map(|last_sequences| {
+            last_sequences
+                .get(&origin_id)
+                .map(|last_sequence| sequence > *last_sequence)
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
+}
+
+fn remember_clipboard_packet_sequence(
+    clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    origin_id: String,
+    sequence: u64,
+) {
+    if let Ok(mut last_sequences) = clipboard_last_sequences.lock() {
+        last_sequences
+            .entry(origin_id)
+            .and_modify(|last_sequence| *last_sequence = (*last_sequence).max(sequence))
+            .or_insert(sequence);
+    }
+}
+
+fn clipboard_packet_targets_local(
+    layout: &LayoutState,
+    packet: &ClipboardPacket,
+    local_peer_id: &str,
+) -> bool {
+    if packet.target_id.trim().is_empty() || packet.target_id == local_peer_id {
+        return true;
+    }
+
+    layout
+        .devices
+        .iter()
+        .any(|device| device.role == "local" && device.id == packet.target_id)
+}
+
+fn clipboard_content_from_packet(packet: ClipboardPacket) -> Option<ClipboardContent> {
+    if let Some(content) = packet
+        .formats
+        .into_iter()
+        .find_map(clipboard_content_from_format)
+    {
+        return Some(content);
+    }
+
+    if let Some(image) = packet.image {
+        Some(ClipboardContent::Image(image))
+    } else if !packet.text.is_empty() {
+        Some(ClipboardContent::Text(packet.text))
+    } else {
+        None
+    }
+}
+
+fn clipboard_content_from_format(format: ClipboardFormat) -> Option<ClipboardContent> {
+    match format.kind.as_str() {
+        "plainText" if !format.text.is_empty() => Some(ClipboardContent::Text(format.text)),
+        "imageRgba" => format.image.map(ClipboardContent::Image),
+        _ => None,
+    }
 }
 
 fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -> bool {
@@ -5748,8 +5940,15 @@ mod tests {
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id: "attacker".into(),
+            target_id: "local-device".into(),
             cluster_id: layout.cluster_id.clone(),
             pair_secret: layout.pair_secret.clone(),
+            signature: "text:hello".into(),
+            formats: vec![ClipboardFormat {
+                kind: "plainText".into(),
+                text: "hello".into(),
+                image: None,
+            }],
             text: "hello".into(),
             image: None,
             sequence: 1,
@@ -5774,6 +5973,234 @@ mod tests {
         });
 
         assert_ne!(first.signature(), second.signature());
+    }
+
+    #[test]
+    fn clipboard_image_packet_fits_transport_stream_budget() {
+        let raw_rgba_bytes = 800 * 600 * 4;
+        let encoded_len = raw_rgba_bytes / 3 * 4;
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Image(ClipboardImage {
+                width: 800,
+                height: 600,
+                rgba_base64: "A".repeat(encoded_len),
+            }),
+            "local-device".into(),
+            "peer-device".into(),
+            "cluster-test".into(),
+            "secret-test".into(),
+            1,
+        );
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+
+        assert!(
+            payload.len() <= quic_transport::MAX_STREAM_BYTES,
+            "clipboard image packet is {} bytes but stream budget is {} bytes",
+            payload.len(),
+            quic_transport::MAX_STREAM_BYTES
+        );
+    }
+
+    #[test]
+    fn clipboard_packet_uses_formats_envelope() {
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Text("hello".into()),
+            "local-device".into(),
+            "peer-device".into(),
+            "cluster-test".into(),
+            "secret-test".into(),
+            42,
+        );
+
+        assert_eq!(packet.target_id, "peer-device");
+        assert_eq!(packet.signature, "text:hello");
+        assert_eq!(packet.formats.len(), 1);
+        assert_eq!(packet.formats[0].kind, "plainText");
+        assert_eq!(packet.formats[0].text, "hello");
+        assert!(packet.formats[0].image.is_none());
+        assert_eq!(packet.text, "hello");
+    }
+
+    #[test]
+    fn clipboard_write_retries_transient_failures() {
+        let content = ClipboardContent::Text("hello".into());
+        let mut calls = 0;
+
+        let result = retry_clipboard_content_write(&content, 3, Duration::ZERO, |_| {
+            calls += 1;
+            if calls < 3 {
+                Err("clipboard busy".into())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn clipboard_formats_only_text_packet_is_accepted() {
+        let layout = test_layout();
+        let packet = ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            origin_id: "peer-client-10-0-0-2".into(),
+            target_id: "local-device".into(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            signature: "text:hello".into(),
+            formats: vec![ClipboardFormat {
+                kind: "plainText".into(),
+                text: "hello".into(),
+                image: None,
+            }],
+            text: String::new(),
+            image: None,
+            sequence: 1,
+        };
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut written = None;
+
+        let accepted = handle_clipboard_packet_with_writer(
+            &payload,
+            &layout,
+            "local-device",
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            |content| {
+                if let ClipboardContent::Text(text) = content {
+                    written = Some(text.clone());
+                }
+                Ok(())
+            },
+        );
+
+        assert!(accepted);
+        assert_eq!(written.as_deref(), Some("hello"));
+        assert_eq!(
+            clipboard_seen_text.lock().expect("seen lock").as_deref(),
+            Some("text:hello")
+        );
+    }
+
+    #[test]
+    fn clipboard_legacy_text_packet_is_still_accepted() {
+        let layout = test_layout();
+        let packet = ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            origin_id: "peer-client-10-0-0-2".into(),
+            target_id: String::new(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            signature: String::new(),
+            formats: Vec::new(),
+            text: "legacy".into(),
+            image: None,
+            sequence: 1,
+        };
+        let payload = encode_wire_packet(&packet).expect("legacy clipboard packet should encode");
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut written = None;
+
+        let accepted = handle_clipboard_packet_with_writer(
+            &payload,
+            &layout,
+            "local-device",
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            |content| {
+                if let ClipboardContent::Text(text) = content {
+                    written = Some(text.clone());
+                }
+                Ok(())
+            },
+        );
+
+        assert!(accepted);
+        assert_eq!(written.as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn clipboard_formats_packet_rejects_stale_sequence() {
+        let layout = test_layout();
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut written = Vec::new();
+
+        let first = clipboard_packet_from_content(
+            ClipboardContent::Text("new".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            10,
+        );
+        let stale = clipboard_packet_from_content(
+            ClipboardContent::Text("old".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            9,
+        );
+
+        for packet in [first, stale] {
+            let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+            let _ = handle_clipboard_packet_with_writer(
+                &payload,
+                &layout,
+                "local-device",
+                &clipboard_seen_text,
+                &clipboard_echo_until,
+                &clipboard_last_sequences,
+                |content| {
+                    if let ClipboardContent::Text(text) = content {
+                        written.push(text.clone());
+                    }
+                    Ok(())
+                },
+            );
+        }
+
+        assert_eq!(written, vec!["new"]);
+    }
+
+    #[test]
+    fn clipboard_text_packet_rejects_when_system_write_fails() {
+        let layout = test_layout();
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Text("hello".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            1,
+        );
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+
+        let accepted = handle_clipboard_packet_with_writer(
+            &payload,
+            &layout,
+            "local-device",
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            |_| Err("clipboard busy".into()),
+        );
+
+        assert!(!accepted);
+        assert!(clipboard_seen_text.lock().expect("seen lock").is_none());
     }
 
     #[test]

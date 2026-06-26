@@ -28,10 +28,13 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 const SERVER_NAME: &str = "mykvm.local";
 const MAX_DATAGRAM_BYTES: usize = 16 * 1024;
-const MAX_STREAM_BYTES: usize = 512 * 1024;
+// Clipboard images are sent as RGBA base64 over streams. The clipboard module
+// caps decoded images at 32 MiB, which becomes roughly 43 MiB on the wire.
+pub(crate) const MAX_STREAM_BYTES: usize = 48 * 1024 * 1024;
 const PORT_SCAN_COUNT: u16 = 64;
 
-type PacketHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
+type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
+type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> bool + Send + Sync + 'static>;
 
 #[derive(Clone, Debug)]
 pub struct PeerEndpoint {
@@ -78,6 +81,23 @@ impl TransportHandle {
     }
 
     pub fn send_stream(&self, peer: PeerEndpoint, payload: Vec<u8>) -> Result<(), String> {
+        self.send_stream_inner(peer, payload, false)
+    }
+
+    pub fn send_stream_expect_ack(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+    ) -> Result<(), String> {
+        self.send_stream_inner(peer, payload, true)
+    }
+
+    fn send_stream_inner(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+        ack_required: bool,
+    ) -> Result<(), String> {
         if payload.len() > MAX_STREAM_BYTES {
             return Err(format!(
                 "QUIC stream payload is too large: {} bytes",
@@ -90,6 +110,7 @@ impl TransportHandle {
             .send(TransportCommand::SendStream {
                 peer,
                 payload,
+                ack_required,
                 result: result_tx,
             })
             .map_err(|_| "QUIC transport is stopped".to_string())?;
@@ -111,6 +132,7 @@ enum TransportCommand {
     SendStream {
         peer: PeerEndpoint,
         payload: Vec<u8>,
+        ack_required: bool,
         result: mpsc::Sender<Result<(), String>>,
     },
     Shutdown,
@@ -125,8 +147,8 @@ struct PeerKey {
 pub fn start(
     preferred_port: u16,
     identity_dir: PathBuf,
-    on_datagram: PacketHandler,
-    on_stream: PacketHandler,
+    on_datagram: DatagramHandler,
+    on_stream: StreamHandler,
 ) -> Result<TransportHandle, String> {
     // Load (or create-and-persist) this machine's transport identity *before*
     // spawning the runtime thread so a stable public key is reused across
@@ -182,8 +204,8 @@ async fn run_transport(
     preferred_port: u16,
     identity: TransportIdentity,
     mut commands: tokio_mpsc::UnboundedReceiver<TransportCommand>,
-    on_datagram: PacketHandler,
-    on_stream: PacketHandler,
+    on_datagram: DatagramHandler,
+    on_stream: StreamHandler,
     ready_tx: mpsc::Sender<Result<ReadyTransport, String>>,
 ) {
     let (endpoint, public_key) = match bind_endpoint(preferred_port, &identity) {
@@ -217,9 +239,11 @@ async fn run_transport(
             TransportCommand::SendStream {
                 peer,
                 payload,
+                ack_required,
                 result,
             } => {
-                let send_result = send_stream(&endpoint, &mut connections, peer, payload).await;
+                let send_result =
+                    send_stream(&endpoint, &mut connections, peer, payload, ack_required).await;
                 if let Err(error) = &send_result {
                     log::warn!("QUIC stream send failed: {error}");
                 }
@@ -489,7 +513,7 @@ fn client_config(peer: &PeerEndpoint) -> Result<ClientConfig, String> {
     Ok(config)
 }
 
-fn spawn_accept_loop(endpoint: Endpoint, on_datagram: PacketHandler, on_stream: PacketHandler) {
+fn spawn_accept_loop(endpoint: Endpoint, on_datagram: DatagramHandler, on_stream: StreamHandler) {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let remote = incoming.remote_address();
@@ -514,7 +538,7 @@ fn spawn_accept_loop(endpoint: Endpoint, on_datagram: PacketHandler, on_stream: 
 fn spawn_datagram_reader(
     connection: quinn::Connection,
     remote: SocketAddr,
-    on_datagram: PacketHandler,
+    on_datagram: DatagramHandler,
 ) {
     tokio::spawn(async move {
         loop {
@@ -532,7 +556,7 @@ fn spawn_datagram_reader(
 fn spawn_stream_reader(
     connection: quinn::Connection,
     remote: SocketAddr,
-    on_stream: PacketHandler,
+    on_stream: StreamHandler,
 ) {
     tokio::spawn(async move {
         loop {
@@ -542,8 +566,9 @@ fn spawn_stream_reader(
                     tokio::spawn(async move {
                         match recv.read_to_end(MAX_STREAM_BYTES).await {
                             Ok(payload) => {
-                                on_stream(payload, remote);
-                                let _ = send.write_all(b"ok").await;
+                                let accepted = on_stream(payload, remote);
+                                let ack: &[u8] = if accepted { b"ok" } else { b"reject" };
+                                let _ = send.write_all(ack).await;
                                 let _ = send.finish();
                             }
                             Err(error) => {
@@ -578,6 +603,7 @@ async fn send_stream(
     connections: &mut HashMap<PeerKey, quinn::Connection>,
     peer: PeerEndpoint,
     payload: Vec<u8>,
+    ack_required: bool,
 ) -> Result<(), String> {
     let connection = connection_for(endpoint, connections, &peer).await?;
     let (mut send, mut recv) = connection
@@ -589,8 +615,30 @@ async fn send_stream(
         .map_err(|error| format!("failed to write QUIC stream: {error}"))?;
     send.finish()
         .map_err(|error| format!("failed to finish QUIC stream: {error}"))?;
-    let _ = tokio::time::timeout(Duration::from_millis(500), recv.read_to_end(64)).await;
+    let ack = tokio::time::timeout(Duration::from_millis(500), recv.read_to_end(64)).await;
+    if ack_required {
+        match ack {
+            Ok(Ok(bytes)) => verify_stream_ack(&bytes)?,
+            Ok(Err(error)) => {
+                return Err(format!("failed to read QUIC stream ack: {error}"));
+            }
+            Err(_) => {
+                return Err("QUIC stream ack timed out".into());
+            }
+        }
+    }
     Ok(())
+}
+
+fn verify_stream_ack(bytes: &[u8]) -> Result<(), String> {
+    if bytes == b"ok" {
+        Ok(())
+    } else {
+        Err(format!(
+            "QUIC stream receiver rejected payload: {}",
+            String::from_utf8_lossy(bytes)
+        ))
+    }
 }
 
 async fn connection_for(
@@ -681,6 +729,12 @@ mod tests {
             protocol_version: PROTOCOL_VERSION + 1,
         };
         assert!(client_config(&peer).is_err());
+    }
+
+    #[test]
+    fn stream_ack_rejects_non_ok_payloads() {
+        assert!(verify_stream_ack(b"ok").is_ok());
+        assert!(verify_stream_ack(b"reject").is_err());
     }
 
     #[test]
