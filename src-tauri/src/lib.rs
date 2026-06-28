@@ -1816,7 +1816,7 @@ fn restart_as_admin(app: AppHandle, state: tauri::State<'_, AppRuntime>) -> Resu
 
         release_single_instance();
         restart_current_process_as_admin()?;
-        app.exit(0);
+        request_app_quit(&app);
         Ok(())
     }
 
@@ -2876,7 +2876,7 @@ fn spawn_instance_event_listener(name: &str, app: AppHandle, event_kind: Instanc
                 });
             }
             InstanceEvent::Quit => {
-                app.exit(0);
+                request_app_quit(&app);
                 break;
             }
         }
@@ -2884,21 +2884,26 @@ fn spawn_instance_event_listener(name: &str, app: AppHandle, event_kind: Instanc
 }
 
 fn request_app_quit(app: &AppHandle) {
-    if let Some(state) = app.try_state::<AppRuntime>() {
-        state.allow_explicit_quit.store(true, Ordering::Relaxed);
-    }
+    mark_explicit_quit(app);
     app.exit(0);
 }
 
-#[cfg(target_os = "macos")]
-fn should_allow_macos_exit(app: &AppHandle, code: Option<i32>) -> bool {
-    if code == Some(tauri::RESTART_EXIT_CODE) {
-        return true;
+fn mark_explicit_quit(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        state.allow_explicit_quit.store(true, Ordering::Relaxed);
     }
+}
 
-    app.try_state::<AppRuntime>()
+fn should_allow_app_exit(app: &AppHandle, code: Option<i32>) -> bool {
+    let explicit_quit = app
+        .try_state::<AppRuntime>()
         .map(|state| state.allow_explicit_quit.swap(false, Ordering::Relaxed))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    should_allow_app_exit_request(code, explicit_quit)
+}
+
+fn should_allow_app_exit_request(code: Option<i32>, explicit_quit: bool) -> bool {
+    code == Some(tauri::RESTART_EXIT_CODE) || explicit_quit
 }
 
 fn launched_from_autostart() -> bool {
@@ -3259,28 +3264,21 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            #[cfg(target_os = "macos")]
-            {
-                match event {
-                    tauri::RunEvent::ExitRequested { code, api, .. } => {
-                        if !should_allow_macos_exit(app, code) {
-                            api.prevent_exit();
-                            let _ = hide_main_window_handle(app);
-                        }
-                    }
-                    tauri::RunEvent::Reopen {
-                        has_visible_windows: false,
-                        ..
-                    } => {
-                        let _ = show_main_window_handle(app);
-                    }
-                    _ => {}
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
+                if !should_allow_app_exit(app, code) {
+                    api.prevent_exit();
+                    let _ = hide_main_window_handle(app);
                 }
             }
-
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app, event);
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => {
+                let _ = show_main_window_handle(app);
+            }
+            _ => {}
         });
 }
 
@@ -7380,6 +7378,16 @@ mod tests {
             app_version: "test".into(),
             last_seen_ms: now_ms(),
         }
+    }
+
+    #[test]
+    fn app_exit_policy_blocks_implicit_last_window_exit() {
+        assert!(!should_allow_app_exit_request(None, false));
+        assert!(should_allow_app_exit_request(None, true));
+        assert!(should_allow_app_exit_request(
+            Some(tauri::RESTART_EXIT_CODE),
+            false
+        ));
     }
 
     #[test]
