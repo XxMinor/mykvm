@@ -2482,7 +2482,7 @@ pub fn run() {
                 }
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
-                    let _ = destroy_main_window_handle(window.app_handle());
+                    let _ = hide_main_window_handle(window.app_handle());
                 }
             }
         })
@@ -2570,7 +2570,7 @@ pub fn run() {
             apply_custom_chrome(app.handle())?;
             setup_single_instance_events(app.handle().clone());
             if silent_launch {
-                destroy_main_window_handle(app.handle())?;
+                hide_main_window_handle(app.handle())?;
             } else {
                 show_main_window_handle(app.handle())?;
             }
@@ -2726,7 +2726,46 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
 }
 
 fn hide_main_window_handle(app: &AppHandle) -> Result<(), String> {
-    destroy_main_window_handle(app)
+    match main_window_hide_mode() {
+        MainWindowHideMode::Hide => hide_existing_main_window_handle(app),
+        MainWindowHideMode::Destroy => destroy_main_window_handle(app),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainWindowHideMode {
+    Hide,
+    Destroy,
+}
+
+fn main_window_hide_mode() -> MainWindowHideMode {
+    main_window_hide_mode_for_target(std::env::consts::OS)
+}
+
+fn main_window_hide_mode_for_target(target_os: &str) -> MainWindowHideMode {
+    if target_os == "macos" {
+        MainWindowHideMode::Destroy
+    } else {
+        MainWindowHideMode::Hide
+    }
+}
+
+fn hide_existing_main_window_handle(app: &AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("main") else {
+        set_main_window_visible(app, false);
+        set_main_window_focused(app, false);
+        return Ok(());
+    };
+    let result = window
+        .hide()
+        .map_err(|error| format!("failed to hide main window: {error}"));
+
+    if result.is_ok() {
+        set_main_window_visible(app, false);
+        set_main_window_focused(app, false);
+    }
+
+    result
 }
 
 fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
@@ -5709,6 +5748,22 @@ mod tests {
             app_version: "test".into(),
             last_seen_ms: now_ms(),
         }
+    }
+
+    #[test]
+    fn main_window_hide_policy_keeps_non_macos_window_alive_for_tray() {
+        assert_eq!(
+            main_window_hide_mode_for_target("windows"),
+            MainWindowHideMode::Hide
+        );
+        assert_eq!(
+            main_window_hide_mode_for_target("linux"),
+            MainWindowHideMode::Hide
+        );
+        assert_eq!(
+            main_window_hide_mode_for_target("macos"),
+            MainWindowHideMode::Destroy
+        );
     }
 
     #[test]
