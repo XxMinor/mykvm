@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        mpsc, Arc, Mutex, OnceLock, TryLockError,
     },
     thread,
     time::{Duration, Instant},
@@ -42,6 +42,8 @@ static INPUT_TX_SKIPS: AtomicU64 = AtomicU64::new(0);
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE: AtomicBool = AtomicBool::new(true);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Edge {
@@ -54,6 +56,9 @@ enum Edge {
 #[derive(Debug, Clone)]
 struct InputTarget {
     device_id: String,
+    origin_device_id: String,
+    cluster_id: String,
+    pair_secret: String,
     target_addr: String,
     target_platform: String,
     transport_public_key: String,
@@ -174,6 +179,7 @@ pub fn start_input_runtime(
     if layout.input_mode == "receive" {
         remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&clipboard_target);
+        start_platform_receive_monitor(stop);
         return (receive_only_status(), inject_status);
     }
 
@@ -478,6 +484,7 @@ fn start_platform_capture(
     let (ready_tx, ready_rx) = mpsc::channel();
 
     thread::spawn(move || {
+        refresh_windows_input_desktop_cache();
         let context = Arc::new(WindowsCaptureContext {
             quic_transport,
             layout_state,
@@ -542,7 +549,7 @@ fn start_platform_capture(
         while !stop.load(Ordering::Relaxed) {
             if last_desktop_check.elapsed() >= Duration::from_millis(100) {
                 last_desktop_check = Instant::now();
-                if !windows_input_desktop_is_default() {
+                if !refresh_windows_input_desktop_cache() {
                     release_windows_remote_control(&context, true);
                 }
             }
@@ -597,6 +604,20 @@ fn start_platform_capture(
     unsupported_capture_status()
 }
 
+#[cfg(target_os = "windows")]
+fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        refresh_windows_input_desktop_cache();
+        while !stop.load(Ordering::Relaxed) {
+            refresh_windows_input_desktop_cache();
+            thread::sleep(Duration::from_millis(WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS));
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_platform_receive_monitor(_stop: Arc<AtomicBool>) {}
+
 fn no_target_status(layout: &LayoutState) -> NativeStageStatus {
     let remote_count = layout
         .devices
@@ -647,6 +668,7 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
         .or_else(|| native_layout.devices.first());
 
     let local_screens = &local_device.screens;
+    let origin_device_id = crate::local_peer_from_layout(layout).id;
     let mut targets = Vec::new();
 
     for device in layout.devices.iter().filter(|device| {
@@ -676,6 +698,9 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
                 if let Some(edge) = touching_edge(layout_local_screen, remote_screen) {
                     targets.push(InputTarget {
                         device_id: device.id.clone(),
+                        origin_device_id: origin_device_id.clone(),
+                        cluster_id: layout.cluster_id.clone(),
+                        pair_secret: layout.pair_secret.clone(),
                         target_addr: format!("{}:{}", device.host, quic_port),
                         target_platform: device.platform.clone(),
                         transport_public_key: device.transport_public_key.clone(),
@@ -895,14 +920,18 @@ fn input_packet_context(
         protocol_version: target.protocol_version,
     };
 
-    let Ok(layout) = layout_state.lock() else {
-        return InputPacketContext {
-            origin_device_id: String::new(),
-            cluster_id: String::new(),
-            pair_secret: String::new(),
-            peer: Some(fallback_peer()),
-            event,
-        };
+    let fallback_context = |event| InputPacketContext {
+        origin_device_id: target.origin_device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        peer: Some(fallback_peer()),
+        event,
+    };
+
+    let layout = match layout_state.try_lock() {
+        Ok(layout) => layout,
+        Err(TryLockError::WouldBlock) => return fallback_context(event),
+        Err(TryLockError::Poisoned(_)) => return fallback_context(event),
     };
 
     let origin_device_id = origin_peer_id(&layout);
@@ -1484,28 +1513,12 @@ fn should_route_to_windows_helper(command: &InputCommand) -> bool {
 }
 
 /// Cached check of whether the current input desktop is "Default", for the
-/// inject path. Probing `OpenInputDesktop` on every input datagram is too
-/// expensive for high-frequency mouse moves, so the result is cached for a short
-/// TTL. When the workstation locks, the user-mode app can no longer open the
-/// secure input desktop, so `windows_input_desktop_is_default()` returns false
-/// and we route to the helper.
+/// inject path. Probing `OpenInputDesktop` from the mouse/datagram hot path is
+/// expensive enough to show up as periodic dropped frames, so capture/receive
+/// monitor threads refresh this cache out of band.
 #[cfg(target_os = "windows")]
 fn windows_inject_desktop_is_default() -> bool {
-    const DESKTOP_PROBE_TTL: Duration = Duration::from_millis(100);
-
-    static CACHE: OnceLock<Mutex<(Instant, bool)>> = OnceLock::new();
-    let cell = CACHE.get_or_init(|| Mutex::new((Instant::now() - DESKTOP_PROBE_TTL, true)));
-
-    if let Ok(mut guard) = cell.lock() {
-        if guard.0.elapsed() < DESKTOP_PROBE_TTL {
-            return guard.1;
-        }
-        let value = windows_input_desktop_is_default();
-        *guard = (Instant::now(), value);
-        value
-    } else {
-        windows_input_desktop_is_default()
-    }
+    cached_windows_input_desktop_is_default()
 }
 
 fn input_event_to_command(
@@ -1982,7 +1995,7 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
-    if !windows_input_desktop_is_default() {
+    if !cached_windows_input_desktop_is_default() {
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
@@ -2020,7 +2033,7 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
-    if !windows_input_desktop_is_default() {
+    if !cached_windows_input_desktop_is_default() {
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
@@ -2168,6 +2181,18 @@ fn windows_foreground_window_is_fullscreen_cached(context: &WindowsCaptureContex
     }
 
     windows_foreground_window_is_fullscreen()
+}
+
+#[cfg(target_os = "windows")]
+fn cached_windows_input_desktop_is_default() -> bool {
+    WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_windows_input_desktop_cache() -> bool {
+    let value = windows_input_desktop_is_default();
+    WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE.store(value, Ordering::Relaxed);
+    value
 }
 
 #[cfg(target_os = "windows")]
@@ -4224,6 +4249,9 @@ mod tests {
     fn target_for_coordinate_tests() -> InputTarget {
         InputTarget {
             device_id: "peer-device".into(),
+            origin_device_id: "peer-local-192-168-66-92".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47833".into(),
             target_platform: "windows".into(),
             transport_public_key: "test-public-key".into(),
@@ -4351,6 +4379,9 @@ mod tests {
         let entry = screen("peer-device", "peer-device-scr-1", 1920, 0, 1920, 1080);
         let target = InputTarget {
             device_id: "peer-device".into(),
+            origin_device_id: "peer-local-192-168-66-92".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47834".into(),
             target_platform: "windows".into(),
             transport_public_key: "peer-public-key".into(),
@@ -4403,6 +4434,9 @@ mod tests {
         );
         let target = InputTarget {
             device_id: "peer-device".into(),
+            origin_device_id: "peer-local-192-168-66-92".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47834".into(),
             target_platform: "windows".into(),
             transport_public_key: "peer-public-key".into(),
@@ -4448,6 +4482,9 @@ mod tests {
         );
         let target = InputTarget {
             device_id: "peer-device".into(),
+            origin_device_id: "peer-local-192-168-66-92".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47834".into(),
             target_platform: "windows".into(),
             transport_public_key: "peer-public-key".into(),
@@ -4510,6 +4547,9 @@ mod tests {
         ] {
             let target = InputTarget {
                 device_id: "peer-device".into(),
+                origin_device_id: "peer-local-192-168-66-92".into(),
+                cluster_id: "cluster-test".into(),
+                pair_secret: "secret-test".into(),
                 target_addr: "10.0.0.2:47834".into(),
                 target_platform: "windows".into(),
                 transport_public_key: "peer-public-key".into(),
@@ -4595,6 +4635,36 @@ mod tests {
 
         assert_ne!(expected_origin_id, "local-device");
         assert_eq!(context.origin_device_id, expected_origin_id);
+    }
+
+    #[test]
+    fn input_packet_context_uses_cached_target_when_layout_lock_is_busy() {
+        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
+        let _held_layout = layout_state.lock().expect("hold layout lock");
+        let target = target_for_coordinate_tests();
+        let layout_state_for_thread = Arc::clone(&layout_state);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let context = input_packet_context(
+                &target,
+                InputEvent::MouseMove {
+                    screen_id: "local-display-1".into(),
+                    x: 10,
+                    y: 20,
+                },
+                &layout_state_for_thread,
+            );
+            tx.send(context).expect("send packet context");
+        });
+
+        let context = rx
+            .recv_timeout(Duration::from_millis(50))
+            .expect("packet context should not block on the layout lock");
+        assert_eq!(context.origin_device_id, "peer-local-192-168-66-92");
+        assert_eq!(context.cluster_id, "cluster-test");
+        assert_eq!(context.pair_secret, "secret-test");
+        assert!(context.peer.is_some());
     }
 
     #[test]
@@ -4802,6 +4872,9 @@ mod tests {
     fn crossing_uses_native_edge_before_mapping_to_layout() {
         let target = InputTarget {
             device_id: "peer-device".into(),
+            origin_device_id: "peer-local-192-168-66-92".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47833".into(),
             target_platform: "windows".into(),
             transport_public_key: "test-public-key".into(),
@@ -4833,6 +4906,9 @@ mod tests {
     fn crossing_rejects_fast_jump_from_middle() {
         let target = InputTarget {
             device_id: "peer-device".into(),
+            origin_device_id: "peer-local-192-168-66-92".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47833".into(),
             target_platform: "windows".into(),
             transport_public_key: "test-public-key".into(),
@@ -5031,6 +5107,18 @@ mod tests {
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].target_addr, "10.0.0.2:52001");
+    }
+
+    #[test]
+    fn input_targets_cache_pairing_context_for_hot_path() {
+        let layout = layout_for_target_tests();
+        let expected_origin_id = crate::local_peer_from_layout(&layout).id;
+        let targets = build_input_targets(&layout, &layout);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].origin_device_id, expected_origin_id);
+        assert_eq!(targets[0].cluster_id, "cluster-test");
+        assert_eq!(targets[0].pair_secret, "secret-test");
     }
 
     #[test]
