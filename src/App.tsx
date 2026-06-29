@@ -58,6 +58,7 @@ import {
   getScreenById,
   moveScreen,
   screenPositionOverlaps,
+  snapOverlappingScreenPosition,
   snapScreenPosition,
 } from "./layout";
 import type { FlattenedScreen, LayoutBounds } from "./layout";
@@ -961,8 +962,30 @@ function App() {
   }, []);
 
   const endDrag = useEffectEvent(() => {
-    if (layout) {
-      void persistLayout(layout);
+    if (layout && dragState) {
+      const screen = getScreenById(layout, dragState.screenId);
+      const currentPosition = screen ? { x: screen.x, y: screen.y } : null;
+      const startPosition = { x: dragState.startX, y: dragState.startY };
+      const nextLayout =
+        screen &&
+        currentPosition &&
+        screenPositionOverlaps(layout, dragState.screenId, currentPosition)
+          ? moveScreen(
+              layout,
+              dragState.screenId,
+              snapOverlappingScreenPosition(
+                layout,
+                dragState.screenId,
+                currentPosition,
+                startPosition,
+              ) ?? startPosition,
+            )
+          : layout;
+
+      setSnapshot((current) =>
+        current ? { ...current, layout: nextLayout } : current,
+      );
+      void persistLayout(nextLayout);
     }
     setDragState(null);
   });
@@ -997,9 +1020,6 @@ function App() {
         x: dragState.startX + deltaX,
         y: dragState.startY + deltaY,
       });
-      if (screenPositionOverlaps(current.layout, dragState.screenId, nextPosition)) {
-        return current;
-      }
 
       return {
         ...current,
@@ -1369,9 +1389,7 @@ function App() {
       const nextSnapshot = await resetPairing();
       setSnapshot(nextSnapshot);
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.pairingFailed,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.pairingFailed));
     }
   }
 
@@ -1463,9 +1481,7 @@ function App() {
       setServerPairingCode("");
       setServerPairingError(null);
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.pairingFailed,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.pairingFailed));
     } finally {
       setIsPairingDevice(false);
     }
@@ -1511,9 +1527,7 @@ function App() {
       setServerPairingCode("");
       setServerPairingError(null);
     } catch (error: unknown) {
-      setServerPairingError(
-        error instanceof Error ? error.message : ui.errors.pairingFailed,
-      );
+      setServerPairingError(formatUnknownError(error, ui.errors.pairingFailed));
     } finally {
       setIsPairingDevice(false);
     }
@@ -1534,9 +1548,7 @@ function App() {
           : current,
       );
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.pairingFailed,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.pairingFailed));
     } finally {
       setIsDismissingPairing(false);
     }
@@ -1652,25 +1664,39 @@ function App() {
     void openUpdateReleasePage();
   }
 
-  function renderErrorBanner(message: string) {
+  function renderErrorDialog(message: string) {
     const canRelaunch = shouldOfferPermissionRelaunch(message);
 
     return (
-      <div className={`error-banner ${canRelaunch ? "with-action" : ""}`} role="alert">
-        <span className="error-banner-message">{message}</span>
-        {canRelaunch ? (
+      <div className="error-dialog-backdrop" role="presentation">
+        <section className="error-dialog" role="alertdialog" aria-modal="true">
           <button
             type="button"
-            className="error-banner-action"
-            onClick={() => void handleRelaunchApp()}
-            disabled={isAppRelaunchPending}
+            className="error-dialog-close"
+            onClick={() => setErrorMessage(null)}
+            aria-label={ui.errors.close}
+            title={ui.errors.close}
           >
-            <RestartIcon />
-            <span>
-              {isAppRelaunchPending ? ui.common.relaunching : ui.common.relaunch}
-            </span>
+            <WindowCloseIcon />
           </button>
-        ) : null}
+          <h2>{ui.errors.title}</h2>
+          <p className="error-dialog-message">{message}</p>
+          {canRelaunch ? (
+            <button
+              type="button"
+              className="error-dialog-action"
+              onClick={() => void handleRelaunchApp()}
+              disabled={isAppRelaunchPending}
+            >
+              <RestartIcon />
+              <span>
+                {isAppRelaunchPending
+                  ? ui.common.relaunching
+                  : ui.common.relaunch}
+              </span>
+            </button>
+          ) : null}
+        </section>
       </div>
     );
   }
@@ -1691,7 +1717,7 @@ function App() {
           <p className="eyebrow">mykvm</p>
           <h1>{ui.loading.title}</h1>
           <p>{ui.loading.copy}</p>
-          {errorMessage ? renderErrorBanner(errorMessage) : null}
+          {errorMessage ? renderErrorDialog(errorMessage) : null}
         </section>
       </main>
     );
@@ -1868,7 +1894,7 @@ function App() {
         </div>
       </header>
 
-      {errorMessage ? renderErrorBanner(errorMessage) : null}
+      {errorMessage ? renderErrorDialog(errorMessage) : null}
       {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
 
       {machineRole === "server" && currentTab === "layout" ? (

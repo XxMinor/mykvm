@@ -43,6 +43,62 @@ export function screenPositionOverlaps(
   )
 }
 
+export function snapOverlappingScreenPosition(
+  layout: LayoutState,
+  screenId: string,
+  nextPosition: ScreenPosition,
+  startPosition: ScreenPosition,
+): ScreenPosition | null {
+  const movingScreen = getScreenById(layout, screenId)
+  if (!movingScreen) {
+    return null
+  }
+
+  const nextScreen = { ...movingScreen, ...nextPosition }
+  let target: Screen | null = null
+  let targetOverlapArea = 0
+  for (const screen of flattenScreens(layout)) {
+    if (screen.id === screenId) {
+      continue
+    }
+
+    const area = screenOverlapArea(nextScreen, screen)
+    if (area > targetOverlapArea) {
+      target = screen
+      targetOverlapArea = area
+    }
+  }
+
+  if (!target) {
+    return null
+  }
+
+  const dx = nextPosition.x - startPosition.x
+  const dy = nextPosition.y - startPosition.y
+  const horizontal = Math.abs(dx) >= Math.abs(dy)
+  const movingCenterX = nextScreen.x + nextScreen.width / 2
+  const movingCenterY = nextScreen.y + nextScreen.height / 2
+  const targetCenterX = target.x + target.width / 2
+  const targetCenterY = target.y + target.height / 2
+  const snapped = horizontal
+    ? {
+        x:
+          movingCenterX < targetCenterX || (movingCenterX === targetCenterX && dx < 0)
+            ? target.x - movingScreen.width
+            : target.x + target.width,
+        y: nextPosition.y,
+      }
+    : {
+        x: nextPosition.x,
+        y:
+          movingCenterY < targetCenterY || (movingCenterY === targetCenterY && dy < 0)
+            ? target.y - movingScreen.height
+            : target.y + target.height,
+      }
+
+  return screenPositionOverlaps(layout, screenId, snapped) ? null : snapped
+}
+
 export function flattenScreens(layout: LayoutState): FlattenedScreen[] {
   return layout.devices.flatMap((device) =>
     device.screens.map((screen) => ({
@@ -89,6 +145,12 @@ function screensOverlap(a: Screen, b: Screen) {
     a.y < b.y + b.height &&
     a.y + a.height > b.y
   )
+}
+
+function screenOverlapArea(a: Screen, b: Screen) {
+  const width = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)
+  const height = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y)
+  return width > 0 && height > 0 ? width * height : 0
 }
 
 export function buildAdjacency(screens: Screen[]): ScreenAdjacency[] {

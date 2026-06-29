@@ -205,6 +205,8 @@ export const TEXT = {
       screensUnit: "屏",
     },
     errors: {
+      title: "操作失败",
+      close: "关闭",
       loadState: "加载桌面状态失败。",
       saveLayout: "保存布局失败。",
       updateRuntime: "更新原生运行时失败。",
@@ -432,6 +434,8 @@ export const TEXT = {
       screensUnit: "screens",
     },
     errors: {
+      title: "Operation Failed",
+      close: "Close",
       loadState: "Failed to load desktop state.",
       saveLayout: "Failed to save layout.",
       updateRuntime: "Failed to update native runtime.",

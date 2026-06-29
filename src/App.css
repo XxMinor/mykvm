@@ -1963,18 +1963,6 @@
   font-size: 13px;
 }
 
-.error-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid rgba(248, 113, 113, 0.28);
-  border-radius: 10px;
-  background: rgba(127, 29, 29, 0.28);
-  color: #fecaca;
-}
-
 .info-banner {
   margin: 0;
   padding: 10px 12px;
@@ -1987,19 +1975,69 @@
   overflow-wrap: anywhere;
 }
 
-.error-banner-message {
-  min-width: 0;
+.error-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(5, 8, 14, 0.66);
+  backdrop-filter: blur(6px);
+}
+
+.error-dialog {
+  position: relative;
+  width: min(460px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 22px;
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: 8px;
+  background: #191a1f;
+  color: #fecaca;
+  box-shadow: 0 22px 54px rgba(0, 0, 0, 0.38);
+}
+
+.error-dialog h2 {
+  margin: 0;
+  color: #f8fafc;
+  font-size: 1.1rem;
+}
+
+.error-dialog-message {
+  margin: 0;
+  color: #fecaca;
+  line-height: 1.65;
   overflow-wrap: anywhere;
 }
 
-.error-banner-action {
-  flex: 0 0 auto;
-  min-height: 30px;
+.error-dialog-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(248, 113, 113, 0.24);
+  border-radius: 999px;
+  background: rgba(248, 113, 113, 0.1);
+  color: #fecaca;
+}
+
+.error-dialog-close:hover {
+  background: rgba(248, 113, 113, 0.18);
+}
+
+.error-dialog-action {
+  justify-self: start;
+  min-height: 32px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 0 10px;
+  padding: 0 12px;
   border: 1px solid rgba(248, 113, 113, 0.58);
   border-radius: 7px;
   background: rgba(248, 113, 113, 0.12);
@@ -2010,13 +2048,52 @@
   white-space: nowrap;
 }
 
-.error-banner-action:hover {
+.error-dialog-action:hover {
   background: rgba(248, 113, 113, 0.2);
 }
 
-.error-banner-action:disabled {
+.error-dialog-action:disabled {
   cursor: progress;
   opacity: 0.62;
+}
+
+.theme-light .error-dialog-backdrop {
+  background: rgba(15, 23, 42, 0.28);
+}
+
+.theme-light .error-dialog {
+  border-color: #fecaca;
+  background: #ffffff;
+  color: #b91c1c;
+  box-shadow: 0 22px 54px rgba(31, 41, 55, 0.18);
+}
+
+.theme-light .error-dialog h2 {
+  color: #172033;
+}
+
+.theme-light .error-dialog-message {
+  color: #b91c1c;
+}
+
+.theme-light .error-dialog-close {
+  border-color: #fecaca;
+  background: #fff1f2;
+  color: #b91c1c;
+}
+
+.theme-light .error-dialog-close:hover {
+  background: #ffe4e6;
+}
+
+.theme-light .error-dialog-action {
+  border-color: #fecaca;
+  background: #fff1f2;
+  color: #b91c1c;
+}
+
+.theme-light .error-dialog-action:hover {
+  background: #ffe4e6;
 }
 
 .button-icon {
