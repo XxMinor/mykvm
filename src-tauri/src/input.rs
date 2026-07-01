@@ -2899,13 +2899,20 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
     let Some(active_target) = active else {
         return false;
     };
-    let raw_delta = (mouse_data >> 16) as i16;
-    let delta = if raw_delta.abs() >= 120 {
-        (raw_delta / 120) as i32
-    } else if raw_delta != 0 {
-        raw_delta.signum() as i32
-    } else {
-        0
+    let raw_delta = (mouse_data >> 16) as i16;
+
+    let delta = if raw_delta.abs() >= 120 {
+
+        (raw_delta / 120) as i32
+
+    } else if raw_delta != 0 {
+
+        raw_delta.signum() as i32
+
+    } else {
+
+        0
+
     };
     let (delta_x, delta_y) = if message == WM_MOUSEHWHEEL {
         (delta, 0)
@@ -3493,6 +3500,15 @@ fn mac_crossing_target(
     };
     let flipped_y = min_y + max_y - y;
     if (flipped_y - y).abs() < 0.5 {
+        return None;
+    }
+
+    // Suppress the Y-flip when the cursor is at an outer edge of the local
+    // screens moving outward.  Without this guard the flip maps a
+    // bottom-edge push into a top-edge crossing (or vice-versa), producing
+    // a false transition to a remote screen on the opposite side.
+    let edge_margin = CROSSING_ACTIVATION_BAND;
+    if (y >= max_y - edge_margin && dy > 0.0) || (y <= min_y + edge_margin && dy < 0.0) {
         return None;
     }
 
