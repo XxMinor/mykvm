@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{mpsc, Arc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -111,7 +111,7 @@ impl TransportHandle {
             })
             .map_err(|_| "QUIC transport is stopped".to_string())?;
         result_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(3))
             .map_err(|_| "QUIC stream send timed out".to_string())?
     }
 
@@ -521,10 +521,16 @@ fn client_config(peer: &PeerEndpoint) -> Result<ClientConfig, String> {
 
 fn spawn_accept_loop(endpoint: Endpoint, on_datagram: DatagramHandler, on_stream: StreamHandler) {
     tokio::spawn(async move {
+        let mut last_fail_log: HashMap<SocketAddr, Instant> = HashMap::new();
         while let Some(incoming) = endpoint.accept().await {
             let remote = incoming.remote_address();
             let on_datagram = Arc::clone(&on_datagram);
             let on_stream = Arc::clone(&on_stream);
+
+            let should_log = last_fail_log
+                .get(&remote)
+                .map(|t| t.elapsed() > Duration::from_secs(10))
+                .unwrap_or(true);
 
             tokio::spawn(async move {
                 match incoming.await {
@@ -533,10 +539,22 @@ fn spawn_accept_loop(endpoint: Endpoint, on_datagram: DatagramHandler, on_stream
                         spawn_stream_reader(connection, remote, on_stream);
                     }
                     Err(error) => {
-                        log::warn!("QUIC incoming connection failed from {remote}: {error}");
+                        if should_log {
+                            log::warn!("QUIC incoming connection failed from {remote}: {error}");
+                        }
                     }
                 }
             });
+
+            // Rate-limit failure logs per remote address.
+            if should_log {
+                last_fail_log.insert(remote, Instant::now());
+            }
+            // Prevent unbounded growth of the log-rate map.
+            if last_fail_log.len() > 64 {
+                let cutoff = Instant::now() - Duration::from_secs(60);
+                last_fail_log.retain(|_, t| *t > cutoff);
+            }
         }
     });
 }

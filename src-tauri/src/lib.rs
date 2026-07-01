@@ -60,6 +60,7 @@ const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
+const CLIPBOARD_BACKOFF_MAX_MS: u64 = 30_000;
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
 const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
@@ -4964,13 +4965,27 @@ fn run_clipboard_sync(
     let mut last_failed: Option<(String, String, String, Instant)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut sequence = now_ms();
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff_until: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
             thread::sleep(Duration::from_millis(120));
             last_poll = Instant::now() - Duration::from_secs(1);
+            consecutive_failures = 0;
+            backoff_until = None;
             continue;
         };
+
+        // Exponential backoff: when consecutive sends keep failing, sleep
+        // progressively longer to avoid burning CPU on a dead peer.
+        if let Some(deadline) = backoff_until {
+            if Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
+                continue;
+            }
+            backoff_until = None;
+        }
 
         if last_poll.elapsed() < Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS) {
             thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
@@ -5061,6 +5076,8 @@ fn run_clipboard_sync(
             if quic_transport.send_stream_expect_ack(peer, payload).is_ok() {
                 transport_packets.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                consecutive_failures = 0;
+                backoff_until = None;
                 let clip_preview = match &packet.formats.first().map(|f| f.kind.as_str()) {
                     Some("plainText") => {
                         let txt = &packet.text;
@@ -5073,6 +5090,11 @@ fn run_clipboard_sync(
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, signature));
             } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff_ms = CLIPBOARD_RETRY_INTERVAL_MS
+                    .saturating_mul(1 << consecutive_failures.min(4))
+                    .min(CLIPBOARD_BACKOFF_MAX_MS);
+                backoff_until = Some(Instant::now() + Duration::from_millis(backoff_ms));
                 last_failed = Some((
                     target.device_id.clone(),
                     target.addr.clone(),
