@@ -92,7 +92,7 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
           isPrimary: true,
         },
       ],
-      appVersion: '0.1.0',
+      appVersion: '0.9.8',
       lastSeenMs: Date.now(),
     },
     peers: [],
@@ -213,7 +213,7 @@ export async function readDiagnosticInfo(): Promise<DiagnosticInfo> {
   if (!isTauri()) {
     return {
       report: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
-      appVersion: '0.1.0',
+      appVersion: '0.9.8',
       platform: navigator.platform,
       role: defaultLayout.machineRole,
       runtimeStarted: browserRuntime.started,
@@ -227,10 +227,44 @@ export async function readDiagnosticInfo(): Promise<DiagnosticInfo> {
       configDir: '',
       networkHint: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
       firewallHint: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
+      inputDebug: {
+        enabled: false,
+        status: 'idle',
+        latestFailure: null,
+        lastRoute: null,
+        recentEventCount: 0,
+        events: [],
+      },
     }
   }
 
   return invoke<DiagnosticInfo>('read_diagnostic_info')
+}
+
+export interface SyncRecord {
+  timestamp: string
+  kind: 'clipboard' | 'file'
+  direction: 'sent' | 'received'
+  target: string
+  contentType: string
+  preview: string
+  detail: string
+}
+
+export async function readSyncHistory(count?: number): Promise<SyncRecord[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return invoke<SyncRecord[]>('read_sync_history', { count: count ?? 100 })
+}
+
+export async function readLogLines(count?: number): Promise<string[]> {
+  if (!isTauri()) {
+    return ['[browser] Log only available in desktop']
+  }
+
+  return invoke<string[]>('read_log_lines', { count: count ?? 200 })
 }
 
 export async function openLogDirectory(): Promise<void> {

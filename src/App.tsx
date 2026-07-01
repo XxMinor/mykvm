@@ -22,6 +22,9 @@ import {
   loadAppState,
   minimizeMainWindow,
   openLogDirectory,
+  readLogLines,
+  readSyncHistory,
+  type SyncRecord,
   openRepositoryUrl,
   openUpdateReleasePage,
   probeLanPeer,
@@ -65,6 +68,7 @@ import type { FlattenedScreen, LayoutBounds } from "./layout";
 import type {
   AppStateSnapshot,
   DiagnosticInfo,
+  InputDebugEvent,
   LanPeer,
   LanPeerScreen,
   PerformanceSample,
@@ -108,13 +112,17 @@ const WORKSPACE_TABS = [
   { id: "layout" },
   { id: "devices" },
   { id: "settings" },
+  { id: "logs" },
+  { id: "sync" },
 ] as const;
 
 type WorkspaceTab = (typeof WORKSPACE_TABS)[number]["id"];
 
-const CLIENT_TABS: WorkspaceTab[] = ["settings"];
+const CLIENT_TABS: WorkspaceTab[] = ["settings", "logs", "sync"];
 const PERFORMANCE_SAMPLE_LIMIT = 32;
 const UPDATE_DISMISSED_VERSION_KEY = "mykvm:update:dismissedVersion";
+const LOG_REFRESH_INTERVAL_MS = 3000;
+const LOG_MAX_LINES = 500;
 type UpdateStatus =
   | "idle"
   | "checking"
@@ -209,6 +217,12 @@ function App() {
   const [isPortable, setIsPortable] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const [logAutoRefresh, setLogAutoRefresh] = useState(true);
+  const [logFilter, setLogFilter] = useState<"all" | "INFO" | "WARN" | "ERROR">("all");
+  const logContainerRef = useRef<HTMLDivElement>(null);
+  const [syncRecords, setSyncRecords] = useState<SyncRecord[]>([]);
+  const [syncFilter, setSyncFilter] = useState<"all" | "clipboard" | "file">("all");
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
@@ -623,6 +637,42 @@ function App() {
     machineRole === "client" && !CLIENT_TABS.includes(activeTab)
       ? "settings"
       : activeTab;
+
+  useEffect(() => {
+    if (currentTab !== "logs") return;
+    let cancelled = false;
+    const fetchLogs = async () => {
+      try {
+        const lines = await readLogLines(LOG_MAX_LINES);
+        if (!cancelled) {
+          setLogLines(lines);
+          if (logContainerRef.current) {
+            logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+    void fetchLogs();
+    if (!logAutoRefresh) return;
+    const timer = setInterval(() => void fetchLogs(), LOG_REFRESH_INTERVAL_MS);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [currentTab, logAutoRefresh]);
+
+  useEffect(() => {
+    if (currentTab !== "sync") return;
+    let cancelled = false;
+    const fetchSync = async () => {
+      try {
+        const records = await readSyncHistory(200);
+        if (!cancelled) setSyncRecords(records);
+      } catch { /* ignore */ }
+    };
+    void fetchSync();
+    const timer = setInterval(() => void fetchSync(), 5000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [currentTab]);
   const isPerformanceActive =
     currentTab === "settings" && Boolean(layout?.performanceMonitor);
   const localPlatform =
@@ -857,6 +907,20 @@ function App() {
     } finally {
       setIsDiagnosticPending(false);
     }
+  }
+
+  function formatInputDebugEvent(event: InputDebugEvent) {
+    const relative =
+      event.relativeX != null && event.relativeY != null
+        ? `rel(${event.relativeX}, ${event.relativeY})`
+        : "rel(-)";
+    const absolute =
+      event.absoluteX != null && event.absoluteY != null
+        ? `abs(${event.absoluteX}, ${event.absoluteY})`
+        : "abs(-)";
+    const pipe =
+      event.pipeAvailable == null ? "pipe --" : `pipe ${event.pipeAvailable ? "yes" : "no"}`;
+    return `${event.eventType} ${relative} ${absolute} ${event.desktop} ${event.route} ${pipe} ${event.result}`;
   }
 
   async function persistLayout(nextLayout: LayoutState) {
@@ -2657,6 +2721,51 @@ function App() {
                     {diagnosticInfo.networkHint} {diagnosticInfo.firewallHint}
                   </p>
                 ) : null}
+                {diagnosticInfo ? (
+                  <section className="diagnostic-input-debug">
+                    <h3>{ui.settings.inputDebug}</h3>
+                    <dl className="network-meta compact-meta">
+                      <div>
+                        <dt>{ui.settings.inputDebugStatus}</dt>
+                        <dd>{diagnosticInfo.inputDebug.status}</dd>
+                      </div>
+                      <div>
+                        <dt>{ui.settings.inputDebugRoute}</dt>
+                        <dd>{diagnosticInfo.inputDebug.lastRoute ?? "--"}</dd>
+                      </div>
+                      <div>
+                        <dt>{ui.settings.inputDebugFailure}</dt>
+                        <dd className="diagnostic-path">
+                          {diagnosticInfo.inputDebug.latestFailure ?? "--"}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>{ui.settings.inputDebugEvents}</dt>
+                        <dd>{diagnosticInfo.inputDebug.recentEventCount}</dd>
+                      </div>
+                    </dl>
+                    {diagnosticInfo.inputDebug.events.length ? (
+                      <div className="diagnostic-event-list">
+                        {diagnosticInfo.inputDebug.events
+                          .slice()
+                          .reverse()
+                          .slice(0, 8)
+                          .map((event) => (
+                            <p
+                              key={`${event.timestampMs}-${event.controllerId}-${event.eventType}`}
+                              className="muted-copy diagnostic-event-item"
+                            >
+                              {formatInputDebugEvent(event)}
+                            </p>
+                          ))}
+                      </div>
+                    ) : (
+                      <p className="muted-copy diagnostic-event-item">
+                        {ui.settings.inputDebugEmpty}
+                      </p>
+                    )}
+                  </section>
+                ) : null}
                 <div className="inline-actions">
                   <button
                     type="button"
@@ -2682,6 +2791,119 @@ function App() {
                 ) : null}
               </section>
             </div>
+          </div>
+        </section>
+      ) : null}
+
+      {currentTab === "sync" ? (
+        <section className="page-panel log-panel">
+          <div className="log-toolbar">
+            <div className="log-toolbar-left">
+              <h2>{ui.syncHistory.title}</h2>
+              <span className="log-line-count">{syncRecords.length}</span>
+            </div>
+            <div className="log-toolbar-right">
+              <div className="log-filter-group">
+                {(["all", "clipboard", "file"] as const).map((f) => (
+                  <button key={f} type="button"
+                    className={`log-filter-btn ${syncFilter === f ? "active" : ""}`}
+                    onClick={() => setSyncFilter(f)}>
+                    {f === "all" ? ui.syncHistory.filterAll : f === "clipboard" ? ui.syncHistory.filterClipboard : ui.syncHistory.filterFile}
+                  </button>
+                ))}
+              </div>
+              <button type="button" className="log-action-btn"
+                onClick={() => { void readSyncHistory(200).then(setSyncRecords); }}>
+                {"\u21BB"} {ui.syncHistory.refresh}
+              </button>
+            </div>
+          </div>
+          <div className="sync-history-list log-container">
+            {syncRecords.filter((r) => syncFilter === "all" || r.kind === syncFilter).length === 0 ? (
+              <p className="log-empty">{ui.syncHistory.noRecords}</p>
+            ) : (
+              syncRecords
+                .filter((r) => syncFilter === "all" || r.kind === syncFilter)
+                .slice()
+                .reverse()
+                .map((rec, i) => (
+                  <div key={i} className={`sync-record sync-${rec.kind}`}>
+                          <span className="sync-time">{rec.timestamp}</span>
+                          <span className={`sync-badge sync-badge-${rec.kind}`}>
+                            {rec.kind === "clipboard" ? ui.syncHistory.clipboard : ui.syncHistory.file}
+                          </span>
+                          <span className={`sync-dir sync-dir-${rec.direction}`}>
+                            {rec.direction === "sent" ? ui.syncHistory.sent : ui.syncHistory.received}
+                          </span>
+                          {rec.contentType === "text" ? <span className="sync-content-type">📋 文本</span> : null}
+                          {rec.contentType === "image" ? <span className="sync-content-type">🖼️ 图片</span> : null}
+                          {rec.contentType === "file" ? <span className="sync-content-type">📁 文件</span> : null}
+                          {rec.target ? <span className="sync-target">→ {rec.target}</span> : null}
+                          {rec.preview ? <span className="sync-preview">{rec.preview}</span> : null}
+                          {rec.detail ? <span className="sync-detail">{rec.detail}</span> : null}
+                        </div>
+                ))
+            )}
+          </div>
+          <div className="log-bottom-bar">
+            <span className="log-status">{ui.syncHistory.subtitle}</span>
+          </div>
+        </section>      ) : null}
+
+      {currentTab === "logs" ? (
+        <section className="page-panel log-panel">
+          <div className="log-toolbar">
+            <div className="log-toolbar-left">
+              <h2>{ui.logs.title}</h2>
+              <span className="log-line-count">{logLines.length} {ui.logs.lineCount}</span>
+            </div>
+            <div className="log-toolbar-right">
+              <div className="log-filter-group">
+                {(["all", "INFO", "WARN", "ERROR"] as const).map((lv) => (
+                  <button key={lv} type="button"
+                    className={`log-filter-btn ${logFilter === lv ? "active" : ""} ${lv === "WARN" ? "warn" : lv === "ERROR" ? "error" : ""}`}
+                    onClick={() => setLogFilter(lv)}>
+                    {lv === "all" ? ui.logs.levelAll : lv}
+                  </button>
+                ))}
+              </div>
+              <div className="log-action-group">
+                <button type="button" className={`log-action-btn ${logAutoRefresh ? "active" : ""}`}
+                  onClick={() => setLogAutoRefresh((v) => !v)}>
+                  {"\u25C9"} {ui.logs.autoRefresh}
+                </button>
+                <button type="button" className="log-action-btn"
+                  onClick={() => { void readLogLines(LOG_MAX_LINES).then(setLogLines); }}>
+                  {"\u21BB"} {ui.logs.refresh}
+                </button>
+                <button type="button" className="log-action-btn"
+                  onClick={() => void openLogDirectory()}>
+                  {"\u2197"} {ui.logs.openLogDir}
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="log-container" ref={logContainerRef}>
+            {logLines.length === 0 ? (
+              <p className="log-empty">{ui.logs.noLogs}</p>
+            ) : (
+              logLines
+                .filter((line) => logFilter === "all" || line.includes(`[${logFilter}]`))
+                .map((line, i) => (
+                  <div key={i} className={`log-line ${line.includes("[ERROR]") ? "log-error" : line.includes("[WARN]") ? "log-warn" : ""}`}>
+                    {line}
+                  </div>
+                ))
+            )}
+          </div>
+          <div className="log-bottom-bar">
+            <span className="log-status">
+              {logAutoRefresh ? `${ui.logs.autoRefresh} ${ui.common.enabled}` : `${ui.logs.autoRefresh} ${ui.common.disabled}`}
+            </span>
+            <button type="button" className="log-action-btn"
+              onClick={() => { if (logContainerRef.current) logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight; }}>
+              {"\u2193"} {ui.logs.scrollToBottom}
+            </button>
           </div>
         </section>
       ) : null}

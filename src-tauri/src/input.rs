@@ -52,10 +52,12 @@ const WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS: u64 = 250;
 static INPUT_TX_FAILURES: AtomicU64 = AtomicU64::new(0);
 static INPUT_TX_SKIPS: AtomicU64 = AtomicU64::new(0);
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
+static INPUT_DEBUG_EVENTS: OnceLock<Mutex<Vec<InputDebugEvent>>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE: AtomicBool = AtomicBool::new(true);
+const INPUT_DEBUG_MAX_EVENTS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Edge {
@@ -161,6 +163,35 @@ struct RemoteMouseState {
     buttons: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InputDebugEvent {
+    pub timestamp_ms: u64,
+    pub controller_id: String,
+    pub event_type: String,
+    pub screen_id: String,
+    pub relative_x: Option<i32>,
+    pub relative_y: Option<i32>,
+    pub absolute_x: Option<i32>,
+    pub absolute_y: Option<i32>,
+    pub desktop: String,
+    pub route: String,
+    pub pipe_available: Option<bool>,
+    pub result: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InputDebugInfo {
+    pub enabled: bool,
+    pub status: String,
+    pub latest_failure: Option<String>,
+    pub last_route: Option<String>,
+    pub recent_event_count: usize,
+    pub events: Vec<InputDebugEvent>,
+}
+
 pub fn stopped_capture_status() -> NativeStageStatus {
     NativeStageStatus {
         state: "stubbed".into(),
@@ -172,6 +203,111 @@ pub fn stopped_inject_status() -> NativeStageStatus {
     NativeStageStatus {
         state: "stubbed".into(),
         detail: "Input injection is stopped.".into(),
+    }
+}
+
+fn input_debug_events() -> &'static Mutex<Vec<InputDebugEvent>> {
+    INPUT_DEBUG_EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn now_input_debug_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn record_input_debug_event(event: InputDebugEvent) {
+    let Ok(mut events) = input_debug_events().lock() else {
+        return;
+    };
+    events.push(event);
+    if events.len() > INPUT_DEBUG_MAX_EVENTS {
+        let overflow = events.len() - INPUT_DEBUG_MAX_EVENTS;
+        events.drain(0..overflow);
+    }
+}
+
+pub fn current_input_debug_info() -> InputDebugInfo {
+    let events = input_debug_events()
+        .lock()
+        .map(|events| events.clone())
+        .unwrap_or_default();
+    let latest_failure = events
+        .iter()
+        .rev()
+        .find(|event| event.result != "injected")
+        .map(|event| event.detail.clone());
+    let last_route = events.last().map(|event| event.route.clone());
+    let recent_event_count = events.len();
+    let status = if events.is_empty() {
+        "idle".to_string()
+    } else {
+        "collecting".to_string()
+    };
+
+    InputDebugInfo {
+        enabled: true,
+        status,
+        latest_failure,
+        last_route,
+        recent_event_count,
+        events,
+    }
+}
+
+pub fn input_debug_report_lines(summary: &InputDebugInfo) -> Vec<String> {
+    let mut lines = vec![format!("input debug: {}", summary.status)];
+    lines.push(format!("input debug recent events: {}", summary.recent_event_count));
+    if let Some(route) = &summary.last_route {
+        lines.push(format!("input debug last route: {route}"));
+    }
+    if let Some(failure) = &summary.latest_failure {
+        lines.push(format!("input debug latest failure: {failure}"));
+    }
+
+    if summary.events.is_empty() {
+        lines.push("input debug events: none".into());
+    } else {
+        lines.push("input debug events:".into());
+        for event in &summary.events {
+            let relative = match (event.relative_x, event.relative_y) {
+                (Some(x), Some(y)) => format!("rel=({x},{y})"),
+                _ => "rel=(n/a)".into(),
+            };
+            let absolute = match (event.absolute_x, event.absolute_y) {
+                (Some(x), Some(y)) => format!("abs=({x},{y})"),
+                _ => "abs=(n/a)".into(),
+            };
+            let pipe = match event.pipe_available {
+                Some(true) => "pipe=true",
+                Some(false) => "pipe=false",
+                None => "pipe=n/a",
+            };
+            lines.push(format!(
+                "- ts={} controller={} event={} screen={} {} {} desktop={} route={} {} result={} detail={}",
+                event.timestamp_ms,
+                event.controller_id,
+                event.event_type,
+                event.screen_id,
+                relative,
+                absolute,
+                event.desktop,
+                event.route,
+                pipe,
+                event.result,
+                event.detail
+            ));
+        }
+    }
+
+    lines
+}
+
+#[cfg(test)]
+fn clear_input_debug_events_for_tests() {
+    if let Ok(mut events) = input_debug_events().lock() {
+        events.clear();
     }
 }
 
@@ -1146,7 +1282,7 @@ pub fn try_inject_packet_from_source(
         );
     }
 
-    let injected = inject_input_event(layout, native_layout, packet.event);
+    let injected = inject_input_event(layout, native_layout, packet.event, &packet.origin_device_id);
     if injected {
         input_events.fetch_add(1, Ordering::Relaxed);
     }
@@ -1261,6 +1397,31 @@ fn origin_peer_id(layout: &LayoutState) -> String {
 
 static LAST_UNAUTHORIZED_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
 
+fn record_unauthorized_debug_event(
+    controller_id: &str,
+    event_type: &str,
+    screen_id: &str,
+    relative_x: Option<i32>,
+    relative_y: Option<i32>,
+    detail: &str,
+) {
+    record_input_debug_event(InputDebugEvent {
+        timestamp_ms: now_input_debug_ms(),
+        controller_id: controller_id.to_string(),
+        event_type: event_type.to_string(),
+        screen_id: screen_id.to_string(),
+        relative_x,
+        relative_y,
+        absolute_x: None,
+        absolute_y: None,
+        desktop: "unauthorized".into(),
+        route: "rejected".into(),
+        pipe_available: None,
+        result: "dropped".into(),
+        detail: detail.to_string(),
+    });
+}
+
 /// Log (at most once every few seconds, since a single mouse move floods many
 /// packets) why a controller's input was rejected. Without this the packets
 /// were dropped silently while the device still showed "online", which makes a
@@ -1282,6 +1443,49 @@ fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
             return;
         }
         *last = Instant::now();
+    }
+
+    match &packet.event {
+        InputEvent::MouseMove { screen_id, x, y } => {
+            record_unauthorized_debug_event(
+                &packet.origin_device_id,
+                "mouseMove",
+                screen_id,
+                Some(*x),
+                Some(*y),
+                reason,
+            );
+        }
+        InputEvent::MouseButton { .. } => {
+            record_unauthorized_debug_event(
+                &packet.origin_device_id,
+                "mouseButton",
+                "",
+                None,
+                None,
+                reason,
+            );
+        }
+        InputEvent::Scroll { .. } => {
+            record_unauthorized_debug_event(
+                &packet.origin_device_id,
+                "scroll",
+                "",
+                None,
+                None,
+                reason,
+            );
+        }
+        InputEvent::Key { .. } => {
+            record_unauthorized_debug_event(
+                &packet.origin_device_id,
+                "key",
+                "",
+                None,
+                None,
+                reason,
+            );
+        }
     }
 
     log::warn!(
@@ -1308,6 +1512,15 @@ fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlP
     } else {
         "controller is not in this device's paired-controllers list"
     };
+
+    record_unauthorized_debug_event(
+        &packet.origin_device_id,
+        "control",
+        "",
+        None,
+        None,
+        reason,
+    );
 
     log::warn!(
         "rejected input control from controller id={} key={}: {}",
@@ -1456,13 +1669,33 @@ fn inject_input_event(
     layout: &LayoutState,
     native_layout: &LayoutState,
     event: InputEvent,
+    controller_id: &str,
 ) -> bool {
+    let debug_event = input_debug_event_from_input_event(&event);
     let Some(command) = input_event_to_command(layout, native_layout, event) else {
+        record_input_debug_event(InputDebugEvent {
+            timestamp_ms: now_input_debug_ms(),
+            controller_id: controller_id.to_string(),
+            event_type: debug_event.event_type,
+            screen_id: debug_event.screen_id,
+            relative_x: debug_event.relative_x,
+            relative_y: debug_event.relative_y,
+            absolute_x: None,
+            absolute_y: None,
+            desktop: "unknown".into(),
+            route: "dropped".into(),
+            pipe_available: None,
+            result: "dropped".into(),
+            detail: "could not map input event to native command".into(),
+        });
         return false;
     };
 
     #[cfg(target_os = "windows")]
     {
+        let desktop_is_default = windows_inject_desktop_is_default();
+        let route_to_helper = should_route_to_windows_helper(&command);
+        let (absolute_x, absolute_y) = command_coordinates(&command);
         // Inject locally on the normal desktop; hand off to the privileged SYSTEM
         // helper only for the secure desktop (lock screen / UAC) or Ctrl+Alt+Del.
         //
@@ -1477,19 +1710,104 @@ fn inject_input_event(
         // logged-in user at the foreground window's own integrity, so it clicks
         // and types normally. On the secure desktop the foreground is LogonUI
         // (System integrity), so the worker's equal-integrity injection works.
-        if should_route_to_windows_helper(&command) {
+        if route_to_helper {
             match windows_pipe_dispatcher().send(&command) {
-                Ok(()) => return true,
-                Err(error) => note_windows_helper_unavailable(&error),
+                Ok(()) => {
+                    record_input_debug_event(InputDebugEvent {
+                        timestamp_ms: now_input_debug_ms(),
+                        controller_id: controller_id.to_string(),
+                        event_type: debug_event.event_type,
+                        screen_id: debug_event.screen_id,
+                        relative_x: debug_event.relative_x,
+                        relative_y: debug_event.relative_y,
+                        absolute_x,
+                        absolute_y,
+                        desktop: if desktop_is_default {
+                            "default".into()
+                        } else {
+                            "secure".into()
+                        },
+                        route: "helper".into(),
+                        pipe_available: Some(true),
+                        result: "injected".into(),
+                        detail: "dispatched through input helper".into(),
+                    });
+                    return true;
+                }
+                Err(error) => {
+                    note_windows_helper_unavailable(&error);
+                    record_input_debug_event(InputDebugEvent {
+                        timestamp_ms: now_input_debug_ms(),
+                        controller_id: controller_id.to_string(),
+                        event_type: debug_event.event_type.clone(),
+                        screen_id: debug_event.screen_id.clone(),
+                        relative_x: debug_event.relative_x,
+                        relative_y: debug_event.relative_y,
+                        absolute_x,
+                        absolute_y,
+                        desktop: if desktop_is_default {
+                            "default".into()
+                        } else {
+                            "secure".into()
+                        },
+                        route: "helper-fallback".into(),
+                        pipe_available: Some(false),
+                        result: "fallback".into(),
+                        detail: error,
+                    });
+                }
             }
         }
         inject_input_command(command);
+        record_input_debug_event(InputDebugEvent {
+            timestamp_ms: now_input_debug_ms(),
+            controller_id: controller_id.to_string(),
+            event_type: debug_event.event_type,
+            screen_id: debug_event.screen_id,
+            relative_x: debug_event.relative_x,
+            relative_y: debug_event.relative_y,
+            absolute_x,
+            absolute_y,
+            desktop: if desktop_is_default {
+                "default".into()
+            } else {
+                "secure".into()
+            },
+            route: if route_to_helper {
+                "helper-fallback".into()
+            } else {
+                "local".into()
+            },
+            pipe_available: if route_to_helper { Some(false) } else { None },
+            result: "injected".into(),
+            detail: if route_to_helper {
+                "fell back to local injection".into()
+            } else {
+                "injected locally".into()
+            },
+        });
         return true;
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         inject_input_command(command);
+        let (absolute_x, absolute_y) = command_coordinates(&command);
+        record_input_debug_event(InputDebugEvent {
+            timestamp_ms: now_input_debug_ms(),
+            controller_id: controller_id.to_string(),
+            event_type: debug_event.event_type,
+            screen_id: debug_event.screen_id,
+            relative_x: debug_event.relative_x,
+            relative_y: debug_event.relative_y,
+            absolute_x,
+            absolute_y,
+            desktop: "n/a".into(),
+            route: "local".into(),
+            pipe_available: None,
+            result: "injected".into(),
+            detail: "injected locally".into(),
+        });
         true
     }
 }
@@ -1577,6 +1895,50 @@ fn input_event_to_command(
         }
         InputEvent::Scroll { delta_x, delta_y } => Some(InputCommand::Scroll { delta_x, delta_y }),
         InputEvent::Key { key_code, down } => Some(InputCommand::Key { key_code, down }),
+    }
+}
+
+struct InputDebugEventSeed {
+    event_type: String,
+    screen_id: String,
+    relative_x: Option<i32>,
+    relative_y: Option<i32>,
+}
+
+fn input_debug_event_from_input_event(event: &InputEvent) -> InputDebugEventSeed {
+    match event {
+        InputEvent::MouseMove { screen_id, x, y } => InputDebugEventSeed {
+            event_type: "mouseMove".into(),
+            screen_id: screen_id.clone(),
+            relative_x: Some(*x),
+            relative_y: Some(*y),
+        },
+        InputEvent::MouseButton { .. } => InputDebugEventSeed {
+            event_type: "mouseButton".into(),
+            screen_id: String::new(),
+            relative_x: None,
+            relative_y: None,
+        },
+        InputEvent::Scroll { .. } => InputDebugEventSeed {
+            event_type: "scroll".into(),
+            screen_id: String::new(),
+            relative_x: None,
+            relative_y: None,
+        },
+        InputEvent::Key { .. } => InputDebugEventSeed {
+            event_type: "key".into(),
+            screen_id: String::new(),
+            relative_x: None,
+            relative_y: None,
+        },
+    }
+}
+
+fn command_coordinates(command: &InputCommand) -> (Option<i32>, Option<i32>) {
+    match command {
+        InputCommand::MouseMove { x, y, .. } => (Some(*x), Some(*y)),
+        InputCommand::MouseButton { x, y, .. } => (Some(*x), Some(*y)),
+        _ => (None, None),
     }
 }
 
@@ -2537,7 +2899,14 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
     let Some(active_target) = active else {
         return false;
     };
-    let delta = ((mouse_data >> 16) as i16 / 120) as i32;
+    let raw_delta = (mouse_data >> 16) as i16;
+    let delta = if raw_delta.abs() >= 120 {
+        (raw_delta / 120) as i32
+    } else if raw_delta != 0 {
+        raw_delta.signum() as i32
+    } else {
+        0
+    };
     let (delta_x, delta_y) = if message == WM_MOUSEHWHEEL {
         (delta, 0)
     } else if message == WM_MOUSEWHEEL {
@@ -4372,6 +4741,98 @@ fn inject_key(_key_code: u16, _down: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_debug_summary_keeps_recent_events_and_latest_failure() {
+        clear_input_debug_events_for_tests();
+
+        for index in 0..(INPUT_DEBUG_MAX_EVENTS + 5) {
+            record_input_debug_event(InputDebugEvent {
+                timestamp_ms: index as u64,
+                controller_id: format!("controller-{index}"),
+                event_type: "mouseMove".into(),
+                screen_id: "screen-1".into(),
+                relative_x: Some(index as i32),
+                relative_y: Some(index as i32 + 1),
+                absolute_x: Some(index as i32 + 100),
+                absolute_y: Some(index as i32 + 200),
+                desktop: "default".into(),
+                route: "local".into(),
+                pipe_available: Some(false),
+                result: "injected".into(),
+                detail: "ok".into(),
+            });
+        }
+
+        record_input_debug_event(InputDebugEvent {
+            timestamp_ms: 999,
+            controller_id: "controller-fail".into(),
+            event_type: "mouseMove".into(),
+            screen_id: "screen-1".into(),
+            relative_x: Some(10),
+            relative_y: Some(20),
+            absolute_x: Some(110),
+            absolute_y: Some(220),
+            desktop: "secure".into(),
+            route: "helper-fallback".into(),
+            pipe_available: Some(false),
+            result: "fallback".into(),
+            detail: "input helper pipe unavailable".into(),
+        });
+
+        let summary = current_input_debug_info();
+
+        assert!(summary.enabled);
+        assert_eq!(summary.recent_event_count, INPUT_DEBUG_MAX_EVENTS);
+        assert_eq!(
+            summary.latest_failure.as_deref(),
+            Some("input helper pipe unavailable")
+        );
+        assert_eq!(summary.last_route.as_deref(), Some("helper-fallback"));
+        assert_eq!(summary.events.len(), INPUT_DEBUG_MAX_EVENTS);
+        assert_eq!(
+            summary.events.last().map(|event| event.controller_id.as_str()),
+            Some("controller-fail")
+        );
+        assert_eq!(
+            summary.events.first().map(|event| event.controller_id.as_str()),
+            Some("controller-6")
+        );
+    }
+
+    #[test]
+    fn input_debug_report_renders_route_and_coordinates() {
+        let summary = InputDebugInfo {
+            enabled: true,
+            status: "collecting".into(),
+            latest_failure: Some("input helper pipe unavailable".into()),
+            last_route: Some("helper-fallback".into()),
+            recent_event_count: 1,
+            events: vec![InputDebugEvent {
+                timestamp_ms: 123,
+                controller_id: "controller-a".into(),
+                event_type: "mouseMove".into(),
+                screen_id: "screen-1".into(),
+                relative_x: Some(10),
+                relative_y: Some(20),
+                absolute_x: Some(110),
+                absolute_y: Some(220),
+                desktop: "secure".into(),
+                route: "helper-fallback".into(),
+                pipe_available: Some(false),
+                result: "fallback".into(),
+                detail: "input helper pipe unavailable".into(),
+            }],
+        };
+
+        let lines = input_debug_report_lines(&summary);
+
+        assert!(lines.iter().any(|line| line.contains("input debug: collecting")));
+        assert!(lines.iter().any(|line| line.contains("latest failure: input helper pipe unavailable")));
+        assert!(lines.iter().any(|line| line.contains("route=helper-fallback")));
+        assert!(lines.iter().any(|line| line.contains("rel=(10,20)")));
+        assert!(lines.iter().any(|line| line.contains("abs=(110,220)")));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
