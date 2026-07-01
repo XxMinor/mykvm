@@ -3,7 +3,10 @@ use std::{
     fs,
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -43,11 +46,19 @@ pub struct PeerEndpoint {
     pub protocol_version: u16,
 }
 
+/// Maximum consecutive datagram failures before `send_datagram` short-circuits
+/// with an error so the input layer can release the cursor immediately.
+const DATAGRAM_FAIL_THRESHOLD: u64 = 3;
+
 #[derive(Clone)]
 pub struct TransportHandle {
     commands: tokio_mpsc::UnboundedSender<TransportCommand>,
     port: u16,
     public_key: String,
+    /// Consecutive datagram send failures observed by the transport loop.
+    /// Shared with the input layer so it can detect a dead peer without
+    /// waiting for the async transport to propagate the error.
+    datagram_failures: Arc<AtomicU64>,
 }
 
 impl TransportHandle {
@@ -73,6 +84,13 @@ impl TransportHandle {
                 "QUIC datagram is too large: {} bytes",
                 payload.len()
             ));
+        }
+
+        // Fast-fail: if the transport loop has observed multiple consecutive
+        // datagram failures for the current peer, report the error immediately
+        // so the input layer can release the cursor.
+        if self.datagram_failures.load(Ordering::Relaxed) >= DATAGRAM_FAIL_THRESHOLD {
+            return Err("QUIC datagram send failed: peer unreachable (consecutive failures)".to_string());
         }
 
         self.commands
@@ -115,6 +133,13 @@ impl TransportHandle {
             .map_err(|_| "QUIC stream send timed out".to_string())?
     }
 
+    /// Reset the datagram failure counter. Call this when a peer is
+    /// re-discovered so subsequent sends are attempted immediately instead
+    /// of being short-circuited.
+    pub fn reset_datagram_failures(&self) {
+        self.datagram_failures.store(0, Ordering::Relaxed);
+    }
+
     pub fn shutdown(&self) {
         let _ = self.commands.send(TransportCommand::Shutdown);
     }
@@ -153,6 +178,8 @@ pub fn start(
     let identity = load_or_create_identity(&identity_dir)?;
     let (ready_tx, ready_rx) = mpsc::channel();
     let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
+    let datagram_failures = Arc::new(AtomicU64::new(0));
+    let datagram_failures_inner = Arc::clone(&datagram_failures);
 
     thread::Builder::new()
         .name("mykvm-quic-transport".into())
@@ -176,6 +203,7 @@ pub fn start(
                 on_datagram,
                 on_stream,
                 ready_tx,
+                datagram_failures_inner,
             ));
         })
         .map_err(|error| format!("failed to spawn QUIC transport thread: {error}"))?;
@@ -188,6 +216,7 @@ pub fn start(
         commands: command_tx,
         port: ready.port,
         public_key: ready.public_key,
+        datagram_failures,
     })
 }
 
@@ -203,6 +232,7 @@ async fn run_transport(
     on_datagram: DatagramHandler,
     on_stream: StreamHandler,
     ready_tx: mpsc::Sender<Result<ReadyTransport, String>>,
+    datagram_failures: Arc<AtomicU64>,
 ) {
     let (endpoint, public_key) = match bind_endpoint(preferred_port, &identity) {
         Ok(bound) => bound,
@@ -224,12 +254,46 @@ async fn run_transport(
     spawn_accept_loop(endpoint.clone(), on_datagram, on_stream);
 
     let mut connections: HashMap<PeerKey, quinn::Connection> = HashMap::new();
+    let mut last_datagram_fail_log: Option<Instant> = None;
+    // Cache of peers whose connection recently failed, to avoid repeated 2s
+    // timeout attempts on every mouse-move datagram.
+    let mut datagram_fail_cache: HashMap<SocketAddr, Instant> = HashMap::new();
     while let Some(command) = commands.recv().await {
         match command {
             TransportCommand::SendDatagram { peer, payload } => {
-                if let Err(error) = send_datagram(&endpoint, &mut connections, peer, payload).await
-                {
-                    log::warn!("QUIC datagram send failed: {error}");
+                // Skip send attempt if this peer failed recently (within 5s).
+                let skip = resolve_peer_addr(&peer.addr)
+                    .ok()
+                    .and_then(|addr| datagram_fail_cache.get(&addr))
+                    .map(|t| t.elapsed() < Duration::from_secs(5))
+                    .unwrap_or(false);
+                let result = if skip {
+                    Err("peer recently unreachable".to_string())
+                } else {
+                    send_datagram(&endpoint, &mut connections, peer.clone(), payload).await
+                };
+                if let Err(error) = result {
+                    let count = datagram_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Evict the dead connection so next attempt reconnects.
+                    if let Ok(addr) = resolve_peer_addr(&peer.addr) {
+                        let key = PeerKey { addr, public_key: peer.public_key.clone() };
+                        connections.remove(&key);
+                        datagram_fail_cache.insert(addr, Instant::now());
+                    }
+                    // Rate-limit the warning log.
+                    let should_log = last_datagram_fail_log
+                        .map(|t| t.elapsed() > Duration::from_secs(10))
+                        .unwrap_or(true);
+                    if should_log {
+                        log::warn!("QUIC datagram send failed (x{count}): {error}");
+                        last_datagram_fail_log = Some(Instant::now());
+                    }
+                } else {
+                    datagram_failures.store(0, Ordering::Relaxed);
+                    // Clear fail cache on success so we try normally next time.
+                    if let Ok(addr) = resolve_peer_addr(&peer.addr) {
+                        datagram_fail_cache.remove(&addr);
+                    }
                 }
             }
             TransportCommand::SendStream {

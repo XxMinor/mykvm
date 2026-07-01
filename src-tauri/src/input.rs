@@ -2807,6 +2807,9 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
 
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
     if let Some(active_target) = crossing_target(&targets, x, y, dx, dy, &context.layout_state) {
+        // Give the connection a fresh chance on each crossing attempt so that
+        // recovery after a transient disconnect is immediate.
+        context.quic_transport.reset_datagram_failures();
         let anchor = local_anchor_point(&active_target);
         hide_windows_cursor_if_needed(context);
         set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
@@ -3254,6 +3257,9 @@ fn handle_macos_mouse_move(
     if let Some(active_target) =
         mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
     {
+        // Give the connection a fresh chance on each crossing attempt so that
+        // recovery after a transient disconnect is immediate.
+        context.quic_transport.reset_datagram_failures();
         let anchor = mac_cursor_point(
             context,
             local_anchor_point(&active_target),
