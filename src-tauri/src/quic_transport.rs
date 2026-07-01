@@ -239,7 +239,17 @@ async fn run_transport(
                 result,
             } => {
                 let send_result =
-                    send_stream(&endpoint, &mut connections, peer, payload, ack_required).await;
+                    send_stream(&endpoint, &mut connections, peer.clone(), payload.clone(), ack_required).await;
+                let send_result = if send_result.is_err() {
+                    if let Ok(addr) = resolve_peer_addr(&peer.addr) {
+                        let key = PeerKey { addr, public_key: peer.public_key.clone() };
+                        connections.remove(&key);
+                    }
+                    log::info!("QUIC stream send retry after connection eviction");
+                    send_stream(&endpoint, &mut connections, peer, payload, ack_required).await
+                } else {
+                    send_result
+                };
                 if let Err(error) = &send_result {
                     log::warn!("QUIC stream send failed: {error}");
                 }

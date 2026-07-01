@@ -82,6 +82,31 @@ export interface DiagnosticDevice {
   sameSubnet?: boolean | null
 }
 
+export interface InputDebugEvent {
+  timestampMs: number
+  controllerId: string
+  eventType: string
+  screenId: string
+  relativeX?: number | null
+  relativeY?: number | null
+  absoluteX?: number | null
+  absoluteY?: number | null
+  desktop: string
+  route: string
+  pipeAvailable?: boolean | null
+  result: string
+  detail: string
+}
+
+export interface InputDebugInfo {
+  enabled: boolean
+  status: string
+  latestFailure?: string | null
+  lastRoute?: string | null
+  recentEventCount: number
+  events: InputDebugEvent[]
+}
+
 export interface DiagnosticInfo {
   report: string
   appVersion: string
@@ -98,6 +123,7 @@ export interface DiagnosticInfo {
   configDir: string
   networkHint: string
   firewallHint: string
+  inputDebug: InputDebugInfo
 }
 
 export interface PrivilegeStatus {
