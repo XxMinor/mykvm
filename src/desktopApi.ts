@@ -108,7 +108,6 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
 }
 
 let browserRuntime = FALLBACK_RUNTIME
-let browserClipboardText = ''
 let pendingAppUpdate: Update | null = null
 
 export async function loadAppState(): Promise<AppStateSnapshot> {
@@ -293,17 +292,8 @@ export async function dismissPairingRequest(): Promise<RuntimeStatus> {
   return invoke<RuntimeStatus>('dismiss_pairing_request')
 }
 
-export async function readClipboardText(): Promise<string> {
-  if (!isTauri()) {
-    return browserClipboardText
-  }
-
-  return invoke<string>('read_clipboard_text')
-}
-
 export async function writeClipboardText(text: string): Promise<void> {
   if (!isTauri()) {
-    browserClipboardText = text
     return
   }
 

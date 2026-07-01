@@ -50,6 +50,7 @@ import type { AppText } from "./i18n";
 import {
   edgeSwitchHotkeyFromKeyboardEvent,
   formatEdgeSwitchHotkeyForDisplay,
+  hotkeyFromKeyboardEvent,
   metaKeyLabelForPlatform,
 } from "./hotkeyInput";
 import {
@@ -90,7 +91,6 @@ const BOARD_ZOOM_MIN = 0.35;
 const BOARD_ZOOM_MAX = 2.4;
 const BOARD_ZOOM_STEP = 0.15;
 const SNAP_SIZE = 20;
-const REMOTE_SCREEN_GAP = 0;
 const DEVICE_COLORS = [
   "#2f7af8",
   "#0f766e",
@@ -211,12 +211,18 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
+  const [capturingDirection, setCapturingDirection] = useState<
+    "left" | "right" | "up" | "down" | null
+  >(null);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
     () => getSystemTheme(),
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
   const edgeSwitchHotkeyButtonRef = useRef<HTMLButtonElement | null>(null);
+  const screenSwitchButtonRefs = useRef<
+    Record<"left" | "right" | "up" | "down", HTMLButtonElement | null>
+  >({ left: null, right: null, up: null, down: null });
   const fileDragTargetIdRef = useRef<string | null>(null);
   const fileTransferFallbackTargetIdRef = useRef<string | null>(null);
   const startupUpdateCheckStarted = useRef(false);
@@ -1319,6 +1325,64 @@ function App() {
     };
   }, [isCapturingEdgeSwitchHotkey]);
 
+  function setScreenSwitchHotkey(
+    direction: "left" | "right" | "up" | "down",
+    value: string,
+  ) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      screenSwitchHotkeys: {
+        ...layoutState.screenSwitchHotkeys,
+        [direction]: value,
+      },
+    }));
+  }
+
+  const captureScreenSwitchHotkey = useEffectEvent((event: KeyboardEvent) => {
+    const direction = capturingDirection;
+    if (!direction) {
+      return;
+    }
+    const hotkey = hotkeyFromKeyboardEvent(event, metaKeyLabel);
+    if (!hotkey) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    setScreenSwitchHotkey(direction, hotkey);
+    setCapturingDirection(null);
+  });
+
+  useEffect(() => {
+    if (!capturingDirection) {
+      return;
+    }
+    const cancelIfOutsideRecorder = (event: Event) => {
+      const target = event.target;
+      const button = screenSwitchButtonRefs.current[capturingDirection];
+      if (target instanceof Node && button?.contains(target)) {
+        return;
+      }
+      setCapturingDirection(null);
+    };
+    const cancelRecording = () => setCapturingDirection(null);
+
+    window.addEventListener("keydown", captureScreenSwitchHotkey, true);
+    document.addEventListener("pointerdown", cancelIfOutsideRecorder, true);
+    document.addEventListener("focusin", cancelIfOutsideRecorder, true);
+    window.addEventListener("blur", cancelRecording);
+    return () => {
+      window.removeEventListener("keydown", captureScreenSwitchHotkey, true);
+      document.removeEventListener(
+        "pointerdown",
+        cancelIfOutsideRecorder,
+        true,
+      );
+      document.removeEventListener("focusin", cancelIfOutsideRecorder, true);
+      window.removeEventListener("blur", cancelRecording);
+    };
+  }, [capturingDirection]);
+
   function setTransportPortMode(transportPortMode: TransportPortMode) {
     updateLayout((layoutState) => ({
       ...layoutState,
@@ -2323,6 +2387,46 @@ function App() {
                   </button>
                 </div>
                 <div className="settings-control-row">
+                  <span>
+                    {ui.settings.screenSwitchTitle}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.screenSwitchCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="screen-switch-hotkeys">
+                    {(["left", "right", "up", "down"] as const).map((dir) => (
+                      <button
+                        key={dir}
+                        type="button"
+                        ref={(el) => {
+                          screenSwitchButtonRefs.current[dir] = el;
+                        }}
+                        className={`hotkey-recorder-button ${
+                          capturingDirection === dir ? "recording" : ""
+                        }`}
+                        aria-pressed={capturingDirection === dir}
+                        onClick={() =>
+                          setCapturingDirection((current) =>
+                            current === dir ? null : dir,
+                          )
+                        }
+                      >
+                        {capturingDirection === dir
+                          ? ui.settings.screenSwitchRecording
+                          : renderHotkeyTags(
+                              formatEdgeSwitchHotkeyForDisplay(
+                                layout.screenSwitchHotkeys[dir],
+                                metaKeyLabel,
+                              ),
+                            )}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="settings-control-row">
                   <span>{ui.settings.clipboard}</span>
                   <div className="segmented-control">
                     <button
@@ -2342,7 +2446,15 @@ function App() {
                   </div>
                 </div>
                 <div className="settings-control-row">
-                  <span>{ui.settings.fileTransfer}</span>
+                  <span>
+                    {ui.settings.fileTransfer}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.fileTransferCopy}
+                      </span>
+                    </span>
+                  </span>
                   <div className="segmented-control">
                     <button
                       type="button"
@@ -2963,6 +3075,14 @@ function hotkeyTagLabel(part: string) {
       return "Enter";
     case "escape":
       return "Esc";
+    case "up":
+      return "↑";
+    case "down":
+      return "↓";
+    case "left":
+      return "←";
+    case "right":
+      return "→";
     case "disabled":
       return "Off";
     default:
@@ -3264,7 +3384,7 @@ function createScreensFromPeer(
   );
   const peerMinX = Math.min(...peerScreens.map((screen) => screen.x));
   const peerMinY = Math.min(...peerScreens.map((screen) => screen.y));
-  const startX = layoutBounds.maxX + REMOTE_SCREEN_GAP;
+  const startX = layoutBounds.maxX;
 
   return peerScreens.map((screen, index) => {
     const id = uniqueScreenId(deviceId, screen, index);

@@ -160,7 +160,7 @@ fn content_hint() -> ClipboardContentHint {
     };
     use windows_sys::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_UNICODETEXT};
 
-    let png_format = unsafe { RegisterClipboardFormatW(wide_null("PNG").as_ptr()) };
+    let png_format = unsafe { RegisterClipboardFormatW(crate::wide_null("PNG").as_ptr()) };
     let image_formats = [
         png_format,
         u32::from(CF_DIBV5),
@@ -251,11 +251,6 @@ fn decode_windows_dib_image(data: &[u8]) -> Option<ClipboardImage> {
         height,
         rgba_base64: BASE64.encode(bytes),
     })
-}
-
-#[cfg(target_os = "windows")]
-fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(target_os = "windows")]

@@ -1,7 +1,5 @@
 export type Platform = 'windows' | 'macos' | 'unknown'
 
-export type ScreenEdge = 'left' | 'right' | 'top' | 'bottom'
-
 export type MachineRole = 'unset' | 'server' | 'client'
 
 export type AppLanguage = 'cn' | 'en'
@@ -16,6 +14,13 @@ export interface ModifierMap {
   control: ModifierTarget
   alt: ModifierTarget
   meta: ModifierTarget
+}
+
+export interface ScreenSwitchHotkeys {
+  left: string
+  right: string
+  up: string
+  down: string
 }
 
 export interface PairedController {
@@ -79,11 +84,5 @@ export interface LayoutState {
   modifierRemap: boolean
   modifierMap: ModifierMap
   edgeSwitchHotkey: string
-}
-
-export interface ScreenAdjacency {
-  fromScreenId: string
-  toScreenId: string
-  fromEdge: ScreenEdge
-  toEdge: ScreenEdge
+  screenSwitchHotkeys: ScreenSwitchHotkeys
 }

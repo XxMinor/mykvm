@@ -71,6 +71,10 @@ export const TEXT = {
       edgeSwitchHotkey: "快捷启停",
       edgeSwitchHotkeyRecording: "按下启停快捷键...",
       edgeSwitchHotkeyPlaceholder: "点击后按组合键 / f12 / disabled",
+      screenSwitchTitle: "快捷切屏",
+      screenSwitchRecording: "按下快捷键...",
+      screenSwitchCopy:
+        "不用移动鼠标到屏幕边缘，直接按方向快捷键把控制权切到对应方向的相邻屏幕。再按一次切回本机。",
       appearanceTitle: "配置",
       language: "语言",
       simplifiedChinese: "cn 中文简体",
@@ -116,6 +120,8 @@ export const TEXT = {
       activeDevice: "当前设备",
       clipboard: "剪贴板同步",
       fileTransfer: "文件传输 (bate)",
+      fileTransferCopy:
+        "将文件或文件夹拖到相邻屏幕即可跨设备传输，落在哪个设备上就送到哪台。",
       modifierTitle: "跨平台改键",
       modifierCopy:
         "本机作为控制端时，发往不同系统对端的修饰键映射（仅 Win↔Mac 跨平台时生效）。默认 Ctrl↔Command 对调，让复制、粘贴、全选等快捷键沿用各自系统习惯。",
@@ -300,6 +306,10 @@ export const TEXT = {
       edgeSwitchHotkey: "Quick toggle",
       edgeSwitchHotkeyRecording: "Press start/stop shortcut...",
       edgeSwitchHotkeyPlaceholder: "Press shortcut / f12 / disabled",
+      screenSwitchTitle: "Quick switch",
+      screenSwitchRecording: "Press shortcut...",
+      screenSwitchCopy:
+        "Jump to the adjacent screen in a direction without moving the mouse to the edge. Press again to return to this machine.",
       appearanceTitle: "Configuration",
       language: "Language",
       simplifiedChinese: "cn 中文简体",
@@ -345,6 +355,8 @@ export const TEXT = {
       activeDevice: "Active Device",
       clipboard: "Clipboard Sync",
       fileTransfer: "File Transfer (bate)",
+      fileTransferCopy:
+        "Drag files or folders onto an adjacent screen to transfer them across devices — wherever they land is where they go.",
       modifierTitle: "Cross-platform Keys",
       modifierCopy:
         "When this machine controls a peer on a different OS, remap modifier keys (only applies across Win↔Mac). The default swaps Ctrl↔Command so copy, paste, and select-all keep each platform's shortcut habits.",

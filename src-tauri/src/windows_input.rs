@@ -14,14 +14,6 @@ pub fn inject_command(command: &InputCommand, pressed_keys: &mut Vec<u16>, butto
     inject_command_without_tracking(command);
 }
 
-#[allow(dead_code)]
-pub fn inject_command_on_fresh_input_desktop(command: &InputCommand) -> Result<String, String> {
-    let mut desktop = DesktopAttachment::new();
-    let name = desktop.attach_current_input_desktop()?;
-    inject_command_without_tracking(command);
-    Ok(name)
-}
-
 pub fn release_pressed_inputs_on_fresh_input_desktop(
     pressed_keys: &mut Vec<u16>,
     button_mask: &mut u64,
@@ -372,7 +364,7 @@ pub fn send_secure_attention() -> Result<(), String> {
     type SendSasFn = unsafe extern "system" fn(windows_sys::core::BOOL);
 
     unsafe {
-        let dll = LoadLibraryW(wide_null("sas.dll").as_ptr());
+        let dll = LoadLibraryW(crate::wide_null("sas.dll").as_ptr());
         if dll.is_null() {
             return Err("SAS.dll is not available on this Windows installation".into());
         }
@@ -385,8 +377,4 @@ pub fn send_secure_attention() -> Result<(), String> {
         let _ = FreeLibrary(dll);
     }
     Ok(())
-}
-
-fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }

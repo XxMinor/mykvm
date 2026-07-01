@@ -1404,6 +1404,65 @@
   border-color: #2786ff;
 }
 
+.screen-switch-hotkeys {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.info-tooltip-host {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 6px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.14);
+  color: inherit;
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+  user-select: none;
+}
+
+.info-tooltip {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: -6px;
+  width: 220px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(28, 31, 42, 0.97);
+  color: #e6eaf2;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: normal;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.14s ease, visibility 0.14s ease;
+  z-index: 50;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+
+.info-tooltip-host:hover .info-tooltip,
+.info-tooltip-host:focus-visible .info-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+
+.theme-light .info-tooltip {
+  background: rgba(255, 255, 255, 0.98);
+  color: #2a3346;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.18);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+}
+
 .hotkey-recorder-button {
   width: 100%;
   max-width: 100%;

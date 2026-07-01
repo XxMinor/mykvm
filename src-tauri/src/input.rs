@@ -49,8 +49,6 @@ const WINDOWS_FULLSCREEN_EDGE_TOLERANCE: i32 = 3;
 #[cfg(target_os = "windows")]
 const WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS: u64 = 250;
 
-static INPUT_TX_FAILURES: AtomicU64 = AtomicU64::new(0);
-static INPUT_TX_SKIPS: AtomicU64 = AtomicU64::new(0);
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
@@ -175,6 +173,95 @@ pub fn stopped_inject_status() -> NativeStageStatus {
     }
 }
 
+/// Direction requested by a screen-switch hotkey. Maps onto the `Edge` that a
+/// mouse crossing would follow: `Right` means "the remote sits to the right of
+/// the local screen", matching `Edge::Right` on the `InputTarget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl SwitchDirection {
+    fn matches_edge(self, edge: Edge) -> bool {
+        matches!(
+            (self, edge),
+            (SwitchDirection::Left, Edge::Left)
+                | (SwitchDirection::Right, Edge::Right)
+                | (SwitchDirection::Up, Edge::Top)
+                | (SwitchDirection::Down, Edge::Bottom)
+        )
+    }
+}
+
+/// Outcome of a hotkey-driven switch request. The capture loop acts on it: an
+/// `Enter` builds an `ActiveTarget` and runs the enter sequence; a `Return`
+/// hands control back to the local machine.
+pub enum SwitchOutcome {
+    Enter(ActiveTarget),
+    Return,
+    Noop,
+}
+
+/// Resolve a hotkey switch request against the current targets and active
+/// state. Called from the capture thread's poll loop.
+///
+/// - If we are currently local (`active` is `None`): pick the first online
+///   target whose `edge` matches the requested direction and build an
+///   `ActiveTarget` centred on the remote screen.
+/// - If we are already controlling a remote (`active` is `Some`): request a
+///   return to local. The user can then press the direction key again to cross
+///   into a different remote.
+pub fn request_screen_switch(
+    direction: SwitchDirection,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    native_layout: &LayoutState,
+    active: &Mutex<Option<ActiveTarget>>,
+) -> SwitchOutcome {
+    let currently_remote = active.lock().map(|a| a.is_some()).unwrap_or(false);
+    if currently_remote {
+        return SwitchOutcome::Return;
+    }
+
+    // Rebuild targets from the live layout every time: peers come and go after
+    // the capture thread started, so the static snapshot built at startup would
+    // miss a device that appeared later.
+    let Ok(layout) = layout_state.lock() else {
+        return SwitchOutcome::Noop;
+    };
+    let targets = build_input_targets(&layout, native_layout);
+    drop(layout);
+
+    let Some(target) = targets
+        .iter()
+        .find(|target| direction.matches_edge(target.edge))
+    else {
+        return SwitchOutcome::Noop;
+    };
+
+    // Land the remote cursor at the centre of the entry screen — there is no
+    // mouse trajectory to derive an entry offset from, so the middle is the
+    // least surprising landing spot.
+    let remote_x = (target.remote_screen.width as f64 / 2.0)
+        .clamp(0.0, (target.remote_screen.width - 1) as f64);
+    let remote_y = (target.remote_screen.height as f64 / 2.0)
+        .clamp(0.0, (target.remote_screen.height - 1) as f64);
+
+    let mut current_screen = target.remote_screen.clone();
+    current_screen.id = target.screen_id.clone();
+
+    SwitchOutcome::Enter(ActiveTarget {
+        target: target.clone(),
+        current_screen,
+        current_screen_id: target.screen_id.clone(),
+        x: remote_x,
+        y: remote_y,
+        invert_y: false,
+    })
+}
+
 pub fn start_input_runtime(
     layout: LayoutState,
     layout_state: Arc<Mutex<LayoutState>>,
@@ -186,6 +273,7 @@ pub fn start_input_runtime(
     main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> (NativeStageStatus, NativeStageStatus) {
     let inject_status = input_receive_status(&layout, true);
     if layout.input_mode == "receive" {
@@ -207,6 +295,7 @@ pub fn start_input_runtime(
         main_window_focused,
         clipboard_target,
         input_events,
+        switch_request,
     );
 
     (capture_status, inject_status)
@@ -318,6 +407,7 @@ fn start_input_capture(
     main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     start_platform_capture(
         targets,
@@ -330,6 +420,7 @@ fn start_input_capture(
         main_window_focused,
         clipboard_target,
         input_events,
+        switch_request,
     )
 }
 
@@ -345,6 +436,7 @@ fn start_platform_capture(
     _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
     use core_graphics::event::{
@@ -366,6 +458,8 @@ fn start_platform_capture(
             remote_active,
             clipboard_target,
             input_events,
+            targets,
+            switch_request,
             anchor: Mutex::new(None),
             cursor_hidden: Mutex::new(false),
             last_mouse_move_sent: Mutex::new(None),
@@ -440,6 +534,7 @@ fn start_platform_capture(
                 Duration::from_millis(100),
                 false,
             );
+            drain_switch_request_macos(&context);
             // macOS disables a tap whose callback ran too long or that idled out.
             // Without re-enabling it the mouse and keyboard silently freeze until
             // the app restarts, which is the classic "works, then sticks after a
@@ -492,6 +587,7 @@ fn start_platform_capture(
     main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, PM_REMOVE, WH_KEYBOARD_LL,
@@ -512,6 +608,8 @@ fn start_platform_capture(
             main_window_focused,
             clipboard_target,
             input_events,
+            targets,
+            switch_request,
             anchor: Mutex::new(None),
             last_point: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
@@ -571,6 +669,7 @@ fn start_platform_capture(
                     release_windows_remote_control(&context, true);
                 }
             }
+            drain_switch_request_windows(&context);
             unsafe {
                 while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
             }
@@ -616,6 +715,7 @@ fn start_platform_capture(
     _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     _input_events: Arc<AtomicU64>,
+    _switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     remote_active.store(false, Ordering::Relaxed);
     clear_clipboard_target(&clipboard_target);
@@ -839,7 +939,6 @@ fn send_packet(
         event,
     };
     let Some(peer) = packet_context.peer else {
-        INPUT_TX_SKIPS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
 
@@ -861,7 +960,6 @@ fn send_packet(
             true
         }
         Err(error) => {
-            INPUT_TX_FAILURES.fetch_add(1, Ordering::Relaxed);
             mark_target_offline(layout_state, target, &error);
             false
         }
@@ -1717,6 +1815,8 @@ struct MacCaptureContext {
     remote_active: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    targets: Vec<InputTarget>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
     anchor: Mutex<Option<(f64, f64)>>,
     cursor_hidden: Mutex<bool>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
@@ -1761,6 +1861,8 @@ struct WindowsCaptureContext {
     main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    targets: Vec<InputTarget>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
     anchor: Mutex<Option<(f64, f64)>>,
     last_point: Mutex<Option<(f64, f64)>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
@@ -3358,6 +3460,163 @@ fn send_remote_cursor_park(
     )
 }
 
+#[cfg(target_os = "macos")]
+fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveTarget) {
+    use core_graphics::geometry::CGPoint;
+
+    let anchor = mac_cursor_point(
+        context,
+        local_anchor_point(&active_target),
+        active_target.invert_y,
+    );
+    set_macos_cursor_decoupled(true);
+    set_macos_warp_suppression_interval(0.0);
+    hide_macos_cursor_if_needed(context);
+    move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
+    if !send_remote_mouse_move(
+        &context.quic_transport,
+        &active_target,
+        &context.layout_state,
+        &context.input_events,
+    ) {
+        reset_mouse_move_timer(&context.last_mouse_move_sent);
+        reset_remote_button_mask(&context.remote_button_mask);
+        reset_cursor_repin_timer(context);
+        set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+        set_macos_cursor_decoupled(false);
+        show_macos_cursor_if_needed(context);
+        context.just_crossed.store(false, Ordering::Relaxed);
+        return;
+    }
+    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    reset_cursor_repin_timer(context);
+    reset_remote_button_mask(&context.remote_button_mask);
+    context.remote_active.store(true, Ordering::Relaxed);
+    set_control_clipboard_target(
+        &context.clipboard_target,
+        &active_target,
+        &context.layout_state,
+    );
+    if let Ok(mut active) = context.active.lock() {
+        *active = Some(active_target);
+    }
+    if let Ok(mut anchor_state) = context.anchor.lock() {
+        *anchor_state = Some(anchor);
+    }
+    context.just_crossed.store(true, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn return_to_local_macos(context: &MacCaptureContext) {
+    use core_graphics::geometry::CGPoint;
+
+    let mut active_target = match context.active.lock().ok().and_then(|mut a| a.take()) {
+        Some(target) => target,
+        None => return,
+    };
+    let point = local_return_point(&active_target);
+    let invert_y = active_target.invert_y;
+    let target = active_target.target.clone();
+    let _ = send_remote_cursor_park(
+        &context.quic_transport,
+        &active_target,
+        &context.layout_state,
+        &context.input_events,
+    );
+    context.remote_active.store(false, Ordering::Relaxed);
+    context.just_crossed.store(false, Ordering::Relaxed);
+    if let Ok(mut last_return) = context.last_return.lock() {
+        *last_return = Some(Instant::now());
+    }
+    release_held_remote_inputs_macos(context, &target);
+    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    reset_cursor_repin_timer(context);
+    if let Ok(mut anchor) = context.anchor.lock() {
+        *anchor = None;
+    }
+    let point = mac_cursor_point(context, point, invert_y);
+    set_macos_warp_suppression_interval(0.0);
+    move_macos_cursor_without_event(context, CGPoint::new(point.0, point.1));
+    set_macos_cursor_decoupled(false);
+    set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+    show_macos_cursor_if_needed(context);
+}
+
+/// Poll the shared switch-request slot and act on it. Called from the capture
+/// loop on each iteration. Centralises the macOS enter/return side effects so
+/// both the mouse-crossing path and the hotkey path stay in sync.
+#[cfg(target_os = "macos")]
+fn drain_switch_request_macos(context: &MacCaptureContext) {
+    let direction = match context.switch_request.lock() {
+        Ok(mut req) => req.take(),
+        Err(_) => return,
+    };
+    let Some(direction) = direction else { return };
+    match request_screen_switch(direction, &context.layout_state, &context.native_layout, &context.active)
+    {
+        SwitchOutcome::Enter(active_target) => {
+            log::info!(
+                "screen switch entering device={}",
+                active_target.target.device_id
+            );
+            enter_remote_target_macos(context, active_target);
+        }
+        SwitchOutcome::Return => {
+            log::info!("screen switch returning to local");
+            return_to_local_macos(context);
+        }
+        SwitchOutcome::Noop => {
+            log::warn!("screen switch {direction:?} ignored: no matching online target");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn drain_switch_request_windows(context: &WindowsCaptureContext) {
+    let direction = match context.switch_request.lock() {
+        Ok(mut req) => req.take(),
+        Err(_) => return,
+    };
+    let Some(direction) = direction else { return };
+    match request_screen_switch(direction, &context.layout_state, &context.native_layout, &context.active)
+    {
+        SwitchOutcome::Enter(active_target) => {
+            log::info!(
+                "screen switch entering device={}",
+                active_target.target.device_id
+            );
+            // Mirror the Windows mouse-crossing enter path: send the initial
+            // move, hide the local cursor, mark remote_active. The remote will
+            // start receiving deltas from subsequent mouse moves.
+            if send_remote_mouse_move(
+                &context.quic_transport,
+                &active_target,
+                &context.layout_state,
+                &context.input_events,
+            ) {
+                hide_windows_cursor_if_needed(context);
+                context.remote_active.store(true, Ordering::Relaxed);
+                set_control_clipboard_target(
+                    &context.clipboard_target,
+                    &active_target,
+                    &context.layout_state,
+                );
+                if let Ok(mut active) = context.active.lock() {
+                    *active = Some(active_target);
+                }
+                context.just_crossed.store(true, Ordering::Relaxed);
+            }
+        }
+        SwitchOutcome::Return => {
+            log::info!("screen switch returning to local");
+            release_windows_remote_control(context, false);
+        }
+        SwitchOutcome::Noop => {
+            log::warn!("screen switch {direction:?} ignored: no matching online target");
+        }
+    }
+}
+
 /// Disconnects (or reconnects) the on-screen cursor from the physical mouse.
 /// While controlling a remote screen we decouple them: the mouse keeps emitting
 /// HID deltas to our event tap, but the local cursor stays frozen, so we never
@@ -4499,6 +4758,7 @@ mod tests {
             modifier_remap: true,
             modifier_map: crate::default_modifier_map(),
             edge_switch_hotkey: crate::default_edge_switch_hotkey(),
+            screen_switch_hotkeys: crate::ScreenSwitchHotkeys::default(),
         }
     }
 

@@ -163,6 +163,46 @@ struct Device {
     screens: Vec<Screen>,
 }
 
+/// Per-direction hotkeys for jumping between adjacent screens without moving
+/// the mouse to an edge. Each value is a canonical shortcut string
+/// (`"alt+right"`, `"disabled"`, etc.) consumed by the global-shortcut plugin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenSwitchHotkeys {
+    #[serde(default = "default_screen_switch_hotkey_left")]
+    pub left: String,
+    #[serde(default = "default_screen_switch_hotkey_right")]
+    pub right: String,
+    #[serde(default = "default_screen_switch_hotkey_up")]
+    pub up: String,
+    #[serde(default = "default_screen_switch_hotkey_down")]
+    pub down: String,
+}
+
+impl Default for ScreenSwitchHotkeys {
+    fn default() -> Self {
+        Self {
+            left: default_screen_switch_hotkey_left(),
+            right: default_screen_switch_hotkey_right(),
+            up: default_screen_switch_hotkey_up(),
+            down: default_screen_switch_hotkey_down(),
+        }
+    }
+}
+
+fn default_screen_switch_hotkey_left() -> String {
+    "alt+left".into()
+}
+fn default_screen_switch_hotkey_right() -> String {
+    "alt+right".into()
+}
+fn default_screen_switch_hotkey_up() -> String {
+    "alt+up".into()
+}
+fn default_screen_switch_hotkey_down() -> String {
+    "alt+down".into()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LayoutState {
@@ -201,6 +241,8 @@ struct LayoutState {
     modifier_map: ModifierMap,
     #[serde(default = "default_edge_switch_hotkey")]
     edge_switch_hotkey: String,
+    #[serde(default)]
+    screen_switch_hotkeys: ScreenSwitchHotkeys,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -508,6 +550,8 @@ struct AppRuntime {
     clipboard_packets: Arc<AtomicU64>,
     runtime_toggle_shortcut: Mutex<Option<String>>,
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
+    screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
+    screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
 }
 
@@ -516,6 +560,7 @@ impl AppRuntime {
         let layout = load_layout_from_disk(&config_path)
             .map(|saved_layout| normalize_saved_layout(saved_layout, detected_layout.clone()))
             .unwrap_or_else(|| detected_layout.clone());
+        let screen_switch_hotkeys = layout.screen_switch_hotkeys.clone();
         Self {
             app_handle,
             layout: Arc::new(Mutex::new(layout)),
@@ -545,6 +590,8 @@ impl AppRuntime {
             clipboard_packets: Arc::new(AtomicU64::new(0)),
             runtime_toggle_shortcut: Mutex::new(None),
             runtime_toggle_menu_item: Mutex::new(None),
+            screen_switch_request: Arc::new(Mutex::new(None)),
+            screen_switch_shortcuts: Mutex::new(screen_switch_hotkeys),
             config_path,
         }
     }
@@ -1057,6 +1104,7 @@ impl AppRuntime {
             Arc::clone(&self.main_window_focused),
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
+            Arc::clone(&self.screen_switch_request),
         );
         *input_stop = Some(stop);
         statuses
@@ -1256,6 +1304,7 @@ fn save_layout(
         }
     }
     sync_runtime_toggle_shortcut(&state.app_handle)?;
+    sync_screen_switch_shortcuts(&state.app_handle)?;
     Ok(state.snapshot())
 }
 
@@ -1701,6 +1750,122 @@ fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<Str
     canonical_runtime_toggle_shortcut(&layout.edge_switch_hotkey)
 }
 
+/// Register/unregister the four direction hotkeys so they stay in sync with the
+/// saved layout. Mirrors `sync_runtime_toggle_shortcut`: compares against the
+/// stored values and only touches the ones that changed.
+fn sync_screen_switch_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return Ok(());
+    };
+    let layout = state.layout_snapshot();
+    let next = ScreenSwitchHotkeys {
+        left: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.left)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        right: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.right)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        up: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.up)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        down: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.down)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+    };
+
+    let mut current = state
+        .screen_switch_shortcuts
+        .lock()
+        .map_err(|_| "screen switch shortcuts lock poisoned".to_string())?;
+
+    for (next_str, prev_str) in [
+        (&next.left, &current.left),
+        (&next.right, &current.right),
+        (&next.up, &current.up),
+        (&next.down, &current.down),
+    ] {
+        if next_str == prev_str {
+            continue;
+        }
+        if !prev_str.is_empty() {
+            if let Err(error) = app.global_shortcut().unregister(prev_str.as_str()) {
+                log::warn!("failed to unregister screen switch shortcut {prev_str}: {error}");
+            }
+        }
+        if !next_str.is_empty() {
+            if let Err(error) = app.global_shortcut().register(next_str.as_str()) {
+                log::warn!("failed to register screen switch shortcut {next_str}: {error}");
+            } else {
+                log::info!("registered screen switch shortcut: {next_str}");
+            }
+        }
+    }
+
+    *current = next;
+    Ok(())
+}
+
+/// Dispatch a pressed global shortcut to its action. The runtime-toggle
+/// shortcut starts/stops capture; the four direction shortcuts post a switch
+/// request that the capture loop consumes.
+fn route_global_shortcut(
+    app: &AppHandle,
+    shortcut: &tauri_plugin_global_shortcut::Shortcut,
+) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return Ok(());
+    };
+
+    // Runtime toggle (quick start/stop).
+    let toggle = state
+        .runtime_toggle_shortcut
+        .lock()
+        .map_err(|_| "runtime toggle shortcut lock poisoned".to_string())?;
+    if let Some(toggle_str) = toggle.as_ref() {
+        if let Ok(toggle_shortcut) = toggle_str.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+            if shortcut == &toggle_shortcut {
+                drop(toggle);
+                toggle_runtime_from_app(app)?;
+                return Ok(());
+            }
+        }
+    }
+    drop(toggle);
+
+    // Direction switch hotkeys.
+    let directions = state
+        .screen_switch_shortcuts
+        .lock()
+        .map_err(|_| "screen switch shortcuts lock poisoned".to_string())?;
+    let direction = [
+        (directions.left.as_str(), input::SwitchDirection::Left),
+        (directions.right.as_str(), input::SwitchDirection::Right),
+        (directions.up.as_str(), input::SwitchDirection::Up),
+        (directions.down.as_str(), input::SwitchDirection::Down),
+    ]
+    .into_iter()
+    .find_map(|(stored, dir)| {
+        if stored.is_empty() {
+            return None;
+        }
+        stored
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .ok()
+            .filter(|parsed| parsed == shortcut)
+            .map(|_| dir)
+    });
+    drop(directions);
+
+    if let Some(direction) = direction {
+        if let Ok(mut request) = state.screen_switch_request.lock() {
+            // Only the latest request wins; a rapid double-tap overwrites.
+            *request = Some(direction);
+        }
+    }
+
+    Ok(())
+}
+
 fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, String> {
     let normalized = normalize_edge_switch_hotkey(value);
     if matches!(normalized.as_str(), "disabled" | "disable" | "off" | "none") {
@@ -1904,15 +2069,7 @@ fn send_files_to_device(
     paths: Vec<String>,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<FileTransferSummary, String> {
-    send_files_to_device_impl(state.inner(), &device_id, paths)
-}
-
-fn send_files_to_device_impl(
-    state: &AppRuntime,
-    device_id: &str,
-    paths: Vec<String>,
-) -> Result<FileTransferSummary, String> {
-    send_files_to_device_with_destination(state, device_id, paths, None)
+    send_files_to_device_with_destination(state.inner(), &device_id, paths, None)
 }
 
 fn send_files_to_device_with_destination(
@@ -3085,10 +3242,10 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state == ShortcutState::Pressed {
-                        if let Err(error) = toggle_runtime_from_app(app) {
-                            log::warn!("quick start/stop shortcut failed: {error}");
+                        if let Err(error) = route_global_shortcut(app, shortcut) {
+                            log::warn!("global shortcut failed: {error}");
                         }
                     }
                 })
@@ -3191,6 +3348,9 @@ pub fn run() {
             setup_tray(app)?;
             if let Err(error) = sync_runtime_toggle_shortcut(app.handle()) {
                 log::warn!("failed to register quick start/stop shortcut: {error}");
+            }
+            if let Err(error) = sync_screen_switch_shortcuts(app.handle()) {
+                log::warn!("failed to register screen switch shortcuts: {error}");
             }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
@@ -3707,7 +3867,7 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
 
         let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
         let display_name = wide_null(shared_input::INPUT_SERVICE_DISPLAY_NAME);
-        let binary = wide_null(&format!("{} --service", quote_windows_arg(helper_path)));
+        let binary = wide_null(&format!("{} --service", quote_windows_arg_str(&helper_path.to_string_lossy())));
         let mut service = CreateServiceW(
             scm,
             service_name.as_ptr(),
@@ -3985,11 +4145,6 @@ fn sas_dll_available() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn quote_windows_arg(value: &PathBuf) -> String {
-    quote_windows_arg_str(&value.to_string_lossy())
-}
-
-#[cfg(target_os = "windows")]
 fn quote_windows_arg_str(value: &str) -> String {
     let mut quoted = String::from("\"");
     for ch in value.chars() {
@@ -4126,7 +4281,7 @@ fn apply_windows_window_chrome(window: &tauri::WebviewWindow, theme: &str) -> Re
 }
 
 #[cfg(target_os = "windows")]
-fn wide_null(value: &str) -> Vec<u16> {
+pub(crate) fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -4161,6 +4316,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         modifier_remap: default_modifier_remap(),
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
+        screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         devices: vec![Device {
             id: device_id,
             name: local_device_name(),
@@ -4203,6 +4359,7 @@ fn detect_fallback_layout() -> LayoutState {
         modifier_remap: default_modifier_remap(),
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
+        screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
     }
 }
 
@@ -4315,6 +4472,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         modifier_remap: saved_layout.modifier_remap,
         modifier_map: normalize_modifier_map(&saved_layout.modifier_map),
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
+        screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
     }
 }
 
@@ -7297,7 +7455,7 @@ fn ensure_windows_firewall_rule() {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -7406,6 +7564,7 @@ mod tests {
             modifier_remap: true,
             modifier_map: default_modifier_map(),
             edge_switch_hotkey: default_edge_switch_hotkey(),
+            screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         }
     }
 

@@ -1,7 +1,7 @@
 use std::{
     process::Command,
     sync::{Mutex, OnceLock},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ pub(crate) fn read_process_sample(
     };
 
     PerformanceSample {
-        timestamp_ms: now_ms(),
+        timestamp_ms: crate::now_ms(),
         app_cpu_percent: app_cpu_percent.clamp(0.0, 100.0),
         app_memory_mb: app_memory_mb.max(0.0),
         transport_packets,
@@ -161,77 +161,6 @@ fn filetime_to_u64(filetime: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64
 }
 
-#[allow(dead_code)]
-pub(crate) fn read_system_overview_sample() -> PerformanceSample {
-    let (app_cpu_percent, app_memory_mb, _memory_total_mb) = if cfg!(target_os = "macos") {
-        read_macos_performance().unwrap_or((0.0, 0.0, 0.0))
-    } else if cfg!(target_os = "windows") {
-        read_windows_performance().unwrap_or((0.0, 0.0, 0.0))
-    } else {
-        read_linux_performance().unwrap_or((0.0, 0.0, 0.0))
-    };
-
-    PerformanceSample {
-        timestamp_ms: now_ms(),
-        app_cpu_percent: app_cpu_percent.clamp(0.0, 100.0),
-        app_memory_mb,
-        transport_packets: 0,
-        input_events: 0,
-        clipboard_packets: 0,
-    }
-}
-
-fn read_macos_performance() -> Result<(f64, f64, f64), String> {
-    let cpu_total = command_stdout(
-        Command::new("sh").args(["-c", "ps -A -o %cpu= | awk '{s+=$1} END{print s+0}'"]),
-    )?
-    .trim()
-    .parse::<f64>()
-    .unwrap_or(0.0);
-    let cpu_count = command_stdout(Command::new("sysctl").args(["-n", "hw.logicalcpu"]))?
-        .trim()
-        .parse::<f64>()
-        .unwrap_or(1.0)
-        .max(1.0);
-    let total_bytes = command_stdout(Command::new("sysctl").args(["-n", "hw.memsize"]))?
-        .trim()
-        .parse::<f64>()
-        .unwrap_or(0.0);
-    let vm_stat = command_stdout(&mut Command::new("vm_stat"))?;
-    let page_size = vm_stat
-        .lines()
-        .next()
-        .and_then(|line| line.split("page size of ").nth(1))
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(4096.0);
-    let free_pages = vm_stat_pages(&vm_stat, "Pages free")
-        + vm_stat_pages(&vm_stat, "Pages inactive")
-        + vm_stat_pages(&vm_stat, "Pages speculative");
-    let total_mb = total_bytes / 1024.0 / 1024.0;
-    let free_mb = free_pages * page_size / 1024.0 / 1024.0;
-    let used_mb = (total_mb - free_mb).max(0.0);
-
-    Ok((cpu_total / cpu_count, used_mb, total_mb))
-}
-
-fn read_windows_performance() -> Result<(f64, f64, f64), String> {
-    let output = command_stdout(Command::new("powershell").args([
-        "-NoProfile",
-        "-Command",
-        "$cpu=(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average; $os=Get-CimInstance Win32_OperatingSystem; $total=[math]::Round($os.TotalVisibleMemorySize/1024,2); $free=[math]::Round($os.FreePhysicalMemory/1024,2); Write-Output \"$cpu,$($total-$free),$total\"",
-    ]))?;
-    parse_metric_triplet(&output)
-}
-
-fn read_linux_performance() -> Result<(f64, f64, f64), String> {
-    let output = command_stdout(Command::new("sh").args([
-        "-c",
-        "cpu=$(top -bn1 | awk '/Cpu\\(s\\)/ {print 100-$8; exit}'); mem=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf \"%.2f,%.2f\", (t-a)/1024, t/1024}' /proc/meminfo); echo \"$cpu,$mem\"",
-    ]))?;
-    parse_metric_triplet(&output)
-}
-
 fn command_stdout(command: &mut Command) -> Result<String, String> {
     let output = command
         .output()
@@ -242,34 +171,4 @@ fn command_stdout(command: &mut Command) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
-}
-
-fn parse_metric_triplet(output: &str) -> Result<(f64, f64, f64), String> {
-    let values = output
-        .trim()
-        .split(',')
-        .map(|value| value.trim().parse::<f64>().unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    if values.len() >= 3 {
-        Ok((values[0], values[1], values[2]))
-    } else {
-        Err("performance command did not return cpu, memory used, memory total".into())
-    }
-}
-
-fn vm_stat_pages(vm_stat: &str, label: &str) -> f64 {
-    vm_stat
-        .lines()
-        .find(|line| line.trim_start().starts_with(label))
-        .and_then(|line| line.split(':').nth(1))
-        .map(|value| value.trim().trim_end_matches('.').replace('.', ""))
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
