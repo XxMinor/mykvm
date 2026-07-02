@@ -68,6 +68,7 @@ const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const FILE_TRANSFER_DESTINATION_POINTER: &str = "pointer";
+const EDGE_DROP_WINDOWS_ENABLED: bool = false;
 const EDGE_DROP_LABEL_PREFIX: &str = "mykvm-edge-drop-";
 const EDGE_DROP_THICKNESS: i32 = 8;
 const FILE_DROP_LANDING_LABEL: &str = "mykvm-file-drop-landing";
@@ -3457,7 +3458,9 @@ pub fn run() {
             setup_macos_cursor_hider(app);
             #[cfg(target_os = "macos")]
             setup_macos_window_visibility_watcher(app);
-            start_edge_drop_window_sync(app.handle().clone());
+            if EDGE_DROP_WINDOWS_ENABLED {
+                start_edge_drop_window_sync(app.handle().clone());
+            }
             setup_tray(app)?;
             if let Err(error) = sync_runtime_toggle_shortcut(app.handle()) {
                 log::warn!("failed to register quick start/stop shortcut: {error}");

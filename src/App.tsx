@@ -2240,7 +2240,9 @@ function App() {
                                 {ui.common.upgrading}
                               </span>
                             ) : null}
-                            {device.online && !device.inputReady ? (
+                            {device.role !== "local" &&
+                            device.online &&
+                            !device.inputReady ? (
                               <span className="tag-pill tag-pill-warning">
                                 {ui.devices.inputNotReady}
                               </span>
