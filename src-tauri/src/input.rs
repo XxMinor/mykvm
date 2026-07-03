@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -44,13 +45,62 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 const RETURN_COOLDOWN_MS: u64 = 150;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
+#[cfg(target_os = "macos")]
+const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
+#[cfg(target_os = "macos")]
+const MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS: u64 = 16;
+#[cfg(target_os = "macos")]
+const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = 50;
+#[cfg(target_os = "macos")]
+const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_SYSTEM_DEFINED: u32 = 14;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_ROTATE: u32 = 18;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_BEGIN_GESTURE: u32 = 19;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_END_GESTURE: u32 = 20;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_GESTURE: u32 = 29;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_MAGNIFY: u32 = 30;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_SWIPE: u32 = 31;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_SMART_MAGNIFY: u32 = 32;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_QUICK_LOOK: u32 = 33;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_PRESSURE: u32 = 34;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_DIRECT_TOUCH: u32 = 37;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_CHANGE_MODE: u32 = 38;
+#[cfg(target_os = "macos")]
+const MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+#[cfg(target_os = "macos")]
+const MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+#[cfg(target_os = "macos")]
+const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
+    MACOS_NSEVENT_TYPE_SYSTEM_DEFINED,
+    MACOS_NSEVENT_TYPE_ROTATE,
+    MACOS_NSEVENT_TYPE_BEGIN_GESTURE,
+    MACOS_NSEVENT_TYPE_END_GESTURE,
+    MACOS_NSEVENT_TYPE_GESTURE,
+    MACOS_NSEVENT_TYPE_MAGNIFY,
+    MACOS_NSEVENT_TYPE_SWIPE,
+    MACOS_NSEVENT_TYPE_SMART_MAGNIFY,
+    MACOS_NSEVENT_TYPE_QUICK_LOOK,
+    MACOS_NSEVENT_TYPE_PRESSURE,
+    MACOS_NSEVENT_TYPE_DIRECT_TOUCH,
+    MACOS_NSEVENT_TYPE_CHANGE_MODE,
+];
 #[cfg(target_os = "windows")]
 const WINDOWS_FULLSCREEN_EDGE_TOLERANCE: i32 = 3;
 #[cfg(target_os = "windows")]
 const WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS: u64 = 250;
 
-static INPUT_TX_FAILURES: AtomicU64 = AtomicU64::new(0);
-static INPUT_TX_SKIPS: AtomicU64 = AtomicU64::new(0);
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
@@ -175,6 +225,341 @@ pub fn stopped_inject_status() -> NativeStageStatus {
     }
 }
 
+/// Direction requested by a screen-switch hotkey. Maps onto the `Edge` that a
+/// mouse crossing would follow: `Right` means "the remote sits to the right of
+/// the local screen", matching `Edge::Right` on the `InputTarget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl SwitchDirection {
+    fn matches_edge(self, edge: Edge) -> bool {
+        matches!(
+            (self, edge),
+            (SwitchDirection::Left, Edge::Left)
+                | (SwitchDirection::Right, Edge::Right)
+                | (SwitchDirection::Up, Edge::Top)
+                | (SwitchDirection::Down, Edge::Bottom)
+        )
+    }
+}
+
+/// Outcome of a hotkey-driven switch request. The capture loop acts on it: an
+/// `Enter` builds an `ActiveTarget` and runs the enter sequence; a `Return`
+/// hands control back to the local machine.
+enum SwitchOutcome {
+    Enter(ActiveTarget),
+    LocalMove {
+        from_screen_id: String,
+        to_screen_id: String,
+        x: f64,
+        y: f64,
+    },
+    Return,
+    Noop,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HotkeyModifiers {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+}
+
+fn screen_switch_hotkey_matches_vk(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    key_code: u16,
+    modifiers: HotkeyModifiers,
+) -> bool {
+    let Ok(layout) = layout_state.lock() else {
+        return false;
+    };
+    if layout.machine_role != "server" {
+        return false;
+    }
+
+    screen_switch_hotkeys_match_vk(&layout.screen_switch_hotkeys, key_code, modifiers)
+}
+
+fn screen_switch_hotkeys_match_vk(
+    hotkeys: &crate::ScreenSwitchHotkeys,
+    key_code: u16,
+    modifiers: HotkeyModifiers,
+) -> bool {
+    [
+        hotkeys.left.as_str(),
+        hotkeys.right.as_str(),
+        hotkeys.up.as_str(),
+        hotkeys.down.as_str(),
+    ]
+    .into_iter()
+    .any(|hotkey| hotkey_matches_vk(hotkey, key_code, modifiers))
+}
+
+fn hotkey_matches_vk(value: &str, key_code: u16, modifiers: HotkeyModifiers) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace(' ', "");
+    if normalized.is_empty()
+        || matches!(normalized.as_str(), "disabled" | "disable" | "off" | "none")
+    {
+        return false;
+    }
+
+    let mut required = HotkeyModifiers::default();
+    let mut main_key = None;
+    for part in normalized.split('+').filter(|part| !part.is_empty()) {
+        match part {
+            "ctrl" | "control" => required.ctrl = true,
+            "alt" | "option" => required.alt = true,
+            "shift" => required.shift = true,
+            "meta" | "cmd" | "command" | "win" | "windows" | "super" | "os" => {
+                required.meta = true;
+            }
+            key => {
+                if main_key.is_some() {
+                    return false;
+                }
+                main_key = hotkey_key_to_windows_vk(key);
+            }
+        }
+    }
+
+    main_key == Some(key_code) && required == modifiers
+}
+
+fn hotkey_key_to_windows_vk(key: &str) -> Option<u16> {
+    if key.len() == 1 {
+        let byte = key.as_bytes()[0];
+        if byte.is_ascii_alphabetic() {
+            return Some(byte.to_ascii_uppercase() as u16);
+        }
+        if byte.is_ascii_digit() {
+            return Some(byte as u16);
+        }
+    }
+
+    if let Some(function_number) = key
+        .strip_prefix('f')
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        if (1..=24).contains(&function_number) {
+            return Some(0x70 + function_number - 1);
+        }
+    }
+
+    Some(match key {
+        "space" | "spacebar" => 0x20,
+        "tab" => 0x09,
+        "enter" | "return" => 0x0D,
+        "esc" | "escape" => 0x1B,
+        "scrolllock" | "scroll" | "scrlk" => 0x91,
+        "up" | "arrowup" => 0x26,
+        "down" | "arrowdown" => 0x28,
+        "left" | "arrowleft" => 0x25,
+        "right" | "arrowright" => 0x27,
+        _ => return None,
+    })
+}
+
+/// Resolve a hotkey switch request against the current targets and active
+/// state. Called from the capture thread's poll loop.
+///
+/// - If we are currently local (`active` is `None`): move to a local screen in
+///   that direction when one exists, otherwise pick the first online remote
+///   target whose `edge` matches the requested direction.
+/// - If we are already controlling a remote (`active` is `Some`): request a
+///   return to local. The user can then press the direction key again to cross
+///   into a different remote.
+#[cfg(test)]
+fn request_screen_switch(
+    direction: SwitchDirection,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    native_layout: &LayoutState,
+    active: &Mutex<Option<ActiveTarget>>,
+) -> SwitchOutcome {
+    request_screen_switch_from_point(direction, layout_state, native_layout, active, None)
+}
+
+fn request_screen_switch_from_point(
+    direction: SwitchDirection,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    native_layout: &LayoutState,
+    active: &Mutex<Option<ActiveTarget>>,
+    current_point: Option<(f64, f64)>,
+) -> SwitchOutcome {
+    let currently_remote = active.lock().map(|a| a.is_some()).unwrap_or(false);
+    if currently_remote {
+        return SwitchOutcome::Return;
+    }
+
+    // Rebuild targets from the live layout every time: peers come and go after
+    // the capture thread started, so the static snapshot built at startup would
+    // miss a device that appeared later.
+    let Ok(layout) = layout_state.lock() else {
+        return SwitchOutcome::Noop;
+    };
+    let source_screen_id =
+        source_local_screen(&layout, native_layout, current_point).map(|screen| screen.id.clone());
+    if let Some(local_move) = local_screen_switch_point(
+        direction,
+        &layout,
+        native_layout,
+        source_screen_id.as_deref(),
+    ) {
+        return SwitchOutcome::LocalMove {
+            from_screen_id: local_move.from_screen_id,
+            to_screen_id: local_move.to_screen_id,
+            x: local_move.x,
+            y: local_move.y,
+        };
+    }
+    let targets = build_input_targets(&layout, native_layout);
+    drop(layout);
+
+    let target = targets
+        .iter()
+        .filter(|target| {
+            source_screen_id
+                .as_deref()
+                .map(|id| target.layout_local_screen.id == id)
+                .unwrap_or(true)
+        })
+        .find(|target| direction.matches_edge(target.edge))
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| direction.matches_edge(target.edge))
+        });
+    let Some(target) = target else {
+        return SwitchOutcome::Noop;
+    };
+
+    // Land the remote cursor at the centre of the entry screen — there is no
+    // mouse trajectory to derive an entry offset from, so the middle is the
+    // least surprising landing spot.
+    let remote_x = (target.remote_screen.width as f64 / 2.0)
+        .clamp(0.0, (target.remote_screen.width - 1) as f64);
+    let remote_y = (target.remote_screen.height as f64 / 2.0)
+        .clamp(0.0, (target.remote_screen.height - 1) as f64);
+
+    let mut current_screen = target.remote_screen.clone();
+    current_screen.id = target.screen_id.clone();
+
+    SwitchOutcome::Enter(ActiveTarget {
+        target: target.clone(),
+        current_screen,
+        current_screen_id: target.screen_id.clone(),
+        x: remote_x,
+        y: remote_y,
+        invert_y: false,
+    })
+}
+
+fn source_local_screen<'a>(
+    layout: &'a LayoutState,
+    native_layout: &LayoutState,
+    current_point: Option<(f64, f64)>,
+) -> Option<&'a Screen> {
+    let local = local_device(layout)?;
+    if let Some((x, y)) = current_point {
+        if let Some(native_local) = local_device(native_layout) {
+            for native_screen in &native_local.screens {
+                let native_screen = platform_native_screen(native_screen);
+                if point_in_screen(&native_screen, x, y) {
+                    if let Some(screen) = local
+                        .screens
+                        .iter()
+                        .find(|screen| screen.id == native_screen.id)
+                    {
+                        return Some(screen);
+                    }
+                }
+            }
+        }
+        if let Some(screen) = local
+            .screens
+            .iter()
+            .find(|screen| point_in_screen(screen, x, y))
+        {
+            return Some(screen);
+        }
+    }
+
+    local
+        .screens
+        .iter()
+        .find(|screen| screen.is_primary)
+        .or_else(|| local.screens.first())
+}
+
+struct LocalScreenMove {
+    from_screen_id: String,
+    to_screen_id: String,
+    x: f64,
+    y: f64,
+}
+
+fn local_screen_switch_point(
+    direction: SwitchDirection,
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+    source_screen_id: Option<&str>,
+) -> Option<LocalScreenMove> {
+    let local = local_device(layout)?;
+    let source = source_screen_id
+        .and_then(|id| local.screens.iter().find(|screen| screen.id == id))
+        .or_else(|| local.screens.iter().find(|screen| screen.is_primary))
+        .or_else(|| local.screens.first())?;
+
+    let target = local.screens.iter().find(|screen| {
+        screen.id != source.id
+            && !screens_overlap(source, screen)
+            && touching_edge(source, screen)
+                .map(|edge| direction.matches_edge(edge))
+                .unwrap_or(false)
+    })?;
+
+    let native_target = local_device(native_layout)
+        .and_then(|device| device.screens.iter().find(|screen| screen.id == target.id))
+        .map(platform_native_screen)
+        .unwrap_or_else(|| platform_native_screen(target));
+    let (x, y) = screen_center_point(&native_target);
+    Some(LocalScreenMove {
+        from_screen_id: source.id.clone(),
+        to_screen_id: target.id.clone(),
+        x,
+        y,
+    })
+}
+
+fn screen_center_point(screen: &Screen) -> (f64, f64) {
+    (
+        screen.x as f64 + (screen.width as f64 / 2.0).clamp(0.0, (screen.width - 1).max(0) as f64),
+        screen.y as f64
+            + (screen.height as f64 / 2.0).clamp(0.0, (screen.height - 1).max(0) as f64),
+    )
+}
+
+fn remembered_local_screen_point(
+    points: &Mutex<HashMap<String, (f64, f64)>>,
+    from_screen_id: &str,
+    to_screen_id: &str,
+    current_point: Option<(f64, f64)>,
+    fallback: (f64, f64),
+) -> (f64, f64) {
+    let Ok(mut points) = points.lock() else {
+        return fallback;
+    };
+    if let Some(point) = current_point {
+        points.insert(from_screen_id.to_string(), point);
+    }
+    points.get(to_screen_id).copied().unwrap_or(fallback)
+}
+
 pub fn start_input_runtime(
     layout: LayoutState,
     layout_state: Arc<Mutex<LayoutState>>,
@@ -186,6 +571,7 @@ pub fn start_input_runtime(
     main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> (NativeStageStatus, NativeStageStatus) {
     let inject_status = input_receive_status(&layout, true);
     if layout.input_mode == "receive" {
@@ -207,6 +593,7 @@ pub fn start_input_runtime(
         main_window_focused,
         clipboard_target,
         input_events,
+        switch_request,
     );
 
     (capture_status, inject_status)
@@ -318,6 +705,7 @@ fn start_input_capture(
     main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     start_platform_capture(
         targets,
@@ -330,6 +718,7 @@ fn start_input_capture(
         main_window_focused,
         clipboard_target,
         input_events,
+        switch_request,
     )
 }
 
@@ -341,10 +730,11 @@ fn start_platform_capture(
     quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
-    _main_window_visible: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
     use core_graphics::event::{
@@ -364,10 +754,15 @@ fn start_platform_capture(
             native_layout,
             active: Mutex::new(None),
             remote_active,
+            main_window_visible,
             clipboard_target,
             input_events,
+            targets,
+            switch_request,
             anchor: Mutex::new(None),
             cursor_hidden: Mutex::new(false),
+            cursor_hide_depth: Mutex::new(0),
+            last_cursor_hide_reassert: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
             last_cursor_repin: Mutex::new(None),
             last_return: Mutex::new(None),
@@ -376,6 +771,9 @@ fn start_platform_capture(
             pressed_keys: Mutex::new(Vec::new()),
             tap_disabled: AtomicBool::new(false),
             just_crossed: AtomicBool::new(false),
+            suppress_next_mouse_delta: AtomicBool::new(false),
+            hotkey_return_point: Mutex::new(None),
+            local_screen_points: Mutex::new(HashMap::new()),
             local_y_bounds,
             display_snapshots,
         });
@@ -428,30 +826,75 @@ fn start_platform_capture(
             }
         };
         CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+        let mut raw_gesture_taps = Vec::new();
+        let mut _raw_gesture_loop_sources = Vec::new();
+        for location in [CGEventTapLocation::HID, CGEventTapLocation::Session] {
+            match RawMacosGestureTap::new(location, Arc::clone(&context)) {
+                Ok(raw_tap) => match raw_tap.mach_port().create_runloop_source(0) {
+                    Ok(source) => {
+                        CFRunLoop::get_current()
+                            .add_source(&source, unsafe { kCFRunLoopCommonModes });
+                        raw_tap.enable();
+                        _raw_gesture_loop_sources.push(source);
+                        raw_gesture_taps.push(raw_tap);
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "failed to attach raw macOS gesture event tap {:?} to run loop",
+                            location
+                        );
+                    }
+                },
+                Err(_) => {
+                    log::warn!(
+                        "failed to create raw macOS gesture event tap {:?}",
+                        location
+                    );
+                }
+            }
+        }
         tap.enable();
-        // Keep this background capture thread off App Nap so the run loop and
-        // its timers are not throttled while MyKVM is not frontmost/minimized.
-        set_macos_app_nap_suppressed(true);
         let _ = ready_tx.send(Ok(()));
+        let mut app_nap_suppressed = false;
 
         while !stop.load(Ordering::Relaxed) {
+            let was_remote_active = context.remote_active.load(Ordering::Relaxed);
+            if app_nap_suppressed != was_remote_active {
+                set_macos_app_nap_suppressed(was_remote_active);
+                app_nap_suppressed = was_remote_active;
+            }
             let _ = CFRunLoop::run_in_mode(
                 unsafe { kCFRunLoopDefaultMode },
-                Duration::from_millis(100),
+                Duration::from_millis(macos_capture_loop_ms(
+                    was_remote_active,
+                    context.main_window_visible.load(Ordering::Relaxed),
+                )),
                 false,
             );
+            drain_switch_request_macos(&context);
             // macOS disables a tap whose callback ran too long or that idled out.
             // Without re-enabling it the mouse and keyboard silently freeze until
             // the app restarts, which is the classic "works, then sticks after a
             // while" failure. Re-arm it as soon as we notice.
             if context.tap_disabled.swap(false, Ordering::Relaxed) {
                 tap.enable();
-                log::info!("[diag] event tap re-enabled after being disabled");
+                for raw_tap in &raw_gesture_taps {
+                    raw_tap.enable();
+                }
+                log::debug!("[diag] event tap re-enabled after being disabled");
             }
-            // No cursor-hide reassert needed here: the transparent cursor pushed
-            // on entry stays active for the whole remote session with no
-            // hide/show state for WindowServer to drop. See
-            // set_macos_cursor_transparent.
+            // While controlling a remote, macOS can re-associate the physical
+            // mouse with the local cursor (especially when backgrounded),
+            // making the server pointer reappear and follow the mouse.
+            // Re-pin it to the anchor and re-assert hide while active.
+            let is_remote_active = context.remote_active.load(Ordering::Relaxed);
+            if app_nap_suppressed != is_remote_active {
+                set_macos_app_nap_suppressed(is_remote_active);
+                app_nap_suppressed = is_remote_active;
+            }
+            if is_remote_active {
+                repin_macos_cursor_while_remote(&context);
+            }
         }
 
         // Critical safety: never leave the cursor decoupled after capture stops,
@@ -459,7 +902,9 @@ fn start_platform_capture(
         set_macos_cursor_decoupled(false);
         set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
         show_macos_cursor_if_needed(&context);
-        set_macos_app_nap_suppressed(false);
+        if app_nap_suppressed {
+            set_macos_app_nap_suppressed(false);
+        }
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
     });
@@ -492,6 +937,7 @@ fn start_platform_capture(
     main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, PM_REMOVE, WH_KEYBOARD_LL,
@@ -512,6 +958,8 @@ fn start_platform_capture(
             main_window_focused,
             clipboard_target,
             input_events,
+            targets,
+            switch_request,
             anchor: Mutex::new(None),
             last_point: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
@@ -520,6 +968,7 @@ fn start_platform_capture(
             cursor_hide_calls: Mutex::new(0),
             fullscreen_foreground_cache: Mutex::new(None),
             just_crossed: AtomicBool::new(false),
+            local_screen_points: Mutex::new(HashMap::new()),
         });
 
         if let Ok(mut current) = WINDOWS_CAPTURE_CONTEXT.lock() {
@@ -571,6 +1020,7 @@ fn start_platform_capture(
                     release_windows_remote_control(&context, true);
                 }
             }
+            drain_switch_request_windows(&context);
             unsafe {
                 while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
             }
@@ -616,6 +1066,7 @@ fn start_platform_capture(
     _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     _input_events: Arc<AtomicU64>,
+    _switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     remote_active.store(false, Ordering::Relaxed);
     clear_clipboard_target(&clipboard_target);
@@ -839,7 +1290,6 @@ fn send_packet(
         event,
     };
     let Some(peer) = packet_context.peer else {
-        INPUT_TX_SKIPS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
 
@@ -861,7 +1311,6 @@ fn send_packet(
             true
         }
         Err(error) => {
-            INPUT_TX_FAILURES.fetch_add(1, Ordering::Relaxed);
             mark_target_offline(layout_state, target, &error);
             false
         }
@@ -1715,10 +2164,15 @@ struct MacCaptureContext {
     native_layout: LayoutState,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    targets: Vec<InputTarget>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
     anchor: Mutex<Option<(f64, f64)>>,
     cursor_hidden: Mutex<bool>,
+    cursor_hide_depth: Mutex<usize>,
+    last_cursor_hide_reassert: Mutex<Option<Instant>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
     last_cursor_repin: Mutex<Option<Instant>>,
     // Instant we last returned control to the local machine. We now land the
@@ -1734,8 +2188,136 @@ struct MacCaptureContext {
     pressed_keys: Mutex<Vec<u16>>,
     tap_disabled: AtomicBool,
     just_crossed: AtomicBool,
+    suppress_next_mouse_delta: AtomicBool,
+    hotkey_return_point: Mutex<Option<(f64, f64)>>,
+    local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
+}
+
+#[cfg(target_os = "macos")]
+struct RawMacosGestureTap {
+    mach_port: core_foundation::mach_port::CFMachPort,
+    _context: Arc<MacCaptureContext>,
+}
+
+#[cfg(target_os = "macos")]
+impl RawMacosGestureTap {
+    fn new(
+        location: core_graphics::event::CGEventTapLocation,
+        context: Arc<MacCaptureContext>,
+    ) -> Result<Self, ()> {
+        use core_foundation::base::TCFType;
+        use core_foundation::mach_port::CFMachPort;
+        use core_graphics::event::{CGEventTapOptions, CGEventTapPlacement};
+
+        let mach_port = unsafe {
+            macos_raw_event_tap_create(
+                location,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                macos_raw_gesture_event_mask(),
+                macos_raw_gesture_event_callback,
+                Arc::as_ptr(&context).cast(),
+            )
+        };
+        if mach_port.is_null() {
+            return Err(());
+        }
+
+        Ok(Self {
+            mach_port: unsafe { CFMachPort::wrap_under_create_rule(mach_port) },
+            _context: context,
+        })
+    }
+
+    fn mach_port(&self) -> &core_foundation::mach_port::CFMachPort {
+        &self.mach_port
+    }
+
+    fn enable(&self) {
+        use core_foundation::base::TCFType;
+
+        unsafe {
+            macos_raw_event_tap_enable(self.mach_port.as_concrete_TypeRef(), true);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RawMacosGestureTap {
+    fn drop(&mut self) {
+        use core_foundation::base::TCFType;
+        use core_foundation::mach_port::CFMachPortInvalidate;
+
+        unsafe {
+            CFMachPortInvalidate(self.mach_port.as_CFTypeRef() as *mut _);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+type MacosRawEventTapCallback = unsafe extern "C" fn(
+    proxy: core_graphics::event::CGEventTapProxy,
+    event_type: u32,
+    event: core_graphics::sys::CGEventRef,
+    user_info: *const std::ffi::c_void,
+) -> core_graphics::sys::CGEventRef;
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    #[link_name = "CGEventTapCreate"]
+    fn macos_raw_event_tap_create(
+        tap: core_graphics::event::CGEventTapLocation,
+        place: core_graphics::event::CGEventTapPlacement,
+        options: core_graphics::event::CGEventTapOptions,
+        events_of_interest: u64,
+        callback: MacosRawEventTapCallback,
+        user_info: *const std::ffi::c_void,
+    ) -> core_foundation::mach_port::CFMachPortRef;
+
+    #[link_name = "CGEventTapEnable"]
+    fn macos_raw_event_tap_enable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_raw_gesture_event_mask() -> u64 {
+    MACOS_RAW_GESTURE_EVENT_TYPES
+        .iter()
+        .fold(0_u64, |mask, event_type| mask | (1_u64 << *event_type))
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn macos_raw_gesture_event_callback(
+    _proxy: core_graphics::event::CGEventTapProxy,
+    event_type: u32,
+    event: core_graphics::sys::CGEventRef,
+    user_info: *const std::ffi::c_void,
+) -> core_graphics::sys::CGEventRef {
+    if user_info.is_null() {
+        return event;
+    }
+
+    let context = unsafe { &*(user_info as *const MacCaptureContext) };
+    if matches!(
+        event_type,
+        MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT | MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT
+    ) {
+        context.tap_disabled.store(true, Ordering::Relaxed);
+        return event;
+    }
+
+    if context.remote_active.load(Ordering::Relaxed) {
+        repin_macos_cursor_while_remote(context);
+        log::debug!(
+            "remote-active macOS gesture/system event {} was dropped",
+            event_type
+        );
+        return std::ptr::null_mut();
+    }
+
+    event
 }
 
 #[cfg(target_os = "macos")]
@@ -1761,6 +2343,8 @@ struct WindowsCaptureContext {
     main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    targets: Vec<InputTarget>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
     anchor: Mutex<Option<(f64, f64)>>,
     last_point: Mutex<Option<(f64, f64)>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
@@ -1771,6 +2355,7 @@ struct WindowsCaptureContext {
     // Swallow the first post-crossing delta so a fast flick across the edge
     // does not shove the cursor inward on Windows, where we pin by warping.
     just_crossed: AtomicBool,
+    local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -2080,6 +2665,11 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
         let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
         let key_code = event.vkCode as u16;
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if down && windows_event_matches_screen_switch_hotkey(&context, key_code) {
+            log::info!("screen switch hotkey returning to local from keyboard hook");
+            release_windows_remote_control(&context, false);
+            return 1;
+        }
         if send_packet(
             &context.quic_transport,
             &target,
@@ -2093,6 +2683,36 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     }
 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_event_matches_screen_switch_hotkey(
+    context: &WindowsCaptureContext,
+    key_code: u16,
+) -> bool {
+    screen_switch_hotkey_matches_vk(
+        &context.layout_state,
+        key_code,
+        windows_current_hotkey_modifiers(),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_current_hotkey_modifiers() -> HotkeyModifiers {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
+
+    fn down(vk: u16) -> bool {
+        unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
+    }
+
+    HotkeyModifiers {
+        ctrl: down(VK_CONTROL),
+        alt: down(VK_MENU),
+        shift: down(VK_SHIFT),
+        meta: down(VK_LWIN) || down(VK_RWIN),
+    }
 }
 
 /// Remembers which keys we have forwarded as pressed so they can be released if
@@ -2573,6 +3193,19 @@ fn set_windows_cursor(x: i32, y: i32) {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_current_cursor_point() -> Option<(f64, f64)> {
+    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+
+    unsafe {
+        let mut point = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut point) == 0 {
+            return None;
+        }
+        Some((point.x as f64, point.y as f64))
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn hide_windows_cursor_if_needed(context: &WindowsCaptureContext) {
     let Ok(mut calls) = context.cursor_hide_calls.lock() else {
         return;
@@ -2709,7 +3342,8 @@ fn handle_macos_event(
                 &context.layout_state,
                 &context.input_events,
             ) {
-                return CallbackResult::Keep;
+                repin_macos_cursor_while_remote(context);
+                return CallbackResult::Drop;
             }
             mark_mouse_move_sent(&context.last_mouse_move_sent);
             send_packet(
@@ -2721,6 +3355,13 @@ fn handle_macos_event(
             )
         }
         CGEventType::KeyDown | CGEventType::KeyUp => {
+            if matches!(event_type, CGEventType::KeyDown)
+                && macos_event_matches_screen_switch_hotkey(context, event)
+            {
+                log::info!("screen switch hotkey returning to local from input tap");
+                return_to_local_macos(context);
+                return CallbackResult::Drop;
+            }
             let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
             if let Some(key_code) = mac_key_to_windows_vk(mac_code) {
                 let down = matches!(event_type, CGEventType::KeyDown);
@@ -2746,11 +3387,36 @@ fn handle_macos_event(
         _ => false,
     };
 
-    if sent {
-        CallbackResult::Drop
-    } else {
-        CallbackResult::Keep
+    repin_macos_cursor_while_remote(context);
+    if !sent {
+        log::debug!(
+            "remote-active local event {:?} was dropped after remote send miss",
+            event_type
+        );
     }
+    CallbackResult::Drop
+}
+
+#[cfg(target_os = "macos")]
+fn macos_event_matches_screen_switch_hotkey(
+    context: &MacCaptureContext,
+    event: &core_graphics::event::CGEvent,
+) -> bool {
+    use core_graphics::event::{CGEventFlags, EventField};
+
+    let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    let Some(key_code) = mac_key_to_windows_vk(mac_code) else {
+        return false;
+    };
+    let flags = event.get_flags();
+    let modifiers = HotkeyModifiers {
+        ctrl: flags.contains(CGEventFlags::CGEventFlagControl),
+        alt: flags.contains(CGEventFlags::CGEventFlagAlternate),
+        shift: flags.contains(CGEventFlags::CGEventFlagShift),
+        meta: flags.contains(CGEventFlags::CGEventFlagCommand),
+    };
+
+    screen_switch_hotkey_matches_vk(&context.layout_state, key_code, modifiers)
 }
 
 #[cfg(target_os = "macos")]
@@ -2766,6 +3432,13 @@ fn handle_macos_mouse_move(
     if let Ok(mut active) = context.active.lock() {
         if let Some(active_target) = active.as_mut() {
             let dy = if active_target.invert_y { -dy } else { dy };
+            if context
+                .suppress_next_mouse_delta
+                .swap(false, Ordering::Relaxed)
+            {
+                repin_macos_cursor_if_drifted(context, location);
+                return CallbackResult::Drop;
+            }
             if context.just_crossed.swap(false, Ordering::Relaxed)
                 && should_ignore_initial_anchor_warp_delta(active_target.target.edge, dx, dy)
             {
@@ -2790,6 +3463,9 @@ fn handle_macos_mouse_move(
                 *active = None;
                 context.remote_active.store(false, Ordering::Relaxed);
                 context.just_crossed.store(false, Ordering::Relaxed);
+                context
+                    .suppress_next_mouse_delta
+                    .store(false, Ordering::Relaxed);
                 // Record the return instant so the crossing test can enforce a
                 // short cooldown — without it, landing flush on the edge (inset
                 // 0) would let a fast back-flick immediately re-cross.
@@ -2815,7 +3491,7 @@ fn handle_macos_mouse_move(
                 move_macos_cursor_without_event(context, CGPoint::new(point.0, point.1));
                 set_macos_cursor_decoupled(false);
                 set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
-                log::info!("[diag] cross BACK to local — showing cursor now");
+                log::debug!("[diag] cross BACK to local — showing cursor now");
                 show_macos_cursor_if_needed(context);
                 return CallbackResult::Drop;
             }
@@ -2837,6 +3513,9 @@ fn handle_macos_mouse_move(
                     *active = None;
                     context.remote_active.store(false, Ordering::Relaxed);
                     context.just_crossed.store(false, Ordering::Relaxed);
+                    context
+                        .suppress_next_mouse_delta
+                        .store(false, Ordering::Relaxed);
                     clear_clipboard_target(&context.clipboard_target);
                     reset_mouse_move_timer(&context.last_mouse_move_sent);
                     reset_cursor_repin_timer(context);
@@ -2854,11 +3533,8 @@ fn handle_macos_mouse_move(
                 }
             }
             repin_macos_cursor_if_drifted(context, location);
-            // Cursor hide re-assertion runs from the capture run loop (see
-            // start_platform_capture), NOT from this mouse-move callback: once the
-            // pointer is over the client the server stops getting mouse-move
-            // events, so a reassert hooked here would silently stop and leave the
-            // pointer visible when WindowServer drops our background hide.
+            // Re-pinning also runs from the capture run loop because mouse-move
+            // callbacks can stop arriving once the pointer is over the client.
             return CallbackResult::Drop;
         }
     }
@@ -2893,7 +3569,7 @@ fn handle_macos_mouse_move(
         // visible offset scales with flick speed. Hiding first means the pointer
         // vanishes where it is, then jumps to the anchor invisibly, so no edge
         // stick is ever visible regardless of scheduling latency.
-        log::info!("[diag] cross INTO remote — hiding+decoupling now");
+        log::debug!("[diag] cross INTO remote — hiding+decoupling now");
         hide_macos_cursor_if_needed(context);
         move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
         if !send_remote_mouse_move(
@@ -3310,6 +3986,23 @@ fn local_return_point(active: &ActiveTarget) -> (f64, f64) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn local_center_point(active: &ActiveTarget) -> (f64, f64) {
+    let local = &active.target.local_screen;
+    (
+        local.x as f64 + (local.width as f64 / 2.0).clamp(0.0, (local.width - 1).max(0) as f64),
+        local.y as f64 + (local.height as f64 / 2.0).clamp(0.0, (local.height - 1).max(0) as f64),
+    )
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn local_hotkey_return_point(
+    active: &ActiveTarget,
+    recorded_point: Option<(f64, f64)>,
+) -> (f64, f64) {
+    recorded_point.unwrap_or_else(|| local_center_point(active))
+}
+
 fn send_remote_mouse_move(
     quic_transport: &quic_transport::TransportHandle,
     active: &ActiveTarget,
@@ -3356,6 +4049,288 @@ fn send_remote_cursor_park(
         layout_state,
         input_events,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveTarget) {
+    use core_graphics::geometry::CGPoint;
+
+    let return_point = macos_current_cursor_location().map(|point| (point.x, point.y));
+    let anchor = mac_cursor_point(
+        context,
+        local_anchor_point(&active_target),
+        active_target.invert_y,
+    );
+    if !send_remote_mouse_move(
+        &context.quic_transport,
+        &active_target,
+        &context.layout_state,
+        &context.input_events,
+    ) {
+        reset_mouse_move_timer(&context.last_mouse_move_sent);
+        reset_remote_button_mask(&context.remote_button_mask);
+        reset_cursor_repin_timer(context);
+        set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+        set_macos_cursor_decoupled(false);
+        show_macos_cursor_if_needed(context);
+        context.just_crossed.store(false, Ordering::Relaxed);
+        context
+            .suppress_next_mouse_delta
+            .store(false, Ordering::Relaxed);
+        if let Ok(mut hotkey_return_point) = context.hotkey_return_point.lock() {
+            *hotkey_return_point = None;
+        }
+        return;
+    }
+    set_macos_cursor_decoupled(true);
+    set_macos_warp_suppression_interval(0.0);
+    hide_macos_cursor_if_needed(context);
+    move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
+    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    reset_cursor_repin_timer(context);
+    reset_remote_button_mask(&context.remote_button_mask);
+    context.remote_active.store(true, Ordering::Relaxed);
+    set_control_clipboard_target(
+        &context.clipboard_target,
+        &active_target,
+        &context.layout_state,
+    );
+    if let Ok(mut active) = context.active.lock() {
+        *active = Some(active_target);
+    }
+    if let Ok(mut anchor_state) = context.anchor.lock() {
+        *anchor_state = Some(anchor);
+    }
+    if let Ok(mut hotkey_return_point) = context.hotkey_return_point.lock() {
+        *hotkey_return_point = return_point;
+    }
+    // Hotkey entry lands at the remote screen centre. macOS can still emit one
+    // synthetic delta from the local anchor warp; drop only that next delta.
+    context.just_crossed.store(false, Ordering::Relaxed);
+    context
+        .suppress_next_mouse_delta
+        .store(true, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn return_to_local_macos(context: &MacCaptureContext) {
+    use core_graphics::geometry::CGPoint;
+
+    let active_target = match context.active.lock().ok().and_then(|mut a| a.take()) {
+        Some(target) => target,
+        None => return,
+    };
+    let recorded_point = context
+        .hotkey_return_point
+        .lock()
+        .ok()
+        .and_then(|mut point| point.take());
+    let point = local_hotkey_return_point(&active_target, recorded_point);
+    let invert_y = active_target.invert_y;
+    let target = active_target.target.clone();
+    let _ = send_remote_cursor_park(
+        &context.quic_transport,
+        &active_target,
+        &context.layout_state,
+        &context.input_events,
+    );
+    context.remote_active.store(false, Ordering::Relaxed);
+    context.just_crossed.store(false, Ordering::Relaxed);
+    context
+        .suppress_next_mouse_delta
+        .store(false, Ordering::Relaxed);
+    if let Ok(mut last_return) = context.last_return.lock() {
+        *last_return = Some(Instant::now());
+    }
+    release_held_remote_inputs_macos(context, &target);
+    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    reset_cursor_repin_timer(context);
+    if let Ok(mut anchor) = context.anchor.lock() {
+        *anchor = None;
+    }
+    let point = if recorded_point.is_some() {
+        point
+    } else {
+        mac_cursor_point(context, point, invert_y)
+    };
+    set_macos_warp_suppression_interval(0.0);
+    move_macos_cursor_without_event(context, CGPoint::new(point.0, point.1));
+    set_macos_cursor_decoupled(false);
+    set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+    show_macos_cursor_if_needed(context);
+}
+
+/// Re-assert cursor decouple + position lock while a remote session is active.
+///
+/// When MyKVM is backgrounded (the normal state while controlling a remote),
+/// macOS can silently re-associate the physical mouse with the on-screen cursor
+/// despite an earlier `CGAssociateMouseAndMouseCursorPosition(false)`. The
+/// pointer then follows the mouse. Reuse the same drift-limited repin path used
+/// by the mouse callback, because the callback can stop firing while the main
+/// window is hidden. Do not repeatedly push hide/transparent cursor state here:
+/// those APIs are stack-based and must stay one enter paired with one return.
+#[cfg(target_os = "macos")]
+fn repin_macos_cursor_while_remote(context: &MacCaptureContext) {
+    set_macos_cursor_decoupled(true);
+    if !context.main_window_visible.load(Ordering::Relaxed) {
+        if let Some(location) = macos_current_cursor_location() {
+            repin_macos_cursor_if_drifted(context, location);
+        } else {
+            force_repin_macos_cursor_to_anchor(context);
+        }
+        reassert_macos_hidden_window_cursor(context);
+        return;
+    }
+
+    if let Some(location) = macos_current_cursor_location() {
+        repin_macos_cursor_if_drifted(context, location);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_capture_loop_ms(remote_active: bool, main_window_visible: bool) -> u64 {
+    if !remote_active {
+        return MACOS_IDLE_CAPTURE_LOOP_MS;
+    }
+    if main_window_visible {
+        MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS
+    } else {
+        MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS
+    }
+}
+
+/// Poll the shared switch-request slot and act on it. Called from the capture
+/// loop on each iteration. Centralises the macOS enter/return side effects so
+/// both the mouse-crossing path and the hotkey path stay in sync.
+#[cfg(target_os = "macos")]
+fn drain_switch_request_macos(context: &MacCaptureContext) {
+    let direction = match context.switch_request.lock() {
+        Ok(mut req) => req.take(),
+        Err(_) => return,
+    };
+    let Some(direction) = direction else { return };
+    let current_point = macos_current_cursor_location().map(|point| (point.x, point.y));
+    match request_screen_switch_from_point(
+        direction,
+        &context.layout_state,
+        &context.native_layout,
+        &context.active,
+        current_point,
+    ) {
+        SwitchOutcome::Enter(active_target) => {
+            log::info!(
+                "screen switch entering device={}",
+                active_target.target.device_id
+            );
+            enter_remote_target_macos(context, active_target);
+        }
+        SwitchOutcome::Return => {
+            log::info!("screen switch returning to local");
+            return_to_local_macos(context);
+        }
+        SwitchOutcome::LocalMove {
+            from_screen_id,
+            to_screen_id,
+            x,
+            y,
+        } => {
+            let (x, y) = remembered_local_screen_point(
+                &context.local_screen_points,
+                &from_screen_id,
+                &to_screen_id,
+                current_point,
+                (x, y),
+            );
+            log::info!("screen switch moving local cursor to ({x:.0}, {y:.0})");
+            set_macos_cursor_decoupled(false);
+            set_macos_warp_suppression_interval(0.0);
+            move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
+            set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+            show_macos_cursor_if_needed(context);
+        }
+        SwitchOutcome::Noop => {
+            log::warn!("screen switch {direction:?} ignored: no matching online target");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn drain_switch_request_windows(context: &WindowsCaptureContext) {
+    let direction = match context.switch_request.lock() {
+        Ok(mut req) => req.take(),
+        Err(_) => return,
+    };
+    let Some(direction) = direction else { return };
+    let current_point = windows_current_cursor_point();
+    match request_screen_switch_from_point(
+        direction,
+        &context.layout_state,
+        &context.native_layout,
+        &context.active,
+        current_point,
+    ) {
+        SwitchOutcome::Enter(active_target) => {
+            log::info!(
+                "screen switch entering device={}",
+                active_target.target.device_id
+            );
+            // Mirror the Windows mouse-crossing enter path. Hotkey entry has no
+            // physical mouse position at the edge, so we explicitly pin to the
+            // local anchor and start sending deltas from there.
+            let anchor = local_anchor_point(&active_target);
+            hide_windows_cursor_if_needed(context);
+            set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+            if send_remote_mouse_move(
+                &context.quic_transport,
+                &active_target,
+                &context.layout_state,
+                &context.input_events,
+            ) {
+                context.remote_active.store(true, Ordering::Relaxed);
+                set_control_clipboard_target(
+                    &context.clipboard_target,
+                    &active_target,
+                    &context.layout_state,
+                );
+                if let Ok(mut active) = context.active.lock() {
+                    *active = Some(active_target);
+                }
+                if let Ok(mut anchor_state) = context.anchor.lock() {
+                    *anchor_state = Some(anchor);
+                }
+                // Hotkey entry lands at the remote centre. The edge-crossing
+                // first-delta guard would eat the user's first real movement.
+                context.just_crossed.store(false, Ordering::Relaxed);
+            } else {
+                reset_mouse_move_timer(&context.last_mouse_move_sent);
+                reset_remote_button_mask(&context.remote_button_mask);
+                show_windows_cursor_if_needed(context);
+            }
+        }
+        SwitchOutcome::Return => {
+            log::info!("screen switch returning to local");
+            release_windows_remote_control(context, false);
+        }
+        SwitchOutcome::LocalMove {
+            from_screen_id,
+            to_screen_id,
+            x,
+            y,
+        } => {
+            let (x, y) = remembered_local_screen_point(
+                &context.local_screen_points,
+                &from_screen_id,
+                &to_screen_id,
+                current_point,
+                (x, y),
+            );
+            log::info!("screen switch moving local cursor to ({x:.0}, {y:.0})");
+            set_windows_cursor(x.round() as i32, y.round() as i32);
+        }
+        SwitchOutcome::Noop => {
+            log::warn!("screen switch {direction:?} ignored: no matching online target");
+        }
+    }
 }
 
 /// Disconnects (or reconnects) the on-screen cursor from the physical mouse.
@@ -3574,7 +4549,12 @@ fn set_macos_cursor_transparent(transparent: bool) {
         let data_sel = sel_registerName(b"dataWithBytes:length:\0".as_ptr() as *const c_char);
         let data_with: extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void =
             std::mem::transmute(objc_msgSend as *const ());
-        let data = data_with(nsdata, data_sel, TRANSPARENT_BYTES.as_ptr(), TRANSPARENT_BYTES.len());
+        let data = data_with(
+            nsdata,
+            data_sel,
+            TRANSPARENT_BYTES.as_ptr(),
+            TRANSPARENT_BYTES.len(),
+        );
         if data.is_null() {
             return;
         }
@@ -3604,8 +4584,13 @@ fn set_macos_cursor_transparent(transparent: bool) {
         // two doubles after the object-pointer argument.
         let cursor_init_sel =
             sel_registerName(b"initWithImage:hotSpot:\0".as_ptr() as *const c_char);
-        let cursor_init: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, c_double, c_double) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as *const ());
+        let cursor_init: extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            c_double,
+            c_double,
+        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
         let cursor_obj = alloc(nscursor, alloc_sel);
         let cursor = cursor_init(cursor_obj, cursor_init_sel, image, 0.0, 0.0);
         if cursor.is_null() {
@@ -3651,7 +4636,19 @@ fn repin_macos_cursor_if_drifted(
     // Re-pin only after actual drift and at a capped rate.
     set_macos_cursor_decoupled(true);
     move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
-    hide_macos_cursor_if_needed(context);
+}
+
+#[cfg(target_os = "macos")]
+fn force_repin_macos_cursor_to_anchor(context: &MacCaptureContext) {
+    let Ok(anchor) = context.anchor.lock() else {
+        return;
+    };
+    let Some((x, y)) = *anchor else {
+        return;
+    };
+    drop(anchor);
+
+    move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
 }
 
 #[cfg(target_os = "macos")]
@@ -3672,10 +4669,51 @@ fn macos_cursor_repin_due(context: &MacCaptureContext, interval: Duration) -> bo
 }
 
 #[cfg(target_os = "macos")]
+fn macos_current_cursor_location() -> Option<core_graphics::geometry::CGPoint> {
+    use core_graphics::{
+        event::CGEvent,
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    CGEvent::new(source).ok().map(|event| event.location())
+}
+
+#[cfg(target_os = "macos")]
 fn reset_cursor_repin_timer(context: &MacCaptureContext) {
     if let Ok(mut last_repin) = context.last_cursor_repin.lock() {
         *last_repin = None;
     }
+}
+
+#[cfg(target_os = "macos")]
+fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext) {
+    let Ok(hidden) = context.cursor_hidden.lock() else {
+        return;
+    };
+    if !*hidden {
+        return;
+    }
+    drop(hidden);
+
+    let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if last_reassert
+        .as_ref()
+        .map(|last| {
+            now.duration_since(*last)
+                < Duration::from_millis(MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS)
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+    *last_reassert = Some(now);
+    drop(last_reassert);
+
+    push_macos_cursor_hide(context);
 }
 
 #[cfg(target_os = "macos")]
@@ -3811,9 +4849,21 @@ fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
     // the thing we rely on.
     enable_macos_background_cursor_hide();
     set_macos_cursor_transparent(true);
-    set_macos_cursor_hidden_with_appkit(true);
-    log::info!("[diag] transparent cursor pushed + hide issued (cursor_hidden false->true)");
+    push_macos_cursor_hide(context);
+    if let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() {
+        *last_reassert = None;
+    }
+    log::debug!("[diag] transparent cursor pushed + hide issued (cursor_hidden false->true)");
+    *hidden = true;
+}
 
+#[cfg(target_os = "macos")]
+fn push_macos_cursor_hide(context: &MacCaptureContext) {
+    let Ok(mut depth) = context.cursor_hide_depth.lock() else {
+        return;
+    };
+
+    set_macos_cursor_hidden_with_appkit(true);
     if context.display_snapshots.is_empty() {
         let _ = core_graphics::display::CGDisplay::main().hide_cursor();
     } else {
@@ -3821,7 +4871,7 @@ fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
             let _ = core_graphics::display::CGDisplay::new(display.id).hide_cursor();
         }
     }
-    *hidden = true;
+    *depth = depth.saturating_add(1);
 }
 
 #[cfg(target_os = "macos")]
@@ -3837,18 +4887,36 @@ fn show_macos_cursor_if_needed(context: &MacCaptureContext) {
     // and is the reliable inverse of the hide. The CGDisplay/NSCursor show calls
     // balance the secondary hide calls.
     set_macos_cursor_transparent(false);
-    if context.display_snapshots.is_empty() {
-        let _ = core_graphics::display::CGDisplay::main().show_cursor();
-    } else {
-        for display in &context.display_snapshots {
-            let _ = core_graphics::display::CGDisplay::new(display.id).show_cursor();
-        }
+    drain_macos_cursor_hide(context);
+    if let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() {
+        *last_reassert = None;
     }
-    set_macos_cursor_hidden_with_appkit(false);
     *hidden = false;
-    log::info!(
-        "[diag] transparent cursor popped + show issued (cursor_hidden true->false)"
-    );
+    log::debug!("[diag] transparent cursor popped + show issued (cursor_hidden true->false)");
+}
+
+#[cfg(target_os = "macos")]
+fn drain_macos_cursor_hide(context: &MacCaptureContext) {
+    let count = context
+        .cursor_hide_depth
+        .lock()
+        .map(|mut depth| {
+            let count = *depth;
+            *depth = 0;
+            count
+        })
+        .unwrap_or(0);
+
+    for _ in 0..count {
+        if context.display_snapshots.is_empty() {
+            let _ = core_graphics::display::CGDisplay::main().show_cursor();
+        } else {
+            for display in &context.display_snapshots {
+                let _ = core_graphics::display::CGDisplay::new(display.id).show_cursor();
+            }
+        }
+        set_macos_cursor_hidden_with_appkit(false);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4388,6 +5456,37 @@ mod tests {
         assert!(windows_vk_to_mac_flag(0x20).is_none()); // Space
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_raw_gesture_mask_covers_trackpad_system_gestures() {
+        let mask = macos_raw_gesture_event_mask();
+
+        for event_type in MACOS_RAW_GESTURE_EVENT_TYPES {
+            assert_ne!(mask & (1_u64 << *event_type), 0);
+        }
+        assert_ne!(mask & (1_u64 << MACOS_NSEVENT_TYPE_SWIPE), 0);
+        assert_ne!(mask & (1_u64 << MACOS_NSEVENT_TYPE_SYSTEM_DEFINED), 0);
+        assert_eq!(mask & (1_u64 << 22), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_hidden_remote_loop_is_slower_than_visible_remote_loop() {
+        assert_eq!(
+            macos_capture_loop_ms(false, false),
+            MACOS_IDLE_CAPTURE_LOOP_MS
+        );
+        assert_eq!(
+            macos_capture_loop_ms(true, true),
+            MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS
+        );
+        assert_eq!(
+            macos_capture_loop_ms(true, false),
+            MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS
+        );
+        assert!(MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS > MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS);
+    }
+
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {
         Screen {
             id: id.into(),
@@ -4499,6 +5598,7 @@ mod tests {
             modifier_remap: true,
             modifier_map: crate::default_modifier_map(),
             edge_switch_hotkey: crate::default_edge_switch_hotkey(),
+            screen_switch_hotkeys: crate::ScreenSwitchHotkeys::default(),
         }
     }
 
@@ -4684,6 +5784,178 @@ mod tests {
 
         assert!(!returned);
         assert_eq!(guarded.x, 1.0);
+    }
+
+    #[test]
+    fn screen_switch_hotkey_matching_requires_exact_modifiers() {
+        let hotkeys = crate::ScreenSwitchHotkeys {
+            left: "alt+left".into(),
+            right: "alt+arrowright".into(),
+            up: "disabled".into(),
+            down: "alt+shift+down".into(),
+        };
+
+        assert!(screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x25,
+            HotkeyModifiers {
+                alt: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x27,
+            HotkeyModifiers {
+                alt: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x28,
+            HotkeyModifiers {
+                alt: true,
+                shift: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(!screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x25,
+            HotkeyModifiers {
+                alt: true,
+                shift: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(!screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x26,
+            HotkeyModifiers {
+                alt: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+    }
+
+    #[test]
+    fn screen_switch_request_enters_remote_at_screen_center() {
+        let layout = layout_for_target_tests();
+        let layout_state = Arc::new(Mutex::new(layout.clone()));
+        let active = Mutex::new(None);
+
+        match request_screen_switch(SwitchDirection::Right, &layout_state, &layout, &active) {
+            SwitchOutcome::Enter(active_target) => {
+                assert_eq!(active_target.target.device_id, "peer-device");
+                assert_eq!(active_target.x, 960.0);
+                assert_eq!(active_target.y, 540.0);
+            }
+            _ => panic!("expected right quick switch to enter the online client"),
+        }
+    }
+
+    #[test]
+    fn screen_switch_request_moves_between_local_screens() {
+        let mut layout = layout_for_target_tests();
+        layout.devices[0].screens.push(screen(
+            "local-device",
+            "local-display-2",
+            512,
+            1080,
+            1512,
+            982,
+        ));
+        let layout_state = Arc::new(Mutex::new(layout.clone()));
+        let active = Mutex::new(None);
+
+        match request_screen_switch_from_point(
+            SwitchDirection::Down,
+            &layout_state,
+            &layout,
+            &active,
+            Some((960.0, 540.0)),
+        ) {
+            SwitchOutcome::LocalMove {
+                from_screen_id,
+                to_screen_id,
+                x,
+                y,
+            } => {
+                assert_eq!(from_screen_id, "local-display-1");
+                assert_eq!(to_screen_id, "local-display-2");
+                assert_eq!(x, 1268.0);
+                assert_eq!(y, 1571.0);
+            }
+            _ => panic!("expected down quick switch to move to the lower local screen"),
+        }
+
+        match request_screen_switch_from_point(
+            SwitchDirection::Up,
+            &layout_state,
+            &layout,
+            &active,
+            Some((1268.0, 1571.0)),
+        ) {
+            SwitchOutcome::LocalMove {
+                from_screen_id,
+                to_screen_id,
+                x,
+                y,
+            } => {
+                assert_eq!(from_screen_id, "local-display-2");
+                assert_eq!(to_screen_id, "local-display-1");
+                assert_eq!(x, 960.0);
+                assert_eq!(y, 540.0);
+            }
+            _ => panic!("expected up quick switch to move back to the upper local screen"),
+        }
+    }
+
+    #[test]
+    fn local_screen_switch_remembers_points_by_screen_id() {
+        let points = Mutex::new(HashMap::new());
+
+        let first_target = remembered_local_screen_point(
+            &points,
+            "local-display-1",
+            "local-display-2",
+            Some((333.0, 444.0)),
+            (1268.0, 1571.0),
+        );
+        assert_eq!(first_target, (1268.0, 1571.0));
+
+        let return_target = remembered_local_screen_point(
+            &points,
+            "local-display-2",
+            "local-display-1",
+            Some((1200.0, 1500.0)),
+            (960.0, 540.0),
+        );
+        assert_eq!(return_target, (333.0, 444.0));
+
+        let points = points.lock().unwrap();
+        assert_eq!(points.get("local-display-1"), Some(&(333.0, 444.0)));
+        assert_eq!(points.get("local-display-2"), Some(&(1200.0, 1500.0)));
+    }
+
+    #[test]
+    fn hotkey_return_uses_recorded_point_then_local_screen_center() {
+        let active = crossing_target(
+            &[target_for_coordinate_tests()],
+            1919.0,
+            500.0,
+            40.0,
+            0.0,
+            &Arc::new(Mutex::new(layout_for_target_tests())),
+        )
+        .expect("target should be active");
+
+        assert_eq!(
+            local_hotkey_return_point(&active, Some((321.0, 654.0))),
+            (321.0, 654.0)
+        );
+        assert_eq!(local_hotkey_return_point(&active, None), (960.0, 540.0));
     }
 
     #[test]

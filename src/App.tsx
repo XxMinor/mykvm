@@ -16,6 +16,7 @@ import {
   confirmLanPairing,
   dismissPairingRequest,
   hideMainWindow,
+  installInputService,
   installAppUpdate,
   isAutostartEnabled,
   isPortableMode,
@@ -26,6 +27,7 @@ import {
   openUpdateReleasePage,
   probeLanPeer,
   readDiagnosticInfo,
+  readInputServiceStatus,
   readPerformanceSample,
   readRuntimeStatus,
   relaunchApp,
@@ -41,6 +43,7 @@ import {
   stopRuntime,
   syncWindowChrome,
   toggleMaximizeMainWindow,
+  uninstallInputService,
   writeClipboardText,
 } from "./desktopApi";
 import type { AppUpdateInfo } from "./desktopApi";
@@ -50,6 +53,7 @@ import type { AppText } from "./i18n";
 import {
   edgeSwitchHotkeyFromKeyboardEvent,
   formatEdgeSwitchHotkeyForDisplay,
+  hotkeyFromKeyboardEvent,
   metaKeyLabelForPlatform,
 } from "./hotkeyInput";
 import {
@@ -90,7 +94,6 @@ const BOARD_ZOOM_MIN = 0.35;
 const BOARD_ZOOM_MAX = 2.4;
 const BOARD_ZOOM_STEP = 0.15;
 const SNAP_SIZE = 20;
-const REMOTE_SCREEN_GAP = 0;
 const DEVICE_COLORS = [
   "#2f7af8",
   "#0f766e",
@@ -122,6 +125,7 @@ type UpdateStatus =
   | "current"
   | "installing"
   | "error";
+type InputServiceAction = "install" | "uninstall";
 
 interface ServerPairingState {
   peer: LanPeer;
@@ -170,6 +174,7 @@ function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [isRuntimePending, setIsRuntimePending] = useState(false);
   const [isScanningLan, setIsScanningLan] = useState(false);
+  const [scanCountdown, setScanCountdown] = useState(0);
   const [isAddingDevice, setIsAddingDevice] = useState(false);
   const [isPairingDevice, setIsPairingDevice] = useState(false);
   const [isDismissingPairing, setIsDismissingPairing] = useState(false);
@@ -181,6 +186,9 @@ function App() {
   );
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
+  const [isInputServicePending, setIsInputServicePending] = useState(false);
+  const [inputServiceAction, setInputServiceAction] =
+    useState<InputServiceAction | null>(null);
   const [boardZoom, setBoardZoom] = useState(1);
   const [manualDeviceName, setManualDeviceName] = useState("");
   const [manualDeviceHost, setManualDeviceHost] = useState("");
@@ -211,12 +219,18 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
+  const [capturingDirection, setCapturingDirection] = useState<
+    "left" | "right" | "up" | "down" | null
+  >(null);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
     () => getSystemTheme(),
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
   const edgeSwitchHotkeyButtonRef = useRef<HTMLButtonElement | null>(null);
+  const screenSwitchButtonRefs = useRef<
+    Record<"left" | "right" | "up" | "down", HTMLButtonElement | null>
+  >({ left: null, right: null, up: null, down: null });
   const fileDragTargetIdRef = useRef<string | null>(null);
   const fileTransferFallbackTargetIdRef = useRef<string | null>(null);
   const startupUpdateCheckStarted = useRef(false);
@@ -493,11 +507,20 @@ function App() {
         return;
       }
 
-      readRuntimeStatus()
-        .then((nextRuntime) => {
+      // Refresh runtime + layout together: device online/inputReady status
+      // lives in layout, and without re-fetching it the UI shows stale
+      // "offline" even after discovery has found the peer again.
+      Promise.all([readRuntimeStatus(), loadAppState()])
+        .then(([nextRuntime, nextSnapshot]) => {
           if (!active) {
             return;
           }
+
+          setSnapshot((current) =>
+            current
+              ? { ...nextSnapshot, runtime: nextRuntime }
+              : nextSnapshot,
+          );
 
           const currentSnapshot = snapshotRef.current;
           if (
@@ -506,24 +529,16 @@ function App() {
             nextRuntime.pairing.state === "paired"
           ) {
             void loadAppState()
-              .then((nextSnapshot) => {
+              .then((pairingSnapshot) => {
                 if (active) {
-                  setSnapshot(nextSnapshot);
+                  setSnapshot({
+                    ...pairingSnapshot,
+                    runtime: nextRuntime,
+                  });
                 }
               })
-              .catch(() => {
-                // Keep the runtime-only refresh below if the full snapshot read fails.
-              });
+              .catch(() => {});
           }
-
-          setSnapshot((current) =>
-            current
-              ? {
-                  ...current,
-                  runtime: nextRuntime,
-                }
-              : current,
-          );
 
           // Keep a persistent blocking condition visible. The inject stage holds
           // the receiver-side reason keys/clicks get dropped (macOS Accessibility
@@ -623,14 +638,36 @@ function App() {
     machineRole === "client" && !CLIENT_TABS.includes(activeTab)
       ? "settings"
       : activeTab;
-  const isPerformanceActive =
-    currentTab === "settings" && Boolean(layout?.performanceMonitor);
   const localPlatform =
     runtime?.discovery.localPeer.platform.toLowerCase() ??
     navigator.platform.toLowerCase();
   const metaKeyLabel = metaKeyLabelForPlatform(localPlatform);
   const usesWindowsChrome = localPlatform.includes("win");
   const usesCustomChrome = usesWindowsChrome;
+  const inputServiceInstalled = Boolean(runtime?.inputService.installed);
+  const inputServiceReady =
+    inputServiceInstalled &&
+    Boolean(runtime?.inputService.running) &&
+    Boolean(runtime?.inputService.pipeAvailable);
+  const inputServiceStatusLabel = inputServiceReady
+    ? ui.settings.inputServiceReady
+    : inputServiceInstalled
+      ? ui.settings.inputServiceInstalledStatus
+      : ui.settings.inputServiceNeedsInstall;
+  const canManageInputService =
+    usesWindowsChrome &&
+    machineRole === "client" &&
+    Boolean(runtime?.privilege.isElevated);
+  const hasBlockingOverlay =
+    Boolean(inputServiceAction) ||
+    Boolean(errorMessage) ||
+    isScanningLan ||
+    Boolean(serverPairing) ||
+    runtime?.pairing.state === "requested";
+  const isPerformanceActive =
+    currentTab === "settings" &&
+    Boolean(layout?.performanceMonitor) &&
+    !hasBlockingOverlay;
   const chromeClassName = usesWindowsChrome
     ? "custom-chrome custom-chrome-windows"
     : "";
@@ -1081,9 +1118,84 @@ function App() {
     }
   }
 
-  async function scanLan() {
-    setIsScanningLan(true);
+  function updateInputServiceStatus(
+    inputService: RuntimeStatus["inputService"],
+  ) {
+    setSnapshot((current) =>
+      current
+        ? {
+            ...current,
+            runtime: {
+              ...current.runtime,
+              inputService,
+            },
+          }
+        : current,
+    );
+  }
+
+  async function refreshInputService() {
+    if (!isTauri()) {
+      return;
+    }
+
+    setIsInputServicePending(true);
     setErrorMessage(null);
+    try {
+      updateInputServiceStatus(await readInputServiceStatus());
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsInputServicePending(false);
+    }
+  }
+
+  async function handleInstallInputService() {
+    setIsInputServicePending(true);
+    setErrorMessage(null);
+    try {
+      updateInputServiceStatus(await installInputService());
+      setInputServiceAction(null);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsInputServicePending(false);
+    }
+  }
+
+  async function handleUninstallInputService() {
+    setIsInputServicePending(true);
+    setErrorMessage(null);
+    try {
+      updateInputServiceStatus(await uninstallInputService());
+      setInputServiceAction(null);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsInputServicePending(false);
+    }
+  }
+
+  async function scanLan() {
+    setErrorMessage(null);
+    setScanCountdown(6);
+    setIsScanningLan(true);
+
+    // Let the browser paint the modal before we hit the blocking backend call,
+    // otherwise the IPC freezes the UI thread and the modal never shows.
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const countdownTimer = setInterval(() => {
+      setScanCountdown((remaining) => (remaining > 0 ? remaining - 1 : 0));
+    }, 1000);
+    const startedAt = Date.now();
 
     try {
       const discovery = await scanLanPeers();
@@ -1103,7 +1215,18 @@ function App() {
         error instanceof Error ? error.message : ui.errors.scanLan,
       );
     } finally {
-      setIsScanningLan(false);
+      clearInterval(countdownTimer);
+      const elapsed = Date.now() - startedAt;
+      const minDisplayMs = 2500;
+      if (elapsed < minDisplayMs) {
+        setTimeout(() => {
+          setScanCountdown(0);
+          setIsScanningLan(false);
+        }, minDisplayMs - elapsed);
+      } else {
+        setScanCountdown(0);
+        setIsScanningLan(false);
+      }
     }
   }
 
@@ -1318,6 +1441,64 @@ function App() {
       window.removeEventListener("blur", cancelRecording);
     };
   }, [isCapturingEdgeSwitchHotkey]);
+
+  function setScreenSwitchHotkey(
+    direction: "left" | "right" | "up" | "down",
+    value: string,
+  ) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      screenSwitchHotkeys: {
+        ...layoutState.screenSwitchHotkeys,
+        [direction]: value,
+      },
+    }));
+  }
+
+  const captureScreenSwitchHotkey = useEffectEvent((event: KeyboardEvent) => {
+    const direction = capturingDirection;
+    if (!direction) {
+      return;
+    }
+    const hotkey = hotkeyFromKeyboardEvent(event, metaKeyLabel);
+    if (!hotkey) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    setScreenSwitchHotkey(direction, hotkey);
+    setCapturingDirection(null);
+  });
+
+  useEffect(() => {
+    if (!capturingDirection) {
+      return;
+    }
+    const cancelIfOutsideRecorder = (event: Event) => {
+      const target = event.target;
+      const button = screenSwitchButtonRefs.current[capturingDirection];
+      if (target instanceof Node && button?.contains(target)) {
+        return;
+      }
+      setCapturingDirection(null);
+    };
+    const cancelRecording = () => setCapturingDirection(null);
+
+    window.addEventListener("keydown", captureScreenSwitchHotkey, true);
+    document.addEventListener("pointerdown", cancelIfOutsideRecorder, true);
+    document.addEventListener("focusin", cancelIfOutsideRecorder, true);
+    window.addEventListener("blur", cancelRecording);
+    return () => {
+      window.removeEventListener("keydown", captureScreenSwitchHotkey, true);
+      document.removeEventListener(
+        "pointerdown",
+        cancelIfOutsideRecorder,
+        true,
+      );
+      document.removeEventListener("focusin", cancelIfOutsideRecorder, true);
+      window.removeEventListener("blur", cancelRecording);
+    };
+  }, [capturingDirection]);
 
   function setTransportPortMode(transportPortMode: TransportPortMode) {
     updateLayout((layoutState) => ({
@@ -1709,6 +1890,74 @@ function App() {
     );
   }
 
+  function renderInputServicePrompt(action: InputServiceAction) {
+    const title =
+      action === "uninstall"
+        ? ui.settings.uninstallInputServicePromptTitle
+        : ui.settings.inputServicePromptTitle;
+    const copy =
+      action === "uninstall"
+        ? ui.settings.uninstallInputServicePromptCopy
+        : ui.settings.inputServicePromptCopy;
+    const label =
+      action === "uninstall"
+        ? ui.settings.uninstallInputService
+        : ui.settings.installInputService;
+    const confirmAction =
+      action === "uninstall"
+        ? handleUninstallInputService
+        : handleInstallInputService;
+
+    return (
+      <div className="pairing-modal-backdrop" role="presentation">
+        <section
+          className="pairing-modal pairing-modal-client"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="input-service-prompt-title"
+        >
+          <button
+            type="button"
+            className="pairing-close-button"
+            onClick={() => setInputServiceAction(null)}
+            disabled={isInputServicePending}
+            title={ui.common.cancel}
+            aria-label={ui.common.cancel}
+          >
+            <WindowCloseIcon />
+          </button>
+          <div>
+            <p className="eyebrow">{ui.settings.inputServiceEyebrow}</p>
+            <h2 id="input-service-prompt-title">{title}</h2>
+            <p>{copy}</p>
+          </div>
+          <div className="pairing-actions">
+            <button
+              type="button"
+              className={
+                action === "uninstall"
+                  ? "secondary-button compact-button danger-button"
+                  : "primary-button compact-button"
+              }
+              onClick={() => void confirmAction()}
+              disabled={isInputServicePending}
+            >
+              {isInputServicePending ? ui.common.pending : label}
+            </button>
+            <button
+              type="button"
+              className="secondary-button compact-button"
+              onClick={() => setInputServiceAction(null)}
+              disabled={isInputServicePending}
+            >
+              {ui.common.cancel}
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   if (!snapshot || !layout || !runtime || !displayLayout) {
     return (
       <main className={shellClassName}>
@@ -1772,7 +2021,7 @@ function App() {
   const lanPeers = runtime.discovery.peers;
   const fileTransferEnabled = layout.fileTransferEnabled;
   const addedOnlyDevices = displayLayout.devices.filter(
-    (device) => !lanPeers.some((peer) => deviceMatchesPeer(device, peer)),
+    (device) => !lanPeers.some((peer) => deviceMatchesPeer(layout, device, peer)),
   );
   const serverFileTransferTargets = displayLayout.devices.filter(
     (device) =>
@@ -1896,6 +2145,7 @@ function App() {
 
       {errorMessage ? renderErrorDialog(errorMessage) : null}
       {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
+      {inputServiceAction ? renderInputServicePrompt(inputServiceAction) : null}
 
       {machineRole === "server" && currentTab === "layout" ? (
         <section className="workspace-shell">
@@ -2077,7 +2327,7 @@ function App() {
                     >
                       <div className="connection-main">
                         <span
-                          className={`device-badge ${peer.inputReady ? "device-badge-online" : "device-badge-offline"}`}
+                          className="device-badge device-badge-online"
                         />
                         <div>
                           <div className="connection-title">
@@ -2089,6 +2339,11 @@ function App() {
                               {addedDevice?.upgrading ? (
                                 <span className="tag-pill tag-pill-upgrading">
                                   {ui.common.upgrading}
+                                </span>
+                              ) : null}
+                              {!peer.inputReady ? (
+                                <span className="tag-pill tag-pill-warning">
+                                  {ui.devices.inputNotReady}
                                 </span>
                               ) : null}
                             </div>
@@ -2145,6 +2400,13 @@ function App() {
                             {device.upgrading ? (
                               <span className="tag-pill tag-pill-upgrading">
                                 {ui.common.upgrading}
+                              </span>
+                            ) : null}
+                            {device.role !== "local" &&
+                            device.online &&
+                            !device.inputReady ? (
+                              <span className="tag-pill tag-pill-warning">
+                                {ui.devices.inputNotReady}
                               </span>
                             ) : null}
                           </div>
@@ -2299,29 +2561,79 @@ function App() {
                     </button>
                   </div>
                 </div>
-                <div className="settings-control-row">
-                  <span>{ui.settings.edgeSwitchHotkey}</span>
-                  <button
-                    type="button"
-                    ref={edgeSwitchHotkeyButtonRef}
-                    className={`hotkey-recorder-button ${
-                      isCapturingEdgeSwitchHotkey ? "recording" : ""
-                    }`}
-                    aria-pressed={isCapturingEdgeSwitchHotkey}
-                    onClick={() =>
-                      setIsCapturingEdgeSwitchHotkey((recording) => !recording)
-                    }
-                  >
-                    {isCapturingEdgeSwitchHotkey
-                      ? ui.settings.edgeSwitchHotkeyRecording
-                      : renderHotkeyTags(
-                          formatEdgeSwitchHotkeyForDisplay(
-                            layout.edgeSwitchHotkey,
-                            metaKeyLabel,
+                {machineRole === "server" ? (
+                  <>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.edgeSwitchHotkey}</span>
+                      <button
+                        type="button"
+                        ref={edgeSwitchHotkeyButtonRef}
+                        className={`hotkey-recorder-button ${
+                          isCapturingEdgeSwitchHotkey ? "recording" : ""
+                        }`}
+                        aria-pressed={isCapturingEdgeSwitchHotkey}
+                        onClick={() =>
+                          setIsCapturingEdgeSwitchHotkey(
+                            (recording) => !recording,
+                          )
+                        }
+                      >
+                        {isCapturingEdgeSwitchHotkey
+                          ? ui.settings.edgeSwitchHotkeyRecording
+                          : renderHotkeyTags(
+                              formatEdgeSwitchHotkeyForDisplay(
+                                layout.edgeSwitchHotkey,
+                                metaKeyLabel,
+                              ),
+                              localPlatform,
+                            )}
+                      </button>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>
+                        {ui.settings.screenSwitchTitle}
+                        <span className="info-tooltip-host" tabIndex={0}>
+                          ⓘ
+                          <span className="info-tooltip">
+                            {ui.settings.screenSwitchCopy}
+                          </span>
+                        </span>
+                      </span>
+                      <div className="screen-switch-hotkeys">
+                        {(["left", "right", "up", "down"] as const).map(
+                          (dir) => (
+                            <button
+                              key={dir}
+                              type="button"
+                              ref={(el) => {
+                                screenSwitchButtonRefs.current[dir] = el;
+                              }}
+                              className={`hotkey-recorder-button ${
+                                capturingDirection === dir ? "recording" : ""
+                              }`}
+                              aria-pressed={capturingDirection === dir}
+                              onClick={() =>
+                                setCapturingDirection((current) =>
+                                  current === dir ? null : dir,
+                                )
+                              }
+                            >
+                              {capturingDirection === dir
+                                ? ui.settings.screenSwitchRecording
+                                : renderHotkeyTags(
+                                    formatEdgeSwitchHotkeyForDisplay(
+                                      layout.screenSwitchHotkeys[dir],
+                                      metaKeyLabel,
+                                    ),
+                                    localPlatform,
+                                  )}
+                            </button>
                           ),
                         )}
-                  </button>
-                </div>
+                      </div>
+                    </div>
+                  </>
+                ) : null}
                 <div className="settings-control-row">
                   <span>{ui.settings.clipboard}</span>
                   <div className="segmented-control">
@@ -2342,7 +2654,15 @@ function App() {
                   </div>
                 </div>
                 <div className="settings-control-row">
-                  <span>{ui.settings.fileTransfer}</span>
+                  <span>
+                    {ui.settings.fileTransfer}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.fileTransferCopy}
+                      </span>
+                    </span>
+                  </span>
                   <div className="segmented-control">
                     <button
                       type="button"
@@ -2462,20 +2782,63 @@ function App() {
                         : ui.settings.standardPrivilege}
                     </dd>
                   </div>
+                  {usesWindowsChrome && machineRole === "client" ? (
+                    <div>
+                      <dt>{ui.settings.inputServiceTitle}</dt>
+                      <dd>
+                        {inputServiceStatusLabel}
+                      </dd>
+                    </div>
+                  ) : null}
                 </dl>
                 <p className="muted-copy">{runtime.privilege.detail}</p>
-                {runtime.privilege.canElevate ? (
+                {runtime.privilege.canElevate ||
+                canManageInputService ? (
                   <div className="inline-actions">
-                    <button
-                      type="button"
-                      className="primary-button compact-button"
-                      onClick={() => void handleRestartAsAdmin()}
-                      disabled={isAdminRestartPending}
-                    >
-                      {isAdminRestartPending
-                        ? ui.settings.adminRestarting
-                        : ui.settings.restartAsAdmin}
-                    </button>
+                    {runtime.privilege.canElevate ? (
+                      <button
+                        type="button"
+                        className="primary-button compact-button"
+                        onClick={() => void handleRestartAsAdmin()}
+                        disabled={isAdminRestartPending}
+                      >
+                        {isAdminRestartPending
+                          ? ui.settings.adminRestarting
+                          : ui.settings.restartAsAdmin}
+                      </button>
+                    ) : null}
+                    {canManageInputService && !inputServiceInstalled ? (
+                      <button
+                        type="button"
+                        className="primary-button compact-button"
+                        onClick={() => setInputServiceAction("install")}
+                        disabled={isInputServicePending}
+                      >
+                        {isInputServicePending
+                          ? ui.common.pending
+                          : ui.settings.installInputService}
+                      </button>
+                    ) : null}
+                    {canManageInputService && runtime.inputService.installed ? (
+                      <button
+                        type="button"
+                        className="secondary-button compact-button danger-button"
+                        onClick={() => setInputServiceAction("uninstall")}
+                        disabled={isInputServicePending}
+                      >
+                        {ui.settings.uninstallInputService}
+                      </button>
+                    ) : null}
+                    {canManageInputService ? (
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        onClick={() => void refreshInputService()}
+                        disabled={isInputServicePending}
+                      >
+                        {ui.common.refresh}
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
               </section>
@@ -2829,6 +3192,21 @@ function App() {
           <GitHubIcon />
         </a>
       </footer>
+
+      {isScanningLan ? (
+        <div className="scan-modal-backdrop" role="presentation">
+          <div className="scan-modal">
+            <div className="scan-modal-spinner" aria-hidden="true" />
+            <strong className="scan-modal-title">
+              {ui.devices.scanningTitle}
+            </strong>
+            <p className="muted-copy">{ui.devices.scanningCopy}</p>
+            {scanCountdown > 0 ? (
+              <span className="scan-modal-countdown">{scanCountdown}s</span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
@@ -2923,7 +3301,7 @@ function normalizeEdgeSwitchHotkeyInput(value: string) {
   return normalized.length === 0 ? "alt+shift+k" : normalized;
 }
 
-function renderHotkeyTags(displayHotkey: string) {
+function renderHotkeyTags(displayHotkey: string, platform = "") {
   const parts = displayHotkey
     .split("+")
     .map((part) => part.trim())
@@ -2933,27 +3311,29 @@ function renderHotkeyTags(displayHotkey: string) {
     <span className="hotkey-tag-list">
       {parts.map((part) => (
         <span className="hotkey-tag" key={part}>
-          {hotkeyTagLabel(part)}
+          {hotkeyTagLabel(part, platform)}
         </span>
       ))}
     </span>
   );
 }
 
-function hotkeyTagLabel(part: string) {
+function hotkeyTagLabel(part: string, platform: string) {
+  const useTextModifiers = prefersTextHotkeyModifiers(platform);
+
   switch (part.toLowerCase()) {
     case "command":
     case "cmd":
     case "meta":
-      return "⌘";
+      return useTextModifiers ? "Meta" : "⌘";
     case "shift":
-      return "⇧";
+      return useTextModifiers ? "Shift" : "⇧";
     case "alt":
     case "option":
-      return "⌥";
+      return useTextModifiers ? "Alt" : "⌥";
     case "control":
     case "ctrl":
-      return "⌃";
+      return useTextModifiers ? "Ctrl" : "⌃";
     case "win":
     case "windows":
       return "Win";
@@ -2963,11 +3343,24 @@ function hotkeyTagLabel(part: string) {
       return "Enter";
     case "escape":
       return "Esc";
+    case "up":
+      return "↑";
+    case "down":
+      return "↓";
+    case "left":
+      return "←";
+    case "right":
+      return "→";
     case "disabled":
       return "Off";
     default:
       return part.length === 1 ? part.toUpperCase() : part.toUpperCase();
   }
+}
+
+function prefersTextHotkeyModifiers(platform: string) {
+  const normalized = platform.toLowerCase();
+  return normalized.includes("win") || normalized.includes("linux");
 }
 
 function clampZoom(value: number) {
@@ -3160,7 +3553,7 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
       }
 
       const peer = peers.find((candidate) =>
-        deviceMatchesPeer(device, candidate),
+        deviceMatchesPeer(layout, device, candidate),
       );
       if (!peer) {
         return {
@@ -3264,7 +3657,7 @@ function createScreensFromPeer(
   );
   const peerMinX = Math.min(...peerScreens.map((screen) => screen.x));
   const peerMinY = Math.min(...peerScreens.map((screen) => screen.y));
-  const startX = layoutBounds.maxX + REMOTE_SCREEN_GAP;
+  const startX = layoutBounds.maxX;
 
   return peerScreens.map((screen, index) => {
     const id = uniqueScreenId(deviceId, screen, index);
@@ -3415,14 +3808,35 @@ function peerDeviceId(peer: LanPeer) {
 }
 
 function findPeerDevice(layout: LayoutState, peer: LanPeer) {
-  return layout.devices.find((device) => deviceMatchesPeer(device, peer));
+  return layout.devices.find((device) => deviceMatchesPeer(layout, device, peer));
 }
 
-function deviceMatchesPeer(device: Device, peer: LanPeer) {
+function deviceMatchesPeer(layout: LayoutState, device: Device, peer: LanPeer) {
   return (
     device.id === peerDeviceId(peer) ||
     (device.transportPublicKey.trim().length > 0 &&
-      device.transportPublicKey === peer.transportPublicKey)
+      device.transportPublicKey === peer.transportPublicKey) ||
+    sameClusterHost(layout, device, peer)
+  );
+}
+
+function sameClusterHost(layout: LayoutState, device: Device, peer: LanPeer) {
+  return (
+    layout.clusterId.trim().length > 0 &&
+    !peer.pairingRequired &&
+    peer.clusterId === layout.clusterId &&
+    (sameHost(device.host, peer.host) || sameHost(device.host, peer.ip))
+  );
+}
+
+function sameHost(value: string, host: string) {
+  const normalizedHost = host.trim().toLowerCase();
+  return (
+    normalizedHost.length > 0 &&
+    value
+      .split("/")
+      .map((part) => part.trim().toLowerCase())
+      .some((part) => part === normalizedHost)
   );
 }
 

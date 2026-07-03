@@ -32,6 +32,7 @@ const MAX_DATAGRAM_BYTES: usize = 16 * 1024;
 // caps decoded images at 32 MiB, which becomes roughly 43 MiB on the wire.
 pub(crate) const MAX_STREAM_BYTES: usize = 48 * 1024 * 1024;
 const PORT_SCAN_COUNT: u16 = 64;
+const QUIC_WORKER_THREADS: usize = 2;
 
 type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
 type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> bool + Send + Sync + 'static>;
@@ -134,7 +135,7 @@ enum TransportCommand {
     Shutdown,
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct PeerKey {
     addr: SocketAddr,
     public_key: String,
@@ -160,6 +161,7 @@ pub fn start(
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_name("mykvm-quic")
+                .worker_threads(QUIC_WORKER_THREADS)
                 .build()
             {
                 Ok(runtime) => runtime,
@@ -588,10 +590,14 @@ async fn send_datagram(
     peer: PeerEndpoint,
     payload: Vec<u8>,
 ) -> Result<(), String> {
-    let connection = connection_for(endpoint, connections, &peer).await?;
-    connection
-        .send_datagram(payload.into())
-        .map_err(|error| error.to_string())
+    let (key, connection) = connection_for(endpoint, connections, &peer).await?;
+    match connection.send_datagram(payload.into()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            connections.remove(&key);
+            Err(error.to_string())
+        }
+    }
 }
 
 async fn send_stream(
@@ -601,7 +607,19 @@ async fn send_stream(
     payload: Vec<u8>,
     ack_required: bool,
 ) -> Result<(), String> {
-    let connection = connection_for(endpoint, connections, &peer).await?;
+    let (key, connection) = connection_for(endpoint, connections, &peer).await?;
+    let result = send_stream_on_connection(connection, payload, ack_required).await;
+    if result.is_err() {
+        connections.remove(&key);
+    }
+    result
+}
+
+async fn send_stream_on_connection(
+    connection: quinn::Connection,
+    payload: Vec<u8>,
+    ack_required: bool,
+) -> Result<(), String> {
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -641,29 +659,33 @@ async fn connection_for(
     endpoint: &Endpoint,
     connections: &mut HashMap<PeerKey, quinn::Connection>,
     peer: &PeerEndpoint,
-) -> Result<quinn::Connection, String> {
-    let addr = resolve_peer_addr(&peer.addr)?;
-    let key = PeerKey {
-        addr,
-        public_key: peer.public_key.clone(),
-    };
+) -> Result<(PeerKey, quinn::Connection), String> {
+    let key = peer_key(peer)?;
 
     if let Some(connection) = connections.get(&key) {
         if connection.close_reason().is_none() {
-            return Ok(connection.clone());
+            return Ok((key, connection.clone()));
         }
     }
+    connections.remove(&key);
 
     let config = client_config(peer)?;
     let connecting = endpoint
-        .connect_with(config, addr, SERVER_NAME)
-        .map_err(|error| format!("failed to start QUIC connection to {addr}: {error}"))?;
+        .connect_with(config, key.addr, SERVER_NAME)
+        .map_err(|error| format!("failed to start QUIC connection to {}: {error}", key.addr))?;
     let connection = tokio::time::timeout(Duration::from_secs(2), connecting)
         .await
-        .map_err(|_| format!("QUIC connection to {addr} timed out"))?
-        .map_err(|error| format!("failed to connect QUIC to {addr}: {error}"))?;
-    connections.insert(key, connection.clone());
-    Ok(connection)
+        .map_err(|_| format!("QUIC connection to {} timed out", key.addr))?
+        .map_err(|error| format!("failed to connect QUIC to {}: {error}", key.addr))?;
+    connections.insert(key.clone(), connection.clone());
+    Ok((key, connection))
+}
+
+fn peer_key(peer: &PeerEndpoint) -> Result<PeerKey, String> {
+    Ok(PeerKey {
+        addr: resolve_peer_addr(&peer.addr)?,
+        public_key: peer.public_key.clone(),
+    })
 }
 
 fn resolve_peer_addr(addr: &str) -> Result<SocketAddr, String> {
@@ -731,6 +753,24 @@ mod tests {
     fn stream_ack_rejects_non_ok_payloads() {
         assert!(verify_stream_ack(b"ok").is_ok());
         assert!(verify_stream_ack(b"reject").is_err());
+    }
+
+    #[test]
+    fn peer_key_uses_resolved_addr_and_public_key() {
+        let key = peer_key(&PeerEndpoint {
+            addr: "127.0.0.1:47834".into(),
+            public_key: "pinned-cert".into(),
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .expect("peer key");
+
+        assert_eq!(key.addr, "127.0.0.1:47834".parse::<SocketAddr>().unwrap());
+        assert_eq!(key.public_key, "pinned-cert");
+    }
+
+    #[test]
+    fn quic_runtime_uses_small_worker_pool() {
+        assert_eq!(QUIC_WORKER_THREADS, 2);
     }
 
     #[test]

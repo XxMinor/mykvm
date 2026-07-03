@@ -46,7 +46,9 @@ const DISCOVERY_PORT_SPAN: u16 = 8;
 const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
 const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
-const PEER_TTL_MS: u64 = 30_000;
+// UDP discovery is a heartbeat, not the transport itself. Keep peers through
+// short announce gaps so online clients do not flicker offline in the UI.
+const PEER_TTL_MS: u64 = 90_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
 const PAIRING_CODE_TTL_MS: u64 = 60_000;
 const PAIRING_MAX_ATTEMPTS: u8 = 5;
@@ -66,6 +68,7 @@ const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const FILE_TRANSFER_DESTINATION_POINTER: &str = "pointer";
+const EDGE_DROP_WINDOWS_ENABLED: bool = false;
 const EDGE_DROP_LABEL_PREFIX: &str = "mykvm-edge-drop-";
 const EDGE_DROP_THICKNESS: i32 = 8;
 const FILE_DROP_LANDING_LABEL: &str = "mykvm-file-drop-landing";
@@ -163,6 +166,46 @@ struct Device {
     screens: Vec<Screen>,
 }
 
+/// Per-direction hotkeys for jumping between adjacent screens without moving
+/// the mouse to an edge. Each value is a canonical shortcut string
+/// (`"alt+right"`, `"disabled"`, etc.) consumed by the global-shortcut plugin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenSwitchHotkeys {
+    #[serde(default = "default_screen_switch_hotkey_left")]
+    pub left: String,
+    #[serde(default = "default_screen_switch_hotkey_right")]
+    pub right: String,
+    #[serde(default = "default_screen_switch_hotkey_up")]
+    pub up: String,
+    #[serde(default = "default_screen_switch_hotkey_down")]
+    pub down: String,
+}
+
+impl Default for ScreenSwitchHotkeys {
+    fn default() -> Self {
+        Self {
+            left: default_screen_switch_hotkey_left(),
+            right: default_screen_switch_hotkey_right(),
+            up: default_screen_switch_hotkey_up(),
+            down: default_screen_switch_hotkey_down(),
+        }
+    }
+}
+
+fn default_screen_switch_hotkey_left() -> String {
+    "alt+left".into()
+}
+fn default_screen_switch_hotkey_right() -> String {
+    "alt+right".into()
+}
+fn default_screen_switch_hotkey_up() -> String {
+    "alt+up".into()
+}
+fn default_screen_switch_hotkey_down() -> String {
+    "alt+down".into()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LayoutState {
@@ -201,6 +244,8 @@ struct LayoutState {
     modifier_map: ModifierMap,
     #[serde(default = "default_edge_switch_hotkey")]
     edge_switch_hotkey: String,
+    #[serde(default)]
+    screen_switch_hotkeys: ScreenSwitchHotkeys,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -508,6 +553,8 @@ struct AppRuntime {
     clipboard_packets: Arc<AtomicU64>,
     runtime_toggle_shortcut: Mutex<Option<String>>,
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
+    screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
+    screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
 }
 
@@ -545,6 +592,8 @@ impl AppRuntime {
             clipboard_packets: Arc::new(AtomicU64::new(0)),
             runtime_toggle_shortcut: Mutex::new(None),
             runtime_toggle_menu_item: Mutex::new(None),
+            screen_switch_request: Arc::new(Mutex::new(None)),
+            screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
             config_path,
         }
     }
@@ -566,8 +615,14 @@ impl AppRuntime {
             return;
         };
         let disk_layout = normalize_saved_layout(saved_layout, native_layout);
-        if let Ok(mut current) = self.layout.lock() {
+        let merged = if let Ok(mut current) = self.layout.lock() {
             *current = merge_disk_layout_into_runtime(disk_layout, &current);
+            true
+        } else {
+            false
+        };
+        if merged {
+            sync_layout_peer_presence(&self.layout, &self.peers);
         }
     }
 
@@ -583,7 +638,6 @@ impl AppRuntime {
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
-        runtime.input_service = current_input_service_status();
 
         runtime
     }
@@ -908,13 +962,12 @@ impl AppRuntime {
                                 target.as_str(),
                             );
                         }
-                        for target in &direct_targets {
-                            let _ = send_discovery_packet(
-                                &socket,
-                                "announce",
-                                &local_peer,
-                                target.as_str(),
-                            );
+                        let probed_peers = probe_known_peer_targets(&local_peer, &direct_targets);
+                        if !probed_peers.is_empty() {
+                            for peer in probed_peers {
+                                merge_peer(&peers, peer);
+                            }
+                            sync_layout_peer_presence(&layout_state, &peers);
                         }
                     }
                     last_announce = Instant::now();
@@ -975,7 +1028,6 @@ impl AppRuntime {
                             if peer_visible_to_layout(&current_layout, &incoming.peer) {
                                 merge_peer(&peers, incoming.peer.clone());
                                 sync_layout_peer_presence(&layout_state, &peers);
-                                warm_quic_peer(&quic_transport, &incoming.peer);
                             }
 
                             if matches!(incoming.kind.as_str(), "announce" | "probe") {
@@ -1057,6 +1109,7 @@ impl AppRuntime {
             Arc::clone(&self.main_window_focused),
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
+            Arc::clone(&self.screen_switch_request),
         );
         *input_stop = Some(stop);
         statuses
@@ -1256,6 +1309,7 @@ fn save_layout(
         }
     }
     sync_runtime_toggle_shortcut(&state.app_handle)?;
+    sync_screen_switch_shortcuts(&state.app_handle)?;
     Ok(state.snapshot())
 }
 
@@ -1698,7 +1752,147 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
 }
 
 fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<String>, String> {
+    if layout.machine_role != "server" {
+        return Ok(None);
+    }
+
     canonical_runtime_toggle_shortcut(&layout.edge_switch_hotkey)
+}
+
+/// Register/unregister the four direction hotkeys so they stay in sync with the
+/// saved layout. Mirrors `sync_runtime_toggle_shortcut`: compares against the
+/// stored values and only touches the ones that changed.
+fn sync_screen_switch_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return Ok(());
+    };
+    let layout = state.layout_snapshot();
+    let next = screen_switch_shortcuts_for_layout(&layout);
+
+    let mut current = state
+        .screen_switch_shortcuts
+        .lock()
+        .map_err(|_| "screen switch shortcuts lock poisoned".to_string())?;
+
+    for (next_str, prev_str) in [
+        (&next.left, &current.left),
+        (&next.right, &current.right),
+        (&next.up, &current.up),
+        (&next.down, &current.down),
+    ] {
+        if next_str == prev_str {
+            continue;
+        }
+        if !prev_str.is_empty() {
+            if let Err(error) = app.global_shortcut().unregister(prev_str.as_str()) {
+                log::warn!("failed to unregister screen switch shortcut {prev_str}: {error}");
+            }
+        }
+        if !next_str.is_empty() {
+            if let Err(error) = app.global_shortcut().register(next_str.as_str()) {
+                log::warn!("failed to register screen switch shortcut {next_str}: {error}");
+            } else {
+                log::info!("registered screen switch shortcut: {next_str}");
+            }
+        }
+    }
+
+    *current = next;
+    Ok(())
+}
+
+fn screen_switch_shortcuts_for_layout(layout: &LayoutState) -> ScreenSwitchHotkeys {
+    if layout.machine_role != "server" {
+        return empty_screen_switch_hotkeys();
+    }
+
+    ScreenSwitchHotkeys {
+        left: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.left)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        right: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.right)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        up: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.up)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        down: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.down)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+    }
+}
+
+fn empty_screen_switch_hotkeys() -> ScreenSwitchHotkeys {
+    ScreenSwitchHotkeys {
+        left: String::new(),
+        right: String::new(),
+        up: String::new(),
+        down: String::new(),
+    }
+}
+
+/// Dispatch a pressed global shortcut to its action. The runtime-toggle
+/// shortcut starts/stops capture; the four direction shortcuts post a switch
+/// request that the capture loop consumes.
+fn route_global_shortcut(
+    app: &AppHandle,
+    shortcut: &tauri_plugin_global_shortcut::Shortcut,
+) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return Ok(());
+    };
+    if state.layout_snapshot().machine_role != "server" {
+        return Ok(());
+    }
+
+    // Runtime toggle (quick start/stop).
+    let toggle = state
+        .runtime_toggle_shortcut
+        .lock()
+        .map_err(|_| "runtime toggle shortcut lock poisoned".to_string())?;
+    if let Some(toggle_str) = toggle.as_ref() {
+        if let Ok(toggle_shortcut) = toggle_str.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+            if shortcut == &toggle_shortcut {
+                drop(toggle);
+                toggle_runtime_from_app(app)?;
+                return Ok(());
+            }
+        }
+    }
+    drop(toggle);
+
+    // Direction switch hotkeys.
+    let directions = state
+        .screen_switch_shortcuts
+        .lock()
+        .map_err(|_| "screen switch shortcuts lock poisoned".to_string())?;
+    let direction = [
+        (directions.left.as_str(), input::SwitchDirection::Left),
+        (directions.right.as_str(), input::SwitchDirection::Right),
+        (directions.up.as_str(), input::SwitchDirection::Up),
+        (directions.down.as_str(), input::SwitchDirection::Down),
+    ]
+    .into_iter()
+    .find_map(|(stored, dir)| {
+        if stored.is_empty() {
+            return None;
+        }
+        stored
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .ok()
+            .filter(|parsed| parsed == shortcut)
+            .map(|_| dir)
+    });
+    drop(directions);
+
+    if let Some(direction) = direction {
+        if let Ok(mut request) = state.screen_switch_request.lock() {
+            // Only the latest request wins; a rapid double-tap overwrites.
+            *request = Some(direction);
+        }
+    }
+
+    Ok(())
 }
 
 fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, String> {
@@ -1829,57 +2023,75 @@ fn restart_as_admin(app: AppHandle, state: tauri::State<'_, AppRuntime>) -> Resu
 }
 
 #[tauri::command]
-fn read_input_service_status() -> InputServiceStatus {
-    current_input_service_status()
+fn read_input_service_status(state: tauri::State<'_, AppRuntime>) -> InputServiceStatus {
+    let status = current_input_service_status();
+    update_runtime_input_service_status(state.inner(), &status);
+    status
 }
 
 #[tauri::command]
-fn install_input_service() -> Result<InputServiceStatus, String> {
+fn install_input_service(
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<InputServiceStatus, String> {
     #[cfg(target_os = "windows")]
     {
         let helper_path = resolve_input_helper_path()?;
-        if is_windows_process_elevated().unwrap_or(false) {
+        let status = if is_windows_process_elevated().unwrap_or(false) {
             install_windows_input_service(&helper_path)?;
             start_windows_input_service()?;
-            return Ok(current_input_service_status());
-        }
-
-        launch_current_process_as_admin(&[
-            INSTALL_INPUT_SERVICE_ARG.into(),
-            HELPER_PATH_ARG.into(),
-            helper_path.to_string_lossy().into_owned(),
-        ])?;
-        Ok(InputServiceStatus {
-            detail: "Administrator approval requested to install the input service.".into(),
-            ..current_input_service_status()
-        })
+            current_input_service_status()
+        } else {
+            launch_current_process_as_admin(&[
+                INSTALL_INPUT_SERVICE_ARG.into(),
+                HELPER_PATH_ARG.into(),
+                helper_path.to_string_lossy().into_owned(),
+            ])?;
+            InputServiceStatus {
+                detail: "Administrator approval requested to install the input service.".into(),
+                ..current_input_service_status()
+            }
+        };
+        update_runtime_input_service_status(state.inner(), &status);
+        Ok(status)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = state;
         Err("Windows input service is only available on Windows.".into())
     }
 }
 
 #[tauri::command]
-fn uninstall_input_service() -> Result<InputServiceStatus, String> {
+fn uninstall_input_service(
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<InputServiceStatus, String> {
     #[cfg(target_os = "windows")]
     {
-        if is_windows_process_elevated().unwrap_or(false) {
+        let status = if is_windows_process_elevated().unwrap_or(false) {
             uninstall_windows_input_service()?;
-            return Ok(current_input_service_status());
-        }
-
-        launch_current_process_as_admin(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
-        Ok(InputServiceStatus {
-            detail: "Administrator approval requested to uninstall the input service.".into(),
-            ..current_input_service_status()
-        })
+            current_input_service_status()
+        } else {
+            launch_current_process_as_admin(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
+            InputServiceStatus {
+                detail: "Administrator approval requested to uninstall the input service.".into(),
+                ..current_input_service_status()
+            }
+        };
+        update_runtime_input_service_status(state.inner(), &status);
+        Ok(status)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = state;
         Err("Windows input service is only available on Windows.".into())
+    }
+}
+
+fn update_runtime_input_service_status(state: &AppRuntime, status: &InputServiceStatus) {
+    if let Ok(mut runtime) = state.runtime.lock() {
+        runtime.input_service = status.clone();
     }
 }
 
@@ -1904,15 +2116,7 @@ fn send_files_to_device(
     paths: Vec<String>,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<FileTransferSummary, String> {
-    send_files_to_device_impl(state.inner(), &device_id, paths)
-}
-
-fn send_files_to_device_impl(
-    state: &AppRuntime,
-    device_id: &str,
-    paths: Vec<String>,
-) -> Result<FileTransferSummary, String> {
-    send_files_to_device_with_destination(state, device_id, paths, None)
+    send_files_to_device_with_destination(state.inner(), &device_id, paths, None)
 }
 
 fn send_files_to_device_with_destination(
@@ -1970,7 +2174,11 @@ fn start_edge_drop_window_sync(app_handle: AppHandle) {
         let runtime = state.inner();
         let layout = runtime.layout_snapshot();
         let peers = active_peer_snapshot(&runtime.peers);
-        let specs = edge_drop_specs_for_layout(&layout, &peers);
+        let specs = edge_drop_specs_for_window_visibility(
+            &layout,
+            &peers,
+            runtime.main_window_visible.load(Ordering::Relaxed),
+        );
         let next_labels = specs
             .iter()
             .map(|spec| spec.label.clone())
@@ -2142,6 +2350,18 @@ fn edge_drop_specs_for_layout(layout: &LayoutState, peers: &[LanPeer]) -> Vec<Ed
     };
     specs.sort_by(|left, right| left.label.cmp(&right.label));
     specs
+}
+
+fn edge_drop_specs_for_window_visibility(
+    layout: &LayoutState,
+    peers: &[LanPeer],
+    main_window_visible: bool,
+) -> Vec<EdgeDropWindowSpec> {
+    if main_window_visible {
+        edge_drop_specs_for_layout(layout, peers)
+    } else {
+        Vec::new()
+    }
 }
 
 fn server_edge_drop_specs(layout: &LayoutState, local_device: &Device) -> Vec<EdgeDropWindowSpec> {
@@ -2502,7 +2722,7 @@ fn set_app_upgrading(state: tauri::State<'_, AppRuntime>, enabled: bool) {
 }
 
 #[tauri::command]
-fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus, String> {
+async fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus, String> {
     state.start_discovery()?;
     let layout = state
         .layout
@@ -2513,7 +2733,14 @@ fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus
     if let Some(transport) = state.quic_transport_handle() {
         apply_transport_to_peer(&mut local_peer, &transport);
     }
-    let discovered = scan_for_peers(&local_peer, discovery_base_port(&layout))?;
+    let base_port = discovery_base_port(&layout);
+
+    // scan_for_peers blocks for ~1.4s on UDP recv; run it on a blocking thread
+    // so the async command doesn't freeze the webview UI.
+    let discovered =
+        tauri::async_runtime::spawn_blocking(move || scan_for_peers(&local_peer, base_port))
+            .await
+            .map_err(|e| format!("scan task failed: {e}"))??;
 
     for peer in discovered {
         merge_peer(&state.peers, peer);
@@ -3085,10 +3312,10 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state == ShortcutState::Pressed {
-                        if let Err(error) = toggle_runtime_from_app(app) {
-                            log::warn!("quick start/stop shortcut failed: {error}");
+                        if let Err(error) = route_global_shortcut(app, shortcut) {
+                            log::warn!("global shortcut failed: {error}");
                         }
                     }
                 })
@@ -3187,10 +3414,15 @@ pub fn run() {
             setup_macos_cursor_hider(app);
             #[cfg(target_os = "macos")]
             setup_macos_window_visibility_watcher(app);
-            start_edge_drop_window_sync(app.handle().clone());
+            if EDGE_DROP_WINDOWS_ENABLED {
+                start_edge_drop_window_sync(app.handle().clone());
+            }
             setup_tray(app)?;
             if let Err(error) = sync_runtime_toggle_shortcut(app.handle()) {
                 log::warn!("failed to register quick start/stop shortcut: {error}");
+            }
+            if let Err(error) = sync_screen_switch_shortcuts(app.handle()) {
+                log::warn!("failed to register screen switch shortcuts: {error}");
             }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
@@ -3346,30 +3578,9 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
 }
 
 fn hide_main_window_handle(app: &AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let Some(window) = app.get_webview_window("main") else {
-            set_main_window_visible(app, false);
-            set_main_window_focused(app, false);
-            return Ok(());
-        };
-        let result = window
-            .hide()
-            .map_err(|error| format!("failed to hide main window: {error}"));
-        if result.is_ok() {
-            set_main_window_visible(app, false);
-            set_main_window_focused(app, false);
-        }
-        result
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        destroy_main_window_handle(app)
-    }
+    destroy_main_window_handle(app)
 }
 
-#[cfg(not(target_os = "macos"))]
 fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window("main") else {
         set_main_window_visible(app, false);
@@ -3594,7 +3805,7 @@ fn current_input_service_status() -> InputServiceStatus {
 #[cfg(target_os = "windows")]
 fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
     use windows_sys::Win32::{
-        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST},
+        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE},
         System::{
             RemoteDesktop::WTSGetActiveConsoleSessionId,
             Services::{
@@ -3616,7 +3827,7 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
         let service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_STATUS);
         if service.is_null() {
             let code = GetLastError();
-            if code == ERROR_SERVICE_DOES_NOT_EXIST {
+            if code == ERROR_SERVICE_DOES_NOT_EXIST || code == ERROR_SERVICE_MARKED_FOR_DELETE {
                 return Ok(InputServiceStatus {
                     installed: false,
                     running: false,
@@ -3707,7 +3918,10 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
 
         let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
         let display_name = wide_null(shared_input::INPUT_SERVICE_DISPLAY_NAME);
-        let binary = wide_null(&format!("{} --service", quote_windows_arg(helper_path)));
+        let binary = wide_null(&format!(
+            "{} --service",
+            quote_windows_arg_str(&helper_path.to_string_lossy())
+        ));
         let mut service = CreateServiceW(
             scm,
             service_name.as_ptr(),
@@ -3809,14 +4023,12 @@ fn start_windows_input_service() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn uninstall_windows_input_service() -> Result<(), String> {
-    use std::time::{Duration, Instant};
     use windows_sys::Win32::{
         Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST},
         Storage::FileSystem::DELETE,
         System::Services::{
             ControlService, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
             SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
-            SERVICE_STOPPED,
         },
     };
 
@@ -3841,48 +4053,13 @@ fn uninstall_windows_input_service() -> Result<(), String> {
         }
         let _service = ServiceHandleGuard(service);
 
-        if let Ok(status) = query_service_status_process_for_uninstall(service) {
-            if status.dwCurrentState != SERVICE_STOPPED {
-                let mut stop_status = SERVICE_STATUS::default();
-                let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status);
-                let deadline = Instant::now() + Duration::from_secs(8);
-                while Instant::now() < deadline {
-                    if let Ok(status) = query_service_status_process_for_uninstall(service) {
-                        if status.dwCurrentState == SERVICE_STOPPED {
-                            break;
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(200));
-                }
-            }
-        }
+        let mut stop_status = SERVICE_STATUS::default();
+        let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status);
 
         if DeleteService(service) == 0 {
             return Err(windows_last_error("DeleteService"));
         }
         return Ok(());
-    }
-
-    unsafe fn query_service_status_process_for_uninstall(
-        service: windows_sys::Win32::System::Services::SC_HANDLE,
-    ) -> Result<windows_sys::Win32::System::Services::SERVICE_STATUS_PROCESS, String> {
-        use windows_sys::Win32::System::Services::{
-            QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
-        };
-        let mut status = SERVICE_STATUS_PROCESS::default();
-        let mut needed = 0_u32;
-        let ok = QueryServiceStatusEx(
-            service,
-            SC_STATUS_PROCESS_INFO,
-            &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
-            std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
-            &mut needed,
-        ) != 0;
-        if ok {
-            Ok(status)
-        } else {
-            Err(windows_last_error("QueryServiceStatusEx"))
-        }
     }
 }
 
@@ -3982,11 +4159,6 @@ fn sas_dll_available() -> bool {
         let _ = FreeLibrary(dll);
         available
     }
-}
-
-#[cfg(target_os = "windows")]
-fn quote_windows_arg(value: &PathBuf) -> String {
-    quote_windows_arg_str(&value.to_string_lossy())
 }
 
 #[cfg(target_os = "windows")]
@@ -4126,7 +4298,7 @@ fn apply_windows_window_chrome(window: &tauri::WebviewWindow, theme: &str) -> Re
 }
 
 #[cfg(target_os = "windows")]
-fn wide_null(value: &str) -> Vec<u16> {
+pub(crate) fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -4161,6 +4333,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         modifier_remap: default_modifier_remap(),
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
+        screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         devices: vec![Device {
             id: device_id,
             name: local_device_name(),
@@ -4203,6 +4376,7 @@ fn detect_fallback_layout() -> LayoutState {
         modifier_remap: default_modifier_remap(),
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
+        screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
     }
 }
 
@@ -4315,6 +4489,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         modifier_remap: saved_layout.modifier_remap,
         modifier_map: normalize_modifier_map(&saved_layout.modifier_map),
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
+        screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
     }
 }
 
@@ -6053,6 +6228,7 @@ fn active_peer_snapshot(peers: &Arc<Mutex<Vec<LanPeer>>>) -> Vec<LanPeer> {
 fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
     let local_transport_port = layout.transport_port;
     let local_quic_port = layout.quic_port;
+    let cluster_id = layout.cluster_id.clone();
     for device in &mut layout.devices {
         if device.role == "local" {
             device.online = true;
@@ -6063,7 +6239,9 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
             continue;
         }
 
-        let peer = peers.iter().find(|peer| device_matches_peer(device, peer));
+        let peer = peers
+            .iter()
+            .find(|peer| device_matches_peer(device, peer, &cluster_id));
         if let Some(peer) = peer {
             update_device_from_peer(device, peer);
         } else {
@@ -6127,10 +6305,19 @@ fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
     }
 }
 
-fn device_matches_peer(device: &Device, peer: &LanPeer) -> bool {
+fn device_matches_peer(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
     device.id == peer_device_id(peer)
         || (!device.transport_public_key.trim().is_empty()
             && device.transport_public_key == peer.transport_public_key)
+        || same_cluster_host(device, peer, layout_cluster_id)
+}
+
+fn same_cluster_host(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
+    let cluster_id = layout_cluster_id.trim();
+    !cluster_id.is_empty()
+        && !peer.pairing_required
+        && peer.cluster_id == cluster_id
+        && (same_host(&device.host, &peer.host) || same_host(&device.host, &peer.ip))
 }
 
 #[allow(dead_code)]
@@ -6360,18 +6547,6 @@ fn apply_transport_to_peer(peer: &mut LanPeer, transport: &quic_transport::Trans
     peer.protocol_version = quic_transport::PROTOCOL_VERSION;
 }
 
-fn warm_quic_peer(transport: &quic_transport::TransportHandle, peer: &LanPeer) {
-    if !peer.input_ready || peer.transport_public_key.trim().is_empty() || peer.quic_port == 0 {
-        return;
-    }
-    let endpoint = transport.peer(
-        format!("{}:{}", peer.ip, peer.quic_port),
-        peer.transport_public_key.clone(),
-        peer.protocol_version,
-    );
-    let _ = transport.send_datagram(endpoint, Vec::new());
-}
-
 fn pairing_required(layout: &LayoutState) -> bool {
     layout.machine_role == "client" && layout.paired_controllers.is_empty()
 }
@@ -6477,6 +6652,41 @@ fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, 
     }
 
     Ok(peers)
+}
+
+fn probe_known_peer_targets(local_peer: &LanPeer, targets: &[String]) -> Vec<LanPeer> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+        return Vec::new();
+    };
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
+    for target in targets {
+        let _ = send_discovery_packet(&socket, "probe", local_peer, target.as_str());
+    }
+
+    let started = Instant::now();
+    let mut buffer = [0_u8; 4096];
+    let mut peers = Vec::new();
+    while started.elapsed() < Duration::from_millis(700) {
+        let Ok((length, source)) = socket.recv_from(&mut buffer) else {
+            continue;
+        };
+        let Some(packet) = decode_discovery_packet(&buffer[..length]) else {
+            continue;
+        };
+        let Some(incoming) =
+            peer_from_discovery_packet(packet, source.ip().to_string(), &local_peer.id)
+        else {
+            continue;
+        };
+        if peer_visible_to_local_peer(local_peer, &incoming.peer) {
+            merge_peer_entry(&mut peers, incoming.peer);
+        }
+    }
+    peers
 }
 
 fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<LanPeer, String> {
@@ -6760,7 +6970,7 @@ fn merge_peer_entry(peers: &mut Vec<LanPeer>, next_peer: LanPeer) {
         }
     }
 
-    log::info!(
+    log::debug!(
         "discovery peer found id={} name={} ip={} discovery_port={} quic_port={} input_ready={} pairing_required={}",
         next_peer.id,
         next_peer.name,
@@ -7297,7 +7507,7 @@ fn ensure_windows_firewall_rule() {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -7406,6 +7616,7 @@ mod tests {
             modifier_remap: true,
             modifier_map: default_modifier_map(),
             edge_switch_hotkey: default_edge_switch_hotkey(),
+            screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         }
     }
 
@@ -7481,6 +7692,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_toggle_shortcut_disabled_for_client_role() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+
+        assert_eq!(
+            runtime_toggle_shortcut_for_layout(&layout).expect("shortcut"),
+            None
+        );
+    }
+
+    #[test]
+    fn screen_switch_shortcuts_disabled_for_client_role() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+
+        assert_eq!(
+            screen_switch_shortcuts_for_layout(&layout),
+            ScreenSwitchHotkeys {
+                left: String::new(),
+                right: String::new(),
+                up: String::new(),
+                down: String::new(),
+            }
+        );
+    }
+
+    #[test]
     fn peer_presence_marks_missing_remote_offline() {
         let mut layout = test_layout();
 
@@ -7503,6 +7741,33 @@ mod tests {
         assert!(layout.devices[1].input_ready);
         assert_eq!(layout.devices[1].host, "10.0.0.2");
         assert_eq!(layout.devices[1].transport_port, 52000);
+    }
+
+    #[test]
+    fn peer_presence_matches_same_cluster_host_after_identity_rotation() {
+        let mut layout = test_layout();
+        let mut peer = test_peer();
+        peer.id = "rotated-client-id".into();
+        peer.transport_public_key = "rotated-client-key".into();
+
+        apply_peer_presence(&mut layout, &[peer]);
+
+        assert!(layout.devices[1].online);
+        assert!(layout.devices[1].input_ready);
+        assert_eq!(layout.devices[1].transport_public_key, "rotated-client-key");
+    }
+
+    #[test]
+    fn discovery_keeps_peer_through_short_heartbeat_gap() {
+        let mut peer = test_peer();
+        peer.last_seen_ms = now_ms().saturating_sub(45_000);
+        let peers = Arc::new(Mutex::new(vec![peer.clone()]));
+
+        assert_eq!(active_peers(&peers, "local-device").len(), 1);
+
+        let mut entries = vec![peer];
+        prune_stale_peer_entries(&mut entries, now_ms());
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]
@@ -7543,6 +7808,18 @@ mod tests {
         let specs = edge_drop_specs_for_layout(&layout, &[]);
 
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn edge_drop_specs_pause_when_main_window_is_hidden() {
+        let mut layout = test_layout();
+        layout.devices[1].screens[0].x = 1920;
+
+        assert_eq!(
+            edge_drop_specs_for_window_visibility(&layout, &[], true).len(),
+            1
+        );
+        assert!(edge_drop_specs_for_window_visibility(&layout, &[], false).is_empty());
     }
 
     #[test]
@@ -8496,14 +8773,15 @@ mod tests {
     }
 
     #[test]
-    fn device_matching_rejects_same_host_with_different_identity() {
+    fn device_matching_rejects_same_host_from_other_cluster() {
         let layout = test_layout();
         let device = &layout.devices[1];
         let mut peer = test_peer();
         peer.id = "peer-other".into();
         peer.transport_public_key = "different-key".into();
+        peer.cluster_id = "other-cluster".into();
 
-        assert!(!device_matches_peer(device, &peer));
+        assert!(!device_matches_peer(device, &peer, &layout.cluster_id));
     }
 
     #[test]

@@ -28,6 +28,17 @@ export function edgeSwitchHotkeyFromKeyboardEvent(
   event: HotkeyKeyboardEventLike,
   metaKeyLabel: MetaKeyLabel = "meta",
 ): string | null {
+  return hotkeyFromKeyboardEvent(event, metaKeyLabel);
+}
+
+/// Generic hotkey capture used by both the runtime-toggle recorder and the
+/// screen-switch direction recorders. Returns the canonical hotkey string, or
+/// `null` to ignore the event (e.g. a bare modifier press), or `"disabled"` to
+/// clear the binding (Backspace/Delete).
+export function hotkeyFromKeyboardEvent(
+  event: HotkeyKeyboardEventLike,
+  metaKeyLabel: MetaKeyLabel = "meta",
+): string | null {
   if (event.key === "Backspace" || event.key === "Delete") {
     return "disabled";
   }
@@ -143,6 +154,14 @@ function normalizeHotkeyCode(code?: string) {
       return "escape";
     case "ScrollLock":
       return "scrolllock";
+    case "ArrowUp":
+      return "up";
+    case "ArrowDown":
+      return "down";
+    case "ArrowLeft":
+      return "left";
+    case "ArrowRight":
+      return "right";
     default:
       return null;
   }
@@ -175,6 +194,18 @@ function normalizeHotkeyKey(key: string) {
     case "scroll":
     case "scrlk":
       return "scrolllock";
+    case "arrowup":
+    case "up":
+      return "up";
+    case "arrowdown":
+    case "down":
+      return "down";
+    case "arrowleft":
+    case "left":
+      return "left";
+    case "arrowright":
+    case "right":
+      return "right";
     default:
       return null;
   }
