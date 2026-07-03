@@ -260,7 +260,11 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
         let sent = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
         if sent == 0 {
             let err = windows_sys::Win32::Foundation::GetLastError();
-            std::fs::write("C:\\ProgramData\\MyKVM\\helper-btn-err.txt", format!("mouse button {flag:?} error {err}\n")).ok();
+            std::fs::write(
+                "C:\\ProgramData\\MyKVM\\helper-btn-err.txt",
+                format!("mouse button {flag:?} error {err}\n"),
+            )
+            .ok();
         }
     }
 }
@@ -297,8 +301,8 @@ pub fn inject_scroll(delta_x: i32, delta_y: i32) {
 
 pub fn inject_key(key_code: u16, down: bool) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
+        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
     };
 
     let mut dw_flags = if down { 0 } else { KEYEVENTF_KEYUP };
@@ -327,7 +331,11 @@ pub fn inject_key(key_code: u16, down: bool) {
         let sent = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
         if sent == 0 {
             let err = windows_sys::Win32::Foundation::GetLastError();
-            std::fs::write("C:\\ProgramData\\MyKVM\\helper-key-err.txt", format!("key {key_code:#04x} down={down} error {err}\n")).ok();
+            std::fs::write(
+                "C:\\ProgramData\\MyKVM\\helper-key-err.txt",
+                format!("key {key_code:#04x} down={down} error {err}\n"),
+            )
+            .ok();
         }
     }
 }

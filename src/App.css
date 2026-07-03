@@ -470,7 +470,6 @@
   padding: 0;
   line-height: 0;
   box-shadow: 0 4px 10px rgba(37, 99, 235, 0.28);
-  animation: brand-update-pulse 2.2s ease-in-out infinite;
 }
 
 .brand-update-badge:hover {
@@ -481,16 +480,6 @@
 .brand-update-badge .runtime-icon {
   width: 11px;
   height: 11px;
-}
-
-@keyframes brand-update-pulse {
-  0%,
-  100% {
-    box-shadow: 0 4px 10px rgba(37, 99, 235, 0.28), 0 0 0 0 rgba(37, 99, 235, 0.42);
-  }
-  50% {
-    box-shadow: 0 4px 10px rgba(37, 99, 235, 0.28), 0 0 0 4px rgba(37, 99, 235, 0);
-  }
 }
 
 .brand-subtitle {
@@ -2052,7 +2041,6 @@
   place-items: center;
   padding: 20px;
   background: rgba(5, 8, 14, 0.66);
-  backdrop-filter: blur(6px);
 }
 
 .error-dialog {
@@ -2241,7 +2229,6 @@
   place-items: center;
   padding: 20px;
   background: rgba(5, 8, 14, 0.66);
-  backdrop-filter: blur(6px);
 }
 
 .pairing-modal {
@@ -2308,7 +2295,6 @@
   place-items: center;
   padding: 20px;
   background: rgba(5, 8, 14, 0.66);
-  backdrop-filter: blur(6px);
 }
 
 .scan-modal {

@@ -16,6 +16,7 @@ import {
   confirmLanPairing,
   dismissPairingRequest,
   hideMainWindow,
+  installInputService,
   installAppUpdate,
   isAutostartEnabled,
   isPortableMode,
@@ -26,6 +27,7 @@ import {
   openUpdateReleasePage,
   probeLanPeer,
   readDiagnosticInfo,
+  readInputServiceStatus,
   readPerformanceSample,
   readRuntimeStatus,
   relaunchApp,
@@ -41,6 +43,7 @@ import {
   stopRuntime,
   syncWindowChrome,
   toggleMaximizeMainWindow,
+  uninstallInputService,
   writeClipboardText,
 } from "./desktopApi";
 import type { AppUpdateInfo } from "./desktopApi";
@@ -122,6 +125,7 @@ type UpdateStatus =
   | "current"
   | "installing"
   | "error";
+type InputServiceAction = "install" | "uninstall";
 
 interface ServerPairingState {
   peer: LanPeer;
@@ -182,6 +186,9 @@ function App() {
   );
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
+  const [isInputServicePending, setIsInputServicePending] = useState(false);
+  const [inputServiceAction, setInputServiceAction] =
+    useState<InputServiceAction | null>(null);
   const [boardZoom, setBoardZoom] = useState(1);
   const [manualDeviceName, setManualDeviceName] = useState("");
   const [manualDeviceHost, setManualDeviceHost] = useState("");
@@ -631,14 +638,36 @@ function App() {
     machineRole === "client" && !CLIENT_TABS.includes(activeTab)
       ? "settings"
       : activeTab;
-  const isPerformanceActive =
-    currentTab === "settings" && Boolean(layout?.performanceMonitor);
   const localPlatform =
     runtime?.discovery.localPeer.platform.toLowerCase() ??
     navigator.platform.toLowerCase();
   const metaKeyLabel = metaKeyLabelForPlatform(localPlatform);
   const usesWindowsChrome = localPlatform.includes("win");
   const usesCustomChrome = usesWindowsChrome;
+  const inputServiceInstalled = Boolean(runtime?.inputService.installed);
+  const inputServiceReady =
+    inputServiceInstalled &&
+    Boolean(runtime?.inputService.running) &&
+    Boolean(runtime?.inputService.pipeAvailable);
+  const inputServiceStatusLabel = inputServiceReady
+    ? ui.settings.inputServiceReady
+    : inputServiceInstalled
+      ? ui.settings.inputServiceInstalledStatus
+      : ui.settings.inputServiceNeedsInstall;
+  const canManageInputService =
+    usesWindowsChrome &&
+    machineRole === "client" &&
+    Boolean(runtime?.privilege.isElevated);
+  const hasBlockingOverlay =
+    Boolean(inputServiceAction) ||
+    Boolean(errorMessage) ||
+    isScanningLan ||
+    Boolean(serverPairing) ||
+    runtime?.pairing.state === "requested";
+  const isPerformanceActive =
+    currentTab === "settings" &&
+    Boolean(layout?.performanceMonitor) &&
+    !hasBlockingOverlay;
   const chromeClassName = usesWindowsChrome
     ? "custom-chrome custom-chrome-windows"
     : "";
@@ -1086,6 +1115,70 @@ function App() {
       );
     } finally {
       setIsRuntimePending(false);
+    }
+  }
+
+  function updateInputServiceStatus(
+    inputService: RuntimeStatus["inputService"],
+  ) {
+    setSnapshot((current) =>
+      current
+        ? {
+            ...current,
+            runtime: {
+              ...current.runtime,
+              inputService,
+            },
+          }
+        : current,
+    );
+  }
+
+  async function refreshInputService() {
+    if (!isTauri()) {
+      return;
+    }
+
+    setIsInputServicePending(true);
+    setErrorMessage(null);
+    try {
+      updateInputServiceStatus(await readInputServiceStatus());
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsInputServicePending(false);
+    }
+  }
+
+  async function handleInstallInputService() {
+    setIsInputServicePending(true);
+    setErrorMessage(null);
+    try {
+      updateInputServiceStatus(await installInputService());
+      setInputServiceAction(null);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsInputServicePending(false);
+    }
+  }
+
+  async function handleUninstallInputService() {
+    setIsInputServicePending(true);
+    setErrorMessage(null);
+    try {
+      updateInputServiceStatus(await uninstallInputService());
+      setInputServiceAction(null);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsInputServicePending(false);
     }
   }
 
@@ -1797,6 +1890,74 @@ function App() {
     );
   }
 
+  function renderInputServicePrompt(action: InputServiceAction) {
+    const title =
+      action === "uninstall"
+        ? ui.settings.uninstallInputServicePromptTitle
+        : ui.settings.inputServicePromptTitle;
+    const copy =
+      action === "uninstall"
+        ? ui.settings.uninstallInputServicePromptCopy
+        : ui.settings.inputServicePromptCopy;
+    const label =
+      action === "uninstall"
+        ? ui.settings.uninstallInputService
+        : ui.settings.installInputService;
+    const confirmAction =
+      action === "uninstall"
+        ? handleUninstallInputService
+        : handleInstallInputService;
+
+    return (
+      <div className="pairing-modal-backdrop" role="presentation">
+        <section
+          className="pairing-modal pairing-modal-client"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="input-service-prompt-title"
+        >
+          <button
+            type="button"
+            className="pairing-close-button"
+            onClick={() => setInputServiceAction(null)}
+            disabled={isInputServicePending}
+            title={ui.common.cancel}
+            aria-label={ui.common.cancel}
+          >
+            <WindowCloseIcon />
+          </button>
+          <div>
+            <p className="eyebrow">{ui.settings.inputServiceEyebrow}</p>
+            <h2 id="input-service-prompt-title">{title}</h2>
+            <p>{copy}</p>
+          </div>
+          <div className="pairing-actions">
+            <button
+              type="button"
+              className={
+                action === "uninstall"
+                  ? "secondary-button compact-button danger-button"
+                  : "primary-button compact-button"
+              }
+              onClick={() => void confirmAction()}
+              disabled={isInputServicePending}
+            >
+              {isInputServicePending ? ui.common.pending : label}
+            </button>
+            <button
+              type="button"
+              className="secondary-button compact-button"
+              onClick={() => setInputServiceAction(null)}
+              disabled={isInputServicePending}
+            >
+              {ui.common.cancel}
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   if (!snapshot || !layout || !runtime || !displayLayout) {
     return (
       <main className={shellClassName}>
@@ -1984,6 +2145,7 @@ function App() {
 
       {errorMessage ? renderErrorDialog(errorMessage) : null}
       {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
+      {inputServiceAction ? renderInputServicePrompt(inputServiceAction) : null}
 
       {machineRole === "server" && currentTab === "layout" ? (
         <section className="workspace-shell">
@@ -2620,20 +2782,63 @@ function App() {
                         : ui.settings.standardPrivilege}
                     </dd>
                   </div>
+                  {usesWindowsChrome && machineRole === "client" ? (
+                    <div>
+                      <dt>{ui.settings.inputServiceTitle}</dt>
+                      <dd>
+                        {inputServiceStatusLabel}
+                      </dd>
+                    </div>
+                  ) : null}
                 </dl>
                 <p className="muted-copy">{runtime.privilege.detail}</p>
-                {runtime.privilege.canElevate ? (
+                {runtime.privilege.canElevate ||
+                canManageInputService ? (
                   <div className="inline-actions">
-                    <button
-                      type="button"
-                      className="primary-button compact-button"
-                      onClick={() => void handleRestartAsAdmin()}
-                      disabled={isAdminRestartPending}
-                    >
-                      {isAdminRestartPending
-                        ? ui.settings.adminRestarting
-                        : ui.settings.restartAsAdmin}
-                    </button>
+                    {runtime.privilege.canElevate ? (
+                      <button
+                        type="button"
+                        className="primary-button compact-button"
+                        onClick={() => void handleRestartAsAdmin()}
+                        disabled={isAdminRestartPending}
+                      >
+                        {isAdminRestartPending
+                          ? ui.settings.adminRestarting
+                          : ui.settings.restartAsAdmin}
+                      </button>
+                    ) : null}
+                    {canManageInputService && !inputServiceInstalled ? (
+                      <button
+                        type="button"
+                        className="primary-button compact-button"
+                        onClick={() => setInputServiceAction("install")}
+                        disabled={isInputServicePending}
+                      >
+                        {isInputServicePending
+                          ? ui.common.pending
+                          : ui.settings.installInputService}
+                      </button>
+                    ) : null}
+                    {canManageInputService && runtime.inputService.installed ? (
+                      <button
+                        type="button"
+                        className="secondary-button compact-button danger-button"
+                        onClick={() => setInputServiceAction("uninstall")}
+                        disabled={isInputServicePending}
+                      >
+                        {ui.settings.uninstallInputService}
+                      </button>
+                    ) : null}
+                    {canManageInputService ? (
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        onClick={() => void refreshInputService()}
+                        disabled={isInputServicePending}
+                      >
+                        {ui.common.refresh}
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
               </section>

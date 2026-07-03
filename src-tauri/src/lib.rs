@@ -555,7 +555,6 @@ struct AppRuntime {
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
-    last_known_peer_probe: Mutex<Option<Instant>>,
     config_path: PathBuf,
 }
 
@@ -564,7 +563,6 @@ impl AppRuntime {
         let layout = load_layout_from_disk(&config_path)
             .map(|saved_layout| normalize_saved_layout(saved_layout, detected_layout.clone()))
             .unwrap_or_else(|| detected_layout.clone());
-        let screen_switch_hotkeys = layout.screen_switch_hotkeys.clone();
         Self {
             app_handle,
             layout: Arc::new(Mutex::new(layout)),
@@ -595,14 +593,12 @@ impl AppRuntime {
             runtime_toggle_shortcut: Mutex::new(None),
             runtime_toggle_menu_item: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
-            screen_switch_shortcuts: Mutex::new(screen_switch_hotkeys),
-            last_known_peer_probe: Mutex::new(None),
+            screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
             config_path,
         }
     }
 
     fn snapshot(&self) -> AppStateSnapshot {
-        self.refresh_known_peers_if_due();
         let layout = self.layout_snapshot();
         let runtime = self.runtime_status_for_layout(&layout);
 
@@ -631,7 +627,6 @@ impl AppRuntime {
     }
 
     fn runtime_status(&self) -> RuntimeStatus {
-        self.refresh_known_peers_if_due();
         let layout = self.layout_snapshot();
 
         self.runtime_status_for_layout(&layout)
@@ -643,70 +638,13 @@ impl AppRuntime {
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
-        runtime.input_service = current_input_service_status();
 
         runtime
     }
 
     fn discovery_status(&self) -> DiscoveryStatus {
-        self.refresh_known_peers_if_due();
         let layout = self.layout_snapshot();
         self.discovery_status_for_layout(&layout)
-    }
-
-    fn refresh_known_peers_if_due(&self) {
-        const KNOWN_PEER_PROBE_INTERVAL: Duration = Duration::from_secs(3);
-
-        if self
-            .discovery_stop
-            .lock()
-            .map(|stop| stop.is_none())
-            .unwrap_or(true)
-        {
-            return;
-        }
-
-        let Ok(mut last_probe) = self.last_known_peer_probe.lock() else {
-            return;
-        };
-        let now = Instant::now();
-        if last_probe
-            .as_ref()
-            .map(|last| now.duration_since(*last) < KNOWN_PEER_PROBE_INTERVAL)
-            .unwrap_or(false)
-        {
-            return;
-        }
-        *last_probe = Some(now);
-        drop(last_probe);
-
-        let layout = self.layout_snapshot();
-        let targets = known_peer_discovery_targets(&layout, discovery_base_port(&layout));
-        if targets.is_empty() {
-            return;
-        }
-
-        let mut local_peer = local_peer_from_layout(&layout);
-        if let Some(transport) = self.quic_transport_handle() {
-            apply_transport_to_peer(&mut local_peer, &transport);
-        }
-        local_peer.input_ready =
-            advertised_input_ready(&layout, self.input_receive_enabled.load(Ordering::Relaxed));
-
-        let probed_peers = probe_known_peer_targets(&local_peer, &targets);
-        if probed_peers.is_empty() {
-            return;
-        }
-
-        log::debug!(
-            "known peer probe refreshed {} peer(s) from {} target(s)",
-            probed_peers.len(),
-            targets.len()
-        );
-        for peer in probed_peers {
-            merge_peer(&self.peers, peer);
-        }
-        sync_layout_peer_presence(&self.layout, &self.peers);
     }
 
     fn discovery_status_for_layout(&self, layout: &LayoutState) -> DiscoveryStatus {
@@ -2085,57 +2023,75 @@ fn restart_as_admin(app: AppHandle, state: tauri::State<'_, AppRuntime>) -> Resu
 }
 
 #[tauri::command]
-fn read_input_service_status() -> InputServiceStatus {
-    current_input_service_status()
+fn read_input_service_status(state: tauri::State<'_, AppRuntime>) -> InputServiceStatus {
+    let status = current_input_service_status();
+    update_runtime_input_service_status(state.inner(), &status);
+    status
 }
 
 #[tauri::command]
-fn install_input_service() -> Result<InputServiceStatus, String> {
+fn install_input_service(
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<InputServiceStatus, String> {
     #[cfg(target_os = "windows")]
     {
         let helper_path = resolve_input_helper_path()?;
-        if is_windows_process_elevated().unwrap_or(false) {
+        let status = if is_windows_process_elevated().unwrap_or(false) {
             install_windows_input_service(&helper_path)?;
             start_windows_input_service()?;
-            return Ok(current_input_service_status());
-        }
-
-        launch_current_process_as_admin(&[
-            INSTALL_INPUT_SERVICE_ARG.into(),
-            HELPER_PATH_ARG.into(),
-            helper_path.to_string_lossy().into_owned(),
-        ])?;
-        Ok(InputServiceStatus {
-            detail: "Administrator approval requested to install the input service.".into(),
-            ..current_input_service_status()
-        })
+            current_input_service_status()
+        } else {
+            launch_current_process_as_admin(&[
+                INSTALL_INPUT_SERVICE_ARG.into(),
+                HELPER_PATH_ARG.into(),
+                helper_path.to_string_lossy().into_owned(),
+            ])?;
+            InputServiceStatus {
+                detail: "Administrator approval requested to install the input service.".into(),
+                ..current_input_service_status()
+            }
+        };
+        update_runtime_input_service_status(state.inner(), &status);
+        Ok(status)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = state;
         Err("Windows input service is only available on Windows.".into())
     }
 }
 
 #[tauri::command]
-fn uninstall_input_service() -> Result<InputServiceStatus, String> {
+fn uninstall_input_service(
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<InputServiceStatus, String> {
     #[cfg(target_os = "windows")]
     {
-        if is_windows_process_elevated().unwrap_or(false) {
+        let status = if is_windows_process_elevated().unwrap_or(false) {
             uninstall_windows_input_service()?;
-            return Ok(current_input_service_status());
-        }
-
-        launch_current_process_as_admin(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
-        Ok(InputServiceStatus {
-            detail: "Administrator approval requested to uninstall the input service.".into(),
-            ..current_input_service_status()
-        })
+            current_input_service_status()
+        } else {
+            launch_current_process_as_admin(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
+            InputServiceStatus {
+                detail: "Administrator approval requested to uninstall the input service.".into(),
+                ..current_input_service_status()
+            }
+        };
+        update_runtime_input_service_status(state.inner(), &status);
+        Ok(status)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = state;
         Err("Windows input service is only available on Windows.".into())
+    }
+}
+
+fn update_runtime_input_service_status(state: &AppRuntime, status: &InputServiceStatus) {
+    if let Ok(mut runtime) = state.runtime.lock() {
+        runtime.input_service = status.clone();
     }
 }
 
@@ -3849,7 +3805,7 @@ fn current_input_service_status() -> InputServiceStatus {
 #[cfg(target_os = "windows")]
 fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
     use windows_sys::Win32::{
-        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST},
+        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE},
         System::{
             RemoteDesktop::WTSGetActiveConsoleSessionId,
             Services::{
@@ -3871,7 +3827,7 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
         let service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_STATUS);
         if service.is_null() {
             let code = GetLastError();
-            if code == ERROR_SERVICE_DOES_NOT_EXIST {
+            if code == ERROR_SERVICE_DOES_NOT_EXIST || code == ERROR_SERVICE_MARKED_FOR_DELETE {
                 return Ok(InputServiceStatus {
                     installed: false,
                     running: false,
@@ -3962,7 +3918,10 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
 
         let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
         let display_name = wide_null(shared_input::INPUT_SERVICE_DISPLAY_NAME);
-        let binary = wide_null(&format!("{} --service", quote_windows_arg_str(&helper_path.to_string_lossy())));
+        let binary = wide_null(&format!(
+            "{} --service",
+            quote_windows_arg_str(&helper_path.to_string_lossy())
+        ));
         let mut service = CreateServiceW(
             scm,
             service_name.as_ptr(),
@@ -4064,14 +4023,12 @@ fn start_windows_input_service() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn uninstall_windows_input_service() -> Result<(), String> {
-    use std::time::{Duration, Instant};
     use windows_sys::Win32::{
         Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST},
         Storage::FileSystem::DELETE,
         System::Services::{
             ControlService, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
             SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
-            SERVICE_STOPPED,
         },
     };
 
@@ -4096,48 +4053,13 @@ fn uninstall_windows_input_service() -> Result<(), String> {
         }
         let _service = ServiceHandleGuard(service);
 
-        if let Ok(status) = query_service_status_process_for_uninstall(service) {
-            if status.dwCurrentState != SERVICE_STOPPED {
-                let mut stop_status = SERVICE_STATUS::default();
-                let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status);
-                let deadline = Instant::now() + Duration::from_secs(8);
-                while Instant::now() < deadline {
-                    if let Ok(status) = query_service_status_process_for_uninstall(service) {
-                        if status.dwCurrentState == SERVICE_STOPPED {
-                            break;
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(200));
-                }
-            }
-        }
+        let mut stop_status = SERVICE_STATUS::default();
+        let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status);
 
         if DeleteService(service) == 0 {
             return Err(windows_last_error("DeleteService"));
         }
         return Ok(());
-    }
-
-    unsafe fn query_service_status_process_for_uninstall(
-        service: windows_sys::Win32::System::Services::SC_HANDLE,
-    ) -> Result<windows_sys::Win32::System::Services::SERVICE_STATUS_PROCESS, String> {
-        use windows_sys::Win32::System::Services::{
-            QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
-        };
-        let mut status = SERVICE_STATUS_PROCESS::default();
-        let mut needed = 0_u32;
-        let ok = QueryServiceStatusEx(
-            service,
-            SC_STATUS_PROCESS_INFO,
-            &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
-            std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
-            &mut needed,
-        ) != 0;
-        if ok {
-            Ok(status)
-        } else {
-            Err(windows_last_error("QueryServiceStatusEx"))
-        }
     }
 }
 
