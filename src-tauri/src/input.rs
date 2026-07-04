@@ -3413,7 +3413,11 @@ fn handle_macos_mouse_move(
                     return CallbackResult::Keep;
                 }
             }
-            repin_macos_cursor_if_drifted(context, location);
+            if repin_macos_cursor_if_drifted(context, location)
+                && !context.main_window_visible.load(Ordering::Relaxed)
+            {
+                reassert_macos_hidden_window_cursor(context, true);
+            }
             // Re-pinning also runs from the capture run loop because mouse-move
             // callbacks can stop arriving once the pointer is over the client.
             return CallbackResult::Drop;
@@ -4054,12 +4058,13 @@ fn return_to_local_macos(context: &MacCaptureContext) {
 fn repin_macos_cursor_while_remote(context: &MacCaptureContext) {
     set_macos_cursor_decoupled(true);
     if !context.main_window_visible.load(Ordering::Relaxed) {
-        if let Some(location) = macos_current_cursor_location() {
-            repin_macos_cursor_if_drifted(context, location);
+        let drifted = if let Some(location) = macos_current_cursor_location() {
+            repin_macos_cursor_if_drifted(context, location)
         } else {
             force_repin_macos_cursor_to_anchor(context);
-        }
-        reassert_macos_hidden_window_cursor(context);
+            true
+        };
+        reassert_macos_hidden_window_cursor(context, drifted);
         return;
     }
 
@@ -4393,6 +4398,16 @@ fn set_macos_cursor_hidden_with_appkit(hidden: bool) {
 /// more robust than the global hide counter when MyKVM is not frontmost.
 #[cfg(target_os = "macos")]
 fn set_macos_cursor_transparent(transparent: bool) {
+    set_macos_cursor_transparent_inner(transparent, true);
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_cursor_transparent_current() {
+    set_macos_cursor_transparent_inner(true, false);
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
     use std::ffi::c_void;
     use std::os::raw::{c_char, c_double};
 
@@ -4478,11 +4493,14 @@ fn set_macos_cursor_transparent(transparent: bool) {
             return;
         }
 
-        // [NSCursor push] — make it the active cursor.
-        let push_sel = sel_registerName(b"push\0".as_ptr() as *const c_char);
-        let push: extern "C" fn(*mut c_void, *mut c_void) =
+        let apply_sel = if push {
+            sel_registerName(b"push\0".as_ptr() as *const c_char)
+        } else {
+            sel_registerName(b"set\0".as_ptr() as *const c_char)
+        };
+        let apply: extern "C" fn(*mut c_void, *mut c_void) =
             std::mem::transmute(objc_msgSend as *const ());
-        push(cursor, push_sel);
+        apply(cursor, apply_sel);
     }
 }
 
@@ -4490,26 +4508,26 @@ fn set_macos_cursor_transparent(transparent: bool) {
 fn repin_macos_cursor_if_drifted(
     context: &MacCaptureContext,
     location: core_graphics::geometry::CGPoint,
-) {
+) -> bool {
     const DRIFT_THRESHOLD_PX: f64 = 1.5;
     const REPIN_INTERVAL_MS: u64 = 8;
 
     let Ok(anchor) = context.anchor.lock() else {
-        return;
+        return false;
     };
     let Some((x, y)) = *anchor else {
-        return;
+        return false;
     };
     drop(anchor);
 
     let dx = location.x - x;
     let dy = location.y - y;
     if dx.abs() <= DRIFT_THRESHOLD_PX && dy.abs() <= DRIFT_THRESHOLD_PX {
-        return;
+        return false;
     }
 
     if !macos_cursor_repin_due(context, Duration::from_millis(REPIN_INTERVAL_MS)) {
-        return;
+        return false;
     }
 
     // When MyKVM is not frontmost, macOS can re-associate the cursor with the
@@ -4517,6 +4535,7 @@ fn repin_macos_cursor_if_drifted(
     // Re-pin only after actual drift and at a capped rate.
     set_macos_cursor_decoupled(true);
     move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -4568,7 +4587,7 @@ fn reset_cursor_repin_timer(context: &MacCaptureContext) {
 }
 
 #[cfg(target_os = "macos")]
-fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext) {
+fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext, transparent_now: bool) {
     let Ok(hidden) = context.cursor_hidden.lock() else {
         return;
     };
@@ -4576,6 +4595,10 @@ fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext) {
         return;
     }
     drop(hidden);
+
+    if transparent_now {
+        set_macos_cursor_transparent_current();
+    }
 
     let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() else {
         return;
@@ -4594,6 +4617,7 @@ fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext) {
     *last_reassert = Some(now);
     drop(last_reassert);
 
+    set_macos_cursor_transparent_current();
     push_macos_cursor_hide(context);
 }
 
