@@ -97,9 +97,7 @@ const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
     MACOS_NSEVENT_TYPE_CHANGE_MODE,
 ];
 #[cfg(target_os = "windows")]
-const WINDOWS_FULLSCREEN_EDGE_TOLERANCE: i32 = 3;
-#[cfg(target_os = "windows")]
-const WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS: u64 = 250;
+const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
 #[cfg(target_os = "macos")]
@@ -966,7 +964,6 @@ fn start_platform_capture(
             remote_button_mask: AtomicU64::new(0),
             pressed_keys: Mutex::new(Vec::new()),
             cursor_hide_calls: Mutex::new(0),
-            fullscreen_foreground_cache: Mutex::new(None),
             just_crossed: AtomicBool::new(false),
             local_screen_points: Mutex::new(HashMap::new()),
         });
@@ -1079,7 +1076,7 @@ fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
         refresh_windows_input_desktop_cache();
         while !stop.load(Ordering::Relaxed) {
             refresh_windows_input_desktop_cache();
-            thread::sleep(Duration::from_millis(WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS));
+            thread::sleep(Duration::from_millis(WINDOWS_DESKTOP_CHECK_INTERVAL_MS));
         }
     });
 }
@@ -2351,7 +2348,6 @@ struct WindowsCaptureContext {
     remote_button_mask: AtomicU64,
     pressed_keys: Mutex<Vec<u16>>,
     cursor_hide_calls: Mutex<u8>,
-    fullscreen_foreground_cache: Mutex<Option<(Instant, bool)>>,
     // Swallow the first post-crossing delta so a fast flick across the edge
     // does not shove the cursor inward on Windows, where we pin by warping.
     just_crossed: AtomicBool,
@@ -2607,9 +2603,6 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
-    if should_suspend_windows_capture(&context) {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
-    }
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
     let message = wparam as u32;
@@ -2647,10 +2640,6 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     }
 
     let message = wparam as u32;
-
-    if should_suspend_windows_capture(&context) {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
-    }
 
     let active = context
         .active
@@ -2797,36 +2786,6 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
 }
 
 #[cfg(target_os = "windows")]
-fn should_suspend_windows_capture(context: &WindowsCaptureContext) -> bool {
-    if windows_foreground_window_is_fullscreen_cached(context) {
-        release_windows_remote_control(context, true);
-        return true;
-    }
-
-    false
-}
-
-#[cfg(target_os = "windows")]
-fn windows_foreground_window_is_fullscreen_cached(context: &WindowsCaptureContext) -> bool {
-    let now = Instant::now();
-    if let Ok(mut cache) = context.fullscreen_foreground_cache.lock() {
-        if let Some((checked_at, value)) = *cache {
-            if now.duration_since(checked_at)
-                < Duration::from_millis(WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS)
-            {
-                return value;
-            }
-        }
-
-        let value = windows_foreground_window_is_fullscreen();
-        *cache = Some((now, value));
-        return value;
-    }
-
-    windows_foreground_window_is_fullscreen()
-}
-
-#[cfg(target_os = "windows")]
 fn cached_windows_input_desktop_is_default() -> bool {
     WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE.load(Ordering::Relaxed)
 }
@@ -2873,84 +2832,6 @@ fn windows_input_desktop_is_default() -> bool {
 
         name.eq_ignore_ascii_case("default")
     }
-}
-
-#[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WindowsRect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-#[cfg(target_os = "windows")]
-fn windows_foreground_window_is_fullscreen() -> bool {
-    use windows_sys::Win32::{
-        Foundation::RECT,
-        Graphics::Gdi::{
-            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-        },
-        System::Threading::GetCurrentProcessId,
-        UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-        },
-    };
-
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_null() || IsWindowVisible(hwnd) == 0 {
-            return false;
-        }
-
-        let mut foreground_pid = 0_u32;
-        GetWindowThreadProcessId(hwnd, &mut foreground_pid);
-        if foreground_pid == GetCurrentProcessId() {
-            return false;
-        }
-
-        let mut window_rect = RECT::default();
-        if GetWindowRect(hwnd, &mut window_rect) == 0 {
-            return false;
-        }
-
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if monitor.is_null() {
-            return false;
-        }
-        let mut monitor_info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            rcMonitor: RECT::default(),
-            rcWork: RECT::default(),
-            dwFlags: 0,
-        };
-        if GetMonitorInfoW(monitor, &mut monitor_info) == 0 {
-            return false;
-        }
-
-        rect_covers_monitor(
-            WindowsRect {
-                left: window_rect.left,
-                top: window_rect.top,
-                right: window_rect.right,
-                bottom: window_rect.bottom,
-            },
-            WindowsRect {
-                left: monitor_info.rcMonitor.left,
-                top: monitor_info.rcMonitor.top,
-                right: monitor_info.rcMonitor.right,
-                bottom: monitor_info.rcMonitor.bottom,
-            },
-        )
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn rect_covers_monitor(window: WindowsRect, monitor: WindowsRect) -> bool {
-    window.left <= monitor.left + WINDOWS_FULLSCREEN_EDGE_TOLERANCE
-        && window.top <= monitor.top + WINDOWS_FULLSCREEN_EDGE_TOLERANCE
-        && window.right >= monitor.right - WINDOWS_FULLSCREEN_EDGE_TOLERANCE
-        && window.bottom >= monitor.bottom - WINDOWS_FULLSCREEN_EDGE_TOLERANCE
 }
 
 #[cfg(target_os = "windows")]

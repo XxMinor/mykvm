@@ -1417,7 +1417,9 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
 
     state.stop_input();
     state.stop_clipboard();
-    state.stop_discovery();
+    // Keep discovery/QUIC alive across input/clipboard restarts. Rebuilding the
+    // QUIC endpoint on the same UDP port can briefly race the old endpoint and
+    // make peers see "server refused to accept a new connection".
     thread::sleep(Duration::from_millis(300));
     state.start_discovery()?;
     let layout = state.layout_snapshot();
@@ -8420,6 +8422,46 @@ mod tests {
         assert_eq!(
             clipboard_seen_text.lock().expect("seen lock").as_deref(),
             Some("text:hello")
+        );
+    }
+
+    #[test]
+    fn clipboard_formats_packet_preserves_non_ascii_text() {
+        let layout = test_layout();
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Text("中文测试 abc 123".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            1,
+        );
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut written = None;
+
+        let accepted = handle_clipboard_packet_with_writer(
+            &payload,
+            &layout,
+            "local-device",
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            |content| {
+                if let ClipboardContent::Text(text) = content {
+                    written = Some(text.clone());
+                }
+                Ok(())
+            },
+        );
+
+        assert!(accepted);
+        assert_eq!(written.as_deref(), Some("中文测试 abc 123"));
+        assert_eq!(
+            clipboard_seen_text.lock().expect("seen lock").as_deref(),
+            Some("text:中文测试 abc 123")
         );
     }
 

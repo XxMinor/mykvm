@@ -1,5 +1,4 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
-import type { Update } from '@tauri-apps/plugin-updater'
 import { RELEASES_URL, REPOSITORY_URL } from './constants'
 import { defaultLayout } from './defaultLayout'
 import type {
@@ -108,7 +107,6 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
 }
 
 let browserRuntime = FALLBACK_RUNTIME
-let pendingAppUpdate: Update | null = null
 
 export async function loadAppState(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
@@ -458,7 +456,6 @@ export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
 
   const { check } = await import('@tauri-apps/plugin-updater')
   const update = await check()
-  pendingAppUpdate = update
 
   if (!update) {
     return { available: false }
@@ -489,7 +486,7 @@ export async function installAppUpdate(): Promise<void> {
     import('@tauri-apps/plugin-updater'),
     import('@tauri-apps/plugin-process'),
   ])
-  const update = pendingAppUpdate ?? (await check())
+  const update = await check()
 
   if (!update) {
     return
@@ -502,6 +499,5 @@ export async function installAppUpdate(): Promise<void> {
     await setAppUpgrading(false).catch(() => {})
     throw error
   }
-  pendingAppUpdate = null
   await relaunch()
 }

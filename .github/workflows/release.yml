@@ -4,8 +4,17 @@ on:
   push:
     branches:
       - main
+      - bate
   workflow_dispatch:
     inputs:
+      channel:
+        description: "Release channel"
+        required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - beta
       bump:
         description: "Version bump to release"
         required: true
@@ -36,6 +45,7 @@ jobs:
       should_release: ${{ steps.version.outputs.should_release }}
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      channel: ${{ steps.version.outputs.channel }}
       release_notes: ${{ steps.version.outputs.release_notes }}
 
     steps:
@@ -46,14 +56,29 @@ jobs:
       - name: Compute next version
         id: version
         shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REQUESTED_CHANNEL: ${{ inputs.channel || '' }}
+          REQUESTED_BUMP: ${{ inputs.bump || '' }}
         run: |
           set -euo pipefail
 
           subject="$(git log -1 --pretty=%s)"
+          channel="${REQUESTED_CHANNEL:-}"
+          if [[ -z "$channel" ]]; then
+            if [[ "$REF_NAME" == "bate" ]]; then
+              channel="beta"
+            else
+              channel="stable"
+            fi
+          fi
+
           bump=""
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            bump="${{ inputs.bump }}"
+          if [[ "$channel" == "beta" ]]; then
+            bump="patch"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            bump="$REQUESTED_BUMP"
           elif [[ "$subject" =~ ^feat(\(.+\))?!?: ]]; then
             bump="minor"
           elif [[ "$subject" =~ ^fix(\(.+\))?: ]]; then
@@ -66,7 +91,10 @@ jobs:
             exit 0
           fi
 
-          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          latest_tag="$(git tag --list 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -Vr \
+            | head -n 1 || true)"
 
           if [[ -z "$latest_tag" ]]; then
             version="0.1.0"
@@ -96,6 +124,19 @@ jobs:
             version="$major.$minor.$patch"
           fi
 
+          if [[ "$channel" == "beta" ]]; then
+            raw="${latest_tag#v}"
+            if [[ -z "$latest_tag" ]]; then
+              major=0
+              minor=1
+              patch=0
+            else
+              IFS='.' read -r major minor patch <<< "$raw"
+              patch=$((patch + 1))
+            fi
+            version="$major.$minor.$patch-beta.${GITHUB_RUN_NUMBER}"
+          fi
+
           tag="v$version"
 
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
@@ -106,6 +147,7 @@ jobs:
           echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
           # Release notes should read like product notes, not a commit/CI dump.
           # Prefer the curated "## [Unreleased]" section of CHANGELOG.md; fall
@@ -269,15 +311,28 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           node - <<'NODE'
           const fs = require('fs');
           const version = process.env.RELEASE_VERSION;
+          const channel = process.env.RELEASE_CHANNEL;
           for (const file of ['package.json', 'src-tauri/tauri.conf.json']) {
             const data = JSON.parse(fs.readFileSync(file, 'utf8'));
             data.version = version;
+            if (file === 'src-tauri/tauri.conf.json' && channel === 'beta') {
+              data.plugins.updater.endpoints = [
+                'https://github.com/XxMinor/mykvm/releases/download/beta/latest.json',
+              ];
+            }
             fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
           }
+
+          const cargoToml = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          fs.writeFileSync(
+            'src-tauri/Cargo.toml',
+            cargoToml.replace(/^version = ".*"$/m, `version = "${version}"`),
+          );
           NODE
 
       - name: Validate Apple signing secrets
@@ -437,7 +492,7 @@ jobs:
           # updater (releases/latest/download/latest.json) 404s for the rest of
           # the build. A failed build also never becomes "latest" this way.
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ needs.prepare.outputs.channel == 'beta' }}
           # latest.json is assembled by the dedicated assemble-latest-json job
           # (single source of truth across platforms); the .sig artifacts are
           # uploaded by tauri-action regardless.
@@ -511,6 +566,7 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_NOTES: ${{ needs.prepare.outputs.release_notes }}
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -518,9 +574,10 @@ jobs:
           const path = require('path');
 
           const dir = 'dl';
-          const files = fs.readdirSync(dir);
+          let files = fs.readdirSync(dir);
           const tag = process.env.TAG;
           const version = process.env.VERSION;
+          const notes = process.env.RELEASE_NOTES || `Release ${tag}`;
           const baseUrl = `https://github.com/${process.env.REPO}/releases/download/${tag}`;
           const assetUrl = (name) => `${baseUrl}/${encodeURIComponent(name)}`;
           const signatureFor = (name) => {
@@ -559,10 +616,18 @@ jobs:
           const windowsAsset = files.find(
             (name) =>
               !name.endsWith('.sig') &&
+              name !== 'mykvm-windows-x64-setup.exe' &&
               (/setup\.exe$/i.test(name) || /\.msi$/i.test(name)),
           );
           if (windowsAsset) {
-            addPlatform('windows-x86_64', windowsAsset);
+            const windowsUpdaterAsset = 'mykvm-windows-x64-setup.exe';
+            fs.copyFileSync(path.join(dir, windowsAsset), path.join(dir, windowsUpdaterAsset));
+            fs.copyFileSync(
+              path.join(dir, `${windowsAsset}.sig`),
+              path.join(dir, `${windowsUpdaterAsset}.sig`),
+            );
+            files = fs.readdirSync(dir);
+            addPlatform('windows-x86_64', windowsUpdaterAsset);
           }
 
           const linuxAsset = files.find(
@@ -580,7 +645,7 @@ jobs:
             `${JSON.stringify(
               {
                 version,
-                notes: `Release ${tag}`,
+                notes,
                 pub_date: new Date().toISOString(),
                 platforms,
               },
@@ -596,17 +661,43 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           set -euo pipefail
+          if [[ -f dl/mykvm-windows-x64-setup.exe ]]; then
+            gh release upload "$TAG" \
+              dl/mykvm-windows-x64-setup.exe \
+              dl/mykvm-windows-x64-setup.exe.sig \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          fi
           gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
+          if [[ "$CHANNEL" == "beta" ]]; then
+            if gh release view beta --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release upload beta latest.json --clobber --repo "$GITHUB_REPOSITORY"
+            else
+              gh release create beta latest.json \
+                --target "$GITHUB_SHA" \
+                --title "MyKVM Beta Updates" \
+                --notes "Updater manifest for beta builds." \
+                --prerelease \
+                --latest=false \
+                --repo "$GITHUB_REPOSITORY"
+            fi
+          fi
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           set -euo pipefail
           # Now that every platform bundle AND latest.json are attached, flip the
           # draft to published. Only at this point does releases/latest advance to
           # this tag, so the in-app updater never sees a manifest-less release.
-          gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
+          if [[ "$CHANNEL" == "beta" ]]; then
+            gh release edit "$TAG" --draft=false --prerelease --latest=false --repo "$GITHUB_REPOSITORY"
+          else
+            gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
+          fi
