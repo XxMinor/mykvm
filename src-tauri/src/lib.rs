@@ -965,6 +965,7 @@ impl AppRuntime {
                         let probed_peers = probe_known_peer_targets(&local_peer, &direct_targets);
                         if !probed_peers.is_empty() {
                             for peer in probed_peers {
+                                warm_quic_peer(&quic_transport, &peer);
                                 merge_peer(&peers, peer);
                             }
                             sync_layout_peer_presence(&layout_state, &peers);
@@ -1028,6 +1029,7 @@ impl AppRuntime {
                             if peer_visible_to_layout(&current_layout, &incoming.peer) {
                                 merge_peer(&peers, incoming.peer.clone());
                                 sync_layout_peer_presence(&layout_state, &peers);
+                                warm_quic_peer(&quic_transport, &incoming.peer);
                             }
 
                             if matches!(incoming.kind.as_str(), "announce" | "probe") {
@@ -5103,12 +5105,16 @@ fn run_clipboard_sync(
                 target.transport_public_key.clone(),
                 target.protocol_version,
             );
-            if quic_transport.send_stream_expect_ack(peer, payload).is_ok() {
+            let send_result = quic_transport.send_stream_expect_ack(peer, payload);
+            if send_result.is_ok() {
                 transport_packets.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, signature));
             } else {
+                if let Err(error) = send_result {
+                    log::warn!("clipboard send failed: {error}");
+                }
                 last_failed = Some((
                     target.device_id.clone(),
                     target.addr.clone(),
@@ -6547,6 +6553,18 @@ fn apply_transport_to_peer(peer: &mut LanPeer, transport: &quic_transport::Trans
     peer.quic_port = transport.port();
     peer.transport_public_key = transport.public_key().to_string();
     peer.protocol_version = quic_transport::PROTOCOL_VERSION;
+}
+
+fn warm_quic_peer(transport: &quic_transport::TransportHandle, peer: &LanPeer) {
+    if !peer.input_ready || peer.transport_public_key.trim().is_empty() || peer.quic_port == 0 {
+        return;
+    }
+    let endpoint = transport.peer(
+        format!("{}:{}", peer.ip, peer.quic_port),
+        peer.transport_public_key.clone(),
+        peer.protocol_version,
+    );
+    let _ = transport.send_datagram(endpoint, Vec::new());
 }
 
 fn pairing_required(layout: &LayoutState) -> bool {

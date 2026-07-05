@@ -80,20 +80,97 @@ pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
 /// when the platform can identify a current image format, wait for an image
 /// read instead of falling back to stale text from a previous clipboard format.
 pub(crate) fn read_content() -> Option<ClipboardContent> {
-    match content_hint() {
-        ClipboardContentHint::Image => read_image().map(ClipboardContent::Image),
-        ClipboardContentHint::Text => read_text()
-            .ok()
-            .filter(|text| !text.is_empty())
-            .map(ClipboardContent::Text),
-        ClipboardContentHint::Unknown => {
-            if let Some(image) = read_image() {
-                return Some(ClipboardContent::Image(image));
-            }
-            read_text()
-                .ok()
-                .filter(|text| !text.is_empty())
-                .map(ClipboardContent::Text)
+    read_content_for_hint(content_hint(), read_text_content, read_image_content)
+}
+
+fn read_content_for_hint<F, G>(
+    hint: ClipboardContentHint,
+    mut read_text: F,
+    mut read_image: G,
+) -> Option<ClipboardContent>
+where
+    F: FnMut() -> Option<ClipboardContent>,
+    G: FnMut() -> Option<ClipboardContent>,
+{
+    match hint {
+        ClipboardContentHint::Image => read_image(),
+        ClipboardContentHint::Text => read_text(),
+        ClipboardContentHint::Unknown => read_unknown_content(read_text, read_image),
+    }
+}
+
+fn read_text_content() -> Option<ClipboardContent> {
+    read_text()
+        .ok()
+        .filter(|text| !text.is_empty())
+        .map(ClipboardContent::Text)
+}
+
+fn read_image_content() -> Option<ClipboardContent> {
+    read_image().map(ClipboardContent::Image)
+}
+
+#[cfg(target_os = "windows")]
+fn read_unknown_content<F, G>(read_text: F, mut read_image: G) -> Option<ClipboardContent>
+where
+    F: FnMut() -> Option<ClipboardContent>,
+    G: FnMut() -> Option<ClipboardContent>,
+{
+    read_image().or_else(read_text)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_unknown_content<F, G>(mut read_text: F, read_image: G) -> Option<ClipboardContent>
+where
+    F: FnMut() -> Option<ClipboardContent>,
+    G: FnMut() -> Option<ClipboardContent>,
+{
+    read_text().or_else(read_image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unknown_clipboard_prefers_text_before_image() {
+        let content = read_content_for_hint(
+            ClipboardContentHint::Unknown,
+            || Some(ClipboardContent::Text("中文测试 abc 123".into())),
+            || {
+                Some(ClipboardContent::Image(ClipboardImage {
+                    width: 1,
+                    height: 1,
+                    rgba_base64: "AAAAAA==".into(),
+                }))
+            },
+        );
+
+        match content {
+            Some(ClipboardContent::Text(text)) => assert_eq!(text, "中文测试 abc 123"),
+            _ => panic!("expected text to win when the platform cannot identify clipboard format"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unknown_clipboard_keeps_windows_image_first_fallback() {
+        let content = read_content_for_hint(
+            ClipboardContentHint::Unknown,
+            || Some(ClipboardContent::Text("中文测试 abc 123".into())),
+            || {
+                Some(ClipboardContent::Image(ClipboardImage {
+                    width: 1,
+                    height: 1,
+                    rgba_base64: "AAAAAA==".into(),
+                }))
+            },
+        );
+
+        match content {
+            Some(ClipboardContent::Image(image)) => assert_eq!(image.width, 1),
+            _ => panic!("expected Windows fallback to keep image priority"),
         }
     }
 }
