@@ -3565,6 +3565,9 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 }
 
 fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    set_macos_dock_visible(app, true)?;
+
     let window = ensure_main_window(app)?;
     window
         .show()
@@ -3598,9 +3601,22 @@ fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
     if result.is_ok() {
         set_main_window_visible(app, false);
         set_main_window_focused(app, false);
+        #[cfg(target_os = "macos")]
+        set_macos_dock_visible(app, false)?;
     }
 
     result
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_dock_visible(app: &AppHandle, visible: bool) -> Result<(), String> {
+    let policy = if visible {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    };
+    app.set_activation_policy(policy)
+        .map_err(|error| format!("failed to update macOS activation policy: {error}"))
 }
 
 fn ensure_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {

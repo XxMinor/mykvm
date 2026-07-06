@@ -50,7 +50,7 @@ const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
 #[cfg(target_os = "macos")]
 const MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS: u64 = 16;
 #[cfg(target_os = "macos")]
-const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = 50;
+const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS;
 #[cfg(target_os = "macos")]
 const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
 #[cfg(target_os = "macos")]
@@ -5376,7 +5376,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_hidden_remote_loop_is_slower_than_visible_remote_loop() {
+    fn macos_hidden_remote_loop_matches_visible_remote_loop() {
         assert_eq!(
             macos_capture_loop_ms(false, false),
             MACOS_IDLE_CAPTURE_LOOP_MS
@@ -5389,7 +5389,10 @@ mod tests {
             macos_capture_loop_ms(true, false),
             MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS
         );
-        assert!(MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS > MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS);
+        assert_eq!(
+            MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS,
+            MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS
+        );
     }
 
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {
