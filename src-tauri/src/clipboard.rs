@@ -173,6 +173,19 @@ mod tests {
             _ => panic!("expected Windows fallback to keep image priority"),
         }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn utf8_command_sets_locale_for_clipboard_tools() {
+        let command = utf8_command("pbpaste");
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect();
+
+        assert_eq!(envs.get("LANG"), Some(&"en_US.UTF-8"));
+        assert_eq!(envs.get("LC_CTYPE"), Some(&"en_US.UTF-8"));
+    }
 }
 
 fn read_image() -> Option<ClipboardImage> {
@@ -344,7 +357,7 @@ fn read_system_text() -> Result<String, String> {
     use std::process::Command;
 
     let output = if cfg!(target_os = "macos") {
-        Command::new("pbpaste").output()
+        utf8_command("pbpaste").output()
     } else {
         Command::new("sh")
             .args([
@@ -380,7 +393,7 @@ fn write_system_text(text: &str) -> Result<(), String> {
     use std::{io::Write, process::Command, process::Stdio};
 
     let mut child = if cfg!(target_os = "macos") {
-        Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+        utf8_command("pbcopy").stdin(Stdio::piped()).spawn()
     } else {
         Command::new("sh")
             .args(["-c", "wl-copy 2>/dev/null || xclip -selection clipboard"])
@@ -403,4 +416,13 @@ fn write_system_text(text: &str) -> Result<(), String> {
     } else {
         Err(format!("clipboard command exited with status {status}"))
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn utf8_command(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_CTYPE", "en_US.UTF-8");
+    command
 }
