@@ -86,3 +86,12 @@ export interface LayoutState {
   edgeSwitchHotkey: string
   screenSwitchHotkeys: ScreenSwitchHotkeys
 }
+
+export interface FileTransferProgress {
+  transferId: string
+  fileName: string
+  targetName: string
+  sentBytes: number
+  totalBytes: number
+  done: boolean
+}

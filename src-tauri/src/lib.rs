@@ -68,6 +68,16 @@ const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const FILE_TRANSFER_DESTINATION_POINTER: &str = "pointer";
+// How many chunks are in flight at once. Each rides its own reliable QUIC
+// stream, so several fill the link's bandwidth-delay product instead of one
+// chunk paying a full round-trip before the next starts — the win grows with
+// link latency. ponytail: 4 saturates a LAN; raise only if profiling a high-RTT
+// path shows the link idling between chunks.
+const FILE_TRANSFER_CONCURRENCY: usize = 4;
+const FILE_TRANSFER_PROGRESS_EVENT: &str = "file-transfer-progress";
+// Coalesce progress emits so a fast transfer does not flood the UI thread with
+// thousands of events; the terminal (done) emit is always sent.
+const FILE_TRANSFER_PROGRESS_MIN_INTERVAL_MS: u64 = 100;
 const EDGE_DROP_WINDOWS_ENABLED: bool = false;
 const EDGE_DROP_LABEL_PREFIX: &str = "mykvm-edge-drop-";
 const EDGE_DROP_THICKNESS: i32 = 8;
@@ -462,9 +472,24 @@ struct IncomingFileTransfer {
     file_name: String,
     total_bytes: u64,
     received_bytes: u64,
-    next_chunk_index: u64,
+    // Offsets already written, so a duplicate or retried chunk is ignored
+    // without double-counting received_bytes. Chunks may arrive out of order
+    // (concurrent senders), so completion is judged by received_bytes, not by a
+    // running index.
+    written_offsets: std::collections::HashSet<u64>,
     temp_path: PathBuf,
     final_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTransferProgress {
+    transfer_id: String,
+    file_name: String,
+    target_name: String,
+    sent_bytes: u64,
+    total_bytes: u64,
+    done: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2157,6 +2182,7 @@ fn send_files_to_device_with_destination(
             &target,
             &file,
             destination_hint,
+            Some(&state.app_handle),
         )?;
         state
             .transport_packets
@@ -5532,9 +5558,9 @@ fn send_transfer_file(
     target: &FileTransferTarget,
     file: &TransferFile,
     destination_hint: Option<&str>,
+    app_handle: Option<&AppHandle>,
 ) -> Result<u64, String> {
     let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
-    let mut packet_count = 0_u64;
 
     send_file_transfer_packet(
         quic_transport,
@@ -5552,40 +5578,124 @@ fn send_transfer_file(
             Vec::new(),
         ),
     )?;
-    packet_count += 1;
+    emit_file_transfer_progress(app_handle, &transfer_id, file, target, 0, false);
 
-    let mut file_handle = fs::File::open(&file.path)
-        .map_err(|error| format!("无法打开文件 {}: {error}", file.path.display()))?;
-    let mut buffer = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
-    let mut offset = 0_u64;
-    let mut chunk_index = 0_u64;
-    loop {
-        let read = file_handle
-            .read(&mut buffer)
-            .map_err(|error| format!("读取文件 {} 失败: {error}", file.path.display()))?;
-        if read == 0 {
-            break;
+    // Fan chunks out to a small pool of workers so several are in flight at
+    // once. The producer reads the file sequentially (one disk cursor) and
+    // hands each chunk to whichever worker is free; the receiver reassembles by
+    // offset, so out-of-order completion is fine.
+    let sent_bytes = Arc::new(AtomicU64::new(0));
+    let chunk_count = Arc::new(AtomicU64::new(0));
+    let error_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_emit = Arc::new(Mutex::new(Instant::now()));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, u64, Vec<u8>)>(FILE_TRANSFER_CONCURRENCY);
+    let rx = Arc::new(Mutex::new(rx));
+
+    std::thread::scope(|scope| {
+        for _ in 0..FILE_TRANSFER_CONCURRENCY {
+            let rx = Arc::clone(&rx);
+            let sent_bytes = Arc::clone(&sent_bytes);
+            let chunk_count = Arc::clone(&chunk_count);
+            let error_slot = Arc::clone(&error_slot);
+            let last_emit = Arc::clone(&last_emit);
+            let transfer_id = transfer_id.as_str();
+            scope.spawn(move || loop {
+                // recv blocks holding the lock; the sync_channel wakes exactly
+                // one waiter per send, so recv is serialized but the slow part
+                // (send_file_transfer_packet) runs unlocked and in parallel.
+                let next = {
+                    let Ok(rx) = rx.lock() else { break };
+                    rx.recv()
+                };
+                let Ok((chunk_index, offset, data)) = next else {
+                    break;
+                };
+                if error_slot.lock().map(|slot| slot.is_some()).unwrap_or(true) {
+                    break;
+                }
+                let len = data.len() as u64;
+                let packet = file_transfer_packet(
+                    "chunk",
+                    transfer_id,
+                    origin_id,
+                    target,
+                    &file.name,
+                    file.total_bytes,
+                    chunk_index,
+                    offset,
+                    destination_hint,
+                    data,
+                );
+                match send_file_transfer_packet(quic_transport, target, packet) {
+                    Ok(()) => {
+                        let total_sent = sent_bytes.fetch_add(len, Ordering::Relaxed) + len;
+                        chunk_count.fetch_add(1, Ordering::Relaxed);
+                        if progress_emit_due(&last_emit) {
+                            emit_file_transfer_progress(
+                                app_handle,
+                                transfer_id,
+                                file,
+                                target,
+                                total_sent,
+                                false,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut slot) = error_slot.lock() {
+                            slot.get_or_insert(error);
+                        }
+                        break;
+                    }
+                }
+            });
         }
-        let data = buffer[..read].to_vec();
-        send_file_transfer_packet(
-            quic_transport,
-            target,
-            file_transfer_packet(
-                "chunk",
-                &transfer_id,
-                origin_id,
-                target,
-                &file.name,
-                file.total_bytes,
-                chunk_index,
-                offset,
-                destination_hint,
-                data,
-            ),
-        )?;
-        packet_count += 1;
-        offset = offset.saturating_add(read as u64);
-        chunk_index = chunk_index.saturating_add(1);
+
+        // Producer: read sequentially and dispatch. Errors (open/read) go through
+        // the shared slot so the workers wind down and the outer result reports it.
+        match fs::File::open(&file.path) {
+            Ok(mut file_handle) => {
+                let mut buffer = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
+                let mut offset = 0_u64;
+                let mut chunk_index = 0_u64;
+                loop {
+                    if error_slot.lock().map(|slot| slot.is_some()).unwrap_or(true) {
+                        break;
+                    }
+                    let read = match file_handle.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(error) => {
+                            if let Ok(mut slot) = error_slot.lock() {
+                                slot.get_or_insert(format!(
+                                    "读取文件 {} 失败: {error}",
+                                    file.path.display()
+                                ));
+                            }
+                            break;
+                        }
+                    };
+                    if tx
+                        .send((chunk_index, offset, buffer[..read].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    offset = offset.saturating_add(read as u64);
+                    chunk_index = chunk_index.saturating_add(1);
+                }
+            }
+            Err(error) => {
+                if let Ok(mut slot) = error_slot.lock() {
+                    slot.get_or_insert(format!("无法打开文件 {}: {error}", file.path.display()));
+                }
+            }
+        }
+        drop(tx);
+    });
+
+    if let Some(error) = error_slot.lock().ok().and_then(|mut slot| slot.take()) {
+        return Err(error);
     }
 
     send_file_transfer_packet(
@@ -5598,15 +5708,58 @@ fn send_transfer_file(
             target,
             &file.name,
             file.total_bytes,
-            chunk_index,
-            offset,
+            chunk_count.load(Ordering::Relaxed),
+            file.total_bytes,
             destination_hint,
             Vec::new(),
         ),
     )?;
-    packet_count += 1;
+    emit_file_transfer_progress(
+        app_handle,
+        &transfer_id,
+        file,
+        target,
+        sent_bytes.load(Ordering::Relaxed),
+        true,
+    );
 
-    Ok(packet_count)
+    // start + chunks + finish
+    Ok(chunk_count.load(Ordering::Relaxed).saturating_add(2))
+}
+
+fn progress_emit_due(last_emit: &Mutex<Instant>) -> bool {
+    let Ok(mut last_emit) = last_emit.lock() else {
+        return false;
+    };
+    if last_emit.elapsed() < Duration::from_millis(FILE_TRANSFER_PROGRESS_MIN_INTERVAL_MS) {
+        return false;
+    }
+    *last_emit = Instant::now();
+    true
+}
+
+fn emit_file_transfer_progress(
+    app_handle: Option<&AppHandle>,
+    transfer_id: &str,
+    file: &TransferFile,
+    target: &FileTransferTarget,
+    sent_bytes: u64,
+    done: bool,
+) {
+    let Some(app) = app_handle else {
+        return;
+    };
+    let _ = app.emit(
+        FILE_TRANSFER_PROGRESS_EVENT,
+        FileTransferProgress {
+            transfer_id: transfer_id.into(),
+            file_name: file.name.clone(),
+            target_name: target.name.clone(),
+            sent_bytes,
+            total_bytes: file.total_bytes,
+            done,
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5991,8 +6144,15 @@ fn start_incoming_file_transfer(
         return false;
     }
 
-    if fs::File::create(&temp_path).is_err() {
-        return false;
+    // Preallocate the full size so concurrent chunks can seek to their offset
+    // and write in any order.
+    match fs::File::create(&temp_path) {
+        Ok(file) => {
+            if packet.total_bytes > 0 && file.set_len(packet.total_bytes).is_err() {
+                return false;
+            }
+        }
+        Err(_) => return false,
     }
 
     let transfer = IncomingFileTransfer {
@@ -6001,7 +6161,7 @@ fn start_incoming_file_transfer(
         file_name,
         total_bytes: packet.total_bytes,
         received_bytes: 0,
-        next_chunk_index: 0,
+        written_offsets: std::collections::HashSet::new(),
         temp_path,
         final_path,
     };
@@ -6019,6 +6179,8 @@ fn append_incoming_file_transfer_chunk(
     packet: FileTransferPacket,
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
 ) -> bool {
+    use std::io::Seek;
+
     if packet.data.is_empty() || packet.data.len() > FILE_TRANSFER_CHUNK_BYTES {
         return false;
     }
@@ -6032,29 +6194,33 @@ fn append_incoming_file_transfer_chunk(
         || packet.target_id != transfer.target_id
         || packet.file_name != transfer.file_name
         || packet.total_bytes != transfer.total_bytes
-        || packet.chunk_index != transfer.next_chunk_index
-        || packet.offset != transfer.received_bytes
-        || transfer
-            .received_bytes
-            .saturating_add(packet.data.len() as u64)
-            > transfer.total_bytes
+        || packet.offset.saturating_add(packet.data.len() as u64) > transfer.total_bytes
     {
         return false;
     }
 
+    // A chunk already written (duplicate / retransmit) is accepted idempotently
+    // so received_bytes is not double-counted.
+    if transfer.written_offsets.contains(&packet.offset) {
+        return true;
+    }
+
     let write_result = fs::OpenOptions::new()
-        .append(true)
+        .write(true)
         .open(&transfer.temp_path)
-        .and_then(|mut file| file.write_all(&packet.data));
+        .and_then(|mut file| {
+            file.seek(std::io::SeekFrom::Start(packet.offset))?;
+            file.write_all(&packet.data)
+        });
     if let Err(error) = write_result {
         log::warn!("file transfer chunk write failed: {error}");
         return false;
     }
 
+    transfer.written_offsets.insert(packet.offset);
     transfer.received_bytes = transfer
         .received_bytes
         .saturating_add(packet.data.len() as u64);
-    transfer.next_chunk_index = transfer.next_chunk_index.saturating_add(1);
     true
 }
 
@@ -6076,8 +6242,6 @@ fn finish_incoming_file_transfer(
             || packet.target_id != transfer.target_id
             || packet.file_name != transfer.file_name
             || packet.total_bytes != transfer.total_bytes
-            || packet.offset != transfer.received_bytes
-            || packet.chunk_index != transfer.next_chunk_index
             || transfer.received_bytes != transfer.total_bytes
         {
             return false;
@@ -8756,11 +8920,88 @@ mod tests {
     }
 
     #[test]
-    fn file_transfer_rejects_out_of_order_chunks() {
+    fn file_transfer_reassembles_out_of_order_and_duplicate_chunks() {
+        // Concurrent senders deliver chunks in any order, sometimes twice on a
+        // retry. The receiver must position by offset and stay idempotent so
+        // the file reassembles exactly and received_bytes is not over-counted.
         let layout = test_layout();
         let root = temp_test_dir("file-transfer-order");
         let transfers = Arc::new(Mutex::new(HashMap::new()));
-        let start = test_file_transfer_packet("start", "transfer-2", "note.txt", 5, 0, 0, b"");
+        let send = |packet: &FileTransferPacket| {
+            let payload = encode_wire_packet(packet).expect("packet should encode");
+            handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            )
+        };
+
+        assert!(send(&test_file_transfer_packet(
+            "start",
+            "transfer-2",
+            "note.txt",
+            10,
+            0,
+            0,
+            b""
+        )));
+        // Second half arrives first.
+        assert!(send(&test_file_transfer_packet(
+            "chunk",
+            "transfer-2",
+            "note.txt",
+            10,
+            1,
+            5,
+            b"World"
+        )));
+        // Duplicate of the same chunk is accepted without double-counting.
+        assert!(send(&test_file_transfer_packet(
+            "chunk",
+            "transfer-2",
+            "note.txt",
+            10,
+            1,
+            5,
+            b"World"
+        )));
+        // First half arrives last.
+        assert!(send(&test_file_transfer_packet(
+            "chunk",
+            "transfer-2",
+            "note.txt",
+            10,
+            0,
+            0,
+            b"Hello"
+        )));
+        assert!(send(&test_file_transfer_packet(
+            "finish",
+            "transfer-2",
+            "note.txt",
+            10,
+            2,
+            10,
+            b""
+        )));
+
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("reassembled file"),
+            "HelloWorld"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_rejects_chunk_past_declared_size() {
+        // A chunk whose offset+len exceeds total_bytes must be refused so a
+        // malformed or hostile sender cannot write past the preallocated file.
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-bounds");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let start = test_file_transfer_packet("start", "transfer-3", "note.txt", 5, 0, 0, b"");
         let start_payload = encode_wire_packet(&start).expect("start should encode");
         assert!(handle_file_transfer_packet_with_root(
             &start_payload,
@@ -8770,10 +9011,11 @@ mod tests {
             &root
         ));
 
-        let stale = test_file_transfer_packet("chunk", "transfer-2", "note.txt", 5, 1, 0, b"hello");
-        let stale_payload = encode_wire_packet(&stale).expect("chunk should encode");
+        let overflow =
+            test_file_transfer_packet("chunk", "transfer-3", "note.txt", 5, 0, 3, b"hello");
+        let overflow_payload = encode_wire_packet(&overflow).expect("chunk should encode");
         assert!(!handle_file_transfer_packet_with_root(
-            &stale_payload,
+            &overflow_payload,
             &layout,
             "local-device",
             &transfers,
