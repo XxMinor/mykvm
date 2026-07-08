@@ -54,6 +54,8 @@ const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = MACOS_VISIBLE_REMOTE_CAPTURE_LO
 #[cfg(target_os = "macos")]
 const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
 #[cfg(target_os = "macos")]
+const MACOS_SESSION_LOCK_CHECK_INTERVAL_MS: u64 = 250;
+#[cfg(target_os = "macos")]
 const MACOS_NSEVENT_TYPE_SYSTEM_DEFINED: u32 = 14;
 #[cfg(target_os = "macos")]
 const MACOS_NSEVENT_TYPE_ROTATE: u32 = 18;
@@ -692,6 +694,64 @@ fn macos_secure_input_enabled() -> bool {
     unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_session_screen_locked() -> bool {
+    use core_foundation::{
+        base::{CFType, TCFType},
+        boolean::CFBoolean,
+        dictionary::{CFDictionary, CFDictionaryRef},
+        string::CFString,
+    };
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+    }
+
+    unsafe {
+        let session = CGSessionCopyCurrentDictionary();
+        if session.is_null() {
+            return false;
+        }
+
+        let session: CFDictionary<CFString, CFType> = TCFType::wrap_under_create_rule(session);
+        let key = CFString::from_static_string("CGSSessionScreenIsLocked");
+        session
+            .find(&key)
+            .and_then(|value| value.downcast::<CFBoolean>())
+            .map(bool::from)
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn should_release_remote_for_session_lock(remote_active: bool, session_locked: bool) -> bool {
+    remote_active && session_locked
+}
+
+#[cfg(target_os = "macos")]
+fn should_poll_macos_session_lock(
+    remote_active: bool,
+    last_check: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !remote_active {
+        *last_check = None;
+        return false;
+    }
+
+    let interval = Duration::from_millis(MACOS_SESSION_LOCK_CHECK_INTERVAL_MS);
+    if last_check
+        .and_then(|last| now.checked_duration_since(last))
+        .is_some_and(|elapsed| elapsed < interval)
+    {
+        return false;
+    }
+
+    *last_check = Some(now);
+    true
+}
+
 fn start_input_capture(
     targets: Vec<InputTarget>,
     layout_state: Arc<Mutex<LayoutState>>,
@@ -853,14 +913,13 @@ fn start_platform_capture(
         }
         tap.enable();
         let _ = ready_tx.send(Ok(()));
-        let mut app_nap_suppressed = false;
+        let mut last_session_lock_check = None;
 
+        // App Nap suppression is held process-wide for the app lifetime (see
+        // lib.rs setup) — toggling it per remote_active left the QUIC/discovery
+        // /clipboard timers napped between controls and on receive-only peers.
         while !stop.load(Ordering::Relaxed) {
             let was_remote_active = context.remote_active.load(Ordering::Relaxed);
-            if app_nap_suppressed != was_remote_active {
-                set_macos_app_nap_suppressed(was_remote_active);
-                app_nap_suppressed = was_remote_active;
-            }
             let _ = CFRunLoop::run_in_mode(
                 unsafe { kCFRunLoopDefaultMode },
                 Duration::from_millis(macos_capture_loop_ms(
@@ -886,9 +945,17 @@ fn start_platform_capture(
             // making the server pointer reappear and follow the mouse.
             // Re-pin it to the anchor and re-assert hide while active.
             let is_remote_active = context.remote_active.load(Ordering::Relaxed);
-            if app_nap_suppressed != is_remote_active {
-                set_macos_app_nap_suppressed(is_remote_active);
-                app_nap_suppressed = is_remote_active;
+            if should_poll_macos_session_lock(
+                is_remote_active,
+                &mut last_session_lock_check,
+                Instant::now(),
+            ) && should_release_remote_for_session_lock(
+                is_remote_active,
+                macos_session_screen_locked(),
+            ) {
+                log::info!("macOS session locked while remote control is active; returning local");
+                return_to_local_macos(&context);
+                continue;
             }
             if is_remote_active {
                 repin_macos_cursor_while_remote(&context);
@@ -900,9 +967,6 @@ fn start_platform_capture(
         set_macos_cursor_decoupled(false);
         set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
         show_macos_cursor_if_needed(&context);
-        if app_nap_suppressed {
-            set_macos_app_nap_suppressed(false);
-        }
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
     });
@@ -4430,10 +4494,11 @@ fn set_macos_warp_suppression_interval(seconds: f64) {
 ///
 /// `NSProcessInfo -beginActivityWithOptions:reason:` with a latency-critical,
 /// user-initiated activity tells the OS to keep us scheduled normally. We hold
-/// the returned (retained) activity token for the whole capture lifetime and
-/// end it on teardown. The option set still allows the machine to idle-sleep.
+/// the returned (retained) activity token for the whole app lifetime (armed in
+/// lib.rs setup — receive-only clients inject input from the background too).
+/// The option set still allows the machine to idle-sleep.
 #[cfg(target_os = "macos")]
-fn set_macos_app_nap_suppressed(suppress: bool) {
+pub fn set_macos_app_nap_suppressed(suppress: bool) {
     use std::ffi::c_void;
     use std::os::raw::c_char;
     use std::sync::atomic::AtomicUsize;
@@ -4776,6 +4841,7 @@ fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext, transparent_
     *last_reassert = Some(now);
     drop(last_reassert);
 
+    enable_macos_background_cursor_hide();
     set_macos_cursor_transparent_current();
     push_macos_cursor_hide(context);
 }
@@ -4859,11 +4925,11 @@ fn enable_macos_background_cursor_hide() {
     // RTLD_DEFAULT on macOS searches every already-loaded image.
     const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
 
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    if ENABLED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-
+    // Deliberately NOT once-guarded: the property is WindowServer-side state,
+    // and lock/unlock or display reconfiguration can drop it — which showed up
+    // as "the hidden server cursor sometimes reappears after a while". The
+    // reassert path re-arms it on its existing 250 ms throttle; two dlsym
+    // lookups at that cadence are noise.
     unsafe {
         let main_conn = dlsym(
             RTLD_DEFAULT,
@@ -5552,6 +5618,39 @@ mod tests {
             MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS,
             MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_lock_only_releases_active_remote_control() {
+        assert!(should_release_remote_for_session_lock(true, true));
+        assert!(!should_release_remote_for_session_lock(false, true));
+        assert!(!should_release_remote_for_session_lock(true, false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_lock_polling_is_throttled_and_resets_when_inactive() {
+        let mut last_check = None;
+        let start = Instant::now();
+
+        assert!(should_poll_macos_session_lock(true, &mut last_check, start));
+        assert!(!should_poll_macos_session_lock(
+            true,
+            &mut last_check,
+            start + Duration::from_millis(MACOS_SESSION_LOCK_CHECK_INTERVAL_MS - 1)
+        ));
+        assert!(should_poll_macos_session_lock(
+            true,
+            &mut last_check,
+            start + Duration::from_millis(MACOS_SESSION_LOCK_CHECK_INTERVAL_MS)
+        ));
+        assert!(!should_poll_macos_session_lock(
+            false,
+            &mut last_check,
+            start + Duration::from_millis(MACOS_SESSION_LOCK_CHECK_INTERVAL_MS * 2)
+        ));
+        assert!(last_check.is_none());
     }
 
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {
