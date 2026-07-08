@@ -3465,6 +3465,20 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Keep the process responsive while hidden in the tray for both
+            // roles. On macOS, App Nap coalesces the QUIC keep-alive/loss
+            // timers and demotes thread QoS the longer the app sits without a
+            // visible window — the "runs fine for a while, then control gets
+            // choppy" degradation. The activity option still allows idle
+            // system sleep, so this only opts out of nap, not power saving.
+            // Windows Power Throttling (EcoQoS) does the same to background
+            // processes; a receive-mode client injects input from exactly that
+            // state.
+            #[cfg(target_os = "macos")]
+            input::set_macos_app_nap_suppressed(true);
+            #[cfg(target_os = "windows")]
+            disable_windows_power_throttling();
+
             let silent_launch = launched_from_autostart();
             if let Err(error) = app
                 .handle()
