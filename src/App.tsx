@@ -77,6 +77,7 @@ import type {
 import type {
   AppLanguage,
   Device,
+  FileTransferProgress,
   LayoutState,
   MachineRole,
   ModifierMap,
@@ -166,6 +167,7 @@ type NativeFileDragPayload =
 
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
+  const [fileTransfers, setFileTransfers] = useState<FileTransferProgress[]>([]);
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [boardSize, setBoardSize] = useState({
     width: DEFAULT_BOARD_WIDTH,
@@ -327,6 +329,54 @@ function App() {
     return () => {
       active = false;
       unlistenRuntime?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    const removalTimers = new Map<string, number>();
+
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<FileTransferProgress>("file-transfer-progress", ({ payload }) => {
+          if (!active) {
+            return;
+          }
+          setFileTransfers((current) => [
+            ...current.filter((item) => item.transferId !== payload.transferId),
+            payload,
+          ]);
+          if (payload.done) {
+            const existing = removalTimers.get(payload.transferId);
+            if (existing) {
+              window.clearTimeout(existing);
+            }
+            const timer = window.setTimeout(() => {
+              setFileTransfers((current) =>
+                current.filter((item) => item.transferId !== payload.transferId),
+              );
+              removalTimers.delete(payload.transferId);
+            }, 2500);
+            removalTimers.set(payload.transferId, timer);
+          }
+        }),
+      )
+      .then((nextUnlisten) => {
+        if (active) {
+          unlisten = nextUnlisten;
+          return;
+        }
+        nextUnlisten();
+      })
+      .catch(() => {
+        // Progress is a nice-to-have overlay; its absence never blocks a transfer.
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+      removalTimers.forEach((timer) => window.clearTimeout(timer));
     };
   }, []);
 
@@ -672,6 +722,55 @@ function App() {
     ? "custom-chrome custom-chrome-windows"
     : "";
   const shellClassName = `app-shell ${chromeClassName} theme-${resolvedTheme}`;
+
+  function renderFileTransferToasts() {
+    if (fileTransfers.length === 0) {
+      return null;
+    }
+    return (
+      <div className="file-transfer-toasts" role="status" aria-live="polite">
+        {fileTransfers.map((transfer) => {
+          const percent =
+            transfer.totalBytes > 0
+              ? Math.min(
+                  100,
+                  Math.round((transfer.sentBytes / transfer.totalBytes) * 100),
+                )
+              : transfer.done
+                ? 100
+                : 0;
+          return (
+            <div
+              key={transfer.transferId}
+              className={`file-transfer-toast${transfer.done ? " is-done" : ""}`}
+            >
+              <div className="file-transfer-toast-row">
+                <span className="file-transfer-toast-name" title={transfer.fileName}>
+                  {transfer.fileName}
+                </span>
+                <span className="file-transfer-toast-percent">
+                  {transfer.done ? ui.devices.fileTransferSent : `${percent}%`}
+                </span>
+              </div>
+              <div className="file-transfer-toast-track">
+                <div
+                  className="file-transfer-toast-fill"
+                  style={{ width: `${percent}%` }}
+                />
+              </div>
+              <div className="file-transfer-toast-meta">
+                {`${
+                  transfer.done
+                    ? ui.devices.fileTransferSent
+                    : ui.devices.fileTransferSending
+                } · ${transfer.targetName}`}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
 
   function renderWindowTitlebar() {
     if (!usesCustomChrome) {
@@ -2078,6 +2177,7 @@ function App() {
   return (
     <main className={shellClassName}>
       {renderWindowTitlebar()}
+      {renderFileTransferToasts()}
       <header className="app-header">
         <div className="brand-lockup">
           <span className="brand-mark">mk</span>

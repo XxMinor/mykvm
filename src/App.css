@@ -2033,6 +2033,113 @@
   overflow-wrap: anywhere;
 }
 
+.file-transfer-toasts {
+  position: fixed;
+  top: 64px;
+  right: 18px;
+  z-index: 55;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(320px, calc(100vw - 36px));
+  pointer-events: none;
+}
+
+.file-transfer-toast {
+  pointer-events: auto;
+  padding: 12px 14px;
+  border: 1px solid rgba(45, 212, 191, 0.28);
+  border-radius: 12px;
+  background: rgba(12, 20, 28, 0.92);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.4);
+  animation: file-transfer-toast-in 0.18s ease-out;
+}
+
+.file-transfer-toast.is-done {
+  border-color: rgba(74, 222, 128, 0.4);
+}
+
+.file-transfer-toast-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.file-transfer-toast-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: #e2e8f0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-transfer-toast-percent {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #5eead4;
+  font-variant-numeric: tabular-nums;
+}
+
+.file-transfer-toast.is-done .file-transfer-toast-percent {
+  color: #4ade80;
+}
+
+.file-transfer-toast-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.2);
+  overflow: hidden;
+}
+
+.file-transfer-toast-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2dd4bf, #22d3ee);
+  transition: width 0.2s ease-out;
+}
+
+.file-transfer-toast.is-done .file-transfer-toast-fill {
+  background: linear-gradient(90deg, #4ade80, #22c55e);
+}
+
+.file-transfer-toast-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #94a3b8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes file-transfer-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.app-shell.theme-light .file-transfer-toast {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(13, 148, 136, 0.3);
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
+}
+
+.app-shell.theme-light .file-transfer-toast-name {
+  color: #0f172a;
+}
+
+.app-shell.theme-light .file-transfer-toast-meta {
+  color: #475569;
+}
+
 .error-dialog-backdrop {
   position: fixed;
   inset: 0;
