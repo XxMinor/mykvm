@@ -160,6 +160,8 @@ export const TEXT = {
       updateFailed: "更新失败",
       updateDismissed: "已忽略这个版本的更新提醒。",
       updateFallback: "已打开 GitHub Releases 下载页。",
+      updateBlockedByClients:
+        "以下客户端仍是旧版本，请先在这些设备上更新，再升级本机（否则升级后会断开连接、无法继续操控它们）：",
       currentVersion: "当前版本",
       latestVersion: "最新版本",
       checkUpdate: "检查更新",
@@ -408,6 +410,8 @@ export const TEXT = {
       updateFailed: "Update failed",
       updateDismissed: "This version's update reminder is dismissed.",
       updateFallback: "GitHub Releases has been opened for manual download.",
+      updateBlockedByClients:
+        "These clients are still on an older version. Update them first, then upgrade this machine (otherwise they disconnect after the upgrade and can no longer be controlled):",
       currentVersion: "Current version",
       latestVersion: "Latest version",
       checkUpdate: "Check for Updates",

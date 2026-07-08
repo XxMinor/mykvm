@@ -165,6 +165,44 @@ type NativeFileDragPayload =
   | { type: "cancel" }
   | { type: string; paths?: string[]; position?: FileDropPosition };
 
+// A client is treated as "present" for the upgrade guard if it was announced
+// within this window; discovery prunes stale peers, this is a belt-and-braces.
+const CLIENT_ONLINE_WINDOW_MS = 20000;
+
+function parseSemverCore(value: string): number[] | null {
+  const core = value
+    .trim()
+    .replace(/^v/i, "")
+    .split("-")[0]
+    .split("+")[0];
+  if (!core) {
+    return null;
+  }
+  const parts = core.split(".").map((part) => Number.parseInt(part, 10));
+  return parts.some((part) => Number.isNaN(part)) ? null : parts;
+}
+
+// True only when `version` is confidently at least `target` (same or newer
+// core version; pre-release suffixes are ignored since they share a protocol).
+// An empty or unparseable version returns false, so an uncertain client blocks
+// the upgrade rather than risking a lockout.
+function versionAtLeast(version: string, target: string): boolean {
+  const a = parseSemverCore(version);
+  const b = parseSemverCore(target);
+  if (!a || !b) {
+    return false;
+  }
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i += 1) {
+    const na = a[i] ?? 0;
+    const nb = b[i] ?? 0;
+    if (na !== nb) {
+      return na > nb;
+    }
+  }
+  return true;
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [fileTransfers, setFileTransfers] = useState<FileTransferProgress[]>([]);
@@ -1900,6 +1938,28 @@ function App() {
 
   async function installDesktopUpdate() {
     if (!availableUpdate || updateStatus === "installing") {
+      return;
+    }
+
+    // Guard against a self-inflicted lockout. This machine has the keyboard and
+    // mouse; it drives the clients. If it upgrades to a build whose transport
+    // protocol the still-old clients cannot speak, they drop offline — and since
+    // a client has no local input of its own, it can no longer be driven to
+    // update. Require every online client to already be on the target version.
+    const now = Date.now();
+    const outdatedClients = (snapshot?.runtime.discovery.peers ?? []).filter(
+      (peer) =>
+        peer.inputReady &&
+        !peer.upgrading &&
+        now - peer.lastSeenMs < CLIENT_ONLINE_WINDOW_MS &&
+        !versionAtLeast(peer.appVersion, availableUpdate.version),
+    );
+    if (outdatedClients.length > 0) {
+      const list = outdatedClients
+        .map((peer) => `${peer.name || peer.host} (v${peer.appVersion || "?"})`)
+        .join("、");
+      setUpdateStatus("available");
+      setUpdateMessage(`${ui.settings.updateBlockedByClients} ${list}`);
       return;
     }
 
