@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex, OnceLock, TryLockError,
+        mpsc, Arc, Condvar, Mutex, OnceLock, TryLockError,
     },
     thread,
     time::{Duration, Instant},
@@ -2722,10 +2722,39 @@ fn release_held_remote_inputs_macos(context: &MacCaptureContext, target: &InputT
     );
 }
 
+// Wakes the clipboard sync thread the moment the target changes, so a crossing
+// pushes the clipboard immediately instead of after the idle-poll sleep.
+// ponytail: process-global — there is exactly one clipboard sync loop.
+static CLIPBOARD_TARGET_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+
+fn clipboard_target_wake() -> &'static (Mutex<u64>, Condvar) {
+    CLIPBOARD_TARGET_WAKE.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+fn notify_clipboard_target_changed() {
+    let (generation, condvar) = clipboard_target_wake();
+    if let Ok(mut generation) = generation.lock() {
+        *generation = generation.wrapping_add(1);
+    }
+    condvar.notify_all();
+}
+
+/// Blocks until the clipboard target changes or `timeout` elapses.
+pub fn wait_for_clipboard_target_change(timeout: Duration) {
+    let (generation, condvar) = clipboard_target_wake();
+    let Ok(guard) = generation.lock() else {
+        thread::sleep(timeout);
+        return;
+    };
+    let start = *guard;
+    let _ = condvar.wait_timeout_while(guard, timeout, |generation| *generation == start);
+}
+
 pub fn clear_clipboard_target(target: &Arc<Mutex<Option<ClipboardTarget>>>) {
     if let Ok(mut target) = target.lock() {
         *target = None;
     }
+    notify_clipboard_target_changed();
 }
 
 pub fn current_clipboard_target(
@@ -2768,6 +2797,7 @@ fn set_clipboard_target(
             expires_at: expires_in.map(|duration| Instant::now() + duration),
         });
     }
+    notify_clipboard_target_changed();
 }
 
 fn set_control_clipboard_target(

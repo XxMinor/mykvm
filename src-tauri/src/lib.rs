@@ -60,6 +60,10 @@ const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 // we never echo received content straight back.
 const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
+// With an OS change counter (macOS changeCount / Windows sequence number) a
+// poll is a single cheap syscall, so we can afford a much snappier cadence;
+// the full read only happens after a real clipboard change.
+const CLIPBOARD_TOKEN_POLL_INTERVAL_MS: u64 = 50;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
@@ -765,8 +769,7 @@ impl AppRuntime {
         }
 
         let layout_for_input = Arc::clone(&self.layout);
-        let layout_for_clipboard = Arc::clone(&self.layout);
-        let layout_for_file_transfer = Arc::clone(&self.layout);
+        let layout_for_stream = Arc::clone(&self.layout);
         let layout_for_pairing = Arc::clone(&self.layout);
         let native_layout_for_input = self.native_layout();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
@@ -828,27 +831,33 @@ impl AppRuntime {
                 return true;
             }
 
-            if let Ok(layout) = layout_for_file_transfer.lock() {
-                let current_peer = local_peer_from_layout(&layout);
-                if handle_file_transfer_packet(
-                    &payload,
-                    &layout,
-                    &current_peer.id,
-                    &file_transfers,
-                    &app_handle_for_file_transfer,
-                ) {
-                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
+            // Snapshot the layout instead of holding the lock: the file and
+            // clipboard handlers below do slow disk/clipboard I/O (a received
+            // image write can take hundreds of ms with retries), and every
+            // incoming input datagram needs this same mutex — holding it here
+            // froze input injection for the whole transfer.
+            let layout = {
+                let Ok(layout) = layout_for_stream.lock() else {
+                    return false;
+                };
+                layout.clone()
+            };
+            let current_peer = local_peer_from_layout(&layout);
+
+            if handle_file_transfer_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &file_transfers,
+                &app_handle_for_file_transfer,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
 
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
                 return false;
             }
-            let Ok(layout) = layout_for_clipboard.lock() else {
-                return false;
-            };
-            let current_peer = local_peer_from_layout(&layout);
             if handle_clipboard_packet(
                 &payload,
                 &layout,
@@ -5271,23 +5280,46 @@ fn run_clipboard_sync(
     let mut last_failed: Option<(String, String, String, Instant)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut sequence = now_ms();
+    // Cheap change gate: when the OS exposes a clipboard change counter we only
+    // pay for a full read (pbpaste spawn / image decode + base64) after a real
+    // change or a target switch. Without it, a screenshot sitting on the
+    // clipboard was re-decoded ~7x per second for the whole control session.
+    let token_supported = clipboard::change_token().is_some();
+    let poll_interval = Duration::from_millis(if token_supported {
+        CLIPBOARD_TOKEN_POLL_INTERVAL_MS
+    } else {
+        CLIPBOARD_POLL_INTERVAL_MS
+    });
+    let mut last_token: Option<u64> = None;
+    let mut last_target_key: Option<(String, String)> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
-            thread::sleep(Duration::from_millis(120));
             last_poll = Instant::now() - Duration::from_secs(1);
+            last_target_key = None;
+            input::wait_for_clipboard_target_change(Duration::from_millis(120));
             continue;
         };
 
-        if last_poll.elapsed() < Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS) {
+        if last_poll.elapsed() < poll_interval {
             thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
             continue;
         }
         last_poll = Instant::now();
 
+        let target_key = (target.device_id.clone(), target.addr.clone());
+        let token = clipboard::change_token();
+        if token.is_some() && token == last_token && last_target_key.as_ref() == Some(&target_key) {
+            continue;
+        }
+
         let Some(content) = clipboard::read_content() else {
+            last_token = token;
+            last_target_key = Some(target_key);
             continue;
         };
+        last_token = token;
+        last_target_key = Some(target_key);
         let signature = content.signature();
 
         // If this is the content we just wrote after receiving a peer packet,
@@ -5329,6 +5361,10 @@ fn run_clipboard_sync(
             })
             .unwrap_or(false)
         {
+            // Keep the unchanged-token gate off while a retry is pending, or
+            // the gate would skip every poll after the cooldown and the retry
+            // would never fire.
+            last_token = None;
             continue;
         }
 
@@ -5375,6 +5411,9 @@ fn run_clipboard_sync(
                 if let Err(error) = send_result {
                     log::warn!("clipboard send failed: {error}");
                 }
+                // Force a re-evaluation on the next poll: the unchanged-token
+                // gate must not swallow the retry (pacing stays on last_failed).
+                last_token = None;
                 last_failed = Some((
                     target.device_id.clone(),
                     target.addr.clone(),
@@ -5446,7 +5485,7 @@ fn handle_clipboard_packet(
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> bool {
-    handle_clipboard_packet_with_writer(
+    let written = handle_clipboard_packet_with_writer(
         payload,
         layout,
         local_peer_id,
@@ -5454,7 +5493,23 @@ fn handle_clipboard_packet(
         clipboard_echo_until,
         clipboard_last_sequences,
         write_clipboard_content_with_retry,
-    )
+    );
+
+    if written {
+        // Record the signature of what the OS *actually* stored, not what the
+        // packet carried: image bytes come back re-encoded, and the mismatch
+        // used to make our own poll loop treat the write as a fresh local copy
+        // once the grace window passed — bouncing the image back to the peer
+        // and overwriting anything they had copied since ("paste gives the
+        // previous value"). The read-back signature makes the echo check exact.
+        if let Some(read_back) = clipboard::read_content() {
+            if let Ok(mut seen) = clipboard_seen_text.lock() {
+                *seen = Some(read_back.signature());
+            }
+        }
+    }
+
+    written
 }
 
 fn handle_clipboard_packet_with_writer<F>(
