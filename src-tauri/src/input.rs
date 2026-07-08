@@ -938,14 +938,14 @@ fn start_platform_capture(
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, PM_REMOVE, WH_KEYBOARD_LL,
-        WH_MOUSE_LL,
+        MsgWaitForMultipleObjects, PeekMessageW, MSG, PM_REMOVE, QS_ALLINPUT,
     };
 
     let target_count = targets.len();
     let (ready_tx, ready_rx) = mpsc::channel();
 
     thread::spawn(move || {
+        set_windows_capture_thread_priority();
         refresh_windows_input_desktop_cache();
         let context = Arc::new(WindowsCaptureContext {
             quic_transport,
@@ -966,50 +966,28 @@ fn start_platform_capture(
             cursor_hide_calls: Mutex::new(0),
             just_crossed: AtomicBool::new(false),
             local_screen_points: Mutex::new(HashMap::new()),
+            last_hook_event_ms: AtomicU64::new(0),
         });
 
         if let Ok(mut current) = WINDOWS_CAPTURE_CONTEXT.lock() {
             *current = Some(Arc::clone(&context));
         }
 
-        let mouse_hook = unsafe {
-            SetWindowsHookExW(
-                WH_MOUSE_LL,
-                Some(windows_mouse_proc),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if mouse_hook.is_null() {
-            context.remote_active.store(false, Ordering::Relaxed);
-            clear_clipboard_target(&context.clipboard_target);
-            clear_windows_capture_context();
-            let _ = ready_tx.send(Err("failed to install Windows mouse hook".into()));
-            return;
-        }
-
-        let keyboard_hook = unsafe {
-            SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(windows_keyboard_proc),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if keyboard_hook.is_null() {
-            unsafe {
-                let _ = UnhookWindowsHookEx(mouse_hook);
+        let mut hooks = match WindowsInputHooks::install() {
+            Ok(hooks) => hooks,
+            Err(error) => {
+                context.remote_active.store(false, Ordering::Relaxed);
+                clear_clipboard_target(&context.clipboard_target);
+                clear_windows_capture_context();
+                let _ = ready_tx.send(Err(error));
+                return;
             }
-            context.remote_active.store(false, Ordering::Relaxed);
-            clear_clipboard_target(&context.clipboard_target);
-            clear_windows_capture_context();
-            let _ = ready_tx.send(Err("failed to install Windows keyboard hook".into()));
-            return;
-        }
+        };
 
         let _ = ready_tx.send(Ok(()));
         let mut message = MSG::default();
         let mut last_desktop_check = Instant::now() - Duration::from_millis(200);
+        let mut last_watchdog_check = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             if last_desktop_check.elapsed() >= Duration::from_millis(100) {
                 last_desktop_check = Instant::now();
@@ -1018,16 +996,25 @@ fn start_platform_capture(
                 }
             }
             drain_switch_request_windows(&context);
+            if last_watchdog_check.elapsed() >= Duration::from_secs(1) {
+                last_watchdog_check = Instant::now();
+                if windows_hooks_look_dead(&context, &hooks) {
+                    log::warn!("low-level input hooks stopped receiving events; reinstalling them");
+                    hooks.reinstall(&context);
+                }
+            }
+            // Hook callbacks are dispatched while this thread services its
+            // message queue. Waiting on the queue instead of sleeping 10 ms
+            // between polls removes up to 10 ms of added latency per input
+            // event and all idle wakeups; slow servicing is also what makes
+            // Windows silently drop low-level hooks.
             unsafe {
+                let _ = MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 20, QS_ALLINPUT);
                 while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
             }
-            thread::sleep(Duration::from_millis(10));
         }
 
-        unsafe {
-            let _ = UnhookWindowsHookEx(mouse_hook);
-            let _ = UnhookWindowsHookEx(keyboard_hook);
-        }
+        hooks.uninstall();
         show_windows_cursor_if_needed(&context);
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
@@ -1925,6 +1912,10 @@ fn inject_input_event(
         return false;
     };
 
+    inject_input_command_with_platform_routing(command)
+}
+
+fn inject_input_command_with_platform_routing(command: InputCommand) -> bool {
     #[cfg(target_os = "windows")]
     {
         // Inject locally on the normal desktop; hand off to the privileged SYSTEM
@@ -2148,13 +2139,28 @@ impl WindowsInputDispatcher {
 fn open_current_session_input_pipe() -> Result<std::fs::File, String> {
     use std::fs::OpenOptions;
 
-    let session_id = current_windows_session_id()?;
+    let own_session = current_windows_session_id()?;
+    // After an RDP hand-off the service moves the worker to the *active*
+    // session (which can be the console logon-screen session) while this
+    // process may still live in the now-detached user session. Try both pipe
+    // names so lock-screen input keeps working through RDP transitions.
+    let console_session =
+        unsafe { windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() };
 
-    let pipe_name = crate::shared_input::input_pipe_name(session_id);
-    OpenOptions::new()
-        .write(true)
-        .open(&pipe_name)
-        .map_err(|error| format!("open input helper pipe {pipe_name}: {error}"))
+    let mut candidates = vec![own_session];
+    if console_session != u32::MAX && console_session != own_session {
+        candidates.push(console_session);
+    }
+
+    let mut last_error = format!("input helper pipe for session {own_session} unavailable");
+    for session_id in candidates {
+        let pipe_name = crate::shared_input::input_pipe_name(session_id);
+        match OpenOptions::new().write(true).open(&pipe_name) {
+            Ok(file) => return Ok(file),
+            Err(error) => last_error = format!("open input helper pipe {pipe_name}: {error}"),
+        }
+    }
+    Err(last_error)
 }
 
 #[cfg(target_os = "windows")]
@@ -2370,6 +2376,11 @@ struct WindowsCaptureContext {
     // does not shove the cursor inward on Windows, where we pin by warping.
     just_crossed: AtomicBool,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
+    // GetTickCount64 of the last time either low-level hook callback fired.
+    // The pump loop compares this against system-wide input activity to detect
+    // hooks Windows silently removed (slow-callback timeout, working-set trim
+    // after hours in the tray) — the "works, then goes dead until restart" bug.
+    last_hook_event_ms: AtomicU64,
 }
 
 #[cfg(target_os = "windows")]
@@ -2385,6 +2396,130 @@ fn clear_windows_capture_context() {
     if let Ok(mut context) = WINDOWS_CAPTURE_CONTEXT.lock() {
         *context = None;
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_tick_ms() -> u64 {
+    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+}
+
+/// Late hook servicing is what makes Windows silently remove low-level hooks;
+/// keep the pump thread ahead of ordinary load.
+#[cfg(target_os = "windows")]
+fn set_windows_capture_thread_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+    };
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsInputHooks {
+    mouse: windows_sys::Win32::UI::WindowsAndMessaging::HHOOK,
+    keyboard: windows_sys::Win32::UI::WindowsAndMessaging::HHOOK,
+    installed_at_ms: u64,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsInputHooks {
+    fn install() -> Result<Self, String> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+        };
+
+        let mouse = unsafe {
+            SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(windows_mouse_proc),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if mouse.is_null() {
+            return Err("failed to install Windows mouse hook".into());
+        }
+        let keyboard = unsafe {
+            SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(windows_keyboard_proc),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if keyboard.is_null() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(mouse);
+            }
+            return Err("failed to install Windows keyboard hook".into());
+        }
+
+        Ok(Self {
+            mouse,
+            keyboard,
+            installed_at_ms: windows_tick_ms(),
+        })
+    }
+
+    fn uninstall(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
+
+        for hook in [&mut self.mouse, &mut self.keyboard] {
+            if !hook.is_null() {
+                unsafe {
+                    let _ = UnhookWindowsHookEx(*hook);
+                }
+                *hook = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Drops and re-adds both hooks. On failure the null handles make the next
+    /// watchdog tick retry; `installed_at_ms` paces the staleness clock so a
+    /// reinstall is not immediately re-triggered.
+    fn reinstall(&mut self, context: &WindowsCaptureContext) {
+        self.uninstall();
+        match Self::install() {
+            Ok(hooks) => *self = hooks,
+            Err(error) => {
+                self.installed_at_ms = windows_tick_ms();
+                log::warn!("failed to reinstall Windows input hooks: {error}");
+            }
+        }
+        context.last_hook_event_ms.store(0, Ordering::Relaxed);
+    }
+}
+
+/// True when the system keeps seeing input but our hooks have gone quiet:
+/// Windows removed them silently (callback timeout, thread starvation after a
+/// working-set trim, ...). A genuinely idle machine trips neither condition.
+#[cfg(target_os = "windows")]
+fn windows_hooks_look_dead(context: &WindowsCaptureContext, hooks: &WindowsInputHooks) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    if hooks.mouse.is_null() || hooks.keyboard.is_null() {
+        return true;
+    }
+
+    const STALE_MS: u64 = 3000;
+    let now_ms = windows_tick_ms();
+    let last_hook = context
+        .last_hook_event_ms
+        .load(Ordering::Relaxed)
+        .max(hooks.installed_at_ms);
+    if now_ms.saturating_sub(last_hook) < STALE_MS {
+        return false;
+    }
+
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if unsafe { GetLastInputInfo(&mut info) } == 0 {
+        return false;
+    }
+    // dwTime is a 32-bit GetTickCount value; compare in 32-bit tick space.
+    let since_system_input = (now_ms as u32).wrapping_sub(info.dwTime);
+    u64::from(since_system_input) < STALE_MS
 }
 
 fn should_send_mouse_move(last_sent: &Mutex<Option<Instant>>, dragging: bool) -> bool {
@@ -2617,6 +2752,9 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
+    context
+        .last_hook_event_ms
+        .store(windows_tick_ms(), Ordering::Relaxed);
     if !cached_windows_input_desktop_is_default() {
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
@@ -2652,6 +2790,9 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
+    context
+        .last_hook_event_ms
+        .store(windows_tick_ms(), Ordering::Relaxed);
     if !cached_windows_input_desktop_is_default() {
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
