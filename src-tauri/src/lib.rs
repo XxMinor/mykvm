@@ -87,6 +87,10 @@ const FILE_DROP_LANDING_HEIGHT: f64 = 72.0;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const AUTOSTART_ARG: &str = "--mykvm-autostart";
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
+#[cfg(target_os = "windows")]
+const ENABLE_ELEVATED_AUTOSTART_ARG: &str = "--mykvm-enable-elevated-autostart";
+#[cfg(target_os = "windows")]
+const DISABLE_ELEVATED_AUTOSTART_ARG: &str = "--mykvm-disable-elevated-autostart";
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
 const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
 const HELPER_PATH_ARG: &str = "--helper-path";
@@ -98,6 +102,8 @@ const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\MyKVM_SingleInstance";
 const ACTIVATE_INSTANCE_EVENT_NAME: &str = "Local\\MyKVM_ActivateWindow";
 #[cfg(target_os = "windows")]
 const QUIT_INSTANCE_EVENT_NAME: &str = "Local\\MyKVM_QuitExisting";
+#[cfg(target_os = "windows")]
+const ELEVATED_AUTOSTART_TASK_NAME: &str = "MyKVM";
 
 static HOSTNAME_CACHE: OnceLock<Option<String>> = OnceLock::new();
 
@@ -2913,6 +2919,11 @@ fn reset_pairing(state: tauri::State<'_, AppRuntime>) -> Result<AppStateSnapshot
 
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    set_platform_autostart(app, enabled)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_platform_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();
     if enabled {
@@ -2929,12 +2940,83 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
         .map_err(|error| format!("failed to read launch-at-startup state: {error}"))
 }
 
+#[cfg(target_os = "windows")]
+fn set_platform_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    if !enabled {
+        let _ = set_legacy_plugin_autostart(&app, false);
+    }
+
+    let task_result = if enabled {
+        enable_windows_elevated_autostart_for_current_exe()
+    } else {
+        disable_windows_elevated_autostart()
+    };
+
+    match task_result {
+        Ok(()) => {
+            // Remove the legacy Run-key autostart registered by tauri-plugin-autostart.
+            // Windows clients need an elevated Task Scheduler entry after reboot; leaving
+            // the legacy entry creates a second non-elevated process that only races the
+            // elevated one.
+            let _ = set_legacy_plugin_autostart(&app, false);
+            Ok(windows_elevated_autostart_enabled()?)
+        }
+        Err(error) if !is_windows_process_elevated().unwrap_or(false) => {
+            let arg = if enabled {
+                ENABLE_ELEVATED_AUTOSTART_ARG
+            } else {
+                DISABLE_ELEVATED_AUTOSTART_ARG
+            };
+            launch_current_process_as_admin(&[arg.into()])?;
+            Ok(enabled)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[tauri::command]
 fn is_autostart_enabled(app: AppHandle) -> Result<bool, String> {
+    is_platform_autostart_enabled(app)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_platform_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
     app.autolaunch()
         .is_enabled()
         .map_err(|error| format!("failed to read launch-at-startup state: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn is_platform_autostart_enabled(app: AppHandle) -> Result<bool, String> {
+    Ok(windows_elevated_autostart_enabled()?
+        || legacy_plugin_autostart_enabled(&app).unwrap_or(false))
+}
+
+#[cfg(target_os = "windows")]
+fn set_legacy_plugin_autostart(app: &AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    if enabled {
+        manager
+            .enable()
+            .map_err(|error| format!("failed to enable legacy launch-at-startup: {error}"))?;
+    } else {
+        manager
+            .disable()
+            .map_err(|error| format!("failed to disable legacy launch-at-startup: {error}"))?;
+    }
+    manager
+        .is_enabled()
+        .map_err(|error| format!("failed to read legacy launch-at-startup state: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn legacy_plugin_autostart_enabled(app: &AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| format!("failed to read legacy launch-at-startup state: {error}"))
 }
 
 #[tauri::command]
@@ -2985,6 +3067,20 @@ pub fn handle_process_control_args() -> bool {
 
         if args.iter().any(|arg| arg == UNINSTALL_INPUT_SERVICE_ARG) {
             if let Err(error) = uninstall_windows_input_service() {
+                eprintln!("{error}");
+            }
+            return true;
+        }
+
+        if args.iter().any(|arg| arg == ENABLE_ELEVATED_AUTOSTART_ARG) {
+            if let Err(error) = enable_windows_elevated_autostart_for_current_exe() {
+                eprintln!("{error}");
+            }
+            return true;
+        }
+
+        if args.iter().any(|arg| arg == DISABLE_ELEVATED_AUTOSTART_ARG) {
+            if let Err(error) = disable_windows_elevated_autostart() {
                 eprintln!("{error}");
             }
             return true;
@@ -4218,6 +4314,114 @@ fn quote_windows_arg_str(value: &str) -> String {
     }
     quoted.push('"');
     quoted
+}
+
+#[cfg(target_os = "windows")]
+fn enable_windows_elevated_autostart_for_current_exe() -> Result<(), String> {
+    let exe =
+        env::current_exe().map_err(|error| format!("failed to locate current exe: {error}"))?;
+    enable_windows_elevated_autostart(&exe)
+}
+
+#[cfg(target_os = "windows")]
+fn enable_windows_elevated_autostart(exe: &Path) -> Result<(), String> {
+    let task_command = windows_elevated_autostart_task_command(&exe.to_string_lossy());
+    let status = windows_hidden_command("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            ELEVATED_AUTOSTART_TASK_NAME,
+            "/TR",
+            &task_command,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ])
+        .status()
+        .map_err(|error| format!("failed to create elevated startup task: {error}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "failed to create elevated startup task; schtasks exited with {status}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn disable_windows_elevated_autostart() -> Result<(), String> {
+    if !windows_elevated_autostart_enabled()? {
+        return Ok(());
+    }
+
+    let status = windows_hidden_command("schtasks")
+        .args(["/Delete", "/TN", ELEVATED_AUTOSTART_TASK_NAME, "/F"])
+        .status()
+        .map_err(|error| format!("failed to delete elevated startup task: {error}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "failed to delete elevated startup task; schtasks exited with {status}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_elevated_autostart_enabled() -> Result<bool, String> {
+    let status = windows_hidden_command("schtasks")
+        .args(["/Query", "/TN", ELEVATED_AUTOSTART_TASK_NAME])
+        .status()
+        .map_err(|error| format!("failed to query elevated startup task: {error}"))?;
+    Ok(status.success())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_elevated_autostart_task_command(exe: &str) -> String {
+    format!("{} {}", quote_windows_arg_str(exe), AUTOSTART_ARG)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hidden_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+/// Opt out of Windows Power Throttling (EcoQoS). Windows 11 slows background /
+/// minimized processes down to efficiency cores and coarse timers; a KVM that
+/// captures or injects input from the tray is exactly such a process, and the
+/// throttle shows up as growing input jitter the longer the window stays closed.
+#[cfg(target_os = "windows")]
+fn disable_windows_power_throttling() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE,
+    };
+
+    // ControlMask selects execution-speed throttling; StateMask 0 = never apply.
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    // Best effort: unsupported editions just keep default scheduling.
+    let _ = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const PROCESS_POWER_THROTTLING_STATE as *const core::ffi::c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
 }
 
 #[cfg(target_os = "windows")]

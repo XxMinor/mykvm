@@ -32,6 +32,25 @@
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$svc=Get-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue; if ($svc) { try { Restart-Service -Name ''MyKVMInputService'' -Force -ErrorAction Stop } catch { Start-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue } }"'
 !macroend
 
+!macro MYKVM_MIGRATE_ELEVATED_AUTOSTART
+  ; Older builds used HKCU\...\Run, which starts mykvm without elevation after
+  ; reboot. If that legacy autostart is enabled, replace it with a highest-
+  ; privileges Task Scheduler entry so the Windows client can keep its firewall
+  ; and input-helper setup working after unattended restarts.
+  ClearErrors
+  ReadRegStr $0 HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Run" "mykvm"
+  IfErrors done
+  StrCmp $0 "" done
+  DetailPrint "Migrating MyKVM startup to elevated Task Scheduler entry..."
+  nsExec::ExecToStack 'schtasks.exe /Create /TN "MyKVM" /TR "\"$INSTDIR\mykvm.exe\" --mykvm-autostart" /SC ONLOGON /RL HIGHEST /F'
+  Pop $1
+  Pop $2
+  StrCmp $1 0 0 done
+  DeleteRegValue HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Run" "mykvm"
+  DeleteRegValue HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "mykvm"
+  done:
+!macroend
+
 !macro MYKVM_DELETE_INPUT_SERVICE
   DetailPrint "Removing MyKVM input service..."
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$svc=Get-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue; if ($svc) { Stop-Service -Name ''MyKVMInputService'' -Force -ErrorAction SilentlyContinue }; sc.exe delete MyKVMInputService"'
@@ -49,6 +68,7 @@
   DetailPrint "Configuring Windows Defender Firewall for mykvm..."
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="MyKVM (UDP-In)"'
   nsExec::ExecToLog 'netsh advfirewall firewall add rule name="MyKVM (UDP-In)" dir=in action=allow program="$INSTDIR\mykvm.exe" protocol=udp profile=any enable=yes'
+  !insertmacro MYKVM_MIGRATE_ELEVATED_AUTOSTART
   !insertmacro MYKVM_START_INPUT_SERVICE_IF_INSTALLED
 !macroend
 
@@ -60,4 +80,5 @@
 !macro NSIS_HOOK_POSTUNINSTALL
   ; Remove the firewall rule we added during install.
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="MyKVM (UDP-In)"'
+  nsExec::ExecToLog 'schtasks.exe /Delete /TN "MyKVM" /F'
 !macroend

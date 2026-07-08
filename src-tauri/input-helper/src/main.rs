@@ -63,7 +63,8 @@ mod windows_helper {
                 PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
             },
             RemoteDesktop::{
-                ProcessIdToSessionId, WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+                ProcessIdToSessionId, WTSActive, WTSEnumerateSessionsW, WTSFreeMemory,
+                WTSGetActiveConsoleSessionId, WTSQueryUserToken, WTS_SESSION_INFOW,
             },
             Threading::{
                 CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId, OpenProcessToken,
@@ -134,7 +135,13 @@ mod windows_helper {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if worker.has_exited() {
+                    // Poll-based backstop: also re-home the worker when the
+                    // active session moved without a (matching) notification —
+                    // RDP hand-offs in particular arrive as reasons that used
+                    // to be ignored, leaving the worker in a detached session
+                    // and lock-screen input dead until a manual unlock.
+                    let desired = desired_worker_session();
+                    if worker.has_exited() || desired.is_some_and(|id| id != worker.session_id) {
                         let _ = worker.restart();
                     }
                 }
@@ -164,12 +171,47 @@ mod windows_helper {
         matches!(
             reason,
             SessionChangeReason::ConsoleConnect
+                | SessionChangeReason::ConsoleDisconnect
                 | SessionChangeReason::RemoteConnect
+                | SessionChangeReason::RemoteDisconnect
                 | SessionChangeReason::SessionLogon
                 | SessionChangeReason::SessionLogoff
                 | SessionChangeReason::SessionCreate
                 | SessionChangeReason::SessionTerminate
         )
+    }
+
+    /// The session the worker should inject into: the active session with a
+    /// logged-on user (physical console *or* RDP — `WTSGetActiveConsoleSessionId`
+    /// alone points at the physical console, which during an RDP hand-off is a
+    /// user-less logon-screen session), falling back to the console session so
+    /// lock-screen input still works when nobody is logged on.
+    fn desired_worker_session() -> Option<u32> {
+        unsafe {
+            let mut sessions: *mut WTS_SESSION_INFOW = ptr::null_mut();
+            let mut count = 0_u32;
+            if WTSEnumerateSessionsW(ptr::null_mut(), 0, 1, &mut sessions, &mut count) != 0 {
+                let mut active_user_session = None;
+                for info in std::slice::from_raw_parts(sessions, count as usize) {
+                    if info.State != WTSActive {
+                        continue;
+                    }
+                    let mut token = ptr::null_mut();
+                    if WTSQueryUserToken(info.SessionId, &mut token) != 0 {
+                        let _ = CloseHandle(token);
+                        active_user_session = Some(info.SessionId);
+                        break;
+                    }
+                }
+                WTSFreeMemory(sessions.cast());
+                if active_user_session.is_some() {
+                    return active_user_session;
+                }
+            }
+
+            let console = WTSGetActiveConsoleSessionId();
+            (console != INVALID_SESSION_ID).then_some(console)
+        }
     }
 
     #[derive(Default)]
@@ -181,10 +223,8 @@ mod windows_helper {
     impl WorkerProcess {
         fn restart(&mut self) -> Result<(), String> {
             self.stop();
-            let session_id = unsafe { WTSGetActiveConsoleSessionId() };
-            if session_id == INVALID_SESSION_ID {
-                return Err("no active console session".into());
-            }
+            let session_id =
+                desired_worker_session().ok_or_else(|| "no active session".to_string())?;
 
             let handle = spawn_worker_in_session(session_id)?;
             self.handle = handle;
