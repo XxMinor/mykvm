@@ -61,6 +61,51 @@ impl ClipboardContent {
     }
 }
 
+/// A cheap OS-level clipboard change counter. When two calls return the same
+/// token the clipboard has not changed in between, so callers can skip the
+/// expensive full read (image decode + base64) entirely. `None` means the
+/// platform has no cheap counter (Linux) and callers must fall back to reading.
+#[cfg(target_os = "macos")]
+pub(crate) fn change_token() -> Option<u64> {
+    use std::os::raw::{c_char, c_void};
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        let pasteboard_class = objc_getClass(b"NSPasteboard\0".as_ptr() as *const c_char);
+        if pasteboard_class.is_null() {
+            return None;
+        }
+        let general_sel = sel_registerName(b"generalPasteboard\0".as_ptr() as *const c_char);
+        let get_object: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let pasteboard = get_object(pasteboard_class, general_sel);
+        if pasteboard.is_null() {
+            return None;
+        }
+        let change_count_sel = sel_registerName(b"changeCount\0".as_ptr() as *const c_char);
+        let get_isize: extern "C" fn(*mut c_void, *mut c_void) -> isize =
+            std::mem::transmute(objc_msgSend as *const ());
+        Some(get_isize(pasteboard, change_count_sel) as u64)
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn change_token() -> Option<u64> {
+    use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+    Some(u64::from(unsafe { GetClipboardSequenceNumber() }))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn change_token() -> Option<u64> {
+    None
+}
+
 pub(crate) fn read_text() -> Result<String, String> {
     read_system_text()
 }
