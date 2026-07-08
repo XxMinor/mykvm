@@ -1275,6 +1275,16 @@ fn send_packet(
 ) -> bool {
     let packet_context = input_packet_context(target, event, layout_state);
     let event = packet_context.event;
+    // Key and mouse-button up/down MUST arrive intact and ordered: a lost
+    // "up" leaves a key or button stuck down (every keystroke then behaves like
+    // a shortcut). Route them over the reliable stream. Mouse motion and scroll
+    // stay on datagrams — losing an intermediate move is invisible, and motion
+    // wants "latest wins" over guaranteed delivery.
+    let send_reliable = matches!(
+        event,
+        InputEvent::Key { .. } | InputEvent::MouseButton { .. }
+    );
+    let send_latest = matches!(event, InputEvent::MouseMove { .. });
     let packet = InputPacket {
         protocol: INPUT_PROTOCOL.into(),
         target_device_id: target.device_id.clone(),
@@ -1302,7 +1312,15 @@ fn send_packet(
         }
     };
 
-    match quic_transport.send_datagram(peer, payload) {
+    let send_result = if send_reliable {
+        quic_transport.send_reliable_input(peer, payload)
+    } else if send_latest {
+        quic_transport.send_latest_datagram(peer, payload)
+    } else {
+        quic_transport.send_datagram(peer, payload)
+    };
+
+    match send_result {
         Ok(()) => {
             input_events.fetch_add(1, Ordering::Relaxed);
             true
