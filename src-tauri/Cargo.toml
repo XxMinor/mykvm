@@ -50,6 +50,8 @@ tauri-plugin-global-shortcut = "2"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
+# PNG encoding for native multi-format pasteboard writes (text + image).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.8.1"
