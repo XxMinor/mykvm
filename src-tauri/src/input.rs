@@ -4871,7 +4871,8 @@ fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext, transparent_
     *last_reassert = Some(now);
     drop(last_reassert);
 
-    enable_macos_background_cursor_hide();
+    // SetsCursorInBackground is armed once in hide_macos_cursor_if_needed; do not
+    // re-set it here — re-setting the connection property repaints the cursor.
     set_macos_cursor_transparent_current();
     push_macos_cursor_hide(context);
 }
@@ -4955,11 +4956,17 @@ fn enable_macos_background_cursor_hide() {
     // RTLD_DEFAULT on macOS searches every already-loaded image.
     const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
 
-    // Deliberately NOT once-guarded: the property is WindowServer-side state,
-    // and lock/unlock or display reconfiguration can drop it — which showed up
-    // as "the hidden server cursor sometimes reappears after a while". The
-    // reassert path re-arms it on its existing 250 ms throttle; two dlsym
-    // lookups at that cadence are noise.
+    // Arm once: SetsCursorInBackground is a WindowServer connection property that
+    // survives for the life of the connection, so it only needs to be set a
+    // single time. Re-setting it on every hide made WindowServer re-evaluate the
+    // cursor and briefly repaint it — the visible "cursor lingers at the edge on
+    // crossing, then hides a moment later" stutter, worst while frontmost (where
+    // the per-frame reassert that would otherwise mask it is skipped).
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    if ENABLED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
     unsafe {
         let main_conn = dlsym(
             RTLD_DEFAULT,
