@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - bate
   workflow_dispatch:
     inputs:
       channel:
