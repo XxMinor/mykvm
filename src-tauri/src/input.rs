@@ -5581,64 +5581,6 @@ pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
 }
 
-/// Flips the real system Caps Lock latch via IOKit, so the menu-bar indicator,
-/// the "Caps Lock switches input source" behaviour, and every subsequent key
-/// (injected or physical) all follow — unlike a per-event AlphaShift flag, which
-/// only capitalises the letters we inject.
-#[cfg(target_os = "macos")]
-fn macos_toggle_system_caps_lock() {
-    use std::os::raw::{c_char, c_void};
-    use std::sync::OnceLock;
-
-    #[link(name = "IOKit", kind = "framework")]
-    extern "C" {
-        fn IOServiceGetMatchingService(main_port: u32, matching: *const c_void) -> u32;
-        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
-        fn IOServiceOpen(service: u32, owning_task: u32, type_: u32, connect: *mut u32) -> i32;
-        fn IOHIDGetModifierLockState(handle: u32, selector: i32, state: *mut bool) -> i32;
-        fn IOHIDSetModifierLockState(handle: u32, selector: i32, state: bool) -> i32;
-    }
-    extern "C" {
-        static mach_task_self_: u32;
-    }
-    const K_IO_HID_PARAM_CONNECT_TYPE: u32 = 1;
-    const K_IO_HID_CAPS_LOCK_STATE: i32 = 0x0000_0001;
-
-    // The IOHIDSystem paramConnect handle is stable for the process; open once.
-    static CONNECT: OnceLock<u32> = OnceLock::new();
-    let connect = *CONNECT.get_or_init(|| unsafe {
-        let matching = IOServiceMatching(b"IOHIDSystem\0".as_ptr() as *const c_char);
-        if matching.is_null() {
-            return 0;
-        }
-        // IOServiceGetMatchingService consumes the matching dictionary.
-        let service = IOServiceGetMatchingService(0, matching);
-        if service == 0 {
-            return 0;
-        }
-        let mut connect: u32 = 0;
-        if IOServiceOpen(
-            service,
-            mach_task_self_,
-            K_IO_HID_PARAM_CONNECT_TYPE,
-            &mut connect,
-        ) != 0
-        {
-            return 0;
-        }
-        connect
-    });
-    if connect == 0 {
-        log::warn!("caps lock toggle: could not open IOHIDSystem");
-        return;
-    }
-    unsafe {
-        let mut state = false;
-        IOHIDGetModifierLockState(connect, K_IO_HID_CAPS_LOCK_STATE, &mut state);
-        IOHIDSetModifierLockState(connect, K_IO_HID_CAPS_LOCK_STATE, !state);
-        log::info!("[diag] system caps lock toggled -> {}", !state);
-    }
-}
 
 #[cfg(not(target_os = "macos"))]
 pub fn reset_injected_modifiers() {}
@@ -5665,16 +5607,11 @@ fn inject_key(key_code: u16, down: bool) {
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
-    // Caps Lock: flip the real system latch on keydown (menu-bar indicator /
-    // input-source switch follow), and swallow the keycode — injecting keycode
-    // 57 does not toggle the OS caps state.
-    const VK_CAPITAL: u16 = 0x14;
-    if key_code == VK_CAPITAL {
-        if down {
-            macos_toggle_system_caps_lock();
-        }
-        return;
-    }
+    // Caps Lock is injected as a real keycode-57 event (below) so the system's
+    // own caps handler — including "Caps Lock switches to a different input
+    // source" — responds exactly as it does to a physical press. (IOKit's
+    // IOHIDSetModifierLockState returns success on modern macOS but no longer
+    // actually toggles the latch without elevated privileges.)
 
     // Keep the running modifier state in sync, so the modifier event itself and
     // every later key carry the right flags.
