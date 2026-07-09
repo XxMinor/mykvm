@@ -913,6 +913,12 @@ fn start_platform_capture(
         }
         tap.enable();
         let _ = ready_tx.send(Ok(()));
+        // Belt-and-braces: ensure App Nap is suppressed from the control-side
+        // capture thread too. The process-wide arm in lib.rs setup runs earlier
+        // and could silently no-op if NSProcessInfo was not ready yet; without
+        // suppression the background capture loop gets throttled and crossings
+        // stutter. Idempotent — skips if already armed (the diag log says which).
+        set_macos_app_nap_suppressed(true);
         let mut last_session_lock_check = None;
 
         // App Nap suppression is held process-wide for the app lifetime (see
@@ -4594,6 +4600,10 @@ pub fn set_macos_app_nap_suppressed(suppress: bool) {
                 std::mem::transmute(objc_msgSend as *const ());
             let retained = retain(activity, retain_sel);
             ACTIVITY_TOKEN.store(retained as usize, Ordering::Relaxed);
+            log::info!(
+                "[diag] macOS App Nap suppression armed (activity={})",
+                retained as usize
+            );
         } else {
             let token = ACTIVITY_TOKEN.swap(0, Ordering::Relaxed);
             if token == 0 {
