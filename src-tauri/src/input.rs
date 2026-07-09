@@ -1079,20 +1079,8 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
     // Warp only — no posted mouse-move event, which the system would service by
     // re-showing the cursor and undoing the hide below.
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x as f64, y as f64));
-    // Baseline the drift monitor from the *event-source* cursor location, NOT the
-    // warp target. macos_current_cursor_location() reports the position of the
-    // last mouse EVENT, and a warp posts no event — so the read-back stays at
-    // wherever the last injected move left the cursor, never at (x,y). Comparing
-    // that read-back against the warp target reads as a permanent >3px drift, so
-    // the monitor re-showed the cursor on the very next 50ms poll after every
-    // hide — the hide/show flicker the user saw. Seeding the baseline from the
-    // same source as the read-back means drift reflects only real physical
-    // movement of the local mouse.
-    let baseline = macos_current_cursor_location()
-        .map(|location| (location.x, location.y))
-        .unwrap_or((x as f64, y as f64));
     if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
-        *point = Some(baseline);
+        *point = Some((x as f64, y as f64));
     }
     // Only run the hide primitives once per hide/show cycle — CGDisplayHideCursor
     // is counted and must pair 1:1 with show, so a repeated CursorPark must not
@@ -1108,11 +1096,7 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
     for display_id in CGDisplay::active_displays().unwrap_or_default() {
         let _ = CGDisplay::new(display_id).hide_cursor();
     }
-    log::info!(
-        "[diag] receive hide cursor warp=({x},{y}) baseline=({:.0},{:.0})",
-        baseline.0,
-        baseline.1
-    );
+    log::info!("[diag] receive hide cursor at ({x},{y})");
 }
 
 /// Reveal the cursor hidden by `macos_receive_hide_cursor`. The swap ensures the
@@ -1155,6 +1139,11 @@ fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
                     if (location.x - px).abs() > RECEIVE_CURSOR_DRIFT_PX
                         || (location.y - py).abs() > RECEIVE_CURSOR_DRIFT_PX
                     {
+                        log::info!(
+                            "[diag] monitor drift show: cur=({:.0},{:.0}) park=({px:.0},{py:.0})",
+                            location.x,
+                            location.y
+                        );
                         macos_receive_show_cursor_if_hidden();
                     }
                 }
@@ -2150,7 +2139,12 @@ fn inject_input_command(command: InputCommand) {
             // Control is back on this client — reveal the cursor we hid when it
             // last left, then move it.
             #[cfg(target_os = "macos")]
-            macos_receive_show_cursor_if_hidden();
+            {
+                if MACOS_RECEIVE_CURSOR_HIDDEN.load(Ordering::Relaxed) {
+                    log::info!("[diag] inject-move show at ({x},{y})");
+                }
+                macos_receive_show_cursor_if_hidden();
+            }
             inject_mouse_move(x, y, drag_button);
         }
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
@@ -4105,11 +4099,24 @@ fn point_in_screen(screen: &Screen, global_x: f64, global_y: f64) -> bool {
 /// (the side bordering the local machine). Mirrors the classic single-screen
 /// return-to-local test, applied to the entry screen.
 fn exited_entry_edge(edge: Edge, screen: &Screen, x: f64, y: f64, dx: f64, dy: f64) -> bool {
+    // A genuine return is an outward push THROUGH the entry edge, not a slide
+    // ALONG it. Sliding down/across the edge produces a large tangential delta
+    // (dy for a vertical edge) with only small outward noise (dx). The old test
+    // `dx < 0.0` treated any leftward sub-pixel jitter as a return, so sliding
+    // along the shared edge flip-flopped the crossing state every frame and the
+    // server sprayed alternating CursorPark/MouseMove at the client — seen as the
+    // cursor rapidly hiding/showing. Require the outward delta to clear a small
+    // floor AND dominate the tangential delta before handing control back.
+    const RETURN_MIN_OUTWARD: f64 = 5.0;
     match edge {
-        Edge::Right => x <= 0.0 && dx < 0.0,
-        Edge::Left => x >= (screen.width - 1) as f64 && dx > 0.0,
-        Edge::Bottom => y <= 0.0 && dy < 0.0,
-        Edge::Top => y >= (screen.height - 1) as f64 && dy > 0.0,
+        Edge::Right => x <= 0.0 && dx <= -RETURN_MIN_OUTWARD && dx.abs() >= dy.abs(),
+        Edge::Left => {
+            x >= (screen.width - 1) as f64 && dx >= RETURN_MIN_OUTWARD && dx.abs() >= dy.abs()
+        }
+        Edge::Bottom => y <= 0.0 && dy <= -RETURN_MIN_OUTWARD && dy.abs() >= dx.abs(),
+        Edge::Top => {
+            y >= (screen.height - 1) as f64 && dy >= RETURN_MIN_OUTWARD && dy.abs() >= dx.abs()
+        }
     }
 }
 
@@ -6106,12 +6113,13 @@ mod tests {
             invert_y: false,
         };
 
-        // Crossed in via the right edge; moving back left off the entry edge
-        // hands control back to the local machine.
-        active.x -= 2.0;
+        // Crossed in via the right edge; a genuine outward push back off the entry
+        // edge (clearing the return hysteresis floor) hands control to the local
+        // machine.
+        active.x -= 6.0;
         assert!(update_active_remote_screen(
             &mut active,
-            -2.0,
+            -6.0,
             0.0,
             &layout_state
         ));
