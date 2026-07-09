@@ -5572,17 +5572,72 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
 #[cfg(target_os = "macos")]
 static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
-/// Tracks the injected Caps Lock toggle state (macOS caps is a latch, not a
-/// held modifier, so a keydown flips it rather than setting-while-held).
-#[cfg(target_os = "macos")]
-static MAC_INJECT_CAPS_ON: AtomicBool = AtomicBool::new(false);
-
 /// Clears the tracked injected-modifier flags. Called when receiving stops so a
 /// dropped modifier key-up cannot leave Shift/Ctrl/Cmd stuck on for later keys.
+/// The system Caps Lock latch is intentionally left as-is (it is real hardware
+/// state the user can see and rely on).
 #[cfg(target_os = "macos")]
 pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
-    MAC_INJECT_CAPS_ON.store(false, Ordering::Relaxed);
+}
+
+/// Flips the real system Caps Lock latch via IOKit, so the menu-bar indicator,
+/// the "Caps Lock switches input source" behaviour, and every subsequent key
+/// (injected or physical) all follow — unlike a per-event AlphaShift flag, which
+/// only capitalises the letters we inject.
+#[cfg(target_os = "macos")]
+fn macos_toggle_system_caps_lock() {
+    use std::os::raw::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOServiceGetMatchingService(main_port: u32, matching: *const c_void) -> u32;
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceOpen(service: u32, owning_task: u32, type_: u32, connect: *mut u32) -> i32;
+        fn IOHIDGetModifierLockState(handle: u32, selector: i32, state: *mut bool) -> i32;
+        fn IOHIDSetModifierLockState(handle: u32, selector: i32, state: bool) -> i32;
+    }
+    extern "C" {
+        static mach_task_self_: u32;
+    }
+    const K_IO_HID_PARAM_CONNECT_TYPE: u32 = 1;
+    const K_IO_HID_CAPS_LOCK_STATE: i32 = 0x0000_0001;
+
+    // The IOHIDSystem paramConnect handle is stable for the process; open once.
+    static CONNECT: OnceLock<u32> = OnceLock::new();
+    let connect = *CONNECT.get_or_init(|| unsafe {
+        let matching = IOServiceMatching(b"IOHIDSystem\0".as_ptr() as *const c_char);
+        if matching.is_null() {
+            return 0;
+        }
+        // IOServiceGetMatchingService consumes the matching dictionary.
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            return 0;
+        }
+        let mut connect: u32 = 0;
+        if IOServiceOpen(
+            service,
+            mach_task_self_,
+            K_IO_HID_PARAM_CONNECT_TYPE,
+            &mut connect,
+        ) != 0
+        {
+            return 0;
+        }
+        connect
+    });
+    if connect == 0 {
+        log::warn!("caps lock toggle: could not open IOHIDSystem");
+        return;
+    }
+    unsafe {
+        let mut state = false;
+        IOHIDGetModifierLockState(connect, K_IO_HID_CAPS_LOCK_STATE, &mut state);
+        IOHIDSetModifierLockState(connect, K_IO_HID_CAPS_LOCK_STATE, !state);
+        log::info!("[diag] system caps lock toggled -> {}", !state);
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -5610,23 +5665,13 @@ fn inject_key(key_code: u16, down: bool) {
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
-    // Caps Lock (VK_CAPITAL) is a latch on macOS: flip AlphaShift on keydown so
-    // later keys are capitalised, and swallow the keycode (injecting keycode 57
-    // does not toggle the OS caps state).
+    // Caps Lock: flip the real system latch on keydown (menu-bar indicator /
+    // input-source switch follow), and swallow the keycode — injecting keycode
+    // 57 does not toggle the OS caps state.
     const VK_CAPITAL: u16 = 0x14;
     if key_code == VK_CAPITAL {
         if down {
-            let now_on = !MAC_INJECT_CAPS_ON.load(Ordering::Relaxed);
-            MAC_INJECT_CAPS_ON.store(now_on, Ordering::Relaxed);
-            let alpha = CGEventFlags::CGEventFlagAlphaShift.bits();
-            let mut flags = MAC_INJECT_FLAGS.load(Ordering::Relaxed);
-            if now_on {
-                flags |= alpha;
-            } else {
-                flags &= !alpha;
-            }
-            MAC_INJECT_FLAGS.store(flags, Ordering::Relaxed);
-            log::info!("[diag] inject caps toggle -> {}", if now_on { "ON" } else { "OFF" });
+            macos_toggle_system_caps_lock();
         }
         return;
     }
