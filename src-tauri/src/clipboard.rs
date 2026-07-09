@@ -26,6 +26,44 @@ enum ClipboardContentHint {
     Unknown,
 }
 
+/// Run an AppKit clipboard operation safely off the main thread. Two things are
+/// required and were missing: (1) an autorelease pool, or the autoreleased
+/// NSPasteboard objects are never drained and objc_msgSend eventually hits a
+/// freed pointer (the SIGSEGV in NSPasteboard._updateTypeCacheIfNeeded); and
+/// (2) serialization, because the clipboard poll thread and the QUIC receive
+/// thread both touch the shared general pasteboard and concurrent access
+/// crashes inside AppKit.
+fn with_clipboard_appkit<T>(f: impl FnOnce() -> T) -> T {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    macos_autorelease_pool(f)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+    use std::os::raw::c_void;
+    extern "C" {
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
+    }
+    struct PoolGuard(*mut c_void);
+    impl Drop for PoolGuard {
+        fn drop(&mut self) {
+            unsafe { objc_autoreleasePoolPop(self.0) }
+        }
+    }
+    // Drops (drains) even if `f` panics, so a bad clipboard payload cannot leak
+    // the pool or unbalance it.
+    let _pool = PoolGuard(unsafe { objc_autoreleasePoolPush() });
+    f()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 fn clipboard_signature_hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
@@ -76,7 +114,7 @@ pub(crate) fn change_token() -> Option<u64> {
         fn objc_msgSend();
     }
 
-    unsafe {
+    with_clipboard_appkit(|| unsafe {
         let pasteboard_class = objc_getClass(b"NSPasteboard\0".as_ptr() as *const c_char);
         if pasteboard_class.is_null() {
             return None;
@@ -92,7 +130,7 @@ pub(crate) fn change_token() -> Option<u64> {
         let get_isize: extern "C" fn(*mut c_void, *mut c_void) -> isize =
             std::mem::transmute(objc_msgSend as *const ());
         Some(get_isize(pasteboard, change_count_sel) as u64)
-    }
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -236,19 +274,21 @@ mod tests {
 fn read_image() -> Option<ClipboardImage> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-    let arboard_image = arboard::Clipboard::new().ok().and_then(|mut clipboard| {
-        let image = clipboard.get_image().ok()?;
-        if image.width == 0 || image.height == 0 || image.bytes.is_empty() {
-            return None;
-        }
-        if image.bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES {
-            return None;
-        }
+    let arboard_image = with_clipboard_appkit(|| {
+        arboard::Clipboard::new().ok().and_then(|mut clipboard| {
+            let image = clipboard.get_image().ok()?;
+            if image.width == 0 || image.height == 0 || image.bytes.is_empty() {
+                return None;
+            }
+            if image.bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES {
+                return None;
+            }
 
-        Some(ClipboardImage {
-            width: image.width as u32,
-            height: image.height as u32,
-            rgba_base64: BASE64.encode(image.bytes.as_ref()),
+            Some(ClipboardImage {
+                width: image.width as u32,
+                height: image.height as u32,
+                rgba_base64: BASE64.encode(image.bytes.as_ref()),
+            })
         })
     });
 
@@ -277,15 +317,17 @@ fn write_image(image: &ClipboardImage) -> Result<(), String> {
         return Err("clipboard image has invalid dimensions".into());
     }
 
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
-    clipboard
-        .set_image(arboard::ImageData {
-            width,
-            height,
-            bytes: std::borrow::Cow::Owned(bytes),
-        })
-        .map_err(|error| format!("failed to write clipboard image: {error}"))
+    with_clipboard_appkit(|| {
+        let mut clipboard = arboard::Clipboard::new()
+            .map_err(|error| format!("failed to open clipboard: {error}"))?;
+        clipboard
+            .set_image(arboard::ImageData {
+                width,
+                height,
+                bytes: std::borrow::Cow::Owned(bytes),
+            })
+            .map_err(|error| format!("failed to write clipboard image: {error}"))
+    })
 }
 
 #[cfg(target_os = "windows")]
