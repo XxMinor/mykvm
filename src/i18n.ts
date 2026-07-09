@@ -119,6 +119,7 @@ export const TEXT = {
       inputServiceNeedsInstall: "需要服务",
       installInputService: "安装服务",
       uninstallInputService: "卸载服务",
+      inputServiceLater: "以后再说",
       transport: "传输配置",
       transportCopy:
         "UDP 用于局域网发现；键鼠和剪贴板走 QUIC。这里配置的是 UDP 发现端口，QUIC 默认使用下一个端口，实际端口见本机信息。",
@@ -369,6 +370,7 @@ export const TEXT = {
       inputServiceNeedsInstall: "Service Required",
       installInputService: "Install Service",
       uninstallInputService: "Uninstall Service",
+      inputServiceLater: "Later",
       transport: "Transport",
       transportCopy:
         "UDP is used for LAN discovery; keyboard, mouse, and clipboard data use QUIC. This setting controls the UDP discovery port, while QUIC defaults to the next port. Actual ports are shown in Local Info.",

@@ -119,6 +119,7 @@ type WorkspaceTab = (typeof WORKSPACE_TABS)[number]["id"];
 const CLIENT_TABS: WorkspaceTab[] = ["settings"];
 const PERFORMANCE_SAMPLE_LIMIT = 32;
 const UPDATE_DISMISSED_VERSION_KEY = "mykvm:update:dismissedVersion";
+const SERVICE_GUIDE_DISMISSED_KEY = "mykvm:service:dismissed";
 type UpdateStatus =
   | "idle"
   | "checking"
@@ -254,6 +255,9 @@ function App() {
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<
     string | null
   >(() => localStorage.getItem(UPDATE_DISMISSED_VERSION_KEY));
+  const [serviceGuideDismissed, setServiceGuideDismissed] = useState(
+    () => localStorage.getItem(SERVICE_GUIDE_DISMISSED_KEY) === "1",
+  );
   const [isPortable, setIsPortable] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -733,6 +737,15 @@ function App() {
   const usesWindowsChrome = localPlatform.includes("win");
   const usesCustomChrome = usesWindowsChrome;
   const inputServiceInstalled = Boolean(runtime?.inputService.installed);
+  // First-run nudge: a Windows client with no lock-screen service can't be
+  // controlled once it locks (it has no local keyboard/mouse to unlock itself),
+  // so prompt to install it up front rather than burying it in Settings.
+  const showServiceGuide =
+    usesWindowsChrome &&
+    machineRole === "client" &&
+    hasLoadedSnapshot &&
+    !inputServiceInstalled &&
+    !serviceGuideDismissed;
   const inputServiceReady =
     inputServiceInstalled &&
     Boolean(runtime?.inputService.running) &&
@@ -760,6 +773,38 @@ function App() {
     ? "custom-chrome custom-chrome-windows"
     : "";
   const shellClassName = `app-shell ${chromeClassName} theme-${resolvedTheme}`;
+
+  function renderServiceGuide() {
+    if (!showServiceGuide) {
+      return null;
+    }
+    return (
+      <div className="service-guide-banner" role="alert">
+        <div className="service-guide-copy">
+          <strong>{ui.settings.inputServicePromptTitle}</strong>
+          <span>{ui.settings.inputServicePromptCopy}</span>
+        </div>
+        <div className="service-guide-actions">
+          <button
+            type="button"
+            className="primary-button compact-button"
+            onClick={() => void handleInstallInputService()}
+            disabled={isInputServicePending}
+          >
+            {ui.settings.installInputService}
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact-button"
+            onClick={dismissServiceGuide}
+            disabled={isInputServicePending}
+          >
+            {ui.settings.inputServiceLater}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   function renderFileTransferToasts() {
     if (fileTransfers.length === 0) {
@@ -1989,6 +2034,11 @@ function App() {
     }
   }
 
+  function dismissServiceGuide() {
+    localStorage.setItem(SERVICE_GUIDE_DISMISSED_KEY, "1");
+    setServiceGuideDismissed(true);
+  }
+
   function dismissDesktopUpdate() {
     if (!availableUpdate) {
       return;
@@ -2238,6 +2288,7 @@ function App() {
     <main className={shellClassName}>
       {renderWindowTitlebar()}
       {renderFileTransferToasts()}
+      {renderServiceGuide()}
       <header className="app-header">
         <div className="brand-lockup">
           <span className="brand-mark">mk</span>

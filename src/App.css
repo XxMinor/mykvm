@@ -2140,6 +2140,58 @@
   color: #475569;
 }
 
+.service-guide-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 10px 16px 0;
+  padding: 12px 16px;
+  border: 1px solid rgba(45, 212, 191, 0.32);
+  border-radius: 12px;
+  background: rgba(15, 118, 110, 0.18);
+}
+
+.service-guide-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 220px;
+  flex: 1;
+}
+
+.service-guide-copy strong {
+  color: #ccfbf1;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.service-guide-copy span {
+  color: #9fb7b3;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.service-guide-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.app-shell.theme-light .service-guide-banner {
+  border-color: rgba(13, 148, 136, 0.3);
+  background: rgba(204, 251, 241, 0.5);
+}
+
+.app-shell.theme-light .service-guide-copy strong {
+  color: #0f172a;
+}
+
+.app-shell.theme-light .service-guide-copy span {
+  color: #475569;
+}
+
 .error-dialog-backdrop {
   position: fixed;
   inset: 0;
