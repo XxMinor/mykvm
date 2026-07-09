@@ -4097,11 +4097,15 @@ fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
     local_return_point(active)
 }
 
-/// When control returns to the local machine, move the controlled cursor into
-/// the far (bottom-right) corner of the remote screen instead of leaving it
-/// parked at the shared edge. True cursor hiding isn't reliably possible on the
-/// controlled side, so tucking it into a corner is the seamless-feeling
-/// approximation.
+/// When control returns to the local machine, tuck the controlled cursor into
+/// the bottom-right *region* of the remote screen instead of leaving it parked
+/// at the shared edge. True cursor hiding isn't reliably possible on the
+/// controlled side, so tucking it away is the seamless-feeling approximation.
+///
+/// Deliberately NOT the exact last pixel: parking on the very corner triggers
+/// the remote's hot corner (macOS Show Desktop / Mission Control) or Windows
+/// Aero Peek, which yanked every window to the screen edge on each crossing.
+/// The margin clears the corner-action trip zone while staying off the edge.
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 fn send_remote_cursor_park(
     quic_transport: &quic_transport::TransportHandle,
@@ -4109,13 +4113,20 @@ fn send_remote_cursor_park(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    const PARK_CORNER_MARGIN: i32 = 64;
+    let park_x = (active.current_screen.width - 1 - PARK_CORNER_MARGIN)
+        .max(active.current_screen.width / 2)
+        .max(0);
+    let park_y = (active.current_screen.height - 1 - PARK_CORNER_MARGIN)
+        .max(active.current_screen.height / 2)
+        .max(0);
     send_packet(
         quic_transport,
         &active.target,
         InputEvent::MouseMove {
             screen_id: active.current_screen_id.clone(),
-            x: (active.current_screen.width - 1).max(0),
-            y: (active.current_screen.height - 1).max(0),
+            x: park_x,
+            y: park_y,
         },
         layout_state,
         input_events,
