@@ -5574,11 +5574,71 @@ static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
 /// Clears the tracked injected-modifier flags. Called when receiving stops so a
 /// dropped modifier key-up cannot leave Shift/Ctrl/Cmd stuck on for later keys.
-/// The system Caps Lock latch is intentionally left as-is (it is real hardware
-/// state the user can see and rely on).
 #[cfg(target_os = "macos")]
 pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
+}
+
+/// Switch to the next enabled keyboard input source, replicating the user's
+/// "Caps Lock switches to a different input source" setting. Injecting a caps
+/// keycode does not trigger this on modern macOS (the OS only reacts to the
+/// physical key), so we drive the Text Input Sources API directly.
+#[cfg(target_os = "macos")]
+fn macos_switch_to_next_input_source() {
+    use std::os::raw::c_void;
+
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        fn TISCreateInputSourceList(properties: *const c_void, include_all: bool) -> *const c_void;
+        fn TISCopyCurrentKeyboardInputSource() -> *const c_void;
+        fn TISSelectInputSource(source: *const c_void) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+        fn CFEqual(a: *const c_void, b: *const c_void) -> u8;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    unsafe {
+        // Selectable, currently-enabled input sources — the ones the user cycles.
+        let list = TISCreateInputSourceList(std::ptr::null(), false);
+        if list.is_null() {
+            return;
+        }
+        let count = CFArrayGetCount(list);
+        let current = TISCopyCurrentKeyboardInputSource();
+        if count < 2 || current.is_null() {
+            if !current.is_null() {
+                CFRelease(current);
+            }
+            CFRelease(list);
+            return;
+        }
+
+        let mut current_index = -1_isize;
+        for i in 0..count {
+            let item = CFArrayGetValueAtIndex(list, i);
+            if !item.is_null() && CFEqual(item, current) != 0 {
+                current_index = i;
+                break;
+            }
+        }
+        let next_index = if current_index >= 0 {
+            (current_index + 1) % count
+        } else {
+            0
+        };
+        let next = CFArrayGetValueAtIndex(list, next_index);
+        if !next.is_null() {
+            let _ = TISSelectInputSource(next);
+            log::info!("[diag] caps -> switched input source ({current_index} -> {next_index})");
+        }
+
+        CFRelease(current);
+        CFRelease(list);
+    }
 }
 
 
@@ -5607,11 +5667,16 @@ fn inject_key(key_code: u16, down: bool) {
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
-    // Caps Lock is injected as a real keycode-57 event (below) so the system's
-    // own caps handler — including "Caps Lock switches to a different input
-    // source" — responds exactly as it does to a physical press. (IOKit's
-    // IOHIDSetModifierLockState returns success on modern macOS but no longer
-    // actually toggles the latch without elevated privileges.)
+    // Caps Lock: neither injecting keycode 57 nor IOKit's IOHIDSetModifierLockState
+    // works on modern macOS (the OS only reacts to the physical key / needs
+    // privileges), so drive the user's "switch input source" behaviour directly.
+    const VK_CAPITAL: u16 = 0x14;
+    if key_code == VK_CAPITAL {
+        if down {
+            macos_switch_to_next_input_source();
+        }
+        return;
+    }
 
     // Keep the running modifier state in sync, so the modifier event itself and
     // every later key carry the right flags.
