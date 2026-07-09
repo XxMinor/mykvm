@@ -1079,8 +1079,20 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
     // Warp only — no posted mouse-move event, which the system would service by
     // re-showing the cursor and undoing the hide below.
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x as f64, y as f64));
+    // Baseline the drift monitor from the *event-source* cursor location, NOT the
+    // warp target. macos_current_cursor_location() reports the position of the
+    // last mouse EVENT, and a warp posts no event — so the read-back stays at
+    // wherever the last injected move left the cursor, never at (x,y). Comparing
+    // that read-back against the warp target reads as a permanent >3px drift, so
+    // the monitor re-showed the cursor on the very next 50ms poll after every
+    // hide — the hide/show flicker the user saw. Seeding the baseline from the
+    // same source as the read-back means drift reflects only real physical
+    // movement of the local mouse.
+    let baseline = macos_current_cursor_location()
+        .map(|location| (location.x, location.y))
+        .unwrap_or((x as f64, y as f64));
     if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
-        *point = Some((x as f64, y as f64));
+        *point = Some(baseline);
     }
     // Only run the hide primitives once per hide/show cycle — CGDisplayHideCursor
     // is counted and must pair 1:1 with show, so a repeated CursorPark must not
@@ -1096,7 +1108,11 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
     for display_id in CGDisplay::active_displays().unwrap_or_default() {
         let _ = CGDisplay::new(display_id).hide_cursor();
     }
-    log::info!("[diag] receive hide cursor at ({x},{y})");
+    log::info!(
+        "[diag] receive hide cursor warp=({x},{y}) baseline=({:.0},{:.0})",
+        baseline.0,
+        baseline.1
+    );
 }
 
 /// Reveal the cursor hidden by `macos_receive_hide_cursor`. The swap ensures the
