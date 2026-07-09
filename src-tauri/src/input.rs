@@ -1079,28 +1079,45 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
     // Warp only — no posted mouse-move event, which the system would service by
     // re-showing the cursor and undoing the hide below.
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x as f64, y as f64));
-    enable_macos_background_cursor_hide();
-    set_macos_cursor_transparent(true);
-    let _ = CGDisplay::main().hide_cursor();
     if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
         *point = Some((x as f64, y as f64));
     }
-    MACOS_RECEIVE_CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+    // Only run the hide primitives once per hide/show cycle — CGDisplayHideCursor
+    // is counted and must pair 1:1 with show, so a repeated CursorPark must not
+    // re-hide (it just re-parks above).
+    if MACOS_RECEIVE_CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Full hide, matching the server: SetsCursorInBackground so it sticks while
+    // not frontmost, transparent cursor, NSCursor hide, and hide on every display.
+    enable_macos_background_cursor_hide();
+    set_macos_cursor_transparent(true);
+    set_macos_cursor_hidden_with_appkit(true);
+    for display_id in CGDisplay::active_displays().unwrap_or_default() {
+        let _ = CGDisplay::new(display_id).hide_cursor();
+    }
+    log::info!("[diag] receive hide cursor at ({x},{y})");
 }
 
-/// Reveal the cursor hidden by `macos_receive_hide_cursor`. Idempotent: the
-/// swap ensures the balancing show/pop runs exactly once per hide, so the
-/// stack-based NSCursor/CGDisplay calls stay paired.
+/// Reveal the cursor hidden by `macos_receive_hide_cursor`. The swap ensures the
+/// balancing show/unhide runs exactly once per hide, so the counted CGDisplay
+/// and stack-based NSCursor calls stay paired.
 #[cfg(target_os = "macos")]
 fn macos_receive_show_cursor_if_hidden() {
+    use core_graphics::display::CGDisplay;
+
     if !MACOS_RECEIVE_CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
         return;
     }
     set_macos_cursor_transparent(false);
-    let _ = core_graphics::display::CGDisplay::main().show_cursor();
+    set_macos_cursor_hidden_with_appkit(false);
+    for display_id in CGDisplay::active_displays().unwrap_or_default() {
+        let _ = CGDisplay::new(display_id).show_cursor();
+    }
     if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
         *point = None;
     }
+    log::info!("[diag] receive show cursor");
 }
 
 #[cfg(target_os = "macos")]
@@ -5555,11 +5572,17 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
 #[cfg(target_os = "macos")]
 static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
+/// Tracks the injected Caps Lock toggle state (macOS caps is a latch, not a
+/// held modifier, so a keydown flips it rather than setting-while-held).
+#[cfg(target_os = "macos")]
+static MAC_INJECT_CAPS_ON: AtomicBool = AtomicBool::new(false);
+
 /// Clears the tracked injected-modifier flags. Called when receiving stops so a
 /// dropped modifier key-up cannot leave Shift/Ctrl/Cmd stuck on for later keys.
 #[cfg(target_os = "macos")]
 pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
+    MAC_INJECT_CAPS_ON.store(false, Ordering::Relaxed);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -5587,6 +5610,27 @@ fn inject_key(key_code: u16, down: bool) {
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
+    // Caps Lock (VK_CAPITAL) is a latch on macOS: flip AlphaShift on keydown so
+    // later keys are capitalised, and swallow the keycode (injecting keycode 57
+    // does not toggle the OS caps state).
+    const VK_CAPITAL: u16 = 0x14;
+    if key_code == VK_CAPITAL {
+        if down {
+            let now_on = !MAC_INJECT_CAPS_ON.load(Ordering::Relaxed);
+            MAC_INJECT_CAPS_ON.store(now_on, Ordering::Relaxed);
+            let alpha = CGEventFlags::CGEventFlagAlphaShift.bits();
+            let mut flags = MAC_INJECT_FLAGS.load(Ordering::Relaxed);
+            if now_on {
+                flags |= alpha;
+            } else {
+                flags &= !alpha;
+            }
+            MAC_INJECT_FLAGS.store(flags, Ordering::Relaxed);
+            log::info!("[diag] inject caps toggle -> {}", if now_on { "ON" } else { "OFF" });
+        }
+        return;
+    }
+
     // Keep the running modifier state in sync, so the modifier event itself and
     // every later key carry the right flags.
     if let Some(flag) = windows_vk_to_mac_flag(key_code) {
@@ -5603,6 +5647,10 @@ fn inject_key(key_code: u16, down: bool) {
         log::debug!("inject_key: no mac keycode for windows vk {key_code:#04x}; dropping");
         return;
     };
+    log::info!(
+        "[diag] inject key vk={key_code:#04x} down={down} mac={mac_code} flags={:#x}",
+        MAC_INJECT_FLAGS.load(Ordering::Relaxed)
+    );
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         log::warn!("inject_key: failed to create CGEventSource");
         return;
