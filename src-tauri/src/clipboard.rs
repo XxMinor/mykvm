@@ -159,11 +159,243 @@ pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
     }
 }
 
+/// Writes every representation of a received copy back to the clipboard at once.
+/// A single item takes the plain (arboard) path; a mix of text and image must be
+/// written natively in one shot, because arboard clears the clipboard on each
+/// set and would leave only the last representation.
+pub(crate) fn write_contents(contents: &[ClipboardContent]) -> Result<(), String> {
+    match contents {
+        [] => Ok(()),
+        [single] => write_content(single),
+        multiple => write_multiple_contents(multiple),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_multiple_contents(contents: &[ClipboardContent]) -> Result<(), String> {
+    use std::os::raw::{c_char, c_void};
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    let text = contents.iter().find_map(|content| match content {
+        ClipboardContent::Text(text) if !text.is_empty() => Some(text.as_str()),
+        _ => None,
+    });
+    // ponytail: declareTypes carries one image representation (covers text+image
+    // rich copies); multi-image via NSPasteboardItem is the next increment.
+    let image_png = contents
+        .iter()
+        .find_map(|content| match content {
+            ClipboardContent::Image(image) => Some(image),
+            _ => None,
+        })
+        .and_then(clipboard_image_to_png);
+
+    if text.is_none() && image_png.is_none() {
+        return Ok(());
+    }
+
+    with_clipboard_appkit(|| unsafe {
+        let pasteboard_class = objc_getClass(b"NSPasteboard\0".as_ptr() as *const c_char);
+        let nsstring_class = objc_getClass(b"NSString\0".as_ptr() as *const c_char);
+        let nsdata_class = objc_getClass(b"NSData\0".as_ptr() as *const c_char);
+        let nsarray_class = objc_getClass(b"NSArray\0".as_ptr() as *const c_char);
+        if pasteboard_class.is_null()
+            || nsstring_class.is_null()
+            || nsdata_class.is_null()
+            || nsarray_class.is_null()
+        {
+            return Err("AppKit classes unavailable".into());
+        }
+        let msg0: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let general_sel = sel_registerName(b"generalPasteboard\0".as_ptr() as *const c_char);
+        let pasteboard = msg0(pasteboard_class, general_sel);
+        if pasteboard.is_null() {
+            return Err("no general pasteboard".into());
+        }
+
+        // NSString type identifiers (UTIs) for the representations we set.
+        let type_string = ns_string(nsstring_class, "public.utf8-plain-text");
+        let type_png = ns_string(nsstring_class, "public.png");
+
+        // Build the declareTypes array from whichever representations we have.
+        let make_array: extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const *mut c_void,
+            usize,
+        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+        let array_sel = sel_registerName(b"arrayWithObjects:count:\0".as_ptr() as *const c_char);
+        let mut type_objs: Vec<*mut c_void> = Vec::new();
+        if text.is_some() {
+            type_objs.push(type_string);
+        }
+        if image_png.is_some() {
+            type_objs.push(type_png);
+        }
+        let types = make_array(
+            nsarray_class,
+            array_sel,
+            type_objs.as_ptr(),
+            type_objs.len(),
+        );
+
+        // declareTypes:owner:
+        let declare_sel = sel_registerName(b"declareTypes:owner:\0".as_ptr() as *const c_char);
+        let declare: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> isize =
+            std::mem::transmute(objc_msgSend as *const ());
+        declare(pasteboard, declare_sel, types, std::ptr::null_mut());
+
+        let mut ok = false;
+        if let Some(text) = text {
+            let value = ns_string(nsstring_class, text);
+            let set_string_sel =
+                sel_registerName(b"setString:forType:\0".as_ptr() as *const c_char);
+            let set_string: extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> bool = std::mem::transmute(objc_msgSend as *const ());
+            ok |= set_string(pasteboard, set_string_sel, value, type_string);
+        }
+        if let Some(png) = image_png.as_ref() {
+            let data_sel = sel_registerName(b"dataWithBytes:length:\0".as_ptr() as *const c_char);
+            let make_data: extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *const u8,
+                usize,
+            ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+            let data = make_data(nsdata_class, data_sel, png.as_ptr(), png.len());
+            let set_data_sel = sel_registerName(b"setData:forType:\0".as_ptr() as *const c_char);
+            let set_data: extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> bool = std::mem::transmute(objc_msgSend as *const ());
+            ok |= set_data(pasteboard, set_data_sel, data, type_png);
+        }
+
+        if ok {
+            Ok(())
+        } else {
+            Err("failed to write clipboard representations".into())
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn ns_string(
+    nsstring_class: *mut std::os::raw::c_void,
+    value: &str,
+) -> *mut std::os::raw::c_void {
+    use std::os::raw::{c_char, c_void};
+    #[link(name = "objc")]
+    extern "C" {
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    // stringWithBytes:length:encoding: with NSUTF8StringEncoding (4).
+    let sel = sel_registerName(b"stringWithBytes:length:encoding:\0".as_ptr() as *const c_char);
+    let make: extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, usize) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as *const ());
+    make(nsstring_class, sel, value.as_ptr(), value.len(), 4)
+}
+
+/// Encodes an RGBA clipboard image to PNG bytes for native pasteboard writes.
+#[cfg(target_os = "macos")]
+fn clipboard_image_to_png(image: &ClipboardImage) -> Option<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
+
+    let bytes = BASE64.decode(image.rgba_base64.as_bytes()).ok()?;
+    let width = image.width;
+    let height = image.height;
+    if width == 0
+        || height == 0
+        || bytes.len()
+            != (width as usize)
+                .checked_mul(height as usize)?
+                .checked_mul(4)?
+    {
+        return None;
+    }
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(&bytes, width, height, ExtendedColorType::Rgba8)
+        .ok()?;
+    Some(png)
+}
+
+/// Non-macOS receivers keep single-representation behaviour for now (writing the
+/// image if present, else the text). Native multi-format write on Windows is the
+/// next increment.
+#[cfg(not(target_os = "macos"))]
+fn write_multiple_contents(contents: &[ClipboardContent]) -> Result<(), String> {
+    if let Some(image) = contents.iter().find_map(|content| match content {
+        ClipboardContent::Image(image) => Some(image),
+        _ => None,
+    }) {
+        return write_image(image);
+    }
+    if let Some(text) = contents.iter().find_map(|content| match content {
+        ClipboardContent::Text(text) => Some(text),
+        _ => None,
+    }) {
+        return write_text(text);
+    }
+    Ok(())
+}
+
 /// Reads whatever is currently on the clipboard. The shared policy lives here:
 /// when the platform can identify a current image format, wait for an image
 /// read instead of falling back to stale text from a previous clipboard format.
 pub(crate) fn read_content() -> Option<ClipboardContent> {
     read_content_for_hint(content_hint(), read_text_content, read_image_content)
+}
+
+/// Reads *every* representation on the clipboard, not just one, so a rich copy
+/// that carries both text and an image (or several images) travels intact
+/// instead of losing all but the first. A fresh copy always clears the previous
+/// contents, so reading both text and image here cannot mix stale data.
+pub(crate) fn read_contents() -> Vec<ClipboardContent> {
+    read_contents_for_hint(content_hint(), read_text_content, read_all_image_contents)
+}
+
+fn read_contents_for_hint<F, G>(
+    hint: ClipboardContentHint,
+    mut read_text: F,
+    mut read_images: G,
+) -> Vec<ClipboardContent>
+where
+    F: FnMut() -> Option<ClipboardContent>,
+    G: FnMut() -> Vec<ClipboardContent>,
+{
+    let mut contents = Vec::new();
+    // A pure-image hint means there is no text representation to fetch; a
+    // pure-text hint means no image. Unknown (macOS) may be either or both.
+    if !matches!(hint, ClipboardContentHint::Image) {
+        contents.extend(read_text());
+    }
+    if !matches!(hint, ClipboardContentHint::Text) {
+        contents.extend(read_images());
+    }
+    contents
+}
+
+fn read_all_image_contents() -> Vec<ClipboardContent> {
+    read_all_images()
+        .into_iter()
+        .map(ClipboardContent::Image)
+        .collect()
 }
 
 fn read_content_for_hint<F, G>(
@@ -303,6 +535,13 @@ fn read_image() -> Option<ClipboardImage> {
             None
         }
     })
+}
+
+/// Reads all image representations on the clipboard.
+/// ponytail: single image via arboard for now; macOS NSPasteboard multi-item
+/// read (真正多图) is the next increment.
+fn read_all_images() -> Vec<ClipboardImage> {
+    read_image().into_iter().collect()
 }
 
 fn write_image(image: &ClipboardImage) -> Result<(), String> {

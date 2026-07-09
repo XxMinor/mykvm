@@ -5220,6 +5220,69 @@ struct ClipboardFormat {
     image: Option<ClipboardImage>,
 }
 
+/// Combined fingerprint over every representation, so the echo/dedup checks
+/// treat "text + image" as one clipboard state distinct from either alone.
+fn clipboard_contents_signature(contents: &[ClipboardContent]) -> String {
+    contents
+        .iter()
+        .map(ClipboardContent::signature)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Builds a packet carrying *all* representations. The legacy `text`/`image`
+/// fields are filled from the first of each kind so a pre-multi-format peer
+/// still gets something usable.
+fn clipboard_packet_from_contents(
+    contents: Vec<ClipboardContent>,
+    origin_id: String,
+    target_id: String,
+    cluster_id: String,
+    pair_secret: String,
+    sequence: u64,
+) -> ClipboardPacket {
+    let signature = clipboard_contents_signature(&contents);
+    let mut formats = Vec::with_capacity(contents.len());
+    let mut legacy_text = String::new();
+    let mut legacy_image: Option<ClipboardImage> = None;
+    for content in contents {
+        match content {
+            ClipboardContent::Text(text) => {
+                if legacy_text.is_empty() {
+                    legacy_text = text.clone();
+                }
+                formats.push(ClipboardFormat {
+                    kind: "plainText".into(),
+                    text,
+                    image: None,
+                });
+            }
+            ClipboardContent::Image(image) => {
+                if legacy_image.is_none() {
+                    legacy_image = Some(image.clone());
+                }
+                formats.push(ClipboardFormat {
+                    kind: "imageRgba".into(),
+                    text: String::new(),
+                    image: Some(image),
+                });
+            }
+        }
+    }
+    ClipboardPacket {
+        protocol: CLIPBOARD_PROTOCOL.into(),
+        origin_id,
+        target_id,
+        cluster_id,
+        pair_secret,
+        signature,
+        formats,
+        text: legacy_text,
+        image: legacy_image,
+        sequence,
+    }
+}
+
 fn clipboard_packet_from_content(
     content: ClipboardContent,
     origin_id: String,
@@ -5313,14 +5376,15 @@ fn run_clipboard_sync(
             continue;
         }
 
-        let Some(content) = clipboard::read_content() else {
+        let contents = clipboard::read_contents();
+        if contents.is_empty() {
             last_token = token;
             last_target_key = Some(target_key);
             continue;
-        };
+        }
         last_token = token;
         last_target_key = Some(target_key);
-        let signature = content.signature();
+        let signature = clipboard_contents_signature(&contents);
 
         // If this is the content we just wrote after receiving a peer packet,
         // suppress it. A different signature during the grace window is treated
@@ -5338,7 +5402,7 @@ fn run_clipboard_sync(
             }
         }
 
-        if content.is_oversized() {
+        if contents.iter().any(|content| content.is_oversized()) {
             continue;
         }
 
@@ -5386,8 +5450,8 @@ fn run_clipboard_sync(
         }
 
         sequence = sequence.saturating_add(1);
-        let packet = clipboard_packet_from_content(
-            content,
+        let packet = clipboard_packet_from_contents(
+            contents,
             local_peer_id.clone(),
             target.device_id.clone(),
             target.cluster_id.clone(),
@@ -5444,28 +5508,28 @@ fn arm_clipboard_echo_guard(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) 
     }
 }
 
-fn write_clipboard_content_with_retry(content: &ClipboardContent) -> Result<(), String> {
-    retry_clipboard_content_write(
-        content,
+fn write_clipboard_contents_with_retry(contents: &[ClipboardContent]) -> Result<(), String> {
+    retry_clipboard_contents_write(
+        contents,
         CLIPBOARD_WRITE_ATTEMPTS,
         Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
-        clipboard::write_content,
+        clipboard::write_contents,
     )
 }
 
-fn retry_clipboard_content_write<F>(
-    content: &ClipboardContent,
+fn retry_clipboard_contents_write<F>(
+    contents: &[ClipboardContent],
     attempts: usize,
     retry_delay: Duration,
-    mut write_content: F,
+    mut write_contents: F,
 ) -> Result<(), String>
 where
-    F: FnMut(&ClipboardContent) -> Result<(), String>,
+    F: FnMut(&[ClipboardContent]) -> Result<(), String>,
 {
     let attempts = attempts.max(1);
     let mut last_error = None;
     for attempt in 0..attempts {
-        match write_content(content) {
+        match write_contents(contents) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -5492,7 +5556,7 @@ fn handle_clipboard_packet(
         clipboard_seen_text,
         clipboard_echo_until,
         clipboard_last_sequences,
-        write_clipboard_content_with_retry,
+        write_clipboard_contents_with_retry,
     );
 
     if written {
@@ -5502,9 +5566,10 @@ fn handle_clipboard_packet(
         // once the grace window passed — bouncing the image back to the peer
         // and overwriting anything they had copied since ("paste gives the
         // previous value"). The read-back signature makes the echo check exact.
-        if let Some(read_back) = clipboard::read_content() {
+        let read_back = clipboard::read_contents();
+        if !read_back.is_empty() {
             if let Ok(mut seen) = clipboard_seen_text.lock() {
-                *seen = Some(read_back.signature());
+                *seen = Some(clipboard_contents_signature(&read_back));
             }
         }
     }
@@ -5519,10 +5584,10 @@ fn handle_clipboard_packet_with_writer<F>(
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
-    mut write_content: F,
+    mut write_contents: F,
 ) -> bool
 where
-    F: FnMut(&ClipboardContent) -> Result<(), String>,
+    F: FnMut(&[ClipboardContent]) -> Result<(), String>,
 {
     let Some(packet) = decode_wire_packet::<ClipboardPacket>(payload) else {
         return false;
@@ -5549,17 +5614,17 @@ where
     }
 
     let accepted_sequence = clipboard_packet_sequence(&packet);
-    let content = clipboard_content_from_packet(packet);
+    let contents = clipboard_contents_from_packet(packet);
 
-    let Some(content) = content else {
+    if contents.is_empty() {
         return false;
-    };
-    if content.is_oversized() {
+    }
+    if contents.iter().any(|content| content.is_oversized()) {
         return false;
     }
 
-    let signature = content.signature();
-    let written = match write_content(&content) {
+    let signature = clipboard_contents_signature(&contents);
+    let written = match write_contents(&contents) {
         Ok(()) => true,
         Err(error) => {
             log::warn!("clipboard receive write failed: {error}");
@@ -5638,21 +5703,23 @@ fn clipboard_packet_targets_local(
         .any(|device| device.role == "local" && device.id == packet.target_id)
 }
 
-fn clipboard_content_from_packet(packet: ClipboardPacket) -> Option<ClipboardContent> {
-    if let Some(content) = packet
+fn clipboard_contents_from_packet(packet: ClipboardPacket) -> Vec<ClipboardContent> {
+    let contents: Vec<ClipboardContent> = packet
         .formats
         .into_iter()
-        .find_map(clipboard_content_from_format)
-    {
-        return Some(content);
+        .filter_map(clipboard_content_from_format)
+        .collect();
+    if !contents.is_empty() {
+        return contents;
     }
 
+    // Legacy single-representation peers: fall back to the flat text/image fields.
     if let Some(image) = packet.image {
-        Some(ClipboardContent::Image(image))
+        vec![ClipboardContent::Image(image)]
     } else if !packet.text.is_empty() {
-        Some(ClipboardContent::Text(packet.text))
+        vec![ClipboardContent::Text(packet.text)]
     } else {
-        None
+        Vec::new()
     }
 }
 
@@ -8835,7 +8902,7 @@ mod tests {
         let content = ClipboardContent::Text("hello".into());
         let mut calls = 0;
 
-        let result = retry_clipboard_content_write(&content, 3, Duration::ZERO, |_| {
+        let result = retry_clipboard_contents_write(&[content], 3, Duration::ZERO, |_| {
             calls += 1;
             if calls < 3 {
                 Err("clipboard busy".into())
@@ -8846,6 +8913,59 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn clipboard_rich_copy_delivers_both_text_and_image() {
+        // A packet carrying both a text and an image format must reassemble to
+        // BOTH representations on the receiver, not just the first one.
+        let layout = test_layout();
+        let packet = ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            origin_id: "peer-client-10-0-0-2".into(),
+            target_id: "local-device".into(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            signature: String::new(),
+            formats: vec![
+                ClipboardFormat {
+                    kind: "plainText".into(),
+                    text: "看图".into(),
+                    image: None,
+                },
+                ClipboardFormat {
+                    kind: "imageRgba".into(),
+                    text: String::new(),
+                    image: Some(ClipboardImage {
+                        width: 1,
+                        height: 1,
+                        rgba_base64: "AAAAAA==".into(),
+                    }),
+                },
+            ],
+            text: "看图".into(),
+            image: None,
+            sequence: 1,
+        };
+
+        let contents = clipboard_contents_from_packet(packet);
+        assert_eq!(contents.len(), 2, "both representations must survive");
+        assert!(matches!(&contents[0], ClipboardContent::Text(t) if t == "看图"));
+        assert!(matches!(&contents[1], ClipboardContent::Image(_)));
+
+        // The send-side builder is the inverse: two contents -> two formats,
+        // with the legacy flat fields filled for old peers.
+        let rebuilt = clipboard_packet_from_contents(
+            contents,
+            "origin".into(),
+            "target".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            2,
+        );
+        assert_eq!(rebuilt.formats.len(), 2);
+        assert_eq!(rebuilt.text, "看图");
+        assert!(rebuilt.image.is_some());
     }
 
     #[test]
@@ -8880,9 +9000,11 @@ mod tests {
             &clipboard_seen_text,
             &clipboard_echo_until,
             &clipboard_last_sequences,
-            |content| {
-                if let ClipboardContent::Text(text) = content {
-                    written = Some(text.clone());
+            |contents| {
+                for content in contents {
+                    if let ClipboardContent::Text(text) = content {
+                        written = Some(text.clone());
+                    }
                 }
                 Ok(())
             },
@@ -8920,9 +9042,11 @@ mod tests {
             &clipboard_seen_text,
             &clipboard_echo_until,
             &clipboard_last_sequences,
-            |content| {
-                if let ClipboardContent::Text(text) = content {
-                    written = Some(text.clone());
+            |contents| {
+                for content in contents {
+                    if let ClipboardContent::Text(text) = content {
+                        written = Some(text.clone());
+                    }
                 }
                 Ok(())
             },
@@ -8964,9 +9088,11 @@ mod tests {
             &clipboard_seen_text,
             &clipboard_echo_until,
             &clipboard_last_sequences,
-            |content| {
-                if let ClipboardContent::Text(text) = content {
-                    written = Some(text.clone());
+            |contents| {
+                for content in contents {
+                    if let ClipboardContent::Text(text) = content {
+                        written = Some(text.clone());
+                    }
                 }
                 Ok(())
             },
@@ -9010,9 +9136,11 @@ mod tests {
                 &clipboard_seen_text,
                 &clipboard_echo_until,
                 &clipboard_last_sequences,
-                |content| {
-                    if let ClipboardContent::Text(text) = content {
-                        written.push(text.clone());
+                |contents| {
+                    for content in contents {
+                        if let ClipboardContent::Text(text) = content {
+                            written.push(text.clone());
+                        }
                     }
                     Ok(())
                 },
