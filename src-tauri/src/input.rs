@@ -43,6 +43,11 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 // After returning to local, refuse to cross back into the remote for this long.
 // Lets a fast back-flick settle at the edge without bouncing into the remote.
 const RETURN_COOLDOWN_MS: u64 = 150;
+// Total outward push (pixels) against the entry edge required before control
+// returns to the local machine. A slide along the edge only jitters out by a few
+// pixels and springs back (resetting the accumulator), so it stays below this; a
+// deliberate outward flick clears it in a frame or two.
+const RETURN_OVERSHOOT_PX: f64 = 20.0;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
 #[cfg(target_os = "macos")]
@@ -143,6 +148,11 @@ struct ActiveTarget {
     y: f64,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     invert_y: bool,
+    // Accumulated outward push against the entry edge. Control returns to local
+    // only once this clears a dead-zone, so a slide ALONG the edge (which nudges
+    // out by jitter and springs back, resetting this) can't flip-flop the
+    // crossing state, while a deliberate outward push still returns promptly.
+    edge_overshoot: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -454,6 +464,7 @@ fn request_screen_switch_from_point(
         x: remote_x,
         y: remote_y,
         invert_y: false,
+        edge_overshoot: 0.0,
     })
 }
 
@@ -3882,6 +3893,7 @@ fn crossing_target_with_transform(
                 x: remote_x,
                 y: remote_y,
                 invert_y,
+                edge_overshoot: 0.0,
             }
         })
 }
@@ -4043,8 +4055,10 @@ fn update_active_remote_screen(
     dy: f64,
     layout_state: &Arc<Mutex<LayoutState>>,
 ) -> bool {
-    // Still within the screen we're already on: nothing to reconcile.
+    // Still within the screen we're already on: nothing to reconcile. Reset the
+    // return accumulator — the cursor is not pressing outward against the edge.
     if point_in_local_bounds(&active.current_screen, active.x, active.y) {
+        active.edge_overshoot = 0.0;
         return false;
     }
 
@@ -4065,13 +4079,19 @@ fn update_active_remote_screen(
         active.y = global_y - screen.y as f64;
         active.current_screen_id = screen.id.clone();
         active.current_screen = screen.clone();
+        active.edge_overshoot = 0.0;
         return false;
     }
 
     // Off the edge with no neighbor there. Only the entry screen borders the
     // local machine, so only it can hand control back; every other outer edge
-    // just clamps the cursor in place.
-    let returned_to_local = active.current_screen_id == active.target.screen_id
+    // just clamps the cursor in place. Rather than return the instant the cursor
+    // touches the edge (any leftward jitter while sliding ALONG the edge would
+    // then flip-flop control and spray the client with CursorPark/MouseMove),
+    // accumulate the outward push and only return once it clears a dead-zone.
+    // Moving back inward resets the accumulator (handled by the early returns
+    // above), so only a sustained deliberate push out hands control back.
+    if active.current_screen_id == active.target.screen_id
         && exited_entry_edge(
             active.target.edge,
             &active.current_screen,
@@ -4079,12 +4099,29 @@ fn update_active_remote_screen(
             active.y,
             dx,
             dy,
-        );
-    if returned_to_local {
-        pin_active_to_entry_edge(active);
+        )
+    {
+        active.edge_overshoot += outward_push(active.target.edge, dx, dy);
+        if active.edge_overshoot >= RETURN_OVERSHOOT_PX {
+            active.edge_overshoot = 0.0;
+            pin_active_to_entry_edge(active);
+            return true;
+        }
+    } else {
+        active.edge_overshoot = 0.0;
     }
 
-    returned_to_local
+    false
+}
+
+/// Magnitude of the movement component pointing outward through `edge`.
+fn outward_push(edge: Edge, dx: f64, dy: f64) -> f64 {
+    match edge {
+        Edge::Right => (-dx).max(0.0),
+        Edge::Left => dx.max(0.0),
+        Edge::Bottom => (-dy).max(0.0),
+        Edge::Top => dy.max(0.0),
+    }
 }
 
 fn should_ignore_initial_anchor_warp_delta(edge: Edge, dx: f64, dy: f64) -> bool {
@@ -6075,6 +6112,7 @@ mod tests {
             x: 100.0,
             y: 1079.0,
             invert_y: false,
+            edge_overshoot: 0.0,
         };
 
         // Pushing down past the primary's bottom edge roams onto the secondary.
@@ -6130,14 +6168,15 @@ mod tests {
             x: 0.0,
             y: 500.0,
             invert_y: false,
+            edge_overshoot: 0.0,
         };
 
-        // Crossed in via the right edge; moving back left off the entry edge
-        // hands control back to the local machine.
-        active.x -= 2.0;
+        // Crossed in via the right edge; a deliberate leftward push past the
+        // entry edge (clearing the return dead-zone) hands control back to local.
+        active.x -= 25.0;
         assert!(update_active_remote_screen(
             &mut active,
-            -2.0,
+            -25.0,
             0.0,
             &layout_state
         ));
@@ -6178,11 +6217,12 @@ mod tests {
             x: 1.0,
             y: 500.0,
             invert_y: false,
+            edge_overshoot: 0.0,
         };
-        // Simulate the small leftward delta the entry-anchor warp can inject.
-        // (Was -RETURN_EDGE_INSET; now that the inset is 0 for edge-flush returns,
-        // use a small fixed delta that still represents the warp's momentum.)
-        let dx = -8.0;
+        // Simulate a leftward entry-anchor warp delta large enough to clear the
+        // return dead-zone, so the guard (not just the dead-zone) is what must
+        // stop it from being mistaken for a deliberate return.
+        let dx = -25.0;
         let dy = 0.0;
 
         let mut unguarded = active.clone();
@@ -6418,6 +6458,7 @@ mod tests {
                 x: x + dx,
                 y: y + dy,
                 invert_y: false,
+                edge_overshoot: 0.0,
             };
 
             assert!(update_active_remote_screen(
