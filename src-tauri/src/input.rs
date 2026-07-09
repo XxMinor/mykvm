@@ -43,12 +43,6 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 // After returning to local, refuse to cross back into the remote for this long.
 // Lets a fast back-flick settle at the edge without bouncing into the remote.
 const RETURN_COOLDOWN_MS: u64 = 150;
-// After crossing into a remote, refuse to hand control back for this long. A
-// slide ALONG the shared edge just after entering otherwise flip-flops the
-// crossing test and sprays the client with alternating CursorPark/MouseMove
-// (visible as the cursor rapidly hiding/showing). A deliberate return happens
-// well after entry, so this guard never blocks it.
-const ENTER_GUARD_MS: u64 = 250;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
 #[cfg(target_os = "macos")]
@@ -770,7 +764,6 @@ fn start_platform_capture(
             last_mouse_move_sent: Mutex::new(None),
             last_cursor_repin: Mutex::new(None),
             last_return: Mutex::new(None),
-            last_enter: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_modifiers: Mutex::new(Vec::new()),
             pressed_keys: Mutex::new(Vec::new()),
@@ -966,7 +959,6 @@ fn start_platform_capture(
             last_point: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
             last_return: Mutex::new(None),
-            last_enter: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_keys: Mutex::new(Vec::new()),
             cursor_hide_calls: Mutex::new(0),
@@ -2333,11 +2325,6 @@ struct MacCaptureContext {
     // immediately re-satisfy the crossing test and bounce to the remote. During
     // the cooldown window we refuse to cross, letting the user's slide settle.
     last_return: Mutex<Option<Instant>>,
-    // Instant control last crossed out to a remote. For a short guard after
-    // entering we refuse to hand control back, so sliding ALONG the shared edge
-    // right after crossing in can't immediately bounce control back out and
-    // flicker the client cursor. A deliberate return happens well after entry.
-    last_enter: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_modifiers: Mutex<Vec<u16>>,
     // Regular (non-modifier) keys we have forwarded as held, so they can be
@@ -2505,13 +2492,12 @@ struct WindowsCaptureContext {
     anchor: Mutex<Option<(f64, f64)>>,
     last_point: Mutex<Option<(f64, f64)>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
-    // Instant control last returned to this machine, and last crossed out to a
-    // remote. Together they debounce the shared edge: no re-cross for a moment
-    // after returning, and no return for a moment after crossing in — so sliding
-    // ALONG the edge can't flip-flop the crossing state and spray the client with
-    // alternating CursorPark/MouseMove (the cursor hide/show flicker).
+    // Instant control last returned to this machine. After returning we refuse to
+    // re-cross for a short cooldown so a slide that settles at the edge (or edge
+    // jitter) doesn't bounce straight back into the remote. The mac path already
+    // had this; the Windows path did not, so it re-crossed instantly and sprayed
+    // the client with alternating CursorPark/MouseMove (the hide/show flicker).
     last_return: Mutex<Option<Instant>>,
-    last_enter: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_keys: Mutex<Vec<u16>>,
     cursor_hide_calls: Mutex<u8>,
@@ -3198,9 +3184,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         active_target.x += dx;
         active_target.y += dy;
 
-        if update_active_remote_screen(active_target, dx, dy, &context.layout_state)
-            && !within_recent(&context.last_enter, ENTER_GUARD_MS)
-        {
+        if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
             let point = local_return_point(active_target);
             let target = active_target.target.clone();
             // Control is returning to the local machine: park the controlled
@@ -3314,7 +3298,6 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             *anchor_state = Some(anchor);
         }
         context.just_crossed.store(true, Ordering::Relaxed);
-        mark_instant(&context.last_enter);
         return true;
     }
 
@@ -3670,9 +3653,7 @@ fn handle_macos_mouse_move(
             active_target.x += dx;
             active_target.y += dy;
 
-            if update_active_remote_screen(active_target, dx, dy, &context.layout_state)
-                && !within_recent(&context.last_enter, ENTER_GUARD_MS)
-            {
+            if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
                 let point = local_return_point(active_target);
                 let invert_y = active_target.invert_y;
                 let target = active_target.target.clone();
@@ -3832,7 +3813,6 @@ fn handle_macos_mouse_move(
             *anchor_state = Some(anchor);
         }
         context.just_crossed.store(true, Ordering::Relaxed);
-        mark_instant(&context.last_enter);
         return CallbackResult::Drop;
     }
 
