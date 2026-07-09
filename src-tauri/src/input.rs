@@ -5583,8 +5583,36 @@ pub fn reset_injected_modifiers() {
 /// "Caps Lock switches to a different input source" setting. Injecting a caps
 /// keycode does not trigger this on modern macOS (the OS only reacts to the
 /// physical key), so we drive the Text Input Sources API directly.
+///
+/// TIS asserts it runs on the main dispatch queue, but injection happens on a
+/// QUIC worker thread — calling it there traps (SIGTRAP). Hop to the main thread.
 #[cfg(target_os = "macos")]
 fn macos_switch_to_next_input_source() {
+    use std::os::raw::c_void;
+    extern "C" {
+        fn dispatch_async_f(
+            queue: *const c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+        static _dispatch_main_q: c_void;
+    }
+    unsafe {
+        dispatch_async_f(
+            &_dispatch_main_q as *const c_void,
+            std::ptr::null_mut(),
+            macos_switch_input_source_thunk,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn macos_switch_input_source_thunk(_: *mut std::os::raw::c_void) {
+    macos_do_switch_input_source();
+}
+
+#[cfg(target_os = "macos")]
+fn macos_do_switch_input_source() {
     use std::os::raw::c_void;
 
     #[link(name = "Carbon", kind = "framework")]
