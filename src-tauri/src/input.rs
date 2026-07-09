@@ -43,6 +43,12 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 // After returning to local, refuse to cross back into the remote for this long.
 // Lets a fast back-flick settle at the edge without bouncing into the remote.
 const RETURN_COOLDOWN_MS: u64 = 150;
+// After crossing into a remote, refuse to hand control back for this long. A
+// slide ALONG the shared edge just after entering otherwise flip-flops the
+// crossing test and sprays the client with alternating CursorPark/MouseMove
+// (visible as the cursor rapidly hiding/showing). A deliberate return happens
+// well after entry, so this guard never blocks it.
+const ENTER_GUARD_MS: u64 = 250;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
 #[cfg(target_os = "macos")]
@@ -764,6 +770,7 @@ fn start_platform_capture(
             last_mouse_move_sent: Mutex::new(None),
             last_cursor_repin: Mutex::new(None),
             last_return: Mutex::new(None),
+            last_enter: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_modifiers: Mutex::new(Vec::new()),
             pressed_keys: Mutex::new(Vec::new()),
@@ -958,6 +965,8 @@ fn start_platform_capture(
             anchor: Mutex::new(None),
             last_point: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
+            last_return: Mutex::new(None),
+            last_enter: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_keys: Mutex::new(Vec::new()),
             cursor_hide_calls: Mutex::new(0),
@@ -2324,6 +2333,11 @@ struct MacCaptureContext {
     // immediately re-satisfy the crossing test and bounce to the remote. During
     // the cooldown window we refuse to cross, letting the user's slide settle.
     last_return: Mutex<Option<Instant>>,
+    // Instant control last crossed out to a remote. For a short guard after
+    // entering we refuse to hand control back, so sliding ALONG the shared edge
+    // right after crossing in can't immediately bounce control back out and
+    // flicker the client cursor. A deliberate return happens well after entry.
+    last_enter: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_modifiers: Mutex<Vec<u16>>,
     // Regular (non-modifier) keys we have forwarded as held, so they can be
@@ -2491,6 +2505,13 @@ struct WindowsCaptureContext {
     anchor: Mutex<Option<(f64, f64)>>,
     last_point: Mutex<Option<(f64, f64)>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
+    // Instant control last returned to this machine, and last crossed out to a
+    // remote. Together they debounce the shared edge: no re-cross for a moment
+    // after returning, and no return for a moment after crossing in — so sliding
+    // ALONG the edge can't flip-flop the crossing state and spray the client with
+    // alternating CursorPark/MouseMove (the cursor hide/show flicker).
+    last_return: Mutex<Option<Instant>>,
+    last_enter: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_keys: Mutex<Vec<u16>>,
     cursor_hide_calls: Mutex<u8>,
@@ -3177,7 +3198,9 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         active_target.x += dx;
         active_target.y += dy;
 
-        if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
+        if update_active_remote_screen(active_target, dx, dy, &context.layout_state)
+            && !within_recent(&context.last_enter, ENTER_GUARD_MS)
+        {
             let point = local_return_point(active_target);
             let target = active_target.target.clone();
             // Control is returning to the local machine: park the controlled
@@ -3188,6 +3211,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
                 &context.layout_state,
                 &context.input_events,
             );
+            mark_instant(&context.last_return);
             *active = None;
             context.remote_active.store(false, Ordering::Relaxed);
             // Keep the clipboard peer so copies still sync after returning.
@@ -3255,6 +3279,12 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         *last_point = Some((x, y));
     }
 
+    // Cooldown after returning: refuse to re-cross for a moment so a slide that
+    // settles at the edge (or edge jitter) doesn't bounce straight back in.
+    if within_recent(&context.last_return, RETURN_COOLDOWN_MS) {
+        return false;
+    }
+
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
     if let Some(active_target) = crossing_target(&targets, x, y, dx, dy, &context.layout_state) {
         let anchor = local_anchor_point(&active_target);
@@ -3284,6 +3314,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             *anchor_state = Some(anchor);
         }
         context.just_crossed.store(true, Ordering::Relaxed);
+        mark_instant(&context.last_enter);
         return true;
     }
 
@@ -3639,7 +3670,9 @@ fn handle_macos_mouse_move(
             active_target.x += dx;
             active_target.y += dy;
 
-            if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
+            if update_active_remote_screen(active_target, dx, dy, &context.layout_state)
+                && !within_recent(&context.last_enter, ENTER_GUARD_MS)
+            {
                 let point = local_return_point(active_target);
                 let invert_y = active_target.invert_y;
                 let target = active_target.target.clone();
@@ -3799,6 +3832,7 @@ fn handle_macos_mouse_move(
             *anchor_state = Some(anchor);
         }
         context.just_crossed.store(true, Ordering::Relaxed);
+        mark_instant(&context.last_enter);
         return CallbackResult::Drop;
     }
 
@@ -4098,25 +4132,30 @@ fn point_in_screen(screen: &Screen, global_x: f64, global_y: f64) -> bool {
 /// Whether the cursor has crossed back over the edge it originally entered from
 /// (the side bordering the local machine). Mirrors the classic single-screen
 /// return-to-local test, applied to the entry screen.
+/// True if `slot` holds an instant less than `ms` milliseconds ago.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn within_recent(slot: &Mutex<Option<Instant>>, ms: u64) -> bool {
+    slot.lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .map(|when| when.elapsed() < Duration::from_millis(ms))
+        .unwrap_or(false)
+}
+
+/// Stamp `slot` with the current instant.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn mark_instant(slot: &Mutex<Option<Instant>>) {
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(Instant::now());
+    }
+}
+
 fn exited_entry_edge(edge: Edge, screen: &Screen, x: f64, y: f64, dx: f64, dy: f64) -> bool {
-    // A genuine return is an outward push THROUGH the entry edge, not a slide
-    // ALONG it. Sliding down/across the edge produces a large tangential delta
-    // (dy for a vertical edge) with only small outward noise (dx). The old test
-    // `dx < 0.0` treated any leftward sub-pixel jitter as a return, so sliding
-    // along the shared edge flip-flopped the crossing state every frame and the
-    // server sprayed alternating CursorPark/MouseMove at the client — seen as the
-    // cursor rapidly hiding/showing. Require the outward delta to clear a small
-    // floor AND dominate the tangential delta before handing control back.
-    const RETURN_MIN_OUTWARD: f64 = 5.0;
     match edge {
-        Edge::Right => x <= 0.0 && dx <= -RETURN_MIN_OUTWARD && dx.abs() >= dy.abs(),
-        Edge::Left => {
-            x >= (screen.width - 1) as f64 && dx >= RETURN_MIN_OUTWARD && dx.abs() >= dy.abs()
-        }
-        Edge::Bottom => y <= 0.0 && dy <= -RETURN_MIN_OUTWARD && dy.abs() >= dx.abs(),
-        Edge::Top => {
-            y >= (screen.height - 1) as f64 && dy >= RETURN_MIN_OUTWARD && dy.abs() >= dx.abs()
-        }
+        Edge::Right => x <= 0.0 && dx < 0.0,
+        Edge::Left => x >= (screen.width - 1) as f64 && dx > 0.0,
+        Edge::Bottom => y <= 0.0 && dy < 0.0,
+        Edge::Top => y >= (screen.height - 1) as f64 && dy > 0.0,
     }
 }
 
@@ -6113,13 +6152,12 @@ mod tests {
             invert_y: false,
         };
 
-        // Crossed in via the right edge; a genuine outward push back off the entry
-        // edge (clearing the return hysteresis floor) hands control to the local
-        // machine.
-        active.x -= 6.0;
+        // Crossed in via the right edge; moving back left off the entry edge
+        // hands control back to the local machine.
+        active.x -= 2.0;
         assert!(update_active_remote_screen(
             &mut active,
-            -6.0,
+            -2.0,
             0.0,
             &layout_state
         ));
