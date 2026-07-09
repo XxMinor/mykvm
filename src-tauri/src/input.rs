@@ -5613,6 +5613,11 @@ extern "C" fn macos_switch_input_source_thunk(_: *mut std::os::raw::c_void) {
 
 #[cfg(target_os = "macos")]
 fn macos_do_switch_input_source() {
+    use core_foundation::{
+        base::TCFType,
+        dictionary::CFDictionary,
+        string::{CFString, CFStringRef},
+    };
     use std::os::raw::c_void;
 
     #[link(name = "Carbon", kind = "framework")]
@@ -5620,6 +5625,8 @@ fn macos_do_switch_input_source() {
         fn TISCreateInputSourceList(properties: *const c_void, include_all: bool) -> *const c_void;
         fn TISCopyCurrentKeyboardInputSource() -> *const c_void;
         fn TISSelectInputSource(source: *const c_void) -> i32;
+        static kTISPropertyInputSourceCategory: CFStringRef;
+        static kTISCategoryKeyboardInputSource: CFStringRef;
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
@@ -5630,8 +5637,16 @@ fn macos_do_switch_input_source() {
     }
 
     unsafe {
-        // Selectable, currently-enabled input sources — the ones the user cycles.
-        let list = TISCreateInputSourceList(std::ptr::null(), false);
+        // Restrict to keyboard input sources so non-keyboard entries (e.g. the
+        // emoji picker) don't land in the cycle and break the switch.
+        let category_key = CFString::wrap_under_get_rule(kTISPropertyInputSourceCategory);
+        let keyboard_value = CFString::wrap_under_get_rule(kTISCategoryKeyboardInputSource);
+        let filter = CFDictionary::from_CFType_pairs(&[(
+            category_key.as_CFType(),
+            keyboard_value.as_CFType(),
+        )]);
+        let list =
+            TISCreateInputSourceList(filter.as_concrete_TypeRef() as *const c_void, false);
         if list.is_null() {
             return;
         }
