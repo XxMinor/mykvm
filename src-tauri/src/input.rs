@@ -1074,9 +1074,14 @@ static MACOS_RECEIVE_PARK_POINT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// tucked, mirroring how the server hides its own cursor while driving a remote.
 #[cfg(target_os = "macos")]
 fn macos_receive_hide_cursor(x: i32, y: i32) {
+    use core_graphics::{display::CGDisplay, geometry::CGPoint};
+
+    // Warp only — no posted mouse-move event, which the system would service by
+    // re-showing the cursor and undoing the hide below.
+    let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x as f64, y as f64));
     enable_macos_background_cursor_hide();
     set_macos_cursor_transparent(true);
-    let _ = core_graphics::display::CGDisplay::main().hide_cursor();
+    let _ = CGDisplay::main().hide_cursor();
     if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
         *point = Some((x as f64, y as f64));
     }
@@ -2123,13 +2128,16 @@ fn inject_input_command(command: InputCommand) {
     }
 }
 
-/// Control has left this client. Move the cursor to the tucked-away point; on
-/// macOS also hide it (it reappears on the next injected move or when the local
-/// user moves the mouse, via the receive-monitor drift check).
+/// Control has left this client. On macOS, hide the cursor (it reappears on the
+/// next injected move or when the local user moves the mouse, via the
+/// receive-monitor drift check). Elsewhere, just tuck it into the corner.
 fn inject_cursor_park(x: i32, y: i32) {
-    inject_mouse_move(x, y, None);
     #[cfg(target_os = "macos")]
     macos_receive_hide_cursor(x, y);
+    // Not on macOS: inject_mouse_move posts a mouse-move event that re-shows the
+    // cursor, which would defeat the hide — so only the non-macOS path uses it.
+    #[cfg(not(target_os = "macos"))]
+    inject_mouse_move(x, y, None);
 }
 
 #[cfg(target_os = "windows")]
