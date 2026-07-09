@@ -1065,7 +1065,70 @@ fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
     });
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+static MACOS_RECEIVE_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MACOS_RECEIVE_PARK_POINT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+/// Control just left this macOS client: hide the local cursor where it was
+/// tucked, mirroring how the server hides its own cursor while driving a remote.
+#[cfg(target_os = "macos")]
+fn macos_receive_hide_cursor(x: i32, y: i32) {
+    enable_macos_background_cursor_hide();
+    set_macos_cursor_transparent(true);
+    let _ = core_graphics::display::CGDisplay::main().hide_cursor();
+    if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
+        *point = Some((x as f64, y as f64));
+    }
+    MACOS_RECEIVE_CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+}
+
+/// Reveal the cursor hidden by `macos_receive_hide_cursor`. Idempotent: the
+/// swap ensures the balancing show/pop runs exactly once per hide, so the
+/// stack-based NSCursor/CGDisplay calls stay paired.
+#[cfg(target_os = "macos")]
+fn macos_receive_show_cursor_if_hidden() {
+    if !MACOS_RECEIVE_CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    set_macos_cursor_transparent(false);
+    let _ = core_graphics::display::CGDisplay::main().show_cursor();
+    if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
+        *point = None;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        // While the cursor is hidden (control has left), watch for the local
+        // user physically moving the mouse — the cursor drifts off the parked
+        // point — and reveal it so they can use this machine again. An injected
+        // move from the server reveals it directly (see inject_input_command).
+        const RECEIVE_CURSOR_DRIFT_PX: f64 = 3.0;
+        while !stop.load(Ordering::Relaxed) {
+            if MACOS_RECEIVE_CURSOR_HIDDEN.load(Ordering::Relaxed) {
+                let parked = MACOS_RECEIVE_PARK_POINT
+                    .lock()
+                    .ok()
+                    .and_then(|point| *point);
+                if let (Some((px, py)), Some(location)) = (parked, macos_current_cursor_location())
+                {
+                    if (location.x - px).abs() > RECEIVE_CURSOR_DRIFT_PX
+                        || (location.y - py).abs() > RECEIVE_CURSOR_DRIFT_PX
+                    {
+                        macos_receive_show_cursor_if_hidden();
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Never leave the cursor hidden after the runtime stops.
+        macos_receive_show_cursor_if_hidden();
+    });
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn start_platform_receive_monitor(_stop: Arc<AtomicBool>) {}
 
 fn no_target_status(layout: &LayoutState) -> NativeStageStatus {
@@ -1266,7 +1329,7 @@ fn send_packet(
     // wants "latest wins" over guaranteed delivery.
     let send_reliable = matches!(
         event,
-        InputEvent::Key { .. } | InputEvent::MouseButton { .. }
+        InputEvent::Key { .. } | InputEvent::MouseButton { .. } | InputEvent::CursorPark { .. }
     );
     let send_latest = matches!(event, InputEvent::MouseMove { .. });
     let packet = InputPacket {
@@ -1998,30 +2061,22 @@ fn input_event_to_command(
 ) -> Option<InputCommand> {
     match event {
         InputEvent::MouseMove { screen_id, x, y } => {
-            if let Some(screen) = local_screen_for_event(layout, &screen_id) {
-                let native_screen = local_screen_for_event(native_layout, &screen_id)
-                    .map(platform_native_screen)
-                    .unwrap_or_else(|| platform_native_screen(screen));
-                let absolute_x = map_relative_to_native_axis(
-                    x,
-                    screen.width,
-                    native_screen.x,
-                    native_screen.width,
-                );
-                let absolute_y = map_relative_to_native_axis(
-                    y,
-                    screen.height,
-                    native_screen.y,
-                    native_screen.height,
-                );
-                let drag_button = update_remote_mouse_position(absolute_x, absolute_y);
-                return Some(InputCommand::MouseMove {
-                    x: absolute_x,
-                    y: absolute_y,
-                    drag_button,
-                });
-            }
-            None
+            let (absolute_x, absolute_y) =
+                map_event_point_to_native(layout, native_layout, &screen_id, x, y)?;
+            let drag_button = update_remote_mouse_position(absolute_x, absolute_y);
+            Some(InputCommand::MouseMove {
+                x: absolute_x,
+                y: absolute_y,
+                drag_button,
+            })
+        }
+        InputEvent::CursorPark { screen_id, x, y } => {
+            let (absolute_x, absolute_y) =
+                map_event_point_to_native(layout, native_layout, &screen_id, x, y)?;
+            Some(InputCommand::CursorPark {
+                x: absolute_x,
+                y: absolute_y,
+            })
         }
         InputEvent::MouseButton { button, down } => {
             let (x, y) = update_remote_mouse_button(button, down);
@@ -2032,14 +2087,49 @@ fn input_event_to_command(
     }
 }
 
+/// Maps a remote screen-relative point to this machine's native pixel coords.
+fn map_event_point_to_native(
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+    screen_id: &str,
+    x: i32,
+    y: i32,
+) -> Option<(i32, i32)> {
+    let screen = local_screen_for_event(layout, screen_id)?;
+    let native_screen = local_screen_for_event(native_layout, screen_id)
+        .map(platform_native_screen)
+        .unwrap_or_else(|| platform_native_screen(screen));
+    let absolute_x =
+        map_relative_to_native_axis(x, screen.width, native_screen.x, native_screen.width);
+    let absolute_y =
+        map_relative_to_native_axis(y, screen.height, native_screen.y, native_screen.height);
+    Some((absolute_x, absolute_y))
+}
+
 fn inject_input_command(command: InputCommand) {
     match command {
-        InputCommand::MouseMove { x, y, drag_button } => inject_mouse_move(x, y, drag_button),
+        InputCommand::MouseMove { x, y, drag_button } => {
+            // Control is back on this client — reveal the cursor we hid when it
+            // last left, then move it.
+            #[cfg(target_os = "macos")]
+            macos_receive_show_cursor_if_hidden();
+            inject_mouse_move(x, y, drag_button);
+        }
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
         InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
+        InputCommand::CursorPark { x, y } => inject_cursor_park(x, y),
         InputCommand::ReleaseAll | InputCommand::SecureAttention => {}
     }
+}
+
+/// Control has left this client. Move the cursor to the tucked-away point; on
+/// macOS also hide it (it reappears on the next injected move or when the local
+/// user moves the mouse, via the receive-monitor drift check).
+fn inject_cursor_park(x: i32, y: i32) {
+    inject_mouse_move(x, y, None);
+    #[cfg(target_os = "macos")]
+    macos_receive_hide_cursor(x, y);
 }
 
 #[cfg(target_os = "windows")]
@@ -4123,7 +4213,7 @@ fn send_remote_cursor_park(
     send_packet(
         quic_transport,
         &active.target,
-        InputEvent::MouseMove {
+        InputEvent::CursorPark {
             screen_id: active.current_screen_id.clone(),
             x: park_x,
             y: park_y,

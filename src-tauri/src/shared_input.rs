@@ -11,10 +11,31 @@ pub const INPUT_SERVICE_DISPLAY_NAME: &str = "MyKVM Lock Screen Input Service";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum InputEvent {
-    MouseMove { screen_id: String, x: i32, y: i32 },
-    MouseButton { button: MouseButton, down: bool },
-    Scroll { delta_x: i32, delta_y: i32 },
-    Key { key_code: u16, down: bool },
+    MouseMove {
+        screen_id: String,
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: MouseButton,
+        down: bool,
+    },
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    Key {
+        key_code: u16,
+        down: bool,
+    },
+    /// Control has left this client: tuck the controlled cursor away at (x, y)
+    /// and, where supported, hide it — it reappears on the next injected move or
+    /// as soon as the local user physically moves the mouse.
+    CursorPark {
+        screen_id: String,
+        x: i32,
+        y: i32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +67,10 @@ pub enum InputCommand {
     Key {
         key_code: u16,
         down: bool,
+    },
+    CursorPark {
+        x: i32,
+        y: i32,
     },
     ReleaseAll,
     SecureAttention,
