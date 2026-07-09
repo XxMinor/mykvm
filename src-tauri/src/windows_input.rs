@@ -56,6 +56,9 @@ pub fn inject_command_without_tracking(command: &InputCommand) {
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
         InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
+        // Windows has no reliable background cursor-hide; just tuck it into the
+        // corner, matching the previous park behaviour.
+        InputCommand::CursorPark { x, y } => inject_mouse_move(x, y, None),
         InputCommand::ReleaseAll => {}
         InputCommand::SecureAttention => {
             let _ = send_secure_attention();
