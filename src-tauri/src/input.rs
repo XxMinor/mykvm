@@ -4966,15 +4966,32 @@ fn move_macos_cursor_without_event(
     context: &MacCaptureContext,
     point: core_graphics::geometry::CGPoint,
 ) {
-    move_macos_cursor_without_event_on_displays(point, &context.display_snapshots);
+    // CGDisplayMoveCursorToPoint re-shows a hidden pointer (documented side
+    // effect), so when we've just hidden the cursor to cross into a remote it
+    // would flash back at the anchor and linger until the next repin re-hides
+    // it — the "cursor still shows for a beat at the edge" stutter. While the
+    // cursor is hidden, warp instead: CGWarpMouseCursorPosition moves it in
+    // global coordinates without changing visibility.
+    let cursor_hidden = context
+        .cursor_hidden
+        .lock()
+        .map(|hidden| *hidden)
+        .unwrap_or(false);
+    move_macos_cursor_without_event_on_displays(point, &context.display_snapshots, cursor_hidden);
 }
 
 #[cfg(target_os = "macos")]
 fn move_macos_cursor_without_event_on_displays(
     point: core_graphics::geometry::CGPoint,
     displays: &[MacDisplaySnapshot],
+    keep_hidden: bool,
 ) {
     use core_graphics::display::CGDisplay;
+
+    if keep_hidden {
+        let _ = CGDisplay::warp_mouse_cursor_position(point);
+        return;
+    }
 
     for display in displays {
         if point.x >= display.origin_x
