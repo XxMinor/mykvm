@@ -5613,11 +5613,6 @@ extern "C" fn macos_switch_input_source_thunk(_: *mut std::os::raw::c_void) {
 
 #[cfg(target_os = "macos")]
 fn macos_do_switch_input_source() {
-    use core_foundation::{
-        base::TCFType,
-        dictionary::CFDictionary,
-        string::{CFString, CFStringRef},
-    };
     use std::os::raw::c_void;
 
     #[link(name = "Carbon", kind = "framework")]
@@ -5625,8 +5620,9 @@ fn macos_do_switch_input_source() {
         fn TISCreateInputSourceList(properties: *const c_void, include_all: bool) -> *const c_void;
         fn TISCopyCurrentKeyboardInputSource() -> *const c_void;
         fn TISSelectInputSource(source: *const c_void) -> i32;
-        static kTISPropertyInputSourceCategory: CFStringRef;
-        static kTISCategoryKeyboardInputSource: CFStringRef;
+        fn TISGetInputSourceProperty(source: *const c_void, key: *const c_void) -> *const c_void;
+        static kTISPropertyInputSourceCategory: *const c_void;
+        static kTISCategoryKeyboardInputSource: *const c_void;
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
@@ -5637,22 +5633,33 @@ fn macos_do_switch_input_source() {
     }
 
     unsafe {
-        // Restrict to keyboard input sources so non-keyboard entries (e.g. the
-        // emoji picker) don't land in the cycle and break the switch.
-        let category_key = CFString::wrap_under_get_rule(kTISPropertyInputSourceCategory);
-        let keyboard_value = CFString::wrap_under_get_rule(kTISCategoryKeyboardInputSource);
-        let filter = CFDictionary::from_CFType_pairs(&[(
-            category_key.as_CFType(),
-            keyboard_value.as_CFType(),
-        )]);
-        let list =
-            TISCreateInputSourceList(filter.as_concrete_TypeRef() as *const c_void, false);
+        let list = TISCreateInputSourceList(std::ptr::null(), false);
         if list.is_null() {
             return;
         }
         let count = CFArrayGetCount(list);
         let current = TISCopyCurrentKeyboardInputSource();
-        if count < 2 || current.is_null() {
+
+        // Keep only keyboard-category sources — the filter dictionary approach
+        // did not take effect, so classify each source directly. This drops the
+        // emoji picker / handwriting etc. that were stalling the cycle.
+        let mut keyboards: Vec<*const c_void> = Vec::new();
+        for i in 0..count {
+            let src = CFArrayGetValueAtIndex(list, i);
+            if src.is_null() {
+                continue;
+            }
+            let category = TISGetInputSourceProperty(src, kTISPropertyInputSourceCategory);
+            if !category.is_null() && CFEqual(category, kTISCategoryKeyboardInputSource) != 0 {
+                keyboards.push(src);
+            }
+        }
+
+        if keyboards.len() < 2 || current.is_null() {
+            log::info!(
+                "[diag] caps: {} keyboard sources (of {count}); no switch",
+                keyboards.len()
+            );
             if !current.is_null() {
                 CFRelease(current);
             }
@@ -5660,24 +5667,21 @@ fn macos_do_switch_input_source() {
             return;
         }
 
-        let mut current_index = -1_isize;
-        for i in 0..count {
-            let item = CFArrayGetValueAtIndex(list, i);
-            if !item.is_null() && CFEqual(item, current) != 0 {
-                current_index = i;
-                break;
-            }
-        }
+        let current_index = keyboards
+            .iter()
+            .position(|&src| CFEqual(src, current) != 0)
+            .map(|i| i as isize)
+            .unwrap_or(-1);
         let next_index = if current_index >= 0 {
-            (current_index + 1) % count
+            (current_index as usize + 1) % keyboards.len()
         } else {
             0
         };
-        let next = CFArrayGetValueAtIndex(list, next_index);
-        if !next.is_null() {
-            let _ = TISSelectInputSource(next);
-            log::info!("[diag] caps -> switched input source ({current_index} -> {next_index})");
-        }
+        let _ = TISSelectInputSource(keyboards[next_index]);
+        log::info!(
+            "[diag] caps switch among {} kbd sources: {current_index} -> {next_index}",
+            keyboards.len()
+        );
 
         CFRelease(current);
         CFRelease(list);
