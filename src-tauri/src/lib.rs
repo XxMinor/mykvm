@@ -6757,7 +6757,13 @@ fn handle_decoded_file_transfer_packet(
 fn cleanup_stale_incoming_file_transfers(
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
 ) {
-    let now = Instant::now();
+    cleanup_stale_incoming_file_transfers_at(transfers, Instant::now());
+}
+
+fn cleanup_stale_incoming_file_transfers_at(
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    now: Instant,
+) {
     if let Ok(mut transfers) = transfers.lock() {
         transfers.retain(|transfer_id, transfer| {
             let keep =
@@ -10760,6 +10766,7 @@ mod tests {
         let layout = test_layout();
         let root = temp_test_dir("file-transfer-stale");
         let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let stale_since = Instant::now();
         let stale = test_file_transfer_packet("start", "stale", "stale.txt", 1, 0, 0, b"");
         let payload = encode_wire_packet(&stale).expect("stale start should encode");
         assert!(handle_file_transfer_packet_with_root(
@@ -10772,10 +10779,13 @@ mod tests {
         let stale_path = {
             let mut active = transfers.lock().expect("transfer lock");
             let transfer = active.get_mut("stale").expect("stale transfer");
-            transfer.last_activity =
-                Instant::now() - FILE_TRANSFER_IDLE_TTL - Duration::from_secs(1);
+            transfer.last_activity = stale_since;
             transfer.temp_path.clone()
         };
+        cleanup_stale_incoming_file_transfers_at(
+            &transfers,
+            stale_since + FILE_TRANSFER_IDLE_TTL + Duration::from_secs(1),
+        );
 
         let fresh = test_file_transfer_packet("start", "fresh", "fresh.txt", 1, 0, 0, b"");
         let payload = encode_wire_packet(&fresh).expect("fresh start should encode");
