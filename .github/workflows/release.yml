@@ -35,6 +35,7 @@ env:
   CARGO_HTTP_MULTIPLEXING: "false"
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
+  MYKVM_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
   prepare:

@@ -121,6 +121,13 @@ const ELEVATED_AUTOSTART_TASK_NAME: &str = "MyKVM";
 
 static HOSTNAME_CACHE: OnceLock<Option<String>> = OnceLock::new();
 
+fn build_commit() -> &'static str {
+    match option_env!("MYKVM_BUILD_COMMIT") {
+        Some(commit) if !commit.is_empty() => commit,
+        _ => "unknown",
+    }
+}
+
 #[cfg(target_os = "windows")]
 static WINDOWS_FIREWALL_ENSURED: AtomicBool = AtomicBool::new(false);
 
@@ -180,7 +187,7 @@ struct Device {
     quic_port: u16,
     #[serde(default)]
     transport_public_key: String,
-    #[serde(default = "default_protocol_version")]
+    #[serde(default)]
     protocol_version: u16,
     color: String,
     online: bool,
@@ -302,7 +309,7 @@ struct PairedController {
     host: String,
     ip: String,
     transport_public_key: String,
-    #[serde(default = "default_protocol_version")]
+    #[serde(default)]
     protocol_version: u16,
     cluster_id: String,
     paired_at_ms: u64,
@@ -334,7 +341,7 @@ struct LanPeer {
     quic_port: u16,
     #[serde(default)]
     transport_public_key: String,
-    #[serde(default = "default_protocol_version")]
+    #[serde(default)]
     protocol_version: u16,
     screen_count: usize,
     #[serde(default)]
@@ -428,6 +435,7 @@ struct DiagnosticDevice {
     name: String,
     host: String,
     role: String,
+    protocol_version: u16,
     online: bool,
     input_ready: bool,
     discovery_port: u16,
@@ -799,7 +807,8 @@ impl AppRuntime {
         let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
         let clipboard_last_sequences = Arc::clone(&self.clipboard_last_sequences);
         let clipboard_receive_gate = Arc::clone(&self.clipboard_receive_gate);
-        let clipboard_target = Arc::clone(&self.clipboard_target);
+        let clipboard_target_for_input = Arc::clone(&self.clipboard_target);
+        let clipboard_target_for_stream = Arc::clone(&self.clipboard_target);
         let app_handle_for_file_transfer = self.app_handle.clone();
         let file_transfers = Arc::clone(&self.file_transfers);
         let transport_packets_for_input = Arc::clone(&self.transport_packets);
@@ -837,7 +846,7 @@ impl AppRuntime {
                 source,
                 &input_events,
                 &current_peer.id,
-                &clipboard_target,
+                &clipboard_target_for_input,
             ) {
                 transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
             }
@@ -887,6 +896,7 @@ impl AppRuntime {
                 &payload,
                 &layout,
                 &current_peer.id,
+                &clipboard_target_for_stream,
                 &clipboard_receive_gate,
                 &clipboard_seen_text,
                 &clipboard_echo_until,
@@ -1601,6 +1611,7 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
             name: device.name.clone(),
             host: device.host.clone(),
             role: device.role.clone(),
+            protocol_version: device.protocol_version,
             online: device.online,
             input_ready: device.input_ready,
             discovery_port: device.transport_port,
@@ -1614,6 +1625,8 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
     let mut lines = vec![
         "MyKVM diagnostics".to_string(),
         format!("version: v{}", env!("CARGO_PKG_VERSION")),
+        format!("build commit: {}", build_commit()),
+        format!("input protocol: v{}", quic_transport::PROTOCOL_VERSION),
         format!("platform: {}", current_platform()),
         format!("role: {}", layout.machine_role),
         format!(
@@ -1649,10 +1662,11 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
                 None => "subnet unknown",
             };
             lines.push(format!(
-                "- {} {} host={} online={} inputReady={} UDP={} QUIC={} {}",
+                "- {} {} host={} protocol=v{} online={} inputReady={} UDP={} QUIC={} {}",
                 device.role,
                 device.name,
                 device.host,
+                device.protocol_version,
                 device.online,
                 device.input_ready,
                 device.discovery_port,
@@ -3558,6 +3572,12 @@ pub fn run() {
                     .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
                     .build(),
             )?;
+            log::info!(
+                "MyKVM startup version=v{} build_commit={} input_protocol=v{}",
+                env!("CARGO_PKG_VERSION"),
+                build_commit(),
+                quic_transport::PROTOCOL_VERSION
+            );
             if let Ok(log_dir) = app.path().app_log_dir() {
                 log::info!("file logging enabled at {}", log_dir.display());
             }
@@ -5602,7 +5622,11 @@ fn run_clipboard_sync(
             sequence,
         );
 
-        if let Ok(payload) = encode_wire_packet(&packet) {
+        if let Some(payload) =
+            prepare_clipboard_payload_for_target(&clipboard_target, &target, || {
+                encode_wire_packet(&packet)
+            })
+        {
             let peer = quic_transport.peer(
                 target.addr.clone(),
                 target.transport_public_key.clone(),
@@ -5640,6 +5664,36 @@ fn should_read_clipboard(
 
 fn should_baseline_clipboard_target(push_on_bind: bool, same_target: bool) -> bool {
     !push_on_bind && !same_target
+}
+
+fn clipboard_target_is_current(
+    clipboard_target: &Arc<Mutex<Option<input::ClipboardTarget>>>,
+    expected: &input::ClipboardTarget,
+) -> bool {
+    input::current_clipboard_target(clipboard_target)
+        .map(|current| {
+            current.device_id == expected.device_id
+                && current.addr == expected.addr
+                && current.transport_public_key == expected.transport_public_key
+                && current.protocol_version == expected.protocol_version
+                && current.cluster_id == expected.cluster_id
+                && current.pair_secret == expected.pair_secret
+                && current.push_on_bind == expected.push_on_bind
+                && current.expires_at == expected.expires_at
+        })
+        .unwrap_or(false)
+}
+
+fn prepare_clipboard_payload_for_target<F>(
+    clipboard_target: &Arc<Mutex<Option<input::ClipboardTarget>>>,
+    expected: &input::ClipboardTarget,
+    encode: F,
+) -> Option<Vec<u8>>
+where
+    F: FnOnce() -> Result<Vec<u8>, String>,
+{
+    let payload = encode().ok()?;
+    clipboard_target_is_current(clipboard_target, expected).then_some(payload)
 }
 
 /// True while we are inside the post-write grace window (see
@@ -5698,15 +5752,17 @@ fn handle_clipboard_packet(
     payload: &[u8],
     layout: &LayoutState,
     local_peer_id: &str,
+    clipboard_target: &Arc<Mutex<Option<input::ClipboardTarget>>>,
     clipboard_receive_gate: &Arc<Mutex<()>>,
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> bool {
-    handle_clipboard_packet_serialized_with_writer(
+    handle_bound_clipboard_packet_serialized_with_writer(
         payload,
         layout,
         local_peer_id,
+        clipboard_target,
         clipboard_receive_gate,
         clipboard_seen_text,
         clipboard_echo_until,
@@ -5717,6 +5773,42 @@ fn handle_clipboard_packet(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn handle_bound_clipboard_packet_serialized_with_writer<F, R>(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    clipboard_target: &Arc<Mutex<Option<input::ClipboardTarget>>>,
+    clipboard_receive_gate: &Arc<Mutex<()>>,
+    clipboard_seen_text: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+    clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    write_contents: F,
+    read_contents: R,
+) -> bool
+where
+    F: FnMut(&[ClipboardContent]) -> Result<(), String>,
+    R: FnMut() -> Vec<ClipboardContent>,
+{
+    handle_clipboard_packet_serialized_with_writer_and_origin_guard(
+        payload,
+        layout,
+        local_peer_id,
+        clipboard_receive_gate,
+        clipboard_seen_text,
+        clipboard_echo_until,
+        clipboard_last_sequences,
+        |origin_id| {
+            input::current_clipboard_target(clipboard_target)
+                .map(|target| target.device_id == origin_id)
+                .unwrap_or(false)
+        },
+        write_contents,
+        read_contents,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn handle_clipboard_packet_serialized_with_writer<F, R>(
     payload: &[u8],
     layout: &LayoutState,
@@ -5726,22 +5818,55 @@ fn handle_clipboard_packet_serialized_with_writer<F, R>(
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
     write_contents: F,
-    mut read_contents: R,
+    read_contents: R,
 ) -> bool
 where
     F: FnMut(&[ClipboardContent]) -> Result<(), String>,
     R: FnMut() -> Vec<ClipboardContent>,
 {
+    handle_clipboard_packet_serialized_with_writer_and_origin_guard(
+        payload,
+        layout,
+        local_peer_id,
+        clipboard_receive_gate,
+        clipboard_seen_text,
+        clipboard_echo_until,
+        clipboard_last_sequences,
+        |_| true,
+        write_contents,
+        read_contents,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_clipboard_packet_serialized_with_writer_and_origin_guard<F, R, G>(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    clipboard_receive_gate: &Arc<Mutex<()>>,
+    clipboard_seen_text: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+    clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    origin_allowed: G,
+    write_contents: F,
+    mut read_contents: R,
+) -> bool
+where
+    F: FnMut(&[ClipboardContent]) -> Result<(), String>,
+    R: FnMut() -> Vec<ClipboardContent>,
+    G: FnMut(&str) -> bool,
+{
     let _receive_guard = clipboard_receive_gate
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let written = handle_clipboard_packet_with_writer(
+    let written = handle_clipboard_packet_with_writer_and_origin_guard(
         payload,
         layout,
         local_peer_id,
         clipboard_seen_text,
         clipboard_echo_until,
         clipboard_last_sequences,
+        origin_allowed,
         write_contents,
     );
 
@@ -5763,6 +5888,7 @@ where
     written
 }
 
+#[cfg(test)]
 fn handle_clipboard_packet_with_writer<F>(
     payload: &[u8],
     layout: &LayoutState,
@@ -5770,10 +5896,37 @@ fn handle_clipboard_packet_with_writer<F>(
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    write_contents: F,
+) -> bool
+where
+    F: FnMut(&[ClipboardContent]) -> Result<(), String>,
+{
+    handle_clipboard_packet_with_writer_and_origin_guard(
+        payload,
+        layout,
+        local_peer_id,
+        clipboard_seen_text,
+        clipboard_echo_until,
+        clipboard_last_sequences,
+        |_| true,
+        write_contents,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_clipboard_packet_with_writer_and_origin_guard<F, G>(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    clipboard_seen_text: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+    clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    mut origin_allowed: G,
     mut write_contents: F,
 ) -> bool
 where
     F: FnMut(&[ClipboardContent]) -> Result<(), String>,
+    G: FnMut(&str) -> bool,
 {
     let Some(packet) = decode_wire_packet::<ClipboardPacket>(payload) else {
         return false;
@@ -5800,6 +5953,7 @@ where
     }
 
     let accepted_sequence = clipboard_packet_sequence(&packet);
+    let origin_id = packet.origin_id.clone();
     let contents = clipboard_contents_from_packet(packet);
 
     if contents.is_empty() {
@@ -5810,6 +5964,9 @@ where
     }
 
     let signature = clipboard_contents_signature(&contents);
+    if !origin_allowed(&origin_id) {
+        return false;
+    }
     let written = match write_contents(&contents) {
         Ok(()) => true,
         Err(error) => {
@@ -7492,6 +7649,8 @@ fn normalize_peer_platform(platform: &str) -> &'static str {
         "windows"
     } else if platform.eq_ignore_ascii_case("macos") {
         "macos"
+    } else if platform.eq_ignore_ascii_case("linux") {
+        "linux"
     } else {
         "unknown"
     }
@@ -7954,9 +8113,6 @@ fn peer_from_discovery_packet(
     peer.ip = source_ip;
     if peer.quic_port == 0 {
         peer.quic_port = peer.transport_port;
-    }
-    if peer.protocol_version == 0 {
-        peer.protocol_version = default_protocol_version();
     }
     if peer.transport_public_key.trim().is_empty()
         || peer.protocol_version != quic_transport::PROTOCOL_VERSION
@@ -8586,6 +8742,14 @@ fn random_pairing_code() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn peer_platform_normalization_preserves_supported_operating_systems() {
+        assert_eq!(normalize_peer_platform("Windows"), "windows");
+        assert_eq!(normalize_peer_platform("macOS"), "macos");
+        assert_eq!(normalize_peer_platform("LINUX"), "linux");
+        assert_eq!(normalize_peer_platform("freebsd"), "unknown");
+    }
+
     fn test_screen(device_id: &str) -> Screen {
         Screen {
             id: format!("{device_id}-display-1"),
@@ -8662,6 +8826,49 @@ mod tests {
         }
     }
 
+    fn test_clipboard_target(device_id: &str) -> input::ClipboardTarget {
+        input::ClipboardTarget {
+            device_id: device_id.into(),
+            addr: "10.0.0.2:47834".into(),
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            push_on_bind: true,
+            expires_at: None,
+        }
+    }
+
+    fn receive_test_clipboard_packet(
+        layout: &LayoutState,
+        packet: ClipboardPacket,
+        target: Option<input::ClipboardTarget>,
+    ) -> (bool, bool) {
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+        let clipboard_target = Arc::new(Mutex::new(target));
+        let receive_gate = Arc::new(Mutex::new(()));
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut wrote = false;
+        let accepted = handle_bound_clipboard_packet_serialized_with_writer(
+            &payload,
+            layout,
+            "local-device",
+            &clipboard_target,
+            &receive_gate,
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            |_| {
+                wrote = true;
+                Ok(())
+            },
+            Vec::new,
+        );
+        (accepted, wrote)
+    }
+
     fn test_peer() -> LanPeer {
         LanPeer {
             id: "peer-client-10-0-0-2".into(),
@@ -8692,6 +8899,30 @@ mod tests {
             app_version: "test".into(),
             last_seen_ms: now_ms(),
         }
+    }
+
+    #[test]
+    fn discovery_peer_without_a_protocol_version_stays_incompatible() {
+        let mut peer = test_peer();
+        peer.protocol_version = 0;
+        peer.input_ready = true;
+        let incoming = peer_from_discovery_packet(
+            DiscoveryPacket {
+                protocol: DISCOVERY_PROTOCOL.into(),
+                kind: "announce".into(),
+                peer,
+                pairing_code: None,
+                pair_cluster_id: None,
+                pair_secret: None,
+                pairing_error: None,
+            },
+            "10.0.0.2".into(),
+            "local-peer",
+        )
+        .expect("remote peer should decode");
+
+        assert_eq!(incoming.peer.protocol_version, 0);
+        assert!(!incoming.peer.input_ready);
     }
 
     #[test]
@@ -9361,6 +9592,177 @@ mod tests {
         assert!(!clipboard_packet_authorized(&layout, &packet));
         packet.origin_id = "server-10-0-0-1".into();
         assert!(clipboard_packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn clipboard_packet_rejects_without_active_target_session() {
+        let layout = test_layout();
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Text("stale".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            1,
+        );
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+        let clipboard_target = Arc::new(Mutex::new(None));
+        let receive_gate = Arc::new(Mutex::new(()));
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut wrote = false;
+
+        let accepted = handle_bound_clipboard_packet_serialized_with_writer(
+            &payload,
+            &layout,
+            "local-device",
+            &clipboard_target,
+            &receive_gate,
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            |_| {
+                wrote = true;
+                Ok(())
+            },
+            Vec::new,
+        );
+
+        assert!(!accepted);
+        assert!(!wrote);
+    }
+
+    #[test]
+    fn clipboard_packet_rejects_origin_outside_active_target_session() {
+        let layout = test_layout();
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Text("wrong peer".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            1,
+        );
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+        let clipboard_target = Arc::new(Mutex::new(Some(test_clipboard_target("another-peer"))));
+        let receive_gate = Arc::new(Mutex::new(()));
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut wrote = false;
+
+        let accepted = handle_bound_clipboard_packet_serialized_with_writer(
+            &payload,
+            &layout,
+            "local-device",
+            &clipboard_target,
+            &receive_gate,
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            |_| {
+                wrote = true;
+                Ok(())
+            },
+            Vec::new,
+        );
+
+        assert!(!accepted);
+        assert!(!wrote);
+    }
+
+    #[test]
+    fn clipboard_packet_accepts_origin_from_active_target_session() {
+        let layout = test_layout();
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Text("current".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            1,
+        );
+
+        let (accepted, wrote) = receive_test_clipboard_packet(
+            &layout,
+            packet,
+            Some(test_clipboard_target("peer-client-10-0-0-2")),
+        );
+
+        assert!(accepted);
+        assert!(wrote);
+    }
+
+    #[test]
+    fn clipboard_packet_rejects_expired_target_session() {
+        let layout = test_layout();
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Text("expired".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            1,
+        );
+        let mut target = test_clipboard_target("peer-client-10-0-0-2");
+        target.expires_at = Some(Instant::now() - Duration::from_millis(1));
+
+        let (accepted, wrote) = receive_test_clipboard_packet(&layout, packet, Some(target));
+
+        assert!(!accepted);
+        assert!(!wrote);
+    }
+
+    #[test]
+    fn clipboard_payload_preparation_rejects_target_cleared_during_encoding() {
+        let clipboard_target = Arc::new(Mutex::new(Some(test_clipboard_target(
+            "peer-client-10-0-0-2",
+        ))));
+        let prepared_for = input::current_clipboard_target(&clipboard_target)
+            .expect("clipboard target should start active");
+
+        let payload =
+            prepare_clipboard_payload_for_target(&clipboard_target, &prepared_for, || {
+                input::clear_clipboard_target(&clipboard_target);
+                Ok(vec![1, 2, 3])
+            });
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn clipboard_payload_preparation_rejects_target_switched_during_encoding() {
+        let clipboard_target = Arc::new(Mutex::new(Some(test_clipboard_target(
+            "peer-client-10-0-0-2",
+        ))));
+        let prepared_for = input::current_clipboard_target(&clipboard_target)
+            .expect("clipboard target should start active");
+
+        let payload =
+            prepare_clipboard_payload_for_target(&clipboard_target, &prepared_for, || {
+                *clipboard_target.lock().expect("clipboard target lock") =
+                    Some(test_clipboard_target("another-peer"));
+                Ok(vec![1, 2, 3])
+            });
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn clipboard_payload_preparation_accepts_unchanged_live_target() {
+        let clipboard_target = Arc::new(Mutex::new(Some(test_clipboard_target(
+            "peer-client-10-0-0-2",
+        ))));
+        let prepared_for = input::current_clipboard_target(&clipboard_target)
+            .expect("clipboard target should start active");
+
+        let payload =
+            prepare_clipboard_payload_for_target(&clipboard_target, &prepared_for, || {
+                Ok(vec![1, 2, 3])
+            });
+
+        assert_eq!(payload, Some(vec![1, 2, 3]));
     }
 
     #[test]

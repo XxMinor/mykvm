@@ -27,11 +27,11 @@ use quinn::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
-// v2: key and mouse-button events moved from unreliable datagrams onto a
-// persistent reliable ordered stream (a dropped KeyUp no longer sticks a key).
-// The version check is strict on both ends, so v1 and v2 peers do not connect
-// or control each other — both sides must run a v2 build.
-pub const PROTOCOL_VERSION: u16 = 2;
+// v3: key packets carry modifier snapshots and monotonic key sequences so the
+// receiver can repair missed modifier transitions without accepting stale input.
+// The version check is strict, so legacy peers cannot silently use the older
+// wire semantics — both sides must run a v3 build.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 const SERVER_NAME: &str = "mykvm.local";
 const MAX_DATAGRAM_BYTES: usize = 16 * 1024;
@@ -73,6 +73,10 @@ const INBOUND_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
 type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> bool + Send + Sync + 'static>;
+
+fn protocol_alpn() -> Vec<u8> {
+    format!("mykvm/{PROTOCOL_VERSION}").into_bytes()
+}
 
 #[derive(Clone, Debug)]
 pub struct PeerEndpoint {
@@ -148,6 +152,18 @@ impl TransportHandle {
         self.send_datagram_inner(peer, payload, DatagramMode::Latest)
     }
 
+    /// Admit a latency-sensitive input datagram without waiting for the Tokio
+    /// actor to acknowledge its bounded per-peer queue. The actor marks the
+    /// peer's input path failed if admission is later rejected, so the capture
+    /// loop can converge through its normal release/reset path.
+    pub fn send_latest_datagram_nonblocking(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+    ) -> Result<(), String> {
+        self.send_datagram_inner_nonblocking(peer, payload, DatagramMode::Latest)
+    }
+
     /// Send an input event that must arrive intact and in order (key / mouse
     /// button up/down). Rides the peer's persistent reliable stream. Enqueue is
     /// fire-and-forget; a genuinely dead peer still surfaces via the datagram
@@ -175,12 +191,38 @@ impl TransportHandle {
                 peer,
                 payload,
                 class,
-                result: result_tx,
+                result: Some(result_tx),
             })
             .map_err(|_| "QUIC transport is stopped".to_string())?;
         result_rx
             .recv_timeout(RELIABLE_INPUT_ENQUEUE_TIMEOUT)
             .map_err(|_| "QUIC reliable input enqueue timed out".to_string())?
+    }
+
+    /// Non-blocking counterpart used by OS input callbacks. Command ordering
+    /// is preserved by `datagram_commands`; the reliable worker retains its
+    /// existing bounded release/reset-aware queue semantics.
+    pub fn send_reliable_input_with_class_nonblocking(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+        class: ReliableInputClass,
+    ) -> Result<(), String> {
+        if payload.len() > MAX_DATAGRAM_BYTES {
+            return Err(format!(
+                "QUIC reliable input is too large: {} bytes",
+                payload.len()
+            ));
+        }
+
+        self.datagram_commands
+            .send(DatagramCommand::SendReliableInput {
+                peer,
+                payload,
+                class,
+                result: None,
+            })
+            .map_err(|_| "QUIC transport is stopped".to_string())
     }
 
     fn send_datagram_inner(
@@ -212,12 +254,45 @@ impl TransportHandle {
                 peer,
                 payload,
                 mode,
-                result: result_tx,
+                result: Some(result_tx),
             })
             .map_err(|_| "QUIC transport is stopped".to_string())?;
         result_rx
             .recv_timeout(DATAGRAM_ENQUEUE_TIMEOUT)
             .map_err(|_| "QUIC datagram enqueue timed out".to_string())?
+    }
+
+    fn send_datagram_inner_nonblocking(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+        mode: DatagramMode,
+    ) -> Result<(), String> {
+        if payload.len() > MAX_DATAGRAM_BYTES {
+            return Err(format!(
+                "QUIC datagram is too large: {} bytes",
+                payload.len()
+            ));
+        }
+
+        let peer_key = TransportPeerKey::from(&peer);
+        let reliable_failed = self
+            .input_failures
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_path(&peer_key, InputFailurePath::Reliable);
+        if reliable_failed {
+            return Err("QUIC reliable input path is recovering".into());
+        }
+
+        self.datagram_commands
+            .send(DatagramCommand::SendDatagram {
+                peer,
+                payload,
+                mode,
+                result: None,
+            })
+            .map_err(|_| "QUIC transport is stopped".to_string())
     }
 
     pub fn send_stream_expect_ack(
@@ -298,13 +373,13 @@ enum DatagramCommand {
         peer: PeerEndpoint,
         payload: Vec<u8>,
         mode: DatagramMode,
-        result: mpsc::Sender<Result<(), String>>,
+        result: Option<mpsc::Sender<Result<(), String>>>,
     },
     SendReliableInput {
         peer: PeerEndpoint,
         payload: Vec<u8>,
         class: ReliableInputClass,
-        result: mpsc::Sender<Result<(), String>>,
+        result: Option<mpsc::Sender<Result<(), String>>>,
     },
     Shutdown {
         result: mpsc::Sender<()>,
@@ -607,9 +682,9 @@ impl ReliableInputQueue {
 
         if class == ReliableInputClass::ResetBoundary {
             state.reset_generation = state.reset_generation.wrapping_add(1);
-            // CursorPark is authoritative for current receivers, but v2 peers
-            // built before that reset behavior only park the pointer. Preserve
-            // explicit Up frames so mixed v2 builds still converge safely.
+            // CursorPark is authoritative, but already-queued explicit Up
+            // frames remain valuable redundancy against a key latching if the
+            // reset and release race during reconnect.
             state
                 .frames
                 .retain(|frame| frame.class == ReliableInputClass::Release);
@@ -954,14 +1029,20 @@ fn enqueue_datagram(
     peer: PeerEndpoint,
     payload: Vec<u8>,
     mode: DatagramMode,
-    result: mpsc::Sender<Result<(), String>>,
+    result: Option<mpsc::Sender<Result<(), String>>>,
     input_failures: &Arc<Mutex<InputFailureState>>,
 ) {
     prune_datagram_workers(workers);
     let worker_key = TransportPeerKey::from(&peer);
     if !workers.contains_key(&worker_key) {
         if workers.len() >= DATAGRAM_MAX_PEERS {
-            let _ = result.send(Err("QUIC datagram peer limit reached".into()));
+            report_input_admission(
+                result,
+                Err("QUIC datagram peer limit reached".into()),
+                input_failures,
+                worker_key,
+                InputFailurePath::Datagram,
+            );
             return;
         }
         workers.insert(
@@ -974,11 +1055,39 @@ fn enqueue_datagram(
             ),
         );
     }
-    workers
+    let queue = &workers
         .get(&worker_key)
         .expect("datagram worker just inserted")
-        .queue
-        .enqueue(payload, mode, result);
+        .queue;
+    match result {
+        Some(result) => queue.enqueue(payload, mode, result),
+        None => {
+            let (result_tx, result_rx) = mpsc::channel();
+            queue.enqueue(payload, mode, result_tx);
+            let admission = result_rx
+                .recv()
+                .unwrap_or_else(|_| Err("QUIC datagram admission result was dropped".into()));
+            if let Err(error) = admission {
+                mark_peer_input_failed(input_failures, worker_key, InputFailurePath::Datagram);
+                log::warn!("nonblocking QUIC datagram admission failed: {error}");
+            }
+        }
+    }
+}
+
+fn report_input_admission(
+    result: Option<mpsc::Sender<Result<(), String>>>,
+    admission: Result<(), String>,
+    input_failures: &Arc<Mutex<InputFailureState>>,
+    peer_key: TransportPeerKey,
+    path: InputFailurePath,
+) {
+    if let Some(result) = result {
+        let _ = result.send(admission);
+    } else if let Err(error) = admission {
+        mark_peer_input_failed(input_failures, peer_key, path);
+        log::warn!("nonblocking QUIC input admission failed: {error}");
+    }
 }
 
 fn prune_datagram_workers(workers: &mut HashMap<TransportPeerKey, DatagramWorker>) {
@@ -1063,14 +1172,20 @@ fn enqueue_reliable_input(
     peer: PeerEndpoint,
     payload: Vec<u8>,
     class: ReliableInputClass,
-    result: mpsc::Sender<Result<(), String>>,
+    result: Option<mpsc::Sender<Result<(), String>>>,
     input_failures: &Arc<Mutex<InputFailureState>>,
 ) {
     prune_reliable_input_workers(workers);
     let worker_key = ReliablePeerKey::from(&peer);
     if !workers.contains_key(&worker_key) {
         if workers.len() >= RELIABLE_INPUT_MAX_PEERS {
-            let _ = result.send(Err("QUIC reliable input peer limit reached".into()));
+            report_input_admission(
+                result,
+                Err("QUIC reliable input peer limit reached".into()),
+                input_failures,
+                worker_key,
+                InputFailurePath::Reliable,
+            );
             return;
         }
         workers.insert(
@@ -1087,7 +1202,20 @@ fn enqueue_reliable_input(
     let worker = workers
         .get(&worker_key)
         .expect("reliable input worker just inserted");
-    worker.queue.enqueue(payload, class, result);
+    match result {
+        Some(result) => worker.queue.enqueue(payload, class, result),
+        None => {
+            let (result_tx, result_rx) = mpsc::channel();
+            worker.queue.enqueue(payload, class, result_tx);
+            let admission = result_rx
+                .recv()
+                .unwrap_or_else(|_| Err("QUIC reliable input admission result was dropped".into()));
+            if let Err(error) = admission {
+                mark_peer_input_failed(input_failures, worker_key, InputFailurePath::Reliable);
+                log::warn!("nonblocking QUIC reliable input admission failed: {error}");
+            }
+        }
+    }
 }
 
 fn prune_reliable_input_workers(workers: &mut HashMap<ReliablePeerKey, ReliableInputWorker>) {
@@ -1366,8 +1494,8 @@ async fn deliver_reliable_input(
             .await
         } else {
             // A later reset may discard obsolete Down/transient state, but it
-            // must never cancel an in-flight Up. Deliver releases first so old
-            // v2 receivers that do not reset keys on CursorPark cannot latch.
+            // must never cancel an in-flight Up. Deliver releases first so a
+            // reconnect race cannot leave the receiver with a latched key.
             Some(
                 tokio::time::timeout(
                     attempt_timeout,
@@ -1668,8 +1796,16 @@ fn candidate_ports(preferred_port: u16) -> Vec<u16> {
 fn server_config(identity: &TransportIdentity) -> Result<ServerConfig, String> {
     let cert_der = CertificateDer::from(identity.cert_der.clone());
     let key_der = PrivatePkcs8KeyDer::from(identity.key_der.clone());
-    let mut config = ServerConfig::with_single_cert(vec![cert_der], key_der.into())
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| format!("failed to build QUIC server TLS config: {error}"))?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der.into())
+        .map_err(|error| format!("failed to configure QUIC server certificate: {error}"))?;
+    crypto.alpn_protocols = vec![protocol_alpn()];
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|error| format!("failed to build QUIC server config: {error}"))?;
+    let mut config = ServerConfig::with_crypto(Arc::new(quic_crypto));
     config.transport = Arc::new(tuned_transport_config());
 
     Ok(config)
@@ -1789,12 +1925,13 @@ fn client_config(peer: &PeerEndpoint) -> Result<ClientConfig, String> {
 
     // QUIC is TLS 1.3 only; pin the advertised certificate with our own verifier
     // rather than WebPKI root validation.
-    let crypto = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+    let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| format!("failed to build QUIC client crypto: {error}"))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier::new(pinned)))
         .with_no_client_auth();
+    crypto.alpn_protocols = vec![protocol_alpn()];
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|error| format!("failed to build QUIC client config: {error}"))?;
@@ -2170,6 +2307,22 @@ mod tests {
             .clone()
     }
 
+    fn legacy_client_config_without_alpn(peer: &PeerEndpoint) -> ClientConfig {
+        let cert_der = BASE64
+            .decode(peer.public_key.as_bytes())
+            .expect("decode pinned certificate");
+        let pinned = CertificateDer::from(cert_der);
+        let crypto = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("build legacy TLS config")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier::new(pinned)))
+            .with_no_client_auth();
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+            .expect("build legacy QUIC config");
+        ClientConfig::new(Arc::new(quic_crypto))
+    }
+
     fn peer(addr: &str) -> PeerEndpoint {
         PeerEndpoint {
             addr: addr.to_string(),
@@ -2263,6 +2416,19 @@ mod tests {
     }
 
     #[test]
+    fn client_config_rejects_legacy_v2_peer() {
+        let peer = PeerEndpoint {
+            addr: "127.0.0.1:47834".to_string(),
+            public_key: BASE64.encode(make_cert().as_ref()),
+            protocol_version: 2,
+        };
+        assert!(
+            client_config(&peer).is_err(),
+            "v3 input semantics must not silently connect to a v2 peer"
+        );
+    }
+
+    #[test]
     fn client_config_rejects_protocol_version_mismatch() {
         let peer = PeerEndpoint {
             addr: "127.0.0.1:47834".to_string(),
@@ -2270,6 +2436,44 @@ mod tests {
             protocol_version: PROTOCOL_VERSION + 1,
         };
         assert!(client_config(&peer).is_err());
+    }
+
+    #[test]
+    fn server_rejects_legacy_client_without_v3_alpn() {
+        let suffix = format!("{}-{}", std::process::id(), crate::now_ms());
+        let dir = std::env::temp_dir().join(format!("mykvm-protocol-alpn-{suffix}"));
+        let _ = fs::remove_dir_all(&dir);
+        let transport = start(0, dir.clone(), Arc::new(|_, _| {}), Arc::new(|_, _| false))
+            .expect("start v3 receiver");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let rejected = runtime.block_on(async {
+            let mut endpoint =
+                Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("create legacy client");
+            let target = transport.peer(
+                format!("127.0.0.1:{}", transport.port()),
+                transport.public_key().to_string(),
+                PROTOCOL_VERSION,
+            );
+            endpoint.set_default_client_config(legacy_client_config_without_alpn(&target));
+            let connecting = endpoint
+                .connect(
+                    format!("127.0.0.1:{}", transport.port()).parse().unwrap(),
+                    SERVER_NAME,
+                )
+                .expect("start legacy connection");
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), connecting).await,
+                Ok(Err(_))
+            )
+        });
+
+        transport.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(rejected, "v3 receiver accepted a client without v3 ALPN");
     }
 
     #[test]
@@ -2644,7 +2848,10 @@ mod tests {
             } => {
                 assert_eq!(payload, b"move");
                 assert_eq!(mode, DatagramMode::Ordered);
-                result.send(Ok(())).expect("admit datagram");
+                result
+                    .expect("synchronous datagram admission")
+                    .send(Ok(()))
+                    .expect("admit datagram");
             }
             DatagramCommand::SendReliableInput { .. } => panic!("unexpected reliable input"),
             DatagramCommand::Shutdown { .. } => panic!("unexpected shutdown"),
@@ -2684,12 +2891,88 @@ mod tests {
                 payload, result, ..
             } => {
                 assert_eq!(payload, b"key");
-                result.send(Ok(())).expect("admit reliable input");
+                result
+                    .expect("synchronous reliable admission")
+                    .send(Ok(()))
+                    .expect("admit reliable input");
             }
             _ => panic!("expected a reliable input command"),
         }
         assert!(reliable_join.join().expect("reliable sender").is_ok());
         assert!(stream_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn nonblocking_input_admission_preserves_actor_fifo_without_ack() {
+        let (datagram_tx, mut datagram_rx) = tokio_mpsc::unbounded_channel();
+        let (stream_tx, _stream_rx) = tokio_mpsc::unbounded_channel();
+        let handle = TransportHandle {
+            datagram_commands: datagram_tx,
+            stream_commands: stream_tx,
+            input_failures: Arc::new(Mutex::new(InputFailureState::default())),
+            port: 47834,
+            public_key: "local-cert".into(),
+        };
+        let target = peer("127.0.0.1:47834");
+
+        // No actor is running and no acknowledgement receiver is serviced.
+        // These calls therefore prove admission does not wait for a worker ACK.
+        handle
+            .send_latest_datagram_nonblocking(target.clone(), b"move-before".to_vec())
+            .expect("admit first move command");
+        handle
+            .send_reliable_input_with_class_nonblocking(
+                target.clone(),
+                b"button".to_vec(),
+                ReliableInputClass::State,
+            )
+            .expect("admit button command");
+        handle
+            .send_latest_datagram_nonblocking(target, b"move-after".to_vec())
+            .expect("admit second move command");
+
+        let commands = (0..3)
+            .map(|_| recv_datagram_command(&mut datagram_rx))
+            .collect::<Vec<_>>();
+        match &commands[..] {
+            [DatagramCommand::SendDatagram {
+                payload: before,
+                result: None,
+                ..
+            }, DatagramCommand::SendReliableInput {
+                payload: boundary,
+                result: None,
+                ..
+            }, DatagramCommand::SendDatagram {
+                payload: after,
+                result: None,
+                ..
+            }] => {
+                assert_eq!(before, b"move-before");
+                assert_eq!(boundary, b"button");
+                assert_eq!(after, b"move-after");
+            }
+            _ => panic!("nonblocking input commands crossed a FIFO boundary"),
+        }
+    }
+
+    #[test]
+    fn rejected_nonblocking_admission_marks_only_its_input_path_failed() {
+        let input_failures = Arc::new(Mutex::new(InputFailureState::default()));
+        let target = peer("127.0.0.1:47834");
+        let key = TransportPeerKey::from(&target);
+
+        report_input_admission(
+            None,
+            Err("queue full".into()),
+            &input_failures,
+            key.clone(),
+            InputFailurePath::Reliable,
+        );
+
+        let failures = input_failures.lock().unwrap();
+        assert!(failures.contains_path(&key, InputFailurePath::Reliable));
+        assert!(!failures.contains_path(&key, InputFailurePath::Datagram));
     }
 
     #[test]

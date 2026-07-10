@@ -1,4 +1,4 @@
-export type Platform = 'windows' | 'macos' | 'unknown'
+export type Platform = 'windows' | 'macos' | 'linux' | 'unknown'
 
 export type MachineRole = 'unset' | 'server' | 'client'
 

@@ -5,7 +5,9 @@ const browserPlatform = platformName.includes('mac')
   ? 'macos'
   : platformName.includes('win')
     ? 'windows'
-    : 'unknown'
+    : platformName.includes('linux')
+      ? 'linux'
+      : 'unknown'
 const browserScreen = window.screen as typeof window.screen & {
   availLeft?: number
   availTop?: number
@@ -42,7 +44,7 @@ export const defaultLayout: LayoutState = {
       transportPort: 47833,
       quicPort: 47834,
       transportPublicKey: '',
-      protocolVersion: 1,
+      protocolVersion: 3,
       color: '#2f7af8',
       online: true,
       inputReady: false,

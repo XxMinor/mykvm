@@ -106,6 +106,7 @@ const DEVICE_COLORS = [
 const PLATFORM_LABELS = {
   windows: "Windows",
   macos: "macOS",
+  linux: "Linux",
   unknown: "Unknown",
 } as const;
 const WORKSPACE_TABS = [
@@ -3759,7 +3760,7 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
           inputReady: false,
           transportPort: layout.transportPort,
           quicPort: layout.quicPort,
-          protocolVersion: 1,
+          protocolVersion: 3,
         };
       }
 
@@ -4092,8 +4093,9 @@ function sanitizeId(value: string) {
 }
 
 function normalizePlatform(platform: string): Platform {
-  if (platform === "windows" || platform === "macos") {
-    return platform;
+  const normalized = platform.toLowerCase();
+  if (normalized === "windows" || normalized === "macos" || normalized === "linux") {
+    return normalized;
   }
 
   return "unknown";

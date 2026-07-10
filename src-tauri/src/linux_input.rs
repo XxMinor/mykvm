@@ -60,6 +60,13 @@ fn capability_state(
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn end_x11_clipboard_session(
+    target: &std::sync::Arc<std::sync::Mutex<Option<super::ClipboardTarget>>>,
+) {
+    super::clear_clipboard_target(target);
+}
+
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReceiveCursorState {
     parked: Option<(i32, i32)>,
@@ -303,10 +310,11 @@ use super::{
     release_remote_buttons, remembered_local_screen_point, request_screen_switch_from_point,
     reset_mouse_move_timer, reset_remote_button_mask, screen_switch_hotkey_matches_vk,
     send_key_packet, send_packet, send_packet_with_modifier_snapshot, send_remote_cursor_park,
-    send_remote_mouse_move, send_remote_mouse_move_with_drag, set_control_clipboard_target,
-    should_send_mouse_move, track_forwarded_key, update_active_remote_screen,
-    update_remote_button_mask, ActiveTarget, ClipboardTarget, HotkeyModifiers, InputEvent,
-    InputTarget, LayoutState, MouseButton, NativeStageStatus, SwitchDirection, SwitchOutcome,
+    send_remote_input_heartbeat, send_remote_mouse_move, send_remote_mouse_move_with_drag,
+    set_control_clipboard_target, should_send_mouse_move, track_forwarded_key,
+    update_active_remote_screen, update_remote_button_mask, ActiveTarget, ClipboardTarget,
+    HotkeyModifiers, InputEvent, InputTarget, LayoutState, MouseButton, NativeStageStatus,
+    SwitchDirection, SwitchOutcome,
 };
 
 #[cfg(target_os = "linux")]
@@ -537,10 +545,24 @@ fn x11_root(connection: &RustConnection, screen_number: usize) -> Result<u32, St
 
 #[cfg(target_os = "linux")]
 fn connect_x11() -> Result<(RustConnection, usize, u32), String> {
-    let (connection, screen_number) =
-        x11rb::connect(None).map_err(|error| format!("无法连接 X11 DISPLAY：{error}"))?;
-    let root = x11_root(&connection, screen_number)?;
-    Ok((connection, screen_number, root))
+    const ATTEMPTS: usize = 3;
+    let mut last_error = String::new();
+    for attempt in 0..ATTEMPTS {
+        match x11rb::connect(None) {
+            Ok((connection, screen_number)) => {
+                let root = x11_root(&connection, screen_number)?;
+                return Ok((connection, screen_number, root));
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+        if attempt + 1 < ATTEMPTS {
+            // Xvfb and a freshly restarted login X server can accept one
+            // client and briefly reset the next while their extensions finish
+            // initializing. Keep startup bounded while tolerating that race.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    Err(format!("无法连接 X11 DISPLAY：{last_error}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1086,6 +1108,7 @@ struct X11CaptureContext {
     last_local_point: Mutex<Option<(f64, f64)>>,
     last_pointer_sync: Mutex<Instant>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
+    last_heartbeat_sent: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     physical_pressed_keys: Mutex<Vec<u16>>,
     forwarded_pressed_keys: Mutex<Vec<u16>>,
@@ -1205,6 +1228,7 @@ pub(super) fn start_capture(
             last_local_point: Mutex::new(initial_point),
             last_pointer_sync: Mutex::new(Instant::now()),
             last_mouse_move_sent: Mutex::new(None),
+            last_heartbeat_sent: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             physical_pressed_keys: Mutex::new(Vec::new()),
             forwarded_pressed_keys: Mutex::new(Vec::new()),
@@ -1228,7 +1252,24 @@ pub(super) fn start_capture(
                         log::warn!(
                             "remote input transport failed; releasing Linux X11 grab and cursor"
                         );
-                        release_x11_remote_control_inner(&context, true, None);
+                        release_x11_remote_control_inner(&context, None);
+                    } else if !send_remote_input_heartbeat(
+                        &context.quic_transport,
+                        &context.active,
+                        &context.remote_button_mask,
+                        context
+                            .physical_pressed_keys
+                            .lock()
+                            .map(|pressed| modifier_mask_for_keys(&pressed))
+                            .unwrap_or_default(),
+                        &context.last_heartbeat_sent,
+                        &context.layout_state,
+                        &context.input_events,
+                    ) {
+                        log::warn!(
+                            "remote input heartbeat failed; releasing Linux X11 grab and cursor"
+                        );
+                        release_x11_remote_control_inner(&context, None);
                     } else {
                         drain_switch_request_x11(&context);
                     }
@@ -1289,7 +1330,7 @@ pub(super) fn start_capture(
                 .send_gate
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            release_x11_remote_control_inner(&context, true, None);
+            release_x11_remote_control_inner(&context, None);
             clear_physical_keys(&context);
         }
         clear_x11_capture_context(&context);
@@ -1473,11 +1514,7 @@ fn enter_x11_remote(
     reset_remote_button_mask(&context.remote_button_mask);
     context.remote_active.store(true, Ordering::Relaxed);
     sync_held_modifiers_x11(context, &active_target.target);
-    set_control_clipboard_target(
-        &context.clipboard_target,
-        &active_target,
-        &context.layout_state,
-    );
+    set_control_clipboard_target(&context.clipboard_target, &active_target);
     if let Ok(mut active) = context.active.lock() {
         *active = Some(active_target);
     }
@@ -1515,11 +1552,7 @@ fn release_forwarded_keys_x11(context: &X11CaptureContext, target: &InputTarget)
 }
 
 #[cfg(target_os = "linux")]
-fn release_x11_remote_control_inner(
-    context: &X11CaptureContext,
-    clear_clipboard: bool,
-    return_point: Option<(f64, f64)>,
-) {
+fn release_x11_remote_control_inner(context: &X11CaptureContext, return_point: Option<(f64, f64)>) {
     let active = context
         .active
         .lock()
@@ -1561,9 +1594,7 @@ fn release_x11_remote_control_inner(
     }
     show_x11_cursor(context);
     ungrab_x11_input(context);
-    if clear_clipboard {
-        clear_clipboard_target(&context.clipboard_target);
-    }
+    end_x11_clipboard_session(&context.clipboard_target);
 }
 
 #[cfg(target_os = "linux")]
@@ -1575,7 +1606,7 @@ pub(super) fn release_active_remote_control() {
         .send_gate
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    release_x11_remote_control_inner(&context, true, None);
+    release_x11_remote_control_inner(&context, None);
 }
 
 #[cfg(target_os = "linux")]
@@ -1737,7 +1768,7 @@ fn handle_x11_motion(context: &X11CaptureContext, dx: f64, dy: f64) {
         if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
             let point = local_return_point(active_target);
             drop(active);
-            release_x11_remote_control_inner(context, false, Some(point));
+            release_x11_remote_control_inner(context, Some(point));
             return;
         }
         active_target.x = active_target
@@ -1758,7 +1789,7 @@ fn handle_x11_motion(context: &X11CaptureContext, dx: f64, dy: f64) {
         {
             let point = local_return_point(active_target);
             drop(active);
-            release_x11_remote_control_inner(context, true, Some(point));
+            release_x11_remote_control_inner(context, Some(point));
             return;
         }
         let anchor = context
@@ -1770,7 +1801,7 @@ fn handle_x11_motion(context: &X11CaptureContext, dx: f64, dy: f64) {
         drop(active);
         if let Err(error) = warp_pointer(context, anchor) {
             log::warn!("Linux X11 pointer re-pin failed: {error}");
-            release_x11_remote_control_inner(context, true, None);
+            release_x11_remote_control_inner(context, None);
         }
         return;
     }
@@ -1829,7 +1860,7 @@ fn handle_x11_key(context: &X11CaptureContext, detail: u32, down: bool) {
             .ok()
             .and_then(|point| *point);
         let point = local_hotkey_return_point(&active, recorded);
-        release_x11_remote_control_inner(context, false, Some(point));
+        release_x11_remote_control_inner(context, Some(point));
         return;
     }
     let modifier_snapshot = context
@@ -1850,7 +1881,7 @@ fn handle_x11_key(context: &X11CaptureContext, detail: u32, down: bool) {
         track_forwarded_key(&context.forwarded_pressed_keys, vk, down);
     } else {
         let point = local_return_point(&active);
-        release_x11_remote_control_inner(context, true, Some(point));
+        release_x11_remote_control_inner(context, Some(point));
     }
 }
 
@@ -1892,7 +1923,7 @@ fn handle_x11_button(context: &X11CaptureContext, detail: u32, down: bool) {
             &context.layout_state,
             &context.input_events,
         ) {
-            release_x11_remote_control_inner(context, true, None);
+            release_x11_remote_control_inner(context, None);
         }
         return;
     }
@@ -1925,7 +1956,7 @@ fn handle_x11_button(context: &X11CaptureContext, detail: u32, down: bool) {
     if sent {
         update_remote_button_mask(&context.remote_button_mask, button, down);
     } else {
-        release_x11_remote_control_inner(context, true, None);
+        release_x11_remote_control_inner(context, None);
     }
 }
 
@@ -1963,7 +1994,7 @@ fn drain_switch_request_x11(context: &X11CaptureContext) {
             let point = active
                 .as_ref()
                 .map(|active| local_hotkey_return_point(active, recorded));
-            release_x11_remote_control_inner(context, false, point);
+            release_x11_remote_control_inner(context, point);
         }
         SwitchOutcome::LocalMove {
             from_screen_id,
@@ -2133,6 +2164,25 @@ mod tests {
     }
 
     #[test]
+    fn ending_x11_control_always_unbinds_the_clipboard_peer() {
+        let target =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(super::super::ClipboardTarget {
+                device_id: "peer-device".into(),
+                addr: "10.0.0.2:47834".into(),
+                transport_public_key: "peer-public-key".into(),
+                protocol_version: crate::quic_transport::PROTOCOL_VERSION,
+                cluster_id: "cluster-test".into(),
+                pair_secret: "secret-test".into(),
+                push_on_bind: true,
+                expires_at: None,
+            })));
+
+        end_x11_clipboard_session(&target);
+
+        assert!(target.lock().expect("clipboard target lock").is_none());
+    }
+
+    #[test]
     fn receive_cursor_park_state_reveals_once_on_real_drift() {
         let mut state = ReceiveCursorState::default();
         assert!(state.park((100, 200)), "first park needs a native hide");
@@ -2169,8 +2219,10 @@ mod tests {
         };
 
         assert!(std::env::var_os("DISPLAY").is_some(), "DISPLAY is required");
-        assert_eq!(capture_status(1).state, "ready");
-        assert_eq!(receive_status(24800).state, "ready");
+        let capture = capture_status(1);
+        assert_eq!(capture.state, "ready", "{}", capture.detail);
+        let receive = receive_status(24800);
+        assert_eq!(receive.state, "ready", "{}", receive.detail);
 
         let mut injector = X11Injector::connect().expect("XTEST/XKB must initialize");
         check_capture_extensions(&injector.connection).expect("XI2/XFixes must initialize");

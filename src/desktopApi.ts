@@ -76,7 +76,7 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
       transportPort: defaultLayout.transportPort,
       quicPort: defaultLayout.quicPort,
       transportPublicKey: '',
-      protocolVersion: 1,
+      protocolVersion: 3,
       screenCount: 1,
       inputReady: false,
       screens: [
@@ -91,7 +91,7 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
           isPrimary: true,
         },
       ],
-      appVersion: '0.1.0',
+      appVersion: '0.9.12-dev.0',
       lastSeenMs: Date.now(),
     },
     peers: [],
@@ -210,7 +210,7 @@ export async function readDiagnosticInfo(): Promise<DiagnosticInfo> {
   if (!isTauri()) {
     return {
       report: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
-      appVersion: '0.1.0',
+      appVersion: '0.9.12-dev.0',
       platform: navigator.platform,
       role: defaultLayout.machineRole,
       runtimeStarted: browserRuntime.started,

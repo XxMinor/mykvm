@@ -75,6 +75,7 @@ export interface DiagnosticDevice {
   name: string
   host: string
   role: string
+  protocolVersion: number
   online: boolean
   inputReady: boolean
   discoveryPort: number

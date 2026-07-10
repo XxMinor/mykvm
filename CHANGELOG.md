@@ -8,9 +8,19 @@ release will reuse them).
 
 ## [Unreleased]
 
+### Changed
+
+- Input compatibility now uses protocol v3 and rejects older peers instead of silently mixing incompatible input state. Update MyKVM on both machines together.
+
 ### Fixed
 
 - Keyboard, mouse, and clipboard could fail to connect between machines — the QUIC handshake rejected the peer with `invalid peer certificate: BadSignature`. The transport now pins the device's advertised certificate directly instead of running brittle chain validation over a self-signed certificate, which fixes cross-platform (macOS ↔ Windows) handshakes.
+- Windows-to-macOS pointer hand-off is smoother and more reliable: edge motion is preserved, the Windows pointer stays hidden while the remote screen is active, and input capture recovers after a low-level hook interruption.
+- macOS control-side input no longer pauses behind network admission or layout saves while crossing screens, moving the pointer, or sending heartbeat state.
+- Remote mouse clicks and double-clicks are no longer dropped when movement packets arrive around the same time.
+- Windows modifier shortcuts such as Win+Arrow map correctly to macOS Control+Arrow. Reliable state heartbeats and a bounded session lease release held keys and mouse buttons after interruptions instead of leaving Command-like input stuck.
+- Clipboard sync follows the active pointer-control session and no longer remains bound to a device after the pointer returns.
+- Linux X11 peers are identified correctly, retry transient display startup races, and clear their clipboard binding when remote control ends.
 
 ## v0.4.0
 

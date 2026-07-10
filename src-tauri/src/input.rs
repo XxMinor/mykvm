@@ -9,7 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "windows", test))]
+use std::collections::VecDeque;
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
@@ -103,9 +106,18 @@ const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
 ];
 #[cfg(target_os = "windows")]
 const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
+#[cfg(target_os = "windows")]
+const WINDOWS_MODIFIER_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
+const REMOTE_INPUT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const REMOTE_INPUT_LEASE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "macos", test))]
+const MACOS_RECEIVE_CURSOR_DRIFT_PX: f64 = 24.0;
+#[cfg(any(target_os = "macos", test))]
+const MACOS_IOHID_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
 static REMOTE_KEY_SEQUENCE_STATE: OnceLock<Mutex<RemoteKeySequenceState>> = OnceLock::new();
+static REMOTE_INPUT_LEASE: OnceLock<Mutex<RemoteInputLease>> = OnceLock::new();
 static REMOTE_INPUT_INJECT_LOCK: Mutex<()> = Mutex::new(());
 static REMOTE_MOUSE_INJECT_LOCK: Mutex<()> = Mutex::new(());
 static REMOTE_INPUT_ORIGIN: Mutex<String> = Mutex::new(String::new());
@@ -130,6 +142,10 @@ struct InputTarget {
     pair_secret: String,
     target_addr: String,
     target_platform: String,
+    modifier_remap: bool,
+    modifier_control: String,
+    modifier_alt: String,
+    modifier_meta: String,
     transport_public_key: String,
     protocol_version: u16,
     screen_id: String,
@@ -154,7 +170,7 @@ struct ActiveTarget {
     invert_y: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardTarget {
     pub device_id: String,
     pub addr: String,
@@ -181,7 +197,7 @@ struct InputPacket {
     origin_port: u16,
     #[serde(default)]
     origin_transport_public_key: String,
-    #[serde(default = "default_protocol_version")]
+    #[serde(default)]
     origin_protocol_version: u16,
     #[serde(default)]
     cluster_id: String,
@@ -196,11 +212,20 @@ struct InputPacket {
     /// connection after a reconnect. Zero is reserved for older peers.
     #[serde(default, skip_serializing_if = "is_zero")]
     key_sequence: u64,
+    /// Reliable liveness frame for an already-active input session. Heartbeats
+    /// carry an authoritative MouseMove snapshot but may never claim an idle
+    /// receiver on their own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    heartbeat: bool,
     event: InputEvent,
 }
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,7 +238,7 @@ struct InputControlPacket {
     origin_device_id: String,
     #[serde(default)]
     origin_transport_public_key: String,
-    #[serde(default = "default_protocol_version")]
+    #[serde(default)]
     origin_protocol_version: u16,
     #[serde(default)]
     cluster_id: String,
@@ -258,6 +283,92 @@ struct RemoteOriginKeySequenceState {
     last_by_key: HashMap<u16, u64>,
 }
 
+#[derive(Debug, Default)]
+struct RemoteInputLease {
+    origin_id: String,
+    expires_at: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RemoteInputExpiration {
+    origin_id: String,
+    buttons: u64,
+    x: i32,
+    y: i32,
+}
+
+impl RemoteInputLease {
+    fn renew(&mut self, origin_id: &str, now: Instant) {
+        self.origin_id.clear();
+        self.origin_id.push_str(origin_id);
+        self.expires_at = Some(now + REMOTE_INPUT_LEASE_TIMEOUT);
+    }
+
+    fn expired_origin(&self, now: Instant) -> Option<&str> {
+        self.expires_at
+            .filter(|expires_at| now >= *expires_at)
+            .map(|_| self.origin_id.as_str())
+    }
+
+    fn end(&mut self, origin_id: &str) -> bool {
+        if self.expires_at.is_none() || self.origin_id != origin_id {
+            return false;
+        }
+        self.origin_id.clear();
+        self.expires_at = None;
+        true
+    }
+}
+
+fn expire_remote_input_session_with_state(
+    lease: &mut RemoteInputLease,
+    key_state: &mut RemoteKeySequenceState,
+    mouse_state: &mut RemoteMouseState,
+    active_origin: &mut String,
+    now: Instant,
+) -> Option<RemoteInputExpiration> {
+    let origin_id = lease.expired_origin(now)?.to_string();
+    if active_origin != &origin_id {
+        lease.end(&origin_id);
+        return None;
+    }
+
+    if let Some(state) = key_state.by_origin.get_mut(&origin_id) {
+        state.boundary_sequence = state.boundary_sequence.max(state.latest_event_sequence);
+    }
+    if let Some(state) = mouse_state.sequence_by_origin.get_mut(&origin_id) {
+        let boundary = state
+            .last_position_sequence
+            .max(state.last_scroll_sequence)
+            .max(state.last_boundary_sequence)
+            .max(
+                state
+                    .last_button_sequence
+                    .into_iter()
+                    .max()
+                    .unwrap_or_default(),
+            );
+        state.last_position_sequence = boundary;
+        state.last_scroll_sequence = boundary;
+        state.last_boundary_sequence = boundary;
+        state.last_button_sequence = [boundary; 3];
+    }
+
+    active_origin.clear();
+    lease.end(&origin_id);
+    if mouse_state.last_origin_id == origin_id {
+        mouse_state.last_origin_id.clear();
+    }
+    let expired = RemoteInputExpiration {
+        origin_id,
+        buttons: mouse_state.buttons,
+        x: mouse_state.x,
+        y: mouse_state.y,
+    };
+    mouse_state.buttons = 0;
+    Some(expired)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RemoteInputAdmission {
     inject_event: bool,
@@ -272,6 +383,37 @@ struct RemoteInputAdmission {
 struct RemoteMouseAdmission {
     button_reconciliation: Option<(u64, u64, i32, i32)>,
     park_accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteInputOutcome {
+    injected: bool,
+    admitted: bool,
+    current_session_owner: bool,
+    session_ended: bool,
+}
+
+impl RemoteInputOutcome {
+    fn renews_session(self) -> bool {
+        self.injected && self.admitted && self.current_session_owner && !self.session_ended
+    }
+}
+
+fn apply_remote_input_lease_outcome(
+    lease: &mut RemoteInputLease,
+    origin_id: &str,
+    outcome: RemoteInputOutcome,
+    now: Instant,
+) {
+    if outcome.session_ended {
+        lease.end(origin_id);
+    } else if outcome.renews_session() {
+        lease.renew(origin_id, now);
+    }
+}
+
+fn remote_input_session_ended(admission: &RemoteInputAdmission) -> bool {
+    admission.inject_event && admission.mouse.is_some_and(|mouse| mouse.park_accepted)
 }
 
 impl RemoteKeySequenceState {
@@ -422,8 +564,9 @@ fn screen_switch_hotkey_matches_vk(
     key_code: u16,
     modifiers: HotkeyModifiers,
 ) -> bool {
-    let Ok(layout) = layout_state.lock() else {
-        return false;
+    let layout = match layout_state.try_lock() {
+        Ok(layout) => layout,
+        Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return false,
     };
     if layout.machine_role != "server" {
         return false;
@@ -720,6 +863,7 @@ pub fn start_input_runtime(
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> (NativeStageStatus, NativeStageStatus) {
     let inject_status = input_receive_status(&layout, true);
+    start_remote_input_lease_monitor(Arc::clone(&stop), Arc::clone(&clipboard_target));
     if layout.input_mode == "receive" {
         remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&clipboard_target);
@@ -743,6 +887,18 @@ pub fn start_input_runtime(
     );
 
     (capture_status, inject_status)
+}
+
+fn start_remote_input_lease_monitor(
+    stop: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+) {
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            expire_remote_input_session(Instant::now(), &clipboard_target);
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
 }
 
 pub fn input_runtime_status(
@@ -954,6 +1110,7 @@ fn start_platform_capture(
             cursor_hide_depth: Mutex::new(0),
             last_cursor_hide_reassert: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
+            last_heartbeat_sent: Mutex::new(None),
             last_cursor_repin: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_modifiers: Mutex::new(Vec::new()),
@@ -1081,7 +1238,21 @@ fn start_platform_capture(
                             "remote input transport failed; returning macOS cursor to local control"
                         );
                         return_to_local_macos(&context);
-                        clear_clipboard_target(&context.clipboard_target);
+                    } else if !send_remote_input_heartbeat(
+                        &context.quic_transport,
+                        &context.active,
+                        &context.remote_button_mask,
+                        context
+                            .pressed_modifiers
+                            .lock()
+                            .map(|pressed| modifier_mask_for_keys(&pressed))
+                            .unwrap_or_default(),
+                        &context.last_heartbeat_sent,
+                        &context.layout_state,
+                        &context.input_events,
+                    ) {
+                        log::warn!("remote input heartbeat failed; returning macOS cursor locally");
+                        return_to_local_macos(&context);
                     } else {
                         drain_switch_request_macos(&context);
                     }
@@ -1092,6 +1263,15 @@ fn start_platform_capture(
             // the app restarts, which is the classic "works, then sticks after a
             // while" failure. Re-arm it as soon as we notice.
             if context.tap_disabled.swap(false, Ordering::Relaxed) {
+                // A disabled tap may have lost the matching KeyUp/ButtonUp.
+                // Converge the remote session before accepting more input;
+                // macOS packet admission is non-blocking, and the transport's
+                // reset-aware FIFO keeps these releases ahead of shutdown.
+                let _send_guard = context
+                    .send_gate
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                return_to_local_macos(&context);
                 tap.enable();
                 for raw_tap in &raw_gesture_taps {
                     raw_tap.enable();
@@ -1161,13 +1341,14 @@ fn start_platform_capture(
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     _main_window_visible: Arc<AtomicBool>,
-    main_window_focused: Arc<AtomicBool>,
+    _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MsgWaitForMultipleObjects, PeekMessageW, MSG, PM_REMOVE, QS_ALLINPUT,
+        DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG,
+        PM_REMOVE, QS_ALLINPUT, WM_QUIT,
     };
 
     let target_count = targets.len();
@@ -1176,6 +1357,14 @@ fn start_platform_capture(
     thread::spawn(move || {
         set_windows_capture_thread_priority();
         refresh_windows_input_desktop_cache();
+        let cursor_hider = match WindowsCursorHider::create() {
+            Ok(hider) => hider,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        };
+        let (event_tx, event_rx) = mpsc::channel();
         let context = Arc::new(WindowsCaptureContext {
             quic_transport,
             layout_state,
@@ -1184,18 +1373,26 @@ fn start_platform_capture(
             send_gate: Mutex::new(()),
             active: Mutex::new(None),
             remote_active,
-            main_window_focused,
             clipboard_target,
             input_events,
-            targets,
             switch_request,
-            anchor: Mutex::new(None),
             last_point: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
+            last_heartbeat_sent: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_keys: Mutex::new(Vec::new()),
-            cursor_hide_calls: Mutex::new(0),
-            just_crossed: AtomicBool::new(false),
+            event_tx,
+            pending_mouse_move: Mutex::new(WindowsPendingMouseMoves::default()),
+            mouse_move_notification_queued: AtomicBool::new(false),
+            dropped_mouse_moves: AtomicU64::new(0),
+            release_notification_queued: AtomicBool::new(false),
+            hook_modifier_bits: AtomicU64::new(0),
+            remote_anchor_x: std::sync::atomic::AtomicI64::new(0),
+            remote_anchor_y: std::sync::atomic::AtomicI64::new(0),
+            warp_cutoff_time: AtomicU64::new(0),
+            cursor_warp_failures: AtomicU64::new(0),
+            cursor_hider_hwnd: std::sync::atomic::AtomicUsize::new(cursor_hider.hwnd as usize),
+            cursor_hider_visible: AtomicBool::new(false),
             local_screen_points: Mutex::new(HashMap::new()),
             last_hook_event_ms: AtomicU64::new(0),
         });
@@ -1204,9 +1401,14 @@ fn start_platform_capture(
             *current = Some(Arc::clone(&context));
         }
 
+        let worker_context = Arc::clone(&context);
+        let worker = thread::spawn(move || run_windows_input_worker(worker_context, event_rx));
+
         let mut hooks = match WindowsInputHooks::install() {
             Ok(hooks) => hooks,
             Err(error) => {
+                shutdown_windows_input_worker(&context);
+                let _ = worker.join();
                 context.remote_active.store(false, Ordering::Relaxed);
                 clear_clipboard_target(&context.clipboard_target);
                 clear_windows_capture_context(&context);
@@ -1217,38 +1419,15 @@ fn start_platform_capture(
 
         let _ = ready_tx.send(Ok(()));
         let mut message = MSG::default();
-        let mut last_desktop_check = Instant::now() - Duration::from_millis(200);
         let mut last_watchdog_check = Instant::now();
+        let mut last_modifier_snapshot = Instant::now() - WINDOWS_MODIFIER_SNAPSHOT_INTERVAL;
         while !stop.load(Ordering::Relaxed) {
-            if last_desktop_check.elapsed() >= Duration::from_millis(100) {
-                last_desktop_check = Instant::now();
-                if !refresh_windows_input_desktop_cache() {
-                    release_windows_remote_control(&context, true);
-                }
-            }
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            {
-                let _send_guard = context
-                    .send_gate
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if !context.stop.load(Ordering::Relaxed) {
-                    if active_target_input_failed(&context.quic_transport, &context.active) {
-                        log::warn!(
-                            "remote input transport failed; releasing Windows remote control"
-                        );
-                        release_windows_remote_control_inner(&context, true);
-                    } else {
-                        drain_switch_request_windows(&context);
-                    }
-                }
-            }
             if last_watchdog_check.elapsed() >= Duration::from_secs(1) {
                 last_watchdog_check = Instant::now();
                 if windows_hooks_look_dead(&context, &hooks) {
                     log::warn!("low-level input hooks stopped receiving events; reinstalling them");
+                    release_windows_worker_for_hook_loss(&context);
+                    clear_windows_hook_modifier_bits(&context.hook_modifier_bits);
                     hooks.reinstall(&context);
                 }
             }
@@ -1259,11 +1438,37 @@ fn start_platform_capture(
             // Windows silently drop low-level hooks.
             unsafe {
                 let _ = MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 20, QS_ALLINPUT);
-                while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
+                while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    if message.message == WM_QUIT {
+                        stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    let _ = TranslateMessage(&message);
+                    let _ = DispatchMessageW(&message);
+                }
+            }
+            // Low-level callbacks run on this message-pump thread, so sampling
+            // immediately after dispatch gives an authoritative post-event
+            // snapshot without racing the callback cache. This independently
+            // repairs a missed Win/Ctrl Up even while mouse events keep the
+            // combined hook watchdog looking healthy.
+            if last_modifier_snapshot.elapsed() >= WINDOWS_MODIFIER_SNAPSHOT_INTERVAL {
+                last_modifier_snapshot = Instant::now();
+                let physical = physical_windows_modifiers();
+                let snapshot = windows_modifier_bits_for_keys(&physical);
+                let previous = context.hook_modifier_bits.swap(snapshot, Ordering::AcqRel);
+                if previous != snapshot && context.remote_active.load(Ordering::Acquire) {
+                    let _ = context
+                        .event_tx
+                        .send(WindowsCapturedEvent::ModifierSnapshot {
+                            modifier_bits: snapshot,
+                        });
+                }
             }
         }
 
-        release_windows_remote_control(&context, true);
+        shutdown_windows_input_worker(&context);
+        let _ = worker.join();
         hooks.uninstall();
         show_windows_cursor_if_needed(&context);
         context.remote_active.store(false, Ordering::Relaxed);
@@ -1385,14 +1590,21 @@ fn macos_receive_show_cursor_if_hidden() {
     log::info!("[diag] receive show cursor");
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_receive_cursor_drifted(parked: (f64, f64), current: (f64, f64)) -> bool {
+    (current.0 - parked.0).abs() > MACOS_RECEIVE_CURSOR_DRIFT_PX
+        || (current.1 - parked.1).abs() > MACOS_RECEIVE_CURSOR_DRIFT_PX
+}
+
 #[cfg(target_os = "macos")]
 fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
     thread::spawn(move || {
         // While the cursor is hidden (control has left), watch for the local
         // user physically moving the mouse — the cursor drifts off the parked
-        // point — and reveal it so they can use this machine again. An injected
-        // move from the server reveals it directly (see inject_input_command).
-        const RECEIVE_CURSOR_DRIFT_PX: f64 = 3.0;
+        // point — and reveal it so they can use this machine again. WindowServer
+        // can drift a parked cursor by roughly 5-18 points after a long idle, so
+        // require a larger intentional move. An injected move from the server
+        // reveals it directly (see inject_input_command).
         while !stop.load(Ordering::Relaxed) {
             if MACOS_RECEIVE_CURSOR_HIDDEN.load(Ordering::Relaxed) {
                 let parked = MACOS_RECEIVE_PARK_POINT
@@ -1401,9 +1613,7 @@ fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
                     .and_then(|point| *point);
                 if let (Some((px, py)), Some(location)) = (parked, macos_current_cursor_location())
                 {
-                    if (location.x - px).abs() > RECEIVE_CURSOR_DRIFT_PX
-                        || (location.y - py).abs() > RECEIVE_CURSOR_DRIFT_PX
-                    {
+                    if macos_receive_cursor_drifted((px, py), (location.x, location.y)) {
                         log::info!(
                             "[diag] monitor drift show: cur=({:.0},{:.0}) park=({px:.0},{py:.0})",
                             location.x,
@@ -1513,6 +1723,10 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
                         pair_secret: layout.pair_secret.clone(),
                         target_addr: format!("{}:{}", device.host, quic_port),
                         target_platform: device.platform.clone(),
+                        modifier_remap: layout.modifier_remap,
+                        modifier_control: layout.modifier_map.control.clone(),
+                        modifier_alt: layout.modifier_map.alt.clone(),
+                        modifier_meta: layout.modifier_map.meta.clone(),
                         transport_public_key: device.transport_public_key.clone(),
                         protocol_version: device.protocol_version,
                         screen_id: peer_screen_id(device, remote_screen),
@@ -1537,6 +1751,17 @@ fn current_input_targets(
         .lock()
         .map(|layout| build_input_targets(&layout, native_layout))
         .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn try_current_input_targets(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    native_layout: &LayoutState,
+) -> Option<Vec<InputTarget>> {
+    match layout_state.try_lock() {
+        Ok(layout) => Some(build_input_targets(&layout, native_layout)),
+        Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => None,
+    }
 }
 
 fn touching_edge(local: &Screen, remote: &Screen) -> Option<Edge> {
@@ -1673,6 +1898,40 @@ fn send_packet_with_modifier_snapshot(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    send_packet_with_options(
+        quic_transport,
+        target,
+        event,
+        modifier_snapshot,
+        false,
+        layout_state,
+        input_events,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputSendAdmission {
+    Confirmed,
+    Nonblocking,
+}
+
+fn platform_input_send_admission() -> InputSendAdmission {
+    if cfg!(target_os = "macos") {
+        InputSendAdmission::Nonblocking
+    } else {
+        InputSendAdmission::Confirmed
+    }
+}
+
+fn send_packet_with_options(
+    quic_transport: &quic_transport::TransportHandle,
+    target: &InputTarget,
+    event: InputEvent,
+    modifier_snapshot: Option<u8>,
+    heartbeat: bool,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
     let packet_context = input_packet_context(target, event, modifier_snapshot, layout_state);
     let event = packet_context.event;
     // State transitions ride a per-peer reliable queue. Releases can evict
@@ -1683,7 +1942,7 @@ fn send_packet_with_modifier_snapshot(
     // motion: replaying hundreds of old drag points after a Wi-Fi pause is worse
     // than dropping intermediate positions, and the receiver can reconcile a
     // transition that arrives on the other QUIC channel.
-    let reliable_class = input_event_reliable_class(&event);
+    let reliable_class = input_packet_reliable_class(&event, heartbeat);
     let send_latest = matches!(event, InputEvent::MouseMove { .. });
     let key_sequence = input_packet_needs_key_sequence(&event, packet_context.modifier_snapshot)
         .then(next_key_sequence)
@@ -1699,6 +1958,7 @@ fn send_packet_with_modifier_snapshot(
         pair_secret: packet_context.pair_secret,
         modifier_snapshot: packet_context.modifier_snapshot,
         key_sequence,
+        heartbeat,
         event,
     };
     let Some(peer) = packet_context.peer else {
@@ -1717,10 +1977,19 @@ fn send_packet_with_modifier_snapshot(
         }
     };
 
+    let admission = platform_input_send_admission();
     let send_result = if let Some(class) = reliable_class {
-        quic_transport.send_reliable_input_with_class(peer, payload, class)
+        if admission == InputSendAdmission::Nonblocking {
+            quic_transport.send_reliable_input_with_class_nonblocking(peer, payload, class)
+        } else {
+            quic_transport.send_reliable_input_with_class(peer, payload, class)
+        }
     } else if send_latest {
-        quic_transport.send_latest_datagram(peer, payload)
+        if admission == InputSendAdmission::Nonblocking {
+            quic_transport.send_latest_datagram_nonblocking(peer, payload)
+        } else {
+            quic_transport.send_latest_datagram(peer, payload)
+        }
     } else {
         quic_transport.send_datagram(peer, payload)
     };
@@ -1758,6 +2027,15 @@ fn input_event_reliable_class(event: &InputEvent) -> Option<quic_transport::Reli
         InputEvent::Scroll { .. } => Some(ReliableInputClass::Transient),
         InputEvent::MouseMove { .. } => None,
     }
+}
+
+fn input_packet_reliable_class(
+    event: &InputEvent,
+    heartbeat: bool,
+) -> Option<quic_transport::ReliableInputClass> {
+    heartbeat
+        .then_some(quic_transport::ReliableInputClass::State)
+        .or_else(|| input_event_reliable_class(event))
 }
 
 pub fn send_secure_attention_control(
@@ -1826,6 +2104,12 @@ fn input_packet_context(
     modifier_snapshot: Option<u8>,
     layout_state: &Arc<Mutex<LayoutState>>,
 ) -> InputPacketContext {
+    // The remap is a session property captured at crossing. Reading live
+    // layout here can both block the event tap behind save-to-disk and map a
+    // Down differently from its later Up after a settings edit.
+    let event = remap_event_for_target_cached(event, target);
+    let modifier_snapshot =
+        modifier_snapshot.map(|mask| remap_modifier_snapshot_for_target_cached(mask, target));
     let fallback_peer = || quic_transport::PeerEndpoint {
         addr: target.target_addr.clone(),
         public_key: target.transport_public_key.clone(),
@@ -1843,16 +2127,6 @@ fn input_packet_context(
 
     let layout = match layout_state.try_lock() {
         Ok(layout) => layout,
-        Err(TryLockError::WouldBlock) if matches!(&event, InputEvent::Key { .. }) => {
-            // Mouse motion must never wait on the UI/layout lock, but modifier
-            // down/up must use one consistent remap. Falling back to the raw
-            // key here could map the down and not the up (or vice versa),
-            // leaving Ctrl/Cmd stuck on the controlled machine.
-            match layout_state.lock() {
-                Ok(layout) => layout,
-                Err(_) => return fallback_context(event),
-            }
-        }
         Err(TryLockError::WouldBlock) => return fallback_context(event),
         Err(TryLockError::Poisoned(_)) => return fallback_context(event),
     };
@@ -1873,10 +2147,6 @@ fn input_packet_context(
                 protocol_version: device.protocol_version,
             })
         });
-    let event = remap_event_for_target_layout(event, target, &layout);
-    let modifier_snapshot = modifier_snapshot
-        .map(|mask| remap_modifier_snapshot_for_target_layout(mask, target, &layout));
-
     InputPacketContext {
         origin_device_id,
         cluster_id: layout.cluster_id.clone(),
@@ -1896,6 +2166,35 @@ fn remap_event_for_target_layout(
     target: &InputTarget,
     layout: &LayoutState,
 ) -> InputEvent {
+    remap_event_for_target_config(
+        event,
+        target,
+        layout.modifier_remap,
+        &layout.modifier_map.control,
+        &layout.modifier_map.alt,
+        &layout.modifier_map.meta,
+    )
+}
+
+fn remap_event_for_target_cached(event: InputEvent, target: &InputTarget) -> InputEvent {
+    remap_event_for_target_config(
+        event,
+        target,
+        target.modifier_remap,
+        &target.modifier_control,
+        &target.modifier_alt,
+        &target.modifier_meta,
+    )
+}
+
+fn remap_event_for_target_config(
+    event: InputEvent,
+    target: &InputTarget,
+    modifier_remap: bool,
+    control: &str,
+    alt: &str,
+    meta: &str,
+) -> InputEvent {
     let InputEvent::Key { key_code, down } = event else {
         return event;
     };
@@ -1908,13 +2207,8 @@ fn remap_event_for_target_layout(
         return InputEvent::Key { key_code, down };
     }
 
-    let remapped = if layout.modifier_remap {
-        remap_modifier_vk(
-            key_code,
-            &layout.modifier_map.control,
-            &layout.modifier_map.alt,
-            &layout.modifier_map.meta,
-        )
+    let remapped = if modifier_remap {
+        remap_modifier_vk(key_code, control, alt, meta)
     } else {
         key_code
     };
@@ -1930,19 +2224,43 @@ fn remap_modifier_snapshot_for_target_layout(
     target: &InputTarget,
     layout: &LayoutState,
 ) -> u8 {
+    remap_modifier_snapshot_for_target_config(
+        mask,
+        target,
+        layout.modifier_remap,
+        &layout.modifier_map.control,
+        &layout.modifier_map.alt,
+        &layout.modifier_map.meta,
+    )
+}
+
+fn remap_modifier_snapshot_for_target_cached(mask: u8, target: &InputTarget) -> u8 {
+    remap_modifier_snapshot_for_target_config(
+        mask,
+        target,
+        target.modifier_remap,
+        &target.modifier_control,
+        &target.modifier_alt,
+        &target.modifier_meta,
+    )
+}
+
+fn remap_modifier_snapshot_for_target_config(
+    mask: u8,
+    target: &InputTarget,
+    modifier_remap: bool,
+    control: &str,
+    alt: &str,
+    meta: &str,
+) -> u8 {
     let target_platform = target.target_platform.as_str();
-    if !layout.modifier_remap
+    if !modifier_remap
         || (target_platform != "macos" && target_platform != "windows")
         || target_platform == crate::current_platform()
     {
         return mask;
     }
-    remap_modifier_mask(
-        mask,
-        &layout.modifier_map.control,
-        &layout.modifier_map.alt,
-        &layout.modifier_map.meta,
-    )
+    remap_modifier_mask(mask, control, alt, meta)
 }
 
 #[cfg(test)]
@@ -1973,12 +2291,8 @@ fn reconcile_windows_modifier_events(
     physical_down: &[u16],
     forwarded_pressed: &[u16],
 ) -> Vec<InputEvent> {
-    let mut releases = Vec::new();
     let mut presses = Vec::new();
     for family in 0..4 {
-        let physical_present = physical_down
-            .iter()
-            .any(|key| windows_modifier_family(*key) == Some(family));
         let forwarded_present = forwarded_pressed
             .iter()
             .any(|key| windows_modifier_family(*key) == Some(family));
@@ -1998,21 +2312,36 @@ fn reconcile_windows_modifier_events(
                     });
                 }
             }
-        } else if !physical_present {
-            releases.extend(
-                forwarded_pressed
-                    .iter()
-                    .copied()
-                    .filter(|key| windows_modifier_family(*key) == Some(family))
-                    .map(|key_code| InputEvent::Key {
-                        key_code,
-                        down: false,
-                    }),
-            );
         }
     }
-    releases.extend(presses);
-    releases
+    presses
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn reconcile_windows_authoritative_modifier_events(
+    physical_down: &[u16],
+    forwarded_pressed: &[u16],
+) -> Vec<InputEvent> {
+    let mut transitions = forwarded_pressed
+        .iter()
+        .copied()
+        .filter(|key| windows_modifier_family(*key).is_some())
+        .filter(|forwarded| {
+            let family = windows_modifier_family(*forwarded);
+            !physical_down
+                .iter()
+                .any(|physical| windows_modifier_family(*physical) == family)
+        })
+        .map(|key_code| InputEvent::Key {
+            key_code,
+            down: false,
+        })
+        .collect::<Vec<_>>();
+    transitions.extend(reconcile_windows_modifier_events(
+        physical_down,
+        forwarded_pressed,
+    ));
+    transitions
 }
 
 /// Groups generic and sided Windows virtual-key codes by physical modifier.
@@ -2071,30 +2400,23 @@ fn remap_modifier_mask(mask: u8, control: &str, alt: &str, meta: &str) -> u8 {
 }
 
 fn mark_target_offline(
-    layout_state: &Arc<Mutex<LayoutState>>,
+    _layout_state: &Arc<Mutex<LayoutState>>,
     target: &InputTarget,
-    _reason: &str,
+    reason: &str,
 ) {
-    let Ok(mut layout) = layout_state.lock() else {
-        return;
-    };
-    let Some(device) = layout
-        .devices
-        .iter_mut()
-        .find(|device| device.id == target.device_id)
-    else {
-        return;
-    };
-    if !device.online {
-        return;
-    }
-
-    device.online = false;
+    // A single input send can fail while discovery and clipboard transport are
+    // still healthy. Discovery owns online/offline state; mutating it here can
+    // make the edge disappear permanently after one transient QUIC failure.
+    log::debug!(
+        "input send failed without changing discovery state device={} reason={}",
+        target.device_id,
+        reason
+    );
 }
 
 fn target_is_online(target: &InputTarget, layout_state: &Arc<Mutex<LayoutState>>) -> bool {
     layout_state
-        .lock()
+        .try_lock()
         .ok()
         .and_then(|layout| {
             layout
@@ -2131,6 +2453,10 @@ pub fn try_inject_packet_from_source(
     if !packet_targets_local(layout, &packet.target_device_id, local_peer_id) {
         return true;
     }
+    if packet.heartbeat && !matches!(&packet.event, InputEvent::MouseMove { .. }) {
+        log::warn!("discarded malformed remote input heartbeat from {}", source);
+        return true;
+    }
 
     let clipboard_peer =
         if packet.origin_port != 0 && !packet.origin_transport_public_key.trim().is_empty() {
@@ -2154,15 +2480,39 @@ pub fn try_inject_packet_from_source(
     } else {
         packet.origin_device_id.clone()
     };
-    let (injected, accepted) = inject_input_event(
+    let outcome = inject_input_event(
         layout,
         native_layout,
         &mouse_origin_id,
         packet.modifier_snapshot,
         packet.key_sequence,
+        packet.heartbeat,
         packet.event,
     );
-    if accepted {
+    apply_remote_input_clipboard_outcome(
+        clipboard_target,
+        &mouse_origin_id,
+        outcome,
+        clipboard_peer,
+        layout,
+    );
+    if outcome.injected && outcome.current_session_owner {
+        input_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    true
+}
+
+fn apply_remote_input_clipboard_outcome(
+    clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
+    origin_id: &str,
+    outcome: RemoteInputOutcome,
+    clipboard_peer: Option<(String, String, String, u16)>,
+    layout: &LayoutState,
+) {
+    if outcome.session_ended {
+        clear_clipboard_target_if_device(clipboard_target, origin_id);
+    } else if outcome.renews_session() {
         if let Some((device_id, addr, public_key, protocol_version)) = clipboard_peer {
             // Only the controller that won sequence/origin admission owns the
             // clipboard return path. A stale or inactive paired controller's
@@ -2180,11 +2530,6 @@ pub fn try_inject_packet_from_source(
             );
         }
     }
-    if injected && accepted {
-        input_events.fetch_add(1, Ordering::Relaxed);
-    }
-
-    true
 }
 
 pub fn try_handle_control_packet_from_source(
@@ -2235,6 +2580,7 @@ pub fn try_handle_control_packet_from_source(
 fn packet_authorized(layout: &LayoutState, packet: &InputPacket) -> bool {
     packet_authorized_fields(
         layout,
+        packet.origin_protocol_version,
         &packet.cluster_id,
         &packet.pair_secret,
         &packet.origin_transport_public_key,
@@ -2245,6 +2591,7 @@ fn packet_authorized(layout: &LayoutState, packet: &InputPacket) -> bool {
 fn control_packet_authorized(layout: &LayoutState, packet: &InputControlPacket) -> bool {
     packet_authorized_fields(
         layout,
+        packet.origin_protocol_version,
         &packet.cluster_id,
         &packet.pair_secret,
         &packet.origin_transport_public_key,
@@ -2254,11 +2601,15 @@ fn control_packet_authorized(layout: &LayoutState, packet: &InputControlPacket) 
 
 fn packet_authorized_fields(
     layout: &LayoutState,
+    origin_protocol_version: u16,
     cluster_id: &str,
     pair_secret: &str,
     origin_transport_public_key: &str,
     origin_device_id: &str,
 ) -> bool {
+    if origin_protocol_version != quic_transport::PROTOCOL_VERSION {
+        return false;
+    }
     if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
         return false;
     }
@@ -2300,7 +2651,9 @@ static LAST_UNAUTHORIZED_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
 /// pairing-credential mismatch impossible to diagnose — exactly the "shows
 /// online but the cursor can't cross" trap.
 fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
-    let reason = if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+    let reason = if packet.origin_protocol_version != quic_transport::PROTOCOL_VERSION {
+        "input protocol mismatch — update MyKVM on both devices"
+    } else if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
         "this device has no pairing configured (empty cluster/secret) — pair it with the controller"
     } else if packet.cluster_id != layout.cluster_id || packet.pair_secret != layout.pair_secret {
         "pairing secret/cluster mismatch — controller and this device are not paired with the same credentials; re-pair them (removing/re-adding the device does NOT re-pair)"
@@ -2318,7 +2671,7 @@ fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
     }
 
     log::warn!(
-        "rejected input from controller id={} key={}: {}",
+        "rejected input from controller id={} key={} protocol=v{} expected=v{}: {}",
         if packet.origin_device_id.trim().is_empty() {
             "<none>"
         } else {
@@ -2329,12 +2682,16 @@ fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
         } else {
             "<set>"
         },
+        packet.origin_protocol_version,
+        quic_transport::PROTOCOL_VERSION,
         reason
     );
 }
 
 fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlPacket) {
-    let reason = if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+    let reason = if packet.origin_protocol_version != quic_transport::PROTOCOL_VERSION {
+        "input protocol mismatch — update MyKVM on both devices"
+    } else if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
         "this device has no pairing configured"
     } else if packet.cluster_id != layout.cluster_id || packet.pair_secret != layout.pair_secret {
         "pairing secret/cluster mismatch"
@@ -2343,7 +2700,7 @@ fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlP
     };
 
     log::warn!(
-        "rejected input control from controller id={} key={}: {}",
+        "rejected input control from controller id={} key={} protocol=v{} expected=v{}: {}",
         if packet.origin_device_id.trim().is_empty() {
             "<none>"
         } else {
@@ -2354,6 +2711,8 @@ fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlP
         } else {
             "<set>"
         },
+        packet.origin_protocol_version,
+        quic_transport::PROTOCOL_VERSION,
         reason
     );
 }
@@ -2378,10 +2737,6 @@ fn decode_input_packet(payload: &[u8]) -> Option<InputPacket> {
 
 fn decode_input_control_packet(payload: &[u8]) -> Option<InputControlPacket> {
     rmp_serde::from_slice::<InputControlPacket>(payload).ok()
-}
-
-fn default_protocol_version() -> u16 {
-    quic_transport::PROTOCOL_VERSION
 }
 
 fn normalize_quic_port(transport_port: u16, quic_port: u16) -> u16 {
@@ -2464,6 +2819,10 @@ fn remote_key_sequence_state() -> &'static Mutex<RemoteKeySequenceState> {
     REMOTE_KEY_SEQUENCE_STATE.get_or_init(|| Mutex::new(RemoteKeySequenceState::default()))
 }
 
+fn remote_input_lease() -> &'static Mutex<RemoteInputLease> {
+    REMOTE_INPUT_LEASE.get_or_init(|| Mutex::new(RemoteInputLease::default()))
+}
+
 fn admit_remote_input_with_state(
     sequence_state: &mut RemoteKeySequenceState,
     mouse_state: &mut RemoteMouseState,
@@ -2471,6 +2830,28 @@ fn admit_remote_input_with_state(
     origin_id: &str,
     modifier_snapshot: Option<u8>,
     key_sequence: u64,
+    event: &mut InputEvent,
+) -> Option<RemoteInputAdmission> {
+    admit_remote_input_packet_with_state(
+        sequence_state,
+        mouse_state,
+        active_origin,
+        origin_id,
+        modifier_snapshot,
+        key_sequence,
+        false,
+        event,
+    )
+}
+
+fn admit_remote_input_packet_with_state(
+    sequence_state: &mut RemoteKeySequenceState,
+    mouse_state: &mut RemoteMouseState,
+    active_origin: &mut String,
+    origin_id: &str,
+    modifier_snapshot: Option<u8>,
+    key_sequence: u64,
+    heartbeat: bool,
     event: &mut InputEvent,
 ) -> Option<RemoteInputAdmission> {
     let is_park = matches!(event, InputEvent::CursorPark { .. });
@@ -2486,7 +2867,7 @@ fn admit_remote_input_with_state(
     }
 
     let active_is_current = active_origin.as_str() == origin_id;
-    let can_claim = active_origin.is_empty() && input_event_can_claim_origin(event);
+    let can_claim = !heartbeat && active_origin.is_empty() && input_event_can_claim_origin(event);
     let owns_event = active_is_current || can_claim;
     let release_keys = is_park && active_is_current;
     let (mouse, mut carried_buttons) = if input_event_mouse_sequence(event).is_some() {
@@ -2566,6 +2947,7 @@ fn admit_remote_input(
     origin_id: &str,
     modifier_snapshot: Option<u8>,
     key_sequence: u64,
+    heartbeat: bool,
     event: &mut InputEvent,
 ) -> Option<RemoteInputAdmission> {
     let mut sequence_state = remote_key_sequence_state()
@@ -2577,15 +2959,33 @@ fn admit_remote_input(
     let mut active_origin = REMOTE_INPUT_ORIGIN
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    admit_remote_input_with_state(
+    admit_remote_input_packet_with_state(
         &mut sequence_state,
         &mut mouse_state,
         &mut active_origin,
         origin_id,
         modifier_snapshot,
         key_sequence,
+        heartbeat,
         event,
     )
+}
+
+fn finish_remote_input_outcome(
+    origin_id: &str,
+    admission: &RemoteInputAdmission,
+    injected: bool,
+) -> RemoteInputOutcome {
+    let outcome = RemoteInputOutcome {
+        injected,
+        admitted: true,
+        current_session_owner: admission.inject_event,
+        session_ended: remote_input_session_ended(admission),
+    };
+    if let Ok(mut lease) = remote_input_lease().lock() {
+        apply_remote_input_lease_outcome(&mut lease, origin_id, outcome, Instant::now());
+    }
+    outcome
 }
 
 fn update_remote_mouse_position(x: i32, y: i32) -> Option<MouseButton> {
@@ -2627,8 +3027,22 @@ fn inject_input_event(
     origin_id: &str,
     modifier_snapshot: Option<u8>,
     key_sequence: u64,
+    heartbeat: bool,
     mut event: InputEvent,
-) -> (bool, bool) {
+) -> RemoteInputOutcome {
+    // Validate every transmitted coordinate before sequence/origin admission.
+    // Admission mutates the active owner and authoritative drag mask, so doing
+    // this later can claim an origin (and press a button) even though no local
+    // screen exists to produce an injectable command.
+    if !input_event_coordinates_mappable(layout, native_layout, &event) {
+        log::warn!("discarded remote input with no mappable local screen");
+        return RemoteInputOutcome {
+            injected: false,
+            admitted: false,
+            current_session_owner: false,
+            session_ended: false,
+        };
+    }
     // QUIC datagrams and each reliable uni stream run on separate tasks. The
     // runtime receive gate serialises their common callback, and this inner
     // guard also makes direct callers atomic from sequence admission through
@@ -2643,13 +3057,22 @@ fn inject_input_event(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     });
-    let Some(admission) =
-        admit_remote_input(origin_id, modifier_snapshot, key_sequence, &mut event)
-    else {
+    let Some(admission) = admit_remote_input(
+        origin_id,
+        modifier_snapshot,
+        key_sequence,
+        heartbeat,
+        &mut event,
+    ) else {
         log::debug!(
             "discarded stale or inactive-origin remote input sequence {key_sequence} from {origin_id}"
         );
-        return (true, false);
+        return RemoteInputOutcome {
+            injected: false,
+            admitted: false,
+            current_session_owner: false,
+            session_ended: false,
+        };
     };
     let modifier_snapshot = admission.effective_modifier_snapshot;
     if let Some((buttons, x, y)) = admission.carried_buttons {
@@ -2684,19 +3107,19 @@ fn inject_input_event(
     if !admission.inject_event {
         // A stale same-origin Park can still be an accepted key-only boundary;
         // foreign/inactive input has both flags false and owns no side effects.
-        return (true, admission.release_keys);
+        return finish_remote_input_outcome(origin_id, &admission, admission.release_keys);
     }
 
     if let InputEvent::Key { key_code, down } = &event {
         #[cfg(target_os = "macos")]
         {
             inject_macos_key_with_modifier_snapshot(*key_code, *down, modifier_snapshot);
-            return (true, true);
+            return finish_remote_input_outcome(origin_id, &admission, true);
         }
         #[cfg(target_os = "linux")]
         {
             linux_input::inject_key_with_modifier_snapshot(*key_code, *down, modifier_snapshot);
-            return (true, true);
+            return finish_remote_input_outcome(origin_id, &admission, true);
         }
         #[cfg(target_os = "windows")]
         {
@@ -2712,7 +3135,7 @@ fn inject_input_event(
             if is_modifier {
                 reconcile_windows_injected_modifier_snapshot(modifier_snapshot);
             }
-            return (injected, true);
+            return finish_remote_input_outcome(origin_id, &admission, injected);
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
@@ -2723,10 +3146,36 @@ fn inject_input_event(
     reconcile_non_key_injected_modifier_snapshot(modifier_snapshot);
 
     let Some(command) = input_event_to_command(layout, native_layout, event) else {
-        return (false, true);
+        return finish_remote_input_outcome(origin_id, &admission, false);
     };
 
-    (inject_input_command_with_platform_routing(command), true)
+    let injected = inject_input_command_with_platform_routing(command);
+    finish_remote_input_outcome(origin_id, &admission, injected)
+}
+
+fn input_event_coordinates_mappable(
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+    event: &InputEvent,
+) -> bool {
+    match event {
+        InputEvent::MouseMove {
+            screen_id, x, y, ..
+        }
+        | InputEvent::CursorPark {
+            screen_id, x, y, ..
+        } => map_event_point_to_native(layout, native_layout, screen_id, *x, *y).is_some(),
+        InputEvent::MouseButton {
+            screen_id, x, y, ..
+        } => match (x, y) {
+            (None, None) => true,
+            (Some(x), Some(y)) if !screen_id.is_empty() => {
+                map_event_point_to_native(layout, native_layout, screen_id, *x, *y).is_some()
+            }
+            _ => false,
+        },
+        InputEvent::Scroll { .. } | InputEvent::Key { .. } => true,
+    }
 }
 
 fn input_event_mouse_sequence(event: &InputEvent) -> Option<u64> {
@@ -2824,18 +3273,19 @@ fn prepare_remote_mouse_event_for_origin(
                 MouseButton::Right => 1,
                 MouseButton::Middle => 2,
             };
-            if sequence <= origin_sequence.last_button_sequence[button_index] {
+            if sequence <= origin_sequence.last_button_sequence[button_index]
+                || (*down && sequence <= origin_sequence.last_boundary_sequence)
+            {
                 return (false, None);
             }
-            origin_sequence.last_button_sequence[button_index] = sequence;
+            origin_sequence.last_button_sequence[button_index] =
+                origin_sequence.last_button_sequence[button_index].max(sequence);
             if sequence > origin_sequence.last_position_sequence {
                 origin_sequence.last_position_sequence = sequence;
-            } else if *down {
-                // A press older than an already-applied park/re-entry boundary
-                // belongs to the previous control epoch. Releases still land
-                // below so a button can never remain stuck.
-                return (false, None);
             } else {
+                // Reliable button streams can be overtaken by latest-position
+                // datagrams. Keep the transition, but apply it at the newest
+                // accepted cursor location instead of warping backwards.
                 screen_id.clear();
                 *x = None;
                 *y = None;
@@ -2870,8 +3320,9 @@ fn authoritative_mouse_button_state(
         InputEvent::CursorPark { sequence, .. } => (0, *sequence, true),
         _ => return (None, false),
     };
-    let reconciliation = (state.buttons != authoritative).then_some((
-        state.buttons,
+    let previous_buttons = state.buttons;
+    let reconciliation = (previous_buttons != authoritative).then_some((
+        previous_buttons,
         authoritative,
         state.x,
         state.y,
@@ -2882,8 +3333,15 @@ fn authoritative_mouse_button_state(
             .sequence_by_origin
             .entry(origin_id.to_string())
             .or_default();
-        for last_sequence in &mut origin_sequence.last_button_sequence {
-            *last_sequence = (*last_sequence).max(sequence);
+        let changed = previous_buttons ^ authoritative;
+        for (index, bit) in [LEFT_BUTTON_MASK, RIGHT_BUTTON_MASK, MIDDLE_BUTTON_MASK]
+            .into_iter()
+            .enumerate()
+        {
+            if park || changed & bit != 0 {
+                origin_sequence.last_button_sequence[index] =
+                    origin_sequence.last_button_sequence[index].max(sequence);
+            }
         }
     }
     (reconciliation, park)
@@ -2939,6 +3397,55 @@ fn reconcile_injected_mouse_buttons(previous: u64, authoritative: u64, x: i32, y
     }
 }
 
+fn expire_remote_input_session(
+    now: Instant,
+    clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
+) -> bool {
+    let _inject_guard = REMOTE_INPUT_INJECT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _mouse_guard = REMOTE_MOUSE_INJECT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let expired = {
+        let mut keys = remote_key_sequence_state()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut mouse = remote_mouse_state()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut active_origin = REMOTE_INPUT_ORIGIN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut lease = remote_input_lease()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        expire_remote_input_session_with_state(
+            &mut lease,
+            &mut keys,
+            &mut mouse,
+            &mut active_origin,
+            now,
+        )
+    };
+    let Some(expired) = expired else {
+        return false;
+    };
+
+    release_injected_mouse_buttons(expired.buttons, expired.x, expired.y);
+    reset_injected_keys();
+    #[cfg(target_os = "macos")]
+    if let Ok(mut tracker) = macos_click_tracker().lock() {
+        *tracker = MacClickTracker::default();
+    }
+    log::warn!(
+        "remote input lease expired for {}; released keys and mouse buttons",
+        expired.origin_id
+    );
+    clear_clipboard_target_if_device(clipboard_target, &expired.origin_id);
+    true
+}
+
 /// Releases receiver-side mouse/modifier state when input sharing stops. This
 /// is deliberately broader than the per-origin reset: a missing final up event
 /// must not leave the OS latched after the runtime has been disabled.
@@ -2962,6 +3469,9 @@ pub fn reset_injected_input_state() {
     }
     if let Ok(mut sequence) = remote_key_sequence_state().lock() {
         *sequence = RemoteKeySequenceState::default();
+    }
+    if let Ok(mut lease) = remote_input_lease().lock() {
+        *lease = RemoteInputLease::default();
     }
     reset_injected_modifiers();
 }
@@ -3543,6 +4053,7 @@ struct MacCaptureContext {
     cursor_hide_depth: Mutex<usize>,
     last_cursor_hide_reassert: Mutex<Option<Instant>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
+    last_heartbeat_sent: Mutex<Option<Instant>>,
     last_cursor_repin: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_modifiers: Mutex<Vec<u16>>,
@@ -3739,6 +4250,94 @@ struct MacDisplaySnapshot {
 #[cfg(target_os = "windows")]
 static WINDOWS_CAPTURE_CONTEXT: Mutex<Option<Arc<WindowsCaptureContext>>> = Mutex::new(None);
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WindowsMouseMoveSnapshot {
+    x: f64,
+    y: f64,
+    modifier_bits: u64,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Default)]
+struct WindowsPendingMouseMoves {
+    snapshots: VecDeque<WindowsMouseMoveSnapshot>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowsPendingMouseMoves {
+    const CAPACITY: usize = 32;
+
+    fn push(&mut self, snapshot: WindowsMouseMoveSnapshot) -> bool {
+        if let Some(last) = self.snapshots.back_mut() {
+            if last.x == snapshot.x && last.y == snapshot.y {
+                *last = snapshot;
+                return false;
+            }
+        }
+        let dropped = self.snapshots.len() == Self::CAPACITY;
+        if dropped {
+            self.snapshots.pop_front();
+        }
+        self.snapshots.push_back(snapshot);
+        dropped
+    }
+
+    fn drain(&mut self) -> Vec<WindowsMouseMoveSnapshot> {
+        self.snapshots.drain(..).collect()
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+enum WindowsCapturedEvent {
+    LocalMouseMoveReady,
+    RemoteMouseDelta {
+        dx: i64,
+        dy: i64,
+    },
+    MouseButton {
+        message: u32,
+        modifier_bits: u64,
+    },
+    Scroll {
+        message: u32,
+        mouse_data: u32,
+        modifier_bits: u64,
+    },
+    Key {
+        key_code: u16,
+        down: bool,
+        modifier_bits: u64,
+    },
+    ModifierSnapshot {
+        modifier_bits: u64,
+    },
+    Release {
+        acknowledged: Option<mpsc::Sender<()>>,
+    },
+    Shutdown {
+        acknowledged: mpsc::Sender<()>,
+    },
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn accumulate_windows_delta(total: &mut (i64, i64), event: &WindowsCapturedEvent) -> bool {
+    let WindowsCapturedEvent::RemoteMouseDelta { dx, dy } = event else {
+        return false;
+    };
+    // Preserve turns as event boundaries. Summing +dx and -dx can erase an
+    // entry-edge excursion completely, making the cursor appear stuck even
+    // though the physical mouse crossed out and came back within one batch.
+    let reverses_x = total.0 != 0 && *dx != 0 && total.0.signum() != dx.signum();
+    let reverses_y = total.1 != 0 && *dy != 0 && total.1.signum() != dy.signum();
+    if reverses_x || reverses_y {
+        return false;
+    }
+    total.0 = total.0.saturating_add(*dx);
+    total.1 = total.1.saturating_add(*dy);
+    true
+}
+
 #[cfg(target_os = "windows")]
 struct WindowsCaptureContext {
     quic_transport: quic_transport::TransportHandle,
@@ -3748,26 +4347,276 @@ struct WindowsCaptureContext {
     send_gate: Mutex<()>,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
-    main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
-    targets: Vec<InputTarget>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
-    anchor: Mutex<Option<(f64, f64)>>,
     last_point: Mutex<Option<(f64, f64)>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
+    last_heartbeat_sent: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_keys: Mutex<Vec<u16>>,
-    cursor_hide_calls: Mutex<u8>,
-    // Swallow the first post-crossing delta so a fast flick across the edge
-    // does not shove the cursor inward on Windows, where we pin by warping.
-    just_crossed: AtomicBool,
+    event_tx: mpsc::Sender<WindowsCapturedEvent>,
+    pending_mouse_move: Mutex<WindowsPendingMouseMoves>,
+    mouse_move_notification_queued: AtomicBool,
+    dropped_mouse_moves: AtomicU64,
+    release_notification_queued: AtomicBool,
+    hook_modifier_bits: AtomicU64,
+    remote_anchor_x: std::sync::atomic::AtomicI64,
+    remote_anchor_y: std::sync::atomic::AtomicI64,
+    warp_cutoff_time: AtomicU64,
+    cursor_warp_failures: AtomicU64,
+    cursor_hider_hwnd: std::sync::atomic::AtomicUsize,
+    cursor_hider_visible: AtomicBool,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     // GetTickCount64 of the last time either low-level hook callback fired.
     // The pump loop compares this against system-wide input activity to detect
     // hooks Windows silently removed (slow-callback timeout, working-set trim
     // after hours in the tray) — the "works, then goes dead until restart" bug.
     last_hook_event_ms: AtomicU64,
+}
+
+#[cfg(target_os = "windows")]
+fn try_windows_capture_context() -> Option<Arc<WindowsCaptureContext>> {
+    WINDOWS_CAPTURE_CONTEXT
+        .try_lock()
+        .ok()
+        .and_then(|context| context.clone())
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsCursorHider {
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    cursor: windows_sys::Win32::UI::WindowsAndMessaging::HCURSOR,
+    instance: windows_sys::Win32::Foundation::HINSTANCE,
+    class_name: Vec<u16>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsCursorHider {
+    fn create() -> Result<Self, String> {
+        use windows_sys::Win32::{
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                CreateCursor, CreateWindowExW, DefWindowProcW, GetSystemMetrics, RegisterClassW,
+                SM_CXCURSOR, SM_CYCURSOR, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_EX_TRANSPARENT, WS_POPUP,
+            },
+        };
+
+        static CLASS_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        if instance.is_null() {
+            return Err("failed to resolve Windows cursor hider module".into());
+        }
+        let width = unsafe { GetSystemMetrics(SM_CXCURSOR) }.max(1);
+        let height = unsafe { GetSystemMetrics(SM_CYCURSOR) }.max(1);
+        let stride = (((width + 31) / 32) * 4) as usize;
+        let and_mask = vec![0xff_u8; stride * height as usize];
+        let xor_mask = vec![0_u8; stride * height as usize];
+        let cursor = unsafe {
+            CreateCursor(
+                instance,
+                0,
+                0,
+                width,
+                height,
+                and_mask.as_ptr().cast(),
+                xor_mask.as_ptr().cast(),
+            )
+        };
+        if cursor.is_null() {
+            return Err("failed to create Windows blank cursor".into());
+        }
+
+        let class_name = crate::wide_null(&format!(
+            "MyKVMCursorHider-{}",
+            CLASS_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            hInstance: instance,
+            hCursor: cursor,
+            lpszClassName: class_name.as_ptr(),
+            ..WNDCLASSW::default()
+        };
+        if unsafe { RegisterClassW(&class) } == 0 {
+            unsafe {
+                let _ = windows_sys::Win32::UI::WindowsAndMessaging::DestroyCursor(cursor);
+            }
+            return Err("failed to register Windows cursor hider window class".into());
+        }
+
+        let title = crate::wide_null("MyKVM Cursor Hider");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null(),
+            )
+        };
+        if hwnd.is_null() {
+            unsafe {
+                let _ = windows_sys::Win32::UI::WindowsAndMessaging::UnregisterClassW(
+                    class_name.as_ptr(),
+                    instance,
+                );
+                let _ = windows_sys::Win32::UI::WindowsAndMessaging::DestroyCursor(cursor);
+            }
+            return Err("failed to create Windows cursor hider window".into());
+        }
+
+        Ok(Self {
+            hwnd,
+            cursor,
+            instance,
+            class_name,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsCursorHider {
+    fn drop(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DestroyCursor, DestroyWindow, UnregisterClassW,
+        };
+
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+            let _ = UnregisterClassW(self.class_name.as_ptr(), self.instance);
+            let _ = DestroyCursor(self.cursor);
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_modifier_family_bits(key_code: u16) -> Option<(u64, u64)> {
+    Some(match key_code {
+        0x10 => (1 << 0, (1 << 0) | (1 << 1)),
+        0xA0 => (1 << 0, (1 << 0) | (1 << 1)),
+        0xA1 => (1 << 1, (1 << 0) | (1 << 1)),
+        0x11 => (1 << 2, (1 << 2) | (1 << 3)),
+        0xA2 => (1 << 2, (1 << 2) | (1 << 3)),
+        0xA3 => (1 << 3, (1 << 2) | (1 << 3)),
+        0x12 => (1 << 4, (1 << 4) | (1 << 5)),
+        0xA4 => (1 << 4, (1 << 4) | (1 << 5)),
+        0xA5 => (1 << 5, (1 << 4) | (1 << 5)),
+        0x5B => (1 << 6, (1 << 6) | (1 << 7)),
+        0x5C => (1 << 7, (1 << 6) | (1 << 7)),
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn update_windows_hook_modifier(context: &WindowsCaptureContext, key_code: u16, down: bool) {
+    let Some((bit, family)) = windows_modifier_family_bits(key_code) else {
+        return;
+    };
+    if down {
+        context.hook_modifier_bits.fetch_or(bit, Ordering::Relaxed);
+    } else if matches!(key_code, 0x10..=0x12) {
+        context
+            .hook_modifier_bits
+            .fetch_and(!family, Ordering::Relaxed);
+    } else {
+        context
+            .hook_modifier_bits
+            .fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn clear_windows_hook_modifier_bits(bits: &AtomicU64) {
+    bits.store(0, Ordering::Release);
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_modifier_keys_from_bits(bits: u64) -> Vec<u16> {
+    [
+        (1 << 0, 0xA0),
+        (1 << 1, 0xA1),
+        (1 << 2, 0xA2),
+        (1 << 3, 0xA3),
+        (1 << 4, 0xA4),
+        (1 << 5, 0xA5),
+        (1 << 6, 0x5B),
+        (1 << 7, 0x5C),
+    ]
+    .into_iter()
+    .filter_map(|(bit, key)| (bits & bit != 0).then_some(key))
+    .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn queue_windows_local_mouse_move(
+    context: &WindowsCaptureContext,
+    snapshot: WindowsMouseMoveSnapshot,
+) {
+    let mut pending = match context.pending_mouse_move.try_lock() {
+        Ok(pending) => pending,
+        Err(TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            context.dropped_mouse_moves.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    if pending.push(snapshot) {
+        context.dropped_mouse_moves.fetch_add(1, Ordering::Relaxed);
+    }
+    if !context
+        .mouse_move_notification_queued
+        .swap(true, Ordering::AcqRel)
+        && context
+            .event_tx
+            .send(WindowsCapturedEvent::LocalMouseMoveReady)
+            .is_err()
+    {
+        context
+            .mouse_move_notification_queued
+            .store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn take_windows_local_mouse_move(context: &WindowsCaptureContext) -> Vec<WindowsMouseMoveSnapshot> {
+    let mut pending = context
+        .pending_mouse_move
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let snapshots = pending.drain();
+    context
+        .mouse_move_notification_queued
+        .store(false, Ordering::Release);
+    snapshots
+}
+
+#[cfg(target_os = "windows")]
+fn queue_windows_release_once(context: &WindowsCaptureContext) {
+    if context
+        .release_notification_queued
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    if context
+        .event_tx
+        .send(WindowsCapturedEvent::Release { acknowledged: None })
+        .is_err()
+    {
+        context
+            .release_notification_queued
+            .store(false, Ordering::Release);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -3972,19 +4821,59 @@ fn physical_windows_modifiers() -> Vec<u16> {
         .collect()
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_modifier_bits_for_keys(keys: &[u16]) -> u64 {
+    keys.iter().fold(0, |bits, key_code| {
+        windows_modifier_family_bits(*key_code)
+            .map(|(bit, _)| bits | bit)
+            .unwrap_or(bits)
+    })
+}
+
 #[cfg(target_os = "windows")]
 fn sync_held_modifiers_windows(
     context: &WindowsCaptureContext,
     target: &InputTarget,
+    captured_modifier_bits: Option<u64>,
 ) -> Option<u8> {
-    let physical = physical_windows_modifiers();
+    let mut held = windows_modifier_keys_from_bits(
+        captured_modifier_bits
+            .unwrap_or_else(|| context.hook_modifier_bits.load(Ordering::Acquire)),
+    );
+    // GetAsyncKeyState is only a recovery signal: low-level callbacks run
+    // before async state updates, so absence must never synthesize an Up. It
+    // may add a Down when Windows or another hook swallowed our modifier event.
+    for key_code in physical_windows_modifiers() {
+        let family = windows_modifier_family(key_code);
+        if !held
+            .iter()
+            .any(|held_key| windows_modifier_family(*held_key) == family)
+        {
+            held.push(key_code);
+        }
+    }
+    send_windows_modifier_transitions(context, target, &held, false)
+}
+
+#[cfg(target_os = "windows")]
+fn send_windows_modifier_transitions(
+    context: &WindowsCaptureContext,
+    target: &InputTarget,
+    held: &[u16],
+    authoritative: bool,
+) -> Option<u8> {
     let forwarded = context
         .pressed_keys
         .lock()
         .map(|pressed| pressed.clone())
         .unwrap_or_default();
 
-    for event in reconcile_windows_modifier_events(&physical, &forwarded) {
+    let transitions = if authoritative {
+        reconcile_windows_authoritative_modifier_events(held, &forwarded)
+    } else {
+        reconcile_windows_modifier_events(held, &forwarded)
+    };
+    for event in transitions {
         let InputEvent::Key { key_code, down } = event else {
             continue;
         };
@@ -3999,7 +4888,7 @@ fn sync_held_modifiers_windows(
         }
         track_forwarded_key(&context.pressed_keys, key_code, down);
     }
-    Some(modifier_mask_for_keys(&physical))
+    Some(modifier_mask_for_keys(held))
 }
 
 #[cfg(target_os = "macos")]
@@ -4148,6 +5037,27 @@ pub fn clear_clipboard_target(target: &Arc<Mutex<Option<ClipboardTarget>>>) {
     notify_clipboard_target_changed();
 }
 
+fn clear_clipboard_target_if_device(
+    target: &Arc<Mutex<Option<ClipboardTarget>>>,
+    device_id: &str,
+) -> bool {
+    let changed = match target.lock() {
+        Ok(mut target)
+            if target
+                .as_ref()
+                .is_some_and(|target| target.device_id == device_id) =>
+        {
+            *target = None;
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        notify_clipboard_target_changed();
+    }
+    changed
+}
+
 pub fn current_clipboard_target(
     target: &Arc<Mutex<Option<ClipboardTarget>>>,
 ) -> Option<ClipboardTarget> {
@@ -4177,50 +5087,45 @@ fn set_clipboard_target(
     pair_secret: String,
     push_on_bind: bool,
     expires_in: Option<Duration>,
-) {
-    if let Ok(mut target) = target.lock() {
-        *target = Some(ClipboardTarget {
-            device_id,
-            addr,
-            transport_public_key,
-            protocol_version,
-            cluster_id,
-            pair_secret,
-            push_on_bind,
-            expires_at: expires_in.map(|duration| Instant::now() + duration),
-        });
+) -> bool {
+    let next = ClipboardTarget {
+        device_id,
+        addr,
+        transport_public_key,
+        protocol_version,
+        cluster_id,
+        pair_secret,
+        push_on_bind,
+        expires_at: expires_in.map(|duration| Instant::now() + duration),
+    };
+    let changed = match target.lock() {
+        Ok(mut target) if target.as_ref() != Some(&next) => {
+            *target = Some(next);
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        notify_clipboard_target_changed();
     }
-    notify_clipboard_target_changed();
+    changed
 }
 
 fn set_control_clipboard_target(
     target: &Arc<Mutex<Option<ClipboardTarget>>>,
     active: &ActiveTarget,
-    layout_state: &Arc<Mutex<LayoutState>>,
 ) {
-    let Ok(layout) = layout_state.lock() else {
-        return;
-    };
-    let Some(device) = layout
-        .devices
-        .iter()
-        .find(|device| device.id == active.target.device_id && device.online && device.input_ready)
-    else {
-        return;
-    };
-
+    // Crossing already validated this target. Use the immutable session
+    // snapshot so binding clipboard cannot block the input callback behind a
+    // concurrent save_layout disk write.
     set_clipboard_target(
         target,
         active.target.device_id.clone(),
-        format!(
-            "{}:{}",
-            device.host,
-            normalize_quic_port(device.transport_port, device.quic_port)
-        ),
-        device.transport_public_key.clone(),
-        device.protocol_version,
-        layout.cluster_id.clone(),
-        layout.pair_secret.clone(),
+        active.target.target_addr.clone(),
+        active.target.transport_public_key.clone(),
+        active.target.protocol_version,
+        active.target.cluster_id.clone(),
+        active.target.pair_secret.clone(),
         true,
         None,
     );
@@ -4237,39 +5142,107 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
-    let Some(context) = windows_capture_context() else {
+    let Some(context) = try_windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
     context
         .last_hook_event_ms
         .store(windows_tick_ms(), Ordering::Relaxed);
     if !cached_windows_input_desktop_is_default() {
-        release_windows_remote_control(&context, true);
+        queue_windows_release_once(&context);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
-    let _send_guard = context
-        .send_gate
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
     if context.stop.load(Ordering::Relaxed) {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
     let message = wparam as u32;
-    let handled = match message {
-        WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
+    if message == WM_MOUSEMOVE {
+        let modifier_bits = context.hook_modifier_bits.load(Ordering::Acquire);
+        if !context.remote_active.load(Ordering::Acquire) {
+            queue_windows_local_mouse_move(
+                &context,
+                WindowsMouseMoveSnapshot {
+                    x: event.pt.x as f64,
+                    y: event.pt.y as f64,
+                    modifier_bits,
+                },
+            );
+            return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+        }
+
+        let anchor = (
+            context.remote_anchor_x.load(Ordering::Acquire) as f64,
+            context.remote_anchor_y.load(Ordering::Acquire) as f64,
+        );
+        let cutoff = context.warp_cutoff_time.load(Ordering::Acquire);
+        let guard = WindowsWarpGuard {
+            ignore_through_sequence: cutoff,
+        };
+        if guard.should_drop(
+            u64::from(event.time),
+            event.pt.x as f64,
+            event.pt.y as f64,
+            anchor,
+        ) {
+            return 1;
+        }
+
+        let dx = i64::from(event.pt.x) - anchor.0 as i64;
+        let dy = i64::from(event.pt.y) - anchor.1 as i64;
+        if unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
+                anchor.0 as i32,
+                anchor.1 as i32,
+            )
+        } == 0
+        {
+            context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Once the first post-entry real event is newer than the cutoff,
+            // FIFO hook delivery guarantees no older backlog can follow it.
+            // Disarm here so high-polling mice with multiple real events in the
+            // same millisecond are not mistaken for synthetic warp events.
+            context.warp_cutoff_time.store(0, Ordering::Release);
+        }
+        if dx != 0 || dy != 0 {
+            let _ = context
+                .event_tx
+                .send(WindowsCapturedEvent::RemoteMouseDelta { dx, dy });
+        }
+        return 1;
+    }
+
+    if !context.remote_active.load(Ordering::Acquire) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
+    let modifier_bits = context.hook_modifier_bits.load(Ordering::Acquire);
+    let queued = match message {
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
-        | WM_MBUTTONUP => handle_windows_mouse_button(&context, message),
-        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => handle_windows_scroll(&context, message, event.mouseData),
+        | WM_MBUTTONUP => context
+            .event_tx
+            .send(WindowsCapturedEvent::MouseButton {
+                message,
+                modifier_bits,
+            })
+            .is_ok(),
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => context
+            .event_tx
+            .send(WindowsCapturedEvent::Scroll {
+                message,
+                mouse_data: event.mouseData,
+                modifier_bits,
+            })
+            .is_ok(),
         _ => false,
     };
 
-    if handled {
-        1
-    } else {
-        unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    if queued {
+        return 1;
     }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
 #[cfg(target_os = "windows")]
@@ -4282,81 +5255,40 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
-    let Some(context) = windows_capture_context() else {
+    let Some(context) = try_windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
     context
         .last_hook_event_ms
         .store(windows_tick_ms(), Ordering::Relaxed);
-    if !cached_windows_input_desktop_is_default() {
-        release_windows_remote_control(&context, true);
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
-    }
-    let _send_guard = context
-        .send_gate
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if context.stop.load(Ordering::Relaxed) {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
-    }
-
     let message = wparam as u32;
-
-    let active = context
-        .active
-        .lock()
-        .ok()
-        .and_then(|active| active.as_ref().map(|active| active.target.clone()));
-    let Some(target) = active else {
+    if !matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
-    };
+    }
+    let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
+    let key_code = event.vkCode as u16;
+    let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+    update_windows_hook_modifier(&context, key_code, down);
 
-    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
-        let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
-        let key_code = event.vkCode as u16;
-        let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
-        if down && windows_event_matches_screen_switch_hotkey(&context, key_code) {
-            log::info!("screen switch hotkey returning to local from keyboard hook");
-            release_windows_remote_control_inner(&context, false);
-            return 1;
-        }
-        // Windows may consume the Win-key hook callback while still delivering
-        // the Arrow callback (shell shortcuts and keyboard utilities can do
-        // this). Reconcile the physical modifier state before the ordinary
-        // KeyDown so the reliable input queue always contains Win-down before
-        // Arrow-down. The target-layout remapper then turns Win into macOS
-        // Control according to the user's mapping.
-        let modifier_snapshot = if down && windows_modifier_family(key_code).is_none() {
-            let Some(mask) = sync_held_modifiers_windows(&context, &target) else {
-                return 1;
-            };
-            Some(mask)
-        } else {
-            None
-        };
-        let sent = if let Some(snapshot) = modifier_snapshot {
-            send_key_packet(
-                &context.quic_transport,
-                &target,
-                key_code,
-                down,
-                snapshot,
-                &context.layout_state,
-                &context.input_events,
-            )
-        } else {
-            send_packet(
-                &context.quic_transport,
-                &target,
-                InputEvent::Key { key_code, down },
-                &context.layout_state,
-                &context.input_events,
-            )
-        };
-        if sent {
-            track_forwarded_key(&context.pressed_keys, key_code, down);
-            return 1;
-        }
+    if !cached_windows_input_desktop_is_default() {
+        queue_windows_release_once(&context);
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    if context.stop.load(Ordering::Relaxed) || !context.remote_active.load(Ordering::Acquire) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
+    let modifier_bits = context.hook_modifier_bits.load(Ordering::Acquire);
+    if context
+        .event_tx
+        .send(WindowsCapturedEvent::Key {
+            key_code,
+            down,
+            modifier_bits,
+        })
+        .is_ok()
+    {
+        return 1;
     }
 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
@@ -4366,29 +5298,341 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
 fn windows_event_matches_screen_switch_hotkey(
     context: &WindowsCaptureContext,
     key_code: u16,
+    modifier_bits: u64,
 ) -> bool {
     screen_switch_hotkey_matches_vk(
         &context.layout_state,
         key_code,
-        windows_current_hotkey_modifiers(),
+        HotkeyModifiers {
+            shift: modifier_bits & ((1 << 0) | (1 << 1)) != 0,
+            ctrl: modifier_bits & ((1 << 2) | (1 << 3)) != 0,
+            alt: modifier_bits & ((1 << 4) | (1 << 5)) != 0,
+            meta: modifier_bits & ((1 << 6) | (1 << 7)) != 0,
+        },
     )
 }
 
 #[cfg(target_os = "windows")]
-fn windows_current_hotkey_modifiers() -> HotkeyModifiers {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+fn handle_windows_key(
+    context: &WindowsCaptureContext,
+    key_code: u16,
+    down: bool,
+    modifier_bits: u64,
+) -> bool {
+    let target = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|active| active.target.clone()));
+    let Some(target) = target else {
+        return false;
     };
 
-    fn down(vk: u16) -> bool {
-        unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
+    if down && windows_event_matches_screen_switch_hotkey(context, key_code, modifier_bits) {
+        log::info!("screen switch hotkey returning to local from Windows input worker");
+        release_windows_remote_control_inner(context);
+        return true;
     }
 
-    HotkeyModifiers {
-        ctrl: down(VK_CONTROL),
-        alt: down(VK_MENU),
-        shift: down(VK_SHIFT),
-        meta: down(VK_LWIN) || down(VK_RWIN),
+    let sent = if windows_modifier_family(key_code).is_none() {
+        let Some(snapshot) = sync_held_modifiers_windows(context, &target, Some(modifier_bits))
+        else {
+            return false;
+        };
+        send_key_packet(
+            &context.quic_transport,
+            &target,
+            key_code,
+            down,
+            snapshot,
+            &context.layout_state,
+            &context.input_events,
+        )
+    } else {
+        send_packet(
+            &context.quic_transport,
+            &target,
+            InputEvent::Key { key_code, down },
+            &context.layout_state,
+            &context.input_events,
+        )
+    };
+    if sent {
+        track_forwarded_key(&context.pressed_keys, key_code, down);
+    }
+    sent
+}
+
+#[cfg(target_os = "windows")]
+fn handle_windows_modifier_snapshot(context: &WindowsCaptureContext, modifier_bits: u64) -> bool {
+    let target = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|active| active.target.clone()));
+    let Some(target) = target else {
+        return true;
+    };
+    let held = windows_modifier_keys_from_bits(modifier_bits);
+    send_windows_modifier_transitions(context, &target, &held, true).is_some()
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_input_worker(
+    context: Arc<WindowsCaptureContext>,
+    events: mpsc::Receiver<WindowsCapturedEvent>,
+) {
+    let mut last_desktop_check = Instant::now() - Duration::from_millis(200);
+    let mut last_transport_check = Instant::now();
+    let mut last_diagnostics = Instant::now();
+    let mut pending_event = None;
+    let mut running = true;
+
+    while running {
+        let event = if pending_event.is_some() {
+            pending_event.take()
+        } else {
+            match events.recv_timeout(Duration::from_millis(10)) {
+                Ok(event) => Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+
+        if let Some(event) = event {
+            let _send_guard = context
+                .send_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match event {
+                WindowsCapturedEvent::LocalMouseMoveReady => {
+                    for snapshot in take_windows_local_mouse_move(&context) {
+                        let _ = handle_windows_local_mouse_move(&context, snapshot);
+                    }
+                }
+                WindowsCapturedEvent::RemoteMouseDelta { dx, dy } => {
+                    let mut total = (dx, dy);
+                    loop {
+                        match events.try_recv() {
+                            Ok(next) => {
+                                if !accumulate_windows_delta(&mut total, &next) {
+                                    pending_event = Some(next);
+                                    break;
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    if !handle_windows_remote_mouse_delta(&context, total.0 as f64, total.1 as f64)
+                    {
+                        release_windows_remote_control_inner(&context);
+                    }
+                }
+                WindowsCapturedEvent::MouseButton {
+                    message,
+                    modifier_bits,
+                } => {
+                    if !handle_windows_mouse_button(&context, message, modifier_bits) {
+                        release_windows_remote_control_inner(&context);
+                    }
+                }
+                WindowsCapturedEvent::Scroll {
+                    message,
+                    mouse_data,
+                    modifier_bits,
+                } => {
+                    if !handle_windows_scroll(&context, message, mouse_data, modifier_bits) {
+                        release_windows_remote_control_inner(&context);
+                    }
+                }
+                WindowsCapturedEvent::Key {
+                    key_code,
+                    down,
+                    modifier_bits,
+                } => {
+                    if !handle_windows_key(&context, key_code, down, modifier_bits) {
+                        release_windows_remote_control_inner(&context);
+                    }
+                }
+                WindowsCapturedEvent::ModifierSnapshot { modifier_bits } => {
+                    if !handle_windows_modifier_snapshot(&context, modifier_bits) {
+                        release_windows_remote_control_inner(&context);
+                    }
+                }
+                WindowsCapturedEvent::Release { acknowledged } => {
+                    release_windows_remote_control_inner(&context);
+                    clear_windows_hook_modifier_bits(&context.hook_modifier_bits);
+                    context
+                        .release_notification_queued
+                        .store(false, Ordering::Release);
+                    if let Some(acknowledged) = acknowledged {
+                        let _ = acknowledged.send(());
+                    }
+                }
+                WindowsCapturedEvent::Shutdown { acknowledged } => {
+                    release_windows_remote_control_inner(&context);
+                    let _ = acknowledged.send(());
+                    running = false;
+                }
+            }
+        }
+
+        if !running {
+            break;
+        }
+        if last_desktop_check.elapsed() >= Duration::from_millis(100) {
+            last_desktop_check = Instant::now();
+            if !refresh_windows_input_desktop_cache() {
+                let _send_guard = context
+                    .send_gate
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                release_windows_remote_control_inner(&context);
+                clear_windows_hook_modifier_bits(&context.hook_modifier_bits);
+            }
+        }
+        if last_transport_check.elapsed() >= Duration::from_millis(100) {
+            last_transport_check = Instant::now();
+            let _send_guard = context
+                .send_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if active_target_input_failed(&context.quic_transport, &context.active) {
+                log::warn!("remote input transport failed; releasing Windows remote control");
+                release_windows_remote_control_inner(&context);
+            } else if !send_remote_input_heartbeat(
+                &context.quic_transport,
+                &context.active,
+                &context.remote_button_mask,
+                modifier_mask_for_keys(&windows_modifier_keys_from_bits(
+                    context.hook_modifier_bits.load(Ordering::Acquire),
+                )),
+                &context.last_heartbeat_sent,
+                &context.layout_state,
+                &context.input_events,
+            ) {
+                log::warn!("remote input heartbeat failed; releasing Windows remote control");
+                release_windows_remote_control_inner(&context);
+            } else {
+                drain_switch_request_windows(&context);
+            }
+        }
+        if last_diagnostics.elapsed() >= Duration::from_secs(1) {
+            last_diagnostics = Instant::now();
+            let dropped = context.dropped_mouse_moves.swap(0, Ordering::Relaxed);
+            let warp_failures = context.cursor_warp_failures.swap(0, Ordering::Relaxed);
+            if dropped != 0 || warp_failures != 0 {
+                log::warn!(
+                    "[input-win] interval diagnostics dropped_local_moves={} cursor_warp_failures={}",
+                    dropped,
+                    warp_failures
+                );
+            }
+        }
+    }
+
+    let dropped = context.dropped_mouse_moves.load(Ordering::Relaxed);
+    let warp_failures = context.cursor_warp_failures.load(Ordering::Relaxed);
+    if dropped != 0 || warp_failures != 0 {
+        log::warn!(
+            "[input-win] worker stopped dropped_local_moves={} cursor_warp_failures={}",
+            dropped,
+            warp_failures
+        );
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn wait_for_worker_ack_with_pump<F>(
+    acknowledged: &mpsc::Receiver<()>,
+    timeout: Duration,
+    mut pump_once: F,
+) -> bool
+where
+    F: FnMut(Duration),
+{
+    let started = Instant::now();
+    loop {
+        match acknowledged.try_recv() {
+            Ok(()) => return true,
+            Err(mpsc::TryRecvError::Disconnected) => return false,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+        pump_once(remaining.min(Duration::from_millis(20)));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn pump_windows_capture_messages(context: &WindowsCaptureContext, wait_for: Duration) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG,
+        PM_REMOVE, QS_ALLINPUT, WM_QUIT,
+    };
+
+    let timeout_ms = wait_for.as_millis().clamp(1, u32::MAX as u128) as u32;
+    unsafe {
+        let _ = MsgWaitForMultipleObjects(0, std::ptr::null(), 0, timeout_ms, QS_ALLINPUT);
+        let mut message = MSG::default();
+        // Keep acknowledgement/timeout checks responsive even under a flooded
+        // high-polling mouse queue.
+        for _ in 0..128 {
+            if PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) == 0 {
+                break;
+            }
+            if message.message == WM_QUIT {
+                context.stop.store(true, Ordering::Release);
+                continue;
+            }
+            let _ = TranslateMessage(&message);
+            let _ = DispatchMessageW(&message);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_windows_worker_ack_while_pumping(
+    context: &WindowsCaptureContext,
+    acknowledged: &mpsc::Receiver<()>,
+    timeout: Duration,
+) -> bool {
+    wait_for_worker_ack_with_pump(acknowledged, timeout, |wait_for| {
+        pump_windows_capture_messages(context, wait_for)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn release_windows_worker_for_hook_loss(context: &WindowsCaptureContext) {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    if context
+        .event_tx
+        .send(WindowsCapturedEvent::Release {
+            acknowledged: Some(ack_tx),
+        })
+        .is_ok()
+        && !wait_for_windows_worker_ack_while_pumping(context, &ack_rx, Duration::from_secs(2))
+    {
+        log::warn!("[input-win] timed out waiting for hook-loss state convergence");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn shutdown_windows_input_worker(context: &WindowsCaptureContext) {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    if context
+        .event_tx
+        .send(WindowsCapturedEvent::Shutdown {
+            acknowledged: ack_tx,
+        })
+        .is_ok()
+        && !wait_for_windows_worker_ack_while_pumping(context, &ack_rx, Duration::from_secs(3))
+    {
+        log::warn!("[input-win] timed out waiting for input worker shutdown");
     }
 }
 
@@ -4435,21 +5679,25 @@ fn release_forwarded_keys_windows(context: &WindowsCaptureContext, target: &Inpu
 }
 
 #[cfg(target_os = "windows")]
-fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboard: bool) {
+fn release_windows_remote_control(context: &WindowsCaptureContext) {
     let _send_guard = context
         .send_gate
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    release_windows_remote_control_inner(context, clear_clipboard);
+    release_windows_remote_control_inner(context);
 }
 
 #[cfg(target_os = "windows")]
-fn release_windows_remote_control_inner(context: &WindowsCaptureContext, clear_clipboard: bool) {
+fn release_windows_remote_control_inner(context: &WindowsCaptureContext) {
     let active = context
         .active
         .lock()
         .ok()
         .and_then(|mut active| active.take());
+    let clipboard_device_id = active
+        .as_ref()
+        .map(|active| active.target.device_id.clone());
+    let return_point = active.as_ref().map(local_return_point);
 
     if let Some(active) = active {
         release_forwarded_keys_windows(context, &active.target);
@@ -4475,17 +5723,16 @@ fn release_windows_remote_control_inner(context: &WindowsCaptureContext, clear_c
         }
     }
 
-    context.remote_active.store(false, Ordering::Relaxed);
-    context.just_crossed.store(false, Ordering::Relaxed);
+    context.remote_active.store(false, Ordering::Release);
     reset_mouse_move_timer(&context.last_mouse_move_sent);
-    show_windows_cursor_if_needed(context);
-    if let Ok(mut anchor) = context.anchor.lock() {
-        *anchor = None;
-    }
+    reveal_windows_cursor_at(context, return_point);
+    clear_windows_remote_anchor(context);
     if let Ok(mut last_point) = context.last_point.lock() {
         *last_point = None;
     }
-    if clear_clipboard {
+    if let Some(device_id) = clipboard_device_id {
+        clear_clipboard_target_if_device(&context.clipboard_target, &device_id);
+    } else {
         clear_clipboard_target(&context.clipboard_target);
     }
 }
@@ -4506,12 +5753,11 @@ pub fn release_active_remote_control() {
         set_macos_cursor_decoupled(false);
         set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
         show_macos_cursor_if_needed(&context);
-        clear_clipboard_target(&context.clipboard_target);
     }
 
     #[cfg(target_os = "windows")]
     if let Some(context) = windows_capture_context() {
-        release_windows_remote_control(&context, true);
+        release_windows_remote_control(&context);
     }
 
     #[cfg(target_os = "linux")]
@@ -4568,107 +5814,81 @@ fn windows_input_desktop_is_default() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) -> bool {
+fn handle_windows_remote_mouse_delta(context: &WindowsCaptureContext, dx: f64, dy: f64) -> bool {
     let mut active = match context.active.lock() {
         Ok(active) => active,
         Err(_) => return false,
     };
-
-    if let Some(active_target) = active.as_mut() {
-        let anchor = context
-            .anchor
-            .lock()
-            .ok()
-            .and_then(|anchor| *anchor)
-            .unwrap_or((x, y));
-        let dx = x - anchor.0;
-        let dy = y - anchor.1;
-
-        if dx.abs() < 0.1 && dy.abs() < 0.1 {
-            // This is the SetCursorPos anchor event, not user motion. Consume
-            // the one-shot guard here so the next real movement is never lost.
-            context.just_crossed.store(false, Ordering::Relaxed);
-            return true;
-        }
-
-        if context.just_crossed.swap(false, Ordering::Relaxed)
-            && should_ignore_initial_anchor_warp_delta(active_target.target.edge, dx, dy)
-        {
-            // Only suppress a synthetic delta that points straight back toward
-            // the entry edge. Forward genuine movement into the remote.
-            set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
-            return true;
-        }
-
-        active_target.x += dx;
-        active_target.y += dy;
-
-        if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
-            let point = local_return_point(active_target);
-            let target = active_target.target.clone();
-            context.remote_active.store(false, Ordering::Relaxed);
-            // Keep the clipboard peer so copies still sync after returning.
-            release_forwarded_keys_windows(context, &target);
-            release_remote_buttons(
-                &context.quic_transport,
-                &target,
-                &context.remote_button_mask,
-                &context.layout_state,
-                &context.input_events,
-            );
-            // Park after all releases so no trailing ButtonUp can re-show the
-            // remote cursor or supersede this authoritative boundary.
-            let _ = send_remote_cursor_park(
-                &context.quic_transport,
-                active_target,
-                &context.layout_state,
-                &context.input_events,
-            );
-            *active = None;
-            reset_mouse_move_timer(&context.last_mouse_move_sent);
-            show_windows_cursor_if_needed(context);
-            set_windows_cursor(point.0.round() as i32, point.1.round() as i32);
-            if let Ok(mut anchor) = context.anchor.lock() {
-                *anchor = None;
-            }
-            return true;
-        }
-
-        active_target.x = active_target
-            .x
-            .clamp(0.0, (active_target.current_screen.width - 1) as f64);
-        active_target.y = active_target
-            .y
-            .clamp(0.0, (active_target.current_screen.height - 1) as f64);
-        let button_mask = context.remote_button_mask.load(Ordering::Relaxed);
-        let dragging = button_mask != 0;
-        if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
-            if !send_remote_mouse_move_with_drag(
-                &context.quic_transport,
-                active_target,
-                button_mask,
-                &context.layout_state,
-                &context.input_events,
-            ) {
-                *active = None;
-                context.remote_active.store(false, Ordering::Relaxed);
-                clear_clipboard_target(&context.clipboard_target);
-                reset_mouse_move_timer(&context.last_mouse_move_sent);
-                reset_remote_button_mask(&context.remote_button_mask);
-                if let Ok(mut pressed) = context.pressed_keys.lock() {
-                    pressed.clear();
-                }
-                show_windows_cursor_if_needed(context);
-                if let Ok(mut anchor) = context.anchor.lock() {
-                    *anchor = None;
-                }
-                return false;
-            }
-        }
-        hide_windows_cursor_if_needed(context);
-        set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+    let Some(active_target) = active.as_mut() else {
+        return false;
+    };
+    if dx.abs() < 0.1 && dy.abs() < 0.1 {
         return true;
     }
+
+    active_target.x += dx;
+    active_target.y += dy;
+
+    if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
+        let point = local_return_point(active_target);
+        let target = active_target.target.clone();
+        release_forwarded_keys_windows(context, &target);
+        release_remote_buttons(
+            &context.quic_transport,
+            &target,
+            &context.remote_button_mask,
+            &context.layout_state,
+            &context.input_events,
+        );
+        let _ = send_remote_cursor_park(
+            &context.quic_transport,
+            active_target,
+            &context.layout_state,
+            &context.input_events,
+        );
+        *active = None;
+        context.remote_active.store(false, Ordering::Release);
+        reset_mouse_move_timer(&context.last_mouse_move_sent);
+        clear_clipboard_target_if_device(&context.clipboard_target, &target.device_id);
+        reveal_windows_cursor_at(context, Some(point));
+        clear_windows_remote_anchor(context);
+        log::debug!("[input-win] returned to local from shared edge");
+        return true;
+    }
+
+    active_target.x = active_target
+        .x
+        .clamp(0.0, (active_target.current_screen.width - 1) as f64);
+    active_target.y = active_target
+        .y
+        .clamp(0.0, (active_target.current_screen.height - 1) as f64);
+    let button_mask = context.remote_button_mask.load(Ordering::Relaxed);
+    let dragging = button_mask != 0;
+    if should_send_mouse_move(&context.last_mouse_move_sent, dragging)
+        && !send_remote_mouse_move_with_drag(
+            &context.quic_transport,
+            active_target,
+            button_mask,
+            &context.layout_state,
+            &context.input_events,
+        )
+    {
+        drop(active);
+        return false;
+    }
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn handle_windows_local_mouse_move(
+    context: &WindowsCaptureContext,
+    snapshot: WindowsMouseMoveSnapshot,
+) -> bool {
+    if context.remote_active.load(Ordering::Acquire) {
+        return true;
+    }
+    let x = snapshot.x;
+    let y = snapshot.y;
 
     let previous = context
         .last_point
@@ -4678,41 +5898,59 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     let (dx, dy) = previous
         .map(|point| (x - point.0, y - point.1))
         .unwrap_or((0.0, 0.0));
+    let repeated_clamped_point =
+        previous.is_some_and(|point| (x - point.0).abs() < 0.1 && (y - point.1).abs() < 0.1);
 
     if let Ok(mut last_point) = context.last_point.lock() {
         *last_point = Some((x, y));
     }
 
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
-    if let Some(active_target) = crossing_target(&targets, x, y, dx, dy, &context.layout_state) {
-        let anchor = local_anchor_point(&active_target);
-        hide_windows_cursor_if_needed(context);
-        set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+    let active_target =
+        crossing_target(&targets, x, y, dx, dy, &context.layout_state).or_else(|| {
+            // A very fast flick can arrive as one middle-to-edge jump, which
+            // the normal safety gate intentionally rejects. Windows continues
+            // delivering low-level move events while the pointer is clamped;
+            // a repeated identical edge point is a second outward-intent
+            // signal and avoids getting stuck forever at dx=0.
+            if repeated_clamped_point {
+                repeated_clamped_windows_crossing_target(&targets, x, y, &context.layout_state)
+            } else {
+                None
+            }
+        });
+    if let Some(active_target) = active_target {
+        let anchor = windows_remote_anchor_point(&active_target);
+        if let Ok(mut active) = context.active.lock() {
+            *active = Some(active_target.clone());
+        } else {
+            return false;
+        }
+        set_windows_remote_anchor(context, anchor);
+        context.remote_active.store(true, Ordering::Release);
         if !send_remote_mouse_move(
             &context.quic_transport,
             &active_target,
             &context.layout_state,
             &context.input_events,
         ) {
-            reset_mouse_move_timer(&context.last_mouse_move_sent);
-            reset_remote_button_mask(&context.remote_button_mask);
-            show_windows_cursor_if_needed(context);
+            release_windows_remote_control_inner(context);
             return false;
         }
         mark_mouse_move_sent(&context.last_mouse_move_sent);
         reset_remote_button_mask(&context.remote_button_mask);
-        context.remote_active.store(true, Ordering::Relaxed);
-        let _ = sync_held_modifiers_windows(context, &active_target.target);
-        set_control_clipboard_target(
-            &context.clipboard_target,
-            &active_target,
-            &context.layout_state,
+        let _ = sync_held_modifiers_windows(
+            context,
+            &active_target.target,
+            Some(snapshot.modifier_bits),
         );
-        *active = Some(active_target);
-        if let Ok(mut anchor_state) = context.anchor.lock() {
-            *anchor_state = Some(anchor);
-        }
-        context.just_crossed.store(true, Ordering::Relaxed);
+        set_control_clipboard_target(&context.clipboard_target, &active_target);
+        log::debug!(
+            "[input-win] entered remote device={} anchor=({:.0},{:.0})",
+            active_target.target.device_id,
+            anchor.0,
+            anchor.1
+        );
         return true;
     }
 
@@ -4720,7 +5958,11 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
 }
 
 #[cfg(target_os = "windows")]
-fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) -> bool {
+fn handle_windows_mouse_button(
+    context: &WindowsCaptureContext,
+    message: u32,
+    modifier_bits: u64,
+) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
@@ -4743,7 +5985,8 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
         _ => return false,
     };
 
-    let Some(modifier_snapshot) = sync_held_modifiers_windows(context, &active_target.target)
+    let Some(modifier_snapshot) =
+        sync_held_modifiers_windows(context, &active_target.target, Some(modifier_bits))
     else {
         return false;
     };
@@ -4769,7 +6012,12 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
 }
 
 #[cfg(target_os = "windows")]
-fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_data: u32) -> bool {
+fn handle_windows_scroll(
+    context: &WindowsCaptureContext,
+    message: u32,
+    mouse_data: u32,
+    modifier_bits: u64,
+) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MOUSEHWHEEL, WM_MOUSEWHEEL};
 
     let active = context
@@ -4789,7 +6037,8 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
         return false;
     };
 
-    let Some(modifier_snapshot) = sync_held_modifiers_windows(context, &active_target.target)
+    let Some(modifier_snapshot) =
+        sync_held_modifiers_windows(context, &active_target.target, Some(modifier_bits))
     else {
         return false;
     };
@@ -4815,6 +6064,33 @@ fn set_windows_cursor(x: i32, y: i32) {
 }
 
 #[cfg(target_os = "windows")]
+fn set_windows_remote_anchor(context: &WindowsCaptureContext, anchor: (f64, f64)) {
+    let x = anchor.0.round() as i32;
+    let y = anchor.1.round() as i32;
+    context
+        .remote_anchor_x
+        .store(i64::from(x), Ordering::Release);
+    context
+        .remote_anchor_y
+        .store(i64::from(y), Ordering::Release);
+    hide_windows_cursor_if_needed(context);
+    if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) } == 0 {
+        context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
+    } else {
+        context
+            .warp_cutoff_time
+            .store(u64::from(windows_tick_ms() as u32), Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn clear_windows_remote_anchor(context: &WindowsCaptureContext) {
+    context.remote_anchor_x.store(0, Ordering::Release);
+    context.remote_anchor_y.store(0, Ordering::Release);
+    context.warp_cutoff_time.store(0, Ordering::Release);
+}
+
+#[cfg(target_os = "windows")]
 fn windows_current_cursor_point() -> Option<(f64, f64)> {
     use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
 
@@ -4829,34 +6105,81 @@ fn windows_current_cursor_point() -> Option<(f64, f64)> {
 
 #[cfg(target_os = "windows")]
 fn hide_windows_cursor_if_needed(context: &WindowsCaptureContext) {
-    let Ok(mut calls) = context.cursor_hide_calls.lock() else {
-        return;
-    };
-    if *calls != 0 {
+    if context.cursor_hider_visible.load(Ordering::Acquire) {
         return;
     }
-
-    for _ in 0..8 {
-        let count = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ShowCursor(0) };
-        *calls += 1;
-        if count < 0 {
-            break;
-        }
+    let x = context.remote_anchor_x.load(Ordering::Acquire) as i32;
+    let y = context.remote_anchor_y.load(Ordering::Acquire) as i32;
+    if position_windows_cursor_hider(context, x, y) {
+        log::debug!("[input-win] cursor hider shown");
     }
 }
 
 #[cfg(target_os = "windows")]
-fn show_windows_cursor_if_needed(context: &WindowsCaptureContext) {
-    let Ok(mut calls) = context.cursor_hide_calls.lock() else {
-        return;
+fn position_windows_cursor_hider(context: &WindowsCaptureContext, x: i32, y: i32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     };
 
-    for _ in 0..*calls {
-        unsafe {
-            let _ = windows_sys::Win32::UI::WindowsAndMessaging::ShowCursor(1);
-        }
+    let hwnd =
+        context.cursor_hider_hwnd.load(Ordering::Acquire) as windows_sys::Win32::Foundation::HWND;
+    if hwnd.is_null() {
+        context.cursor_hider_visible.store(false, Ordering::Release);
+        return false;
     }
-    *calls = 0;
+    // This blank-cursor window is MyKVM's only Windows hide mechanism. Keep it
+    // above always-on-top and borderless-fullscreen windows without activating
+    // it; HWND_TOP alone only raises within the non-topmost band.
+    if unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            1,
+            1,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    } == 0
+    {
+        context.cursor_hider_visible.store(false, Ordering::Release);
+        log::warn!("[input-win] failed to show cursor hider window");
+        false
+    } else {
+        context.cursor_hider_visible.store(true, Ordering::Release);
+        true
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_windows_cursor_at(context: &WindowsCaptureContext, point: Option<(f64, f64)>) {
+    if let Some((x, y)) = point {
+        let x = x.round() as i32;
+        let y = y.round() as i32;
+        // Move the blank-cursor window to the reveal point first. The real
+        // cursor therefore stays blank during SetCursorPos and appears only
+        // when the hider is removed, without a one-frame flash at the anchor.
+        let _ = position_windows_cursor_hider(context, x, y);
+        set_windows_cursor(x, y);
+    }
+    show_windows_cursor_if_needed(context);
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_cursor_if_needed(context: &WindowsCaptureContext) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+    if !context.cursor_hider_visible.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let hwnd =
+        context.cursor_hider_hwnd.load(Ordering::Acquire) as windows_sys::Win32::Foundation::HWND;
+    if !hwnd.is_null() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        log::debug!("[input-win] cursor hider hidden");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4910,10 +6233,22 @@ fn handle_macos_event(
         return CallbackResult::Keep;
     }
 
-    let _send_guard = context
-        .send_gate
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    // A CGEventTap callback must never wait behind shutdown/release work. All
+    // macOS packet admission below is fire-and-forget into the transport actor;
+    // this gate only protects local cursor/session state from an external
+    // release. If that release already owns it, suppress remote-active input
+    // until convergence and let inactive input continue locally.
+    let _send_guard = match context.send_gate.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            return if context.remote_active.load(Ordering::Acquire) {
+                CallbackResult::Drop
+            } else {
+                CallbackResult::Keep
+            };
+        }
+    };
     if context.stop.load(Ordering::Relaxed) {
         return CallbackResult::Keep;
     }
@@ -5107,7 +6442,6 @@ fn handle_macos_mouse_move(
                 context
                     .suppress_next_mouse_delta
                     .store(false, Ordering::Relaxed);
-                // Keep the clipboard peer so copies still sync after returning.
                 release_held_remote_inputs_macos(context, &target);
                 let _ = send_remote_cursor_park(
                     &context.quic_transport,
@@ -5135,6 +6469,7 @@ fn handle_macos_mouse_move(
                 set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
                 log::debug!("[diag] cross BACK to local — showing cursor now");
                 show_macos_cursor_if_needed(context);
+                clear_clipboard_target_if_device(&context.clipboard_target, &target.device_id);
                 return CallbackResult::Drop;
             }
 
@@ -5154,23 +6489,13 @@ fn handle_macos_mouse_move(
                     &context.layout_state,
                     &context.input_events,
                 ) {
-                    *active = None;
-                    context.remote_active.store(false, Ordering::Relaxed);
-                    context.just_crossed.store(false, Ordering::Relaxed);
-                    context
-                        .suppress_next_mouse_delta
-                        .store(false, Ordering::Relaxed);
-                    clear_clipboard_target(&context.clipboard_target);
-                    reset_mouse_move_timer(&context.last_mouse_move_sent);
-                    reset_cursor_repin_timer(context);
-                    reset_remote_button_mask(&context.remote_button_mask);
-                    if let Ok(mut anchor) = context.anchor.lock() {
-                        *anchor = None;
-                    }
-                    set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
-                    set_macos_cursor_decoupled(false);
-                    show_macos_cursor_if_needed(context);
-                    return CallbackResult::Keep;
+                    // Drop the active lock before entering the one canonical
+                    // return path. Even when move admission failed, releases
+                    // and CursorPark are still accepted by the recovery queue;
+                    // skipping them leaves Cmd/a drag latched until the lease.
+                    drop(active);
+                    return_to_local_macos(context);
+                    return CallbackResult::Drop;
                 }
             }
             if repin_macos_cursor_if_drifted(context, location)
@@ -5184,7 +6509,12 @@ fn handle_macos_mouse_move(
         }
     }
 
-    let targets = current_input_targets(&context.layout_state, &context.native_layout);
+    let Some(targets) = try_current_input_targets(&context.layout_state, &context.native_layout)
+    else {
+        // save_layout may hold the mutex while writing to disk. Keep this
+        // physical event local and retry crossing on the next edge sample.
+        return CallbackResult::Keep;
+    };
     if let Some(active_target) =
         mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
     {
@@ -5226,11 +6556,7 @@ fn handle_macos_mouse_move(
         reset_remote_button_mask(&context.remote_button_mask);
         context.remote_active.store(true, Ordering::Relaxed);
         sync_held_modifiers_macos(context, &active_target.target);
-        set_control_clipboard_target(
-            &context.clipboard_target,
-            &active_target,
-            &context.layout_state,
-        );
+        set_control_clipboard_target(&context.clipboard_target, &active_target);
         if let Ok(mut active) = context.active.lock() {
             *active = Some(active_target.clone());
         }
@@ -5254,6 +6580,22 @@ fn crossing_target(
     layout_state: &Arc<Mutex<LayoutState>>,
 ) -> Option<ActiveTarget> {
     crossing_target_with_transform(targets, x, y, dx, dy, false, layout_state)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn repeated_clamped_windows_crossing_target(
+    targets: &[InputTarget],
+    x: f64,
+    y: f64,
+    layout_state: &Arc<Mutex<LayoutState>>,
+) -> Option<ActiveTarget> {
+    // Keep this confirmation Windows-only. Unlike macOS raw deltas, a Windows
+    // low-level hook reports the same clamped screen coordinate while the
+    // physical mouse continues pushing outward. Exact axial probes still pass
+    // through the ordinary shared-edge/online checks below.
+    [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+        .into_iter()
+        .find_map(|(dx, dy)| crossing_target(targets, x, y, dx, dy, layout_state))
 }
 
 fn crossing_target_with_transform(
@@ -5447,13 +6789,10 @@ fn mac_cursor_point(context: &MacCaptureContext, point: (f64, f64), invert_y: bo
         return point;
     }
 
-    local_y_bounds(&current_input_targets(
-        &context.layout_state,
-        &context.native_layout,
-    ))
-    .or(context.local_y_bounds)
-    .map(|(min_y, max_y)| (point.0, min_y + max_y - point.1))
-    .unwrap_or(point)
+    context
+        .local_y_bounds
+        .map(|(min_y, max_y)| (point.0, min_y + max_y - point.1))
+        .unwrap_or(point)
 }
 
 /// After a raw delta has been applied to `active.x`/`active.y`, reconcile which
@@ -5473,10 +6812,21 @@ fn update_active_remote_screen(
         return false;
     }
 
-    let screens = layout_state
-        .lock()
-        .map(|layout| remote_device_screens(&layout, &active.target.device_id))
-        .unwrap_or_default();
+    let screens = match layout_state.try_lock() {
+        Ok(layout) => remote_device_screens(&layout, &active.target.device_id),
+        Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+            // A save may hold the layout mutex while writing to disk. Never
+            // stall the input tap or mistake missing topology for a return;
+            // clamp to this screen and retry reconciliation on the next delta.
+            active.x = active
+                .x
+                .clamp(0.0, (active.current_screen.width - 1).max(0) as f64);
+            active.y = active
+                .y
+                .clamp(0.0, (active.current_screen.height - 1).max(0) as f64);
+            return false;
+        }
+    };
 
     // Position of the cursor in the remote device's shared layout space.
     let global_x = active.current_screen.x as f64 + active.x;
@@ -5518,6 +6868,25 @@ fn should_ignore_initial_anchor_warp_delta(edge: Edge, dx: f64, dy: f64) -> bool
         Edge::Left => dx >= MIN_CROSSING_DELTA && dx.abs() >= dy.abs() * CROSSING_AXIS_DOMINANCE,
         Edge::Bottom => dy <= -MIN_CROSSING_DELTA && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE,
         Edge::Top => dy >= MIN_CROSSING_DELTA && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default, Clone, Copy)]
+struct WindowsWarpGuard {
+    ignore_through_sequence: u64,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowsWarpGuard {
+    fn arm(&mut self, sequence: u64) {
+        self.ignore_through_sequence = sequence;
+    }
+
+    fn should_drop(&self, sequence: u64, x: f64, y: f64, anchor: (f64, f64)) -> bool {
+        (self.ignore_through_sequence != 0
+            && ((sequence as u32).wrapping_sub(self.ignore_through_sequence as u32) as i32) < 0)
+            || ((x - anchor.0).abs() < 0.1 && (y - anchor.1).abs() < 0.1)
     }
 }
 
@@ -5681,8 +7050,70 @@ fn send_remote_mouse_move_with_drag(
     )
 }
 
+fn remote_input_heartbeat_due(last_sent: &mut Option<Instant>, now: Instant) -> bool {
+    if last_sent.is_some_and(|last_sent| {
+        now.saturating_duration_since(last_sent) < REMOTE_INPUT_HEARTBEAT_INTERVAL
+    }) {
+        return false;
+    }
+    *last_sent = Some(now);
+    true
+}
+
+fn send_remote_input_heartbeat(
+    quic_transport: &quic_transport::TransportHandle,
+    active: &Mutex<Option<ActiveTarget>>,
+    remote_button_mask: &AtomicU64,
+    modifier_snapshot: u8,
+    last_sent: &Mutex<Option<Instant>>,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
+    let active = active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().cloned());
+    let Some(active) = active else {
+        if let Ok(mut last_sent) = last_sent.lock() {
+            *last_sent = None;
+        }
+        return true;
+    };
+    let now = Instant::now();
+    let due = last_sent
+        .lock()
+        .map(|mut last_sent| remote_input_heartbeat_due(&mut last_sent, now))
+        .unwrap_or(true);
+    if !due {
+        return true;
+    }
+
+    let button_mask = remote_button_mask.load(Ordering::Relaxed);
+    send_packet_with_options(
+        quic_transport,
+        &active.target,
+        InputEvent::MouseMove {
+            screen_id: active.current_screen_id,
+            x: active.x.round() as i32,
+            y: active.y.round() as i32,
+            drag_button: button_from_mask(button_mask),
+            button_mask: Some(button_mask),
+            sequence: next_mouse_sequence(),
+        },
+        Some(modifier_snapshot),
+        true,
+        layout_state,
+        input_events,
+    )
+}
+
 fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
     local_return_point(active)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_remote_anchor_point(active: &ActiveTarget) -> (f64, f64) {
+    local_center_point(active)
 }
 
 /// When control returns to the local machine, tuck the controlled cursor into
@@ -5762,11 +7193,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
     reset_remote_button_mask(&context.remote_button_mask);
     context.remote_active.store(true, Ordering::Relaxed);
     sync_held_modifiers_macos(context, &active_target.target);
-    set_control_clipboard_target(
-        &context.clipboard_target,
-        &active_target,
-        &context.layout_state,
-    );
+    set_control_clipboard_target(&context.clipboard_target, &active_target);
     if let Ok(mut active) = context.active.lock() {
         *active = Some(active_target);
     }
@@ -5812,6 +7239,7 @@ fn return_to_local_macos(context: &MacCaptureContext) {
         &context.layout_state,
         &context.input_events,
     );
+    clear_clipboard_target_if_device(&context.clipboard_target, &target.device_id);
     reset_mouse_move_timer(&context.last_mouse_move_sent);
     reset_cursor_repin_timer(context);
     if let Ok(mut anchor) = context.anchor.lock() {
@@ -5947,41 +7375,32 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
             // Mirror the Windows mouse-crossing enter path. Hotkey entry has no
             // physical mouse position at the edge, so we explicitly pin to the
             // local anchor and start sending deltas from there.
-            let anchor = local_anchor_point(&active_target);
-            hide_windows_cursor_if_needed(context);
-            set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+            let anchor = windows_remote_anchor_point(&active_target);
+            if let Ok(mut active) = context.active.lock() {
+                *active = Some(active_target.clone());
+            } else {
+                return;
+            }
+            set_windows_remote_anchor(context, anchor);
+            context.remote_active.store(true, Ordering::Release);
             if send_remote_mouse_move(
                 &context.quic_transport,
                 &active_target,
                 &context.layout_state,
                 &context.input_events,
             ) {
-                context.remote_active.store(true, Ordering::Relaxed);
-                let _ = sync_held_modifiers_windows(context, &active_target.target);
-                set_control_clipboard_target(
-                    &context.clipboard_target,
-                    &active_target,
-                    &context.layout_state,
-                );
-                if let Ok(mut active) = context.active.lock() {
-                    *active = Some(active_target);
-                }
-                if let Ok(mut anchor_state) = context.anchor.lock() {
-                    *anchor_state = Some(anchor);
-                }
-                // Hotkey entry lands at the remote centre. The edge-crossing
-                // first-delta guard would eat the user's first real movement.
-                context.just_crossed.store(false, Ordering::Relaxed);
-            } else {
-                reset_mouse_move_timer(&context.last_mouse_move_sent);
+                mark_mouse_move_sent(&context.last_mouse_move_sent);
                 reset_remote_button_mask(&context.remote_button_mask);
-                show_windows_cursor_if_needed(context);
+                let _ = sync_held_modifiers_windows(context, &active_target.target, None);
+                set_control_clipboard_target(&context.clipboard_target, &active_target);
+            } else {
+                release_windows_remote_control_inner(context);
             }
         }
         SwitchOutcome::Return => {
             log::info!("screen switch returning to local");
             // The capture-loop caller already holds send_gate.
-            release_windows_remote_control_inner(context, false);
+            release_windows_remote_control_inner(context);
         }
         SwitchOutcome::LocalMove {
             from_screen_id,
@@ -7646,12 +9065,78 @@ struct MacIoGPoint {
     y: i16,
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default)]
+struct MacIoHidConnectionState {
+    connection: Option<u32>,
+    retry_after: Option<Instant>,
+}
+
+#[cfg(target_os = "macos")]
+static MACOS_IOHID_CONNECTION: Mutex<MacIoHidConnectionState> =
+    Mutex::new(MacIoHidConnectionState {
+        connection: None,
+        retry_after: None,
+    });
+
+#[cfg(any(target_os = "macos", test))]
+fn post_macos_hid_with_recovery<Open, Post, Close>(
+    state: &mut MacIoHidConnectionState,
+    now: Instant,
+    mut open: Open,
+    mut post: Post,
+    mut close: Close,
+) -> bool
+where
+    Open: FnMut() -> Option<u32>,
+    Post: FnMut(u32) -> bool,
+    Close: FnMut(u32),
+{
+    if state.connection.is_none() {
+        if state
+            .retry_after
+            .is_some_and(|retry_after| now < retry_after)
+        {
+            return false;
+        }
+        state.retry_after = None;
+        state.connection = open();
+        if state.connection.is_none() {
+            state.retry_after = Some(now + MACOS_IOHID_RETRY_BACKOFF);
+            return false;
+        }
+    }
+
+    let connection = state.connection.expect("connection opened above");
+    if post(connection) {
+        state.retry_after = None;
+        return true;
+    }
+
+    close(connection);
+    state.connection = None;
+    let Some(reopened) = open() else {
+        state.retry_after = Some(now + MACOS_IOHID_RETRY_BACKOFF);
+        return false;
+    };
+    if post(reopened) {
+        state.connection = Some(reopened);
+        state.retry_after = None;
+        true
+    } else {
+        close(reopened);
+        state.retry_after = Some(now + MACOS_IOHID_RETRY_BACKOFF);
+        false
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
     fn IOServiceMatching(name: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
     fn IOServiceGetMatchingService(main_port: u32, matching: *mut std::ffi::c_void) -> u32;
     fn IOServiceOpen(service: u32, owning_task: u32, kind: u32, connect: *mut u32) -> i32;
+    fn IOServiceClose(connect: u32) -> i32;
     fn IOObjectRelease(object: u32) -> i32;
     fn IOHIDPostEvent(
         connect: u32,
@@ -7670,9 +9155,8 @@ extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_iohid_connection() -> Option<u32> {
-    static CONNECTION: OnceLock<Option<u32>> = OnceLock::new();
-    *CONNECTION.get_or_init(|| unsafe {
+fn open_macos_iohid_connection() -> Option<u32> {
+    unsafe {
         let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
         if matching.is_null() {
             return None;
@@ -7687,29 +9171,37 @@ fn macos_iohid_connection() -> Option<u32> {
         let result = IOServiceOpen(service, mach_task_self_, 1, &mut connection);
         let _ = IOObjectRelease(service);
         (result == 0 && connection != 0).then_some(connection)
-    })
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn post_macos_hid_key_event(plan: MacHidKeyEventPlan) -> bool {
-    let Some(connection) = macos_iohid_connection() else {
-        return false;
-    };
     let event = MacNxKeyEventData {
         key_code: plan.key_code,
         ..MacNxKeyEventData::default()
     };
-    unsafe {
-        IOHIDPostEvent(
-            connection,
-            plan.event_type,
-            MacIoGPoint::default(),
-            &event,
-            2, // kNXEventDataVersion
-            plan.event_flags,
-            plan.options,
-        ) == 0
-    }
+    let mut state = MACOS_IOHID_CONNECTION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    post_macos_hid_with_recovery(
+        &mut state,
+        Instant::now(),
+        open_macos_iohid_connection,
+        |connection| unsafe {
+            IOHIDPostEvent(
+                connection,
+                plan.event_type,
+                MacIoGPoint::default(),
+                &event,
+                2, // kNXEventDataVersion
+                plan.event_flags,
+                plan.options,
+            ) == 0
+        },
+        |connection| unsafe {
+            let _ = IOServiceClose(connection);
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -7885,6 +9377,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_desktop_loss_clears_cached_hook_modifiers() {
+        let modifiers = AtomicU64::new((1 << 2) | (1 << 6));
+        clear_windows_hook_modifier_bits(&modifiers);
+        assert_eq!(modifiers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn authoritative_modifier_snapshot_repairs_missed_win_up_while_mouse_stays_live() {
+        let hook_cache = AtomicU64::new(1 << 6);
+        let physical = Vec::new();
+        let snapshot = windows_modifier_bits_for_keys(&physical);
+        hook_cache.store(snapshot, Ordering::Release);
+
+        assert_eq!(hook_cache.load(Ordering::Acquire), 0);
+        assert_eq!(
+            reconcile_windows_authoritative_modifier_events(&physical, &[0x5B, 0x41]),
+            vec![InputEvent::Key {
+                key_code: 0x5B,
+                down: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn worker_ack_wait_pumps_messages_before_acknowledgement() {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let mut pump_count = 0;
+
+        assert!(wait_for_worker_ack_with_pump(
+            &ack_rx,
+            Duration::from_secs(1),
+            |_| {
+                pump_count += 1;
+                if pump_count == 1 {
+                    ack_tx.send(()).expect("ack from pumped window work");
+                }
+            },
+        ));
+        assert_eq!(pump_count, 1);
+    }
+
+    #[test]
+    fn macos_receive_cursor_ignores_logged_window_server_drift() {
+        let parked = (2495.0, 1375.0);
+
+        assert!(!macos_receive_cursor_drifted(parked, (2505.0, 1370.0)));
+        assert!(!macos_receive_cursor_drifted(parked, (2508.0, 1362.0)));
+        assert!(!macos_receive_cursor_drifted(parked, (2519.0, 1375.0)));
+        assert!(macos_receive_cursor_drifted(parked, (2520.0, 1375.0)));
+    }
+
+    #[test]
     fn missing_windows_key_hook_modifier_is_recovered_before_arrow() {
         let recovered = reconcile_windows_modifier_events(&[0x5B], &[]);
         assert_eq!(
@@ -7945,13 +9489,218 @@ mod tests {
     }
 
     #[test]
-    fn stale_forwarded_windows_modifier_is_released_before_next_key() {
+    fn empty_async_snapshot_does_not_release_a_hook_held_modifier() {
+        assert!(reconcile_windows_modifier_events(&[], &[0xA2]).is_empty());
+    }
+
+    #[test]
+    fn swallowed_windows_modifier_is_not_released_from_empty_async_snapshot() {
+        assert!(reconcile_windows_modifier_events(&[], &[0x5B]).is_empty());
+    }
+
+    #[test]
+    fn windows_remote_anchor_keeps_motion_headroom() {
+        let active = crossing_target(
+            &[target_for_coordinate_tests()],
+            1919.0,
+            500.0,
+            40.0,
+            0.0,
+            &Arc::new(Mutex::new(layout_for_target_tests())),
+        )
+        .expect("target should be active");
+
         assert_eq!(
-            reconcile_windows_modifier_events(&[], &[0xA2]),
-            vec![InputEvent::Key {
-                key_code: 0xA2,
-                down: false,
-            }]
+            windows_remote_anchor_point(&active),
+            local_center_point(&active)
+        );
+    }
+
+    #[test]
+    fn windows_warp_guard_drops_pre_warp_backlog_but_keeps_real_motion() {
+        let anchor = (960.0, 540.0);
+        let mut guard = WindowsWarpGuard::default();
+        guard.arm(10);
+
+        assert!(guard.should_drop(9, 1919.0, 540.0, anchor));
+        assert!(!guard.should_drop(10, anchor.0 + 12.0, anchor.1, anchor));
+        assert!(guard.should_drop(10, anchor.0, anchor.1, anchor));
+        assert!(guard.should_drop(11, anchor.0, anchor.1, anchor));
+        assert!(!guard.should_drop(12, anchor.0 + 12.0, anchor.1, anchor));
+    }
+
+    #[test]
+    fn windows_warp_guard_handles_dword_tick_wraparound() {
+        let anchor = (960.0, 540.0);
+        let mut guard = WindowsWarpGuard::default();
+        guard.arm(u64::from(u32::MAX));
+
+        assert!(!guard.should_drop(0, anchor.0 + 1.0, anchor.1, anchor));
+        assert!(guard.should_drop(u64::from(u32::MAX - 1), anchor.0 + 1.0, anchor.1, anchor));
+    }
+
+    #[test]
+    fn windows_delta_batch_never_crosses_a_button_boundary() {
+        let before = WindowsCapturedEvent::RemoteMouseDelta { dx: 4, dy: 2 };
+        let button = WindowsCapturedEvent::MouseButton {
+            message: 1,
+            modifier_bits: 0,
+        };
+        let after = WindowsCapturedEvent::RemoteMouseDelta { dx: 8, dy: 3 };
+        let mut first_batch = (0, 0);
+
+        assert!(accumulate_windows_delta(&mut first_batch, &before));
+        assert!(!accumulate_windows_delta(&mut first_batch, &button));
+        assert_eq!(first_batch, (4, 2));
+
+        let mut second_batch = (0, 0);
+        assert!(accumulate_windows_delta(&mut second_batch, &after));
+        assert_eq!(second_batch, (8, 3));
+    }
+
+    #[test]
+    fn windows_delta_batch_stops_before_a_direction_reversal() {
+        let outward = WindowsCapturedEvent::RemoteMouseDelta { dx: -4, dy: 0 };
+        let inward = WindowsCapturedEvent::RemoteMouseDelta { dx: 4, dy: 0 };
+        let mut batch = (0, 0);
+
+        assert!(accumulate_windows_delta(&mut batch, &outward));
+        assert!(!accumulate_windows_delta(&mut batch, &inward));
+        assert_eq!(batch, (-4, 0));
+
+        let layout = Arc::new(Mutex::new(layout_for_target_tests()));
+        let mut active = crossing_target(
+            &[target_for_coordinate_tests()],
+            1919.0,
+            500.0,
+            40.0,
+            0.0,
+            &layout,
+        )
+        .expect("enter remote before reversing");
+        active.x = 1.0;
+        active.x += batch.0 as f64;
+        assert!(
+            update_active_remote_screen(&mut active, batch.0 as f64, 0.0, &layout),
+            "the outward segment must return before the later inward segment is processed"
+        );
+    }
+
+    #[test]
+    fn windows_pending_moves_preserve_the_edge_approach_and_deduplicate_clamp_points() {
+        let mut pending = WindowsPendingMouseMoves::default();
+        let snapshot = |x| WindowsMouseMoveSnapshot {
+            x,
+            y: 500.0,
+            modifier_bits: 0,
+        };
+        assert!(!pending.push(snapshot(1800.0)));
+        assert!(!pending.push(snapshot(1919.0)));
+        assert!(!pending.push(snapshot(1919.0)));
+        assert_eq!(pending.snapshots.len(), 2);
+
+        let layout = Arc::new(Mutex::new(layout_for_target_tests()));
+        let targets = [target_for_coordinate_tests()];
+        let mut previous = (500.0, 500.0);
+        let mut crossed = None;
+        for move_snapshot in pending.drain() {
+            let dx = move_snapshot.x - previous.0;
+            let dy = move_snapshot.y - previous.1;
+            crossed = crossing_target(&targets, move_snapshot.x, move_snapshot.y, dx, dy, &layout);
+            previous = (move_snapshot.x, move_snapshot.y);
+        }
+        assert!(crossed.is_some());
+
+        assert!(crossing_target(&targets, 1919.0, 500.0, 1419.0, 0.0, &layout).is_none());
+    }
+
+    #[test]
+    fn windows_pending_move_overflow_keeps_a_crossable_edge_trajectory() {
+        let mut pending = WindowsPendingMouseMoves::default();
+        for index in 0..64 {
+            let _ = pending.push(WindowsMouseMoveSnapshot {
+                x: 1604.0 + index as f64 * 5.0,
+                y: 500.0,
+                modifier_bits: 0,
+            });
+        }
+        for _ in 0..100 {
+            let _ = pending.push(WindowsMouseMoveSnapshot {
+                x: 1919.0,
+                y: 500.0,
+                modifier_bits: 0,
+            });
+        }
+        assert_eq!(pending.snapshots.len(), WindowsPendingMouseMoves::CAPACITY);
+
+        let layout = Arc::new(Mutex::new(layout_for_target_tests()));
+        let targets = [target_for_coordinate_tests()];
+        let mut previous = (500.0, 500.0);
+        let crossed = pending.drain().into_iter().find_map(|snapshot| {
+            let dx = snapshot.x - previous.0;
+            let dy = snapshot.y - previous.1;
+            previous = (snapshot.x, snapshot.y);
+            crossing_target(&targets, snapshot.x, snapshot.y, dx, dy, &layout)
+        });
+
+        assert!(
+            crossed.is_some(),
+            "overflow must retain enough distinct approach points to reach the shared edge"
+        );
+    }
+
+    #[test]
+    fn repeated_windows_clamp_confirms_a_rejected_single_flick() {
+        let layout = Arc::new(Mutex::new(layout_for_target_tests()));
+        let targets = [target_for_coordinate_tests()];
+
+        assert!(
+            crossing_target(&targets, 1919.0, 500.0, 1419.0, 0.0, &layout).is_none(),
+            "one middle-to-edge jump remains rejected"
+        );
+        assert!(
+            repeated_clamped_windows_crossing_target(&targets, 1919.0, 500.0, &layout).is_some(),
+            "a second identical low-level edge event confirms continued outward intent"
+        );
+        assert!(
+            repeated_clamped_windows_crossing_target(&targets, 1900.0, 500.0, &layout).is_none(),
+            "the confirmation applies only at a configured shared edge"
+        );
+    }
+
+    #[test]
+    fn windows_center_anchor_and_return_inset_prevent_handoff_flip_flop() {
+        let layout = Arc::new(Mutex::new(layout_for_target_tests()));
+        let targets = [target_for_coordinate_tests()];
+        let mut active =
+            crossing_target(&targets, 1919.0, 500.0, 40.0, 0.0, &layout).expect("enter remote");
+        let anchor = windows_remote_anchor_point(&active);
+
+        // A same-tick edge sample left behind by the entry warp now points
+        // deeper into the remote screen from the center anchor, never back out.
+        let stale_dx = 1919.0 - anchor.0;
+        let stale_dy = 500.0 - anchor.1;
+        active.x += stale_dx;
+        active.y += stale_dy;
+        assert!(!update_active_remote_screen(
+            &mut active,
+            stale_dx,
+            stale_dy,
+            &layout,
+        ));
+
+        // A real reverse excursion returns, then lands far enough inside the
+        // local screen that the return warp and continued outward motion cannot
+        // immediately enter the remote again.
+        active.x = 1.0;
+        active.y = 500.0;
+        active.x -= 2.0;
+        assert!(update_active_remote_screen(&mut active, -2.0, 0.0, &layout,));
+        let returned = local_return_point(&active);
+        assert!(crossing_target(&targets, returned.0, returned.1, 0.0, 0.0, &layout).is_none());
+        assert!(
+            crossing_target(&targets, returned.0 - 10.0, returned.1, -10.0, 0.0, &layout,)
+                .is_none()
         );
     }
 
@@ -8220,6 +9969,58 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_mouse_move_cannot_claim_an_empty_session() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        let mut mouse_state = RemoteMouseState::default();
+        let mut active_origin = String::new();
+        let mut heartbeat = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 10,
+            y: 20,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 10,
+        };
+
+        let heartbeat_admission = admit_remote_input_packet_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            10,
+            true,
+            &mut heartbeat,
+        )
+        .expect("authorized heartbeat should still advance its high-water");
+        assert!(!heartbeat_admission.inject_event);
+        assert!(active_origin.is_empty());
+
+        let mut real_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 10,
+            y: 20,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 11,
+        };
+        let entry = admit_remote_input_packet_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            11,
+            false,
+            &mut real_move,
+        )
+        .expect("real move after heartbeat should enter");
+        assert!(entry.inject_event);
+        assert!(entry.origin_changed);
+        assert_eq!(active_origin, "server-a");
+    }
+
+    #[test]
     fn stale_origin_sequence_is_rejected_before_it_can_replace_the_active_origin() {
         let mut sequence_state = RemoteKeySequenceState::default();
         assert!(sequence_state.accept_key("server-a", 0x41, 100));
@@ -8365,6 +10166,7 @@ mod tests {
         assert!(!admission.origin_changed);
         assert!(admission.release_keys);
         assert!(!admission.inject_event);
+        assert!(!remote_input_session_ended(&admission));
 
         // A new drag on the mouse channel already overtook the park. Rejecting
         // only its stale coordinates must not erase that new held-button state.
@@ -8554,19 +10356,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_modifier_reconciliation_releases_stale_state_before_new_downs() {
+    fn windows_modifier_reconciliation_only_adds_missing_downs() {
         assert_eq!(
             reconcile_windows_modifier_events(&[0x5B], &[0x11, 0x25]),
-            vec![
-                InputEvent::Key {
-                    key_code: 0x11,
-                    down: false,
-                },
-                InputEvent::Key {
-                    key_code: 0x5B,
-                    down: true,
-                },
-            ]
+            vec![InputEvent::Key {
+                key_code: 0x5B,
+                down: true,
+            }]
         );
     }
 
@@ -8684,6 +10480,74 @@ mod tests {
             .iter()
             .all(|plan| plan.event_flags == 0 && plan.options == 0));
         assert!(state.pressed_keys().is_empty());
+    }
+
+    #[test]
+    fn macos_iohid_reopens_a_stale_cached_connection_once() {
+        let mut state = MacIoHidConnectionState {
+            connection: Some(10),
+            retry_after: None,
+        };
+        let mut opened = vec![20_u32].into_iter();
+        let mut posted = Vec::new();
+        let mut closed = Vec::new();
+
+        assert!(post_macos_hid_with_recovery(
+            &mut state,
+            Instant::now(),
+            || opened.next(),
+            |connection| {
+                posted.push(connection);
+                connection == 20
+            },
+            |connection| closed.push(connection),
+        ));
+        assert_eq!(posted, vec![10, 20]);
+        assert_eq!(closed, vec![10]);
+        assert_eq!(state.connection, Some(20));
+        assert_eq!(state.retry_after, None);
+    }
+
+    #[test]
+    fn macos_iohid_unavailable_connection_retries_after_backoff() {
+        let started = Instant::now();
+        let mut state = MacIoHidConnectionState::default();
+        let mut open_calls = 0;
+
+        assert!(!post_macos_hid_with_recovery(
+            &mut state,
+            started,
+            || {
+                open_calls += 1;
+                None
+            },
+            |_| unreachable!("no connection to post"),
+            |_| unreachable!("no connection to close"),
+        ));
+        assert_eq!(open_calls, 1);
+        assert!(!post_macos_hid_with_recovery(
+            &mut state,
+            started + Duration::from_millis(500),
+            || {
+                open_calls += 1;
+                Some(30)
+            },
+            |_| true,
+            |_| {},
+        ));
+        assert_eq!(open_calls, 1, "typing during cooldown must stay cheap");
+        assert!(post_macos_hid_with_recovery(
+            &mut state,
+            started + MACOS_IOHID_RETRY_BACKOFF,
+            || {
+                open_calls += 1;
+                Some(30)
+            },
+            |connection| connection == 30,
+            |_| {},
+        ));
+        assert_eq!(open_calls, 2);
+        assert_eq!(state.connection, Some(30));
     }
 
     #[cfg(target_os = "macos")]
@@ -8995,6 +10859,10 @@ mod tests {
             pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47833".into(),
             target_platform: "windows".into(),
+            modifier_remap: true,
+            modifier_control: "meta".into(),
+            modifier_alt: "alt".into(),
+            modifier_meta: "control".into(),
             transport_public_key: "test-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_id: "local-display-1".into(),
@@ -9089,6 +10957,46 @@ mod tests {
     }
 
     #[test]
+    fn unmappable_drag_is_rejected_before_it_can_claim_or_press() {
+        let mut layout = layout_for_target_tests();
+        let mut native_layout = layout.clone();
+        for candidate in [&mut layout, &mut native_layout] {
+            candidate
+                .devices
+                .iter_mut()
+                .filter(|device| device.role == "local")
+                .for_each(|device| device.screens.clear());
+        }
+        *remote_key_sequence_state().lock().unwrap() = RemoteKeySequenceState::default();
+        *remote_mouse_state().lock().unwrap() = RemoteMouseState::default();
+        REMOTE_INPUT_ORIGIN.lock().unwrap().clear();
+        *remote_input_lease().lock().unwrap() = RemoteInputLease::default();
+
+        let outcome = inject_input_event(
+            &layout,
+            &native_layout,
+            "server-invalid-screen",
+            Some(META_MODIFIER_MASK),
+            1,
+            false,
+            InputEvent::MouseMove {
+                screen_id: "missing-screen".into(),
+                x: 100,
+                y: 100,
+                drag_button: Some(MouseButton::Left),
+                button_mask: Some(LEFT_BUTTON_MASK),
+                sequence: 1,
+            },
+        );
+
+        assert!(!outcome.admitted);
+        assert!(!outcome.injected);
+        assert!(REMOTE_INPUT_ORIGIN.lock().unwrap().is_empty());
+        assert_eq!(remote_mouse_state().lock().unwrap().buttons, 0);
+        assert!(remote_input_lease().lock().unwrap().origin_id.is_empty());
+    }
+
+    #[test]
     fn cursor_roams_across_remote_device_screens() {
         // Remote device with two stacked screens: a primary and a secondary
         // directly below it (the screenshot's #10086 / #41039 arrangement).
@@ -9126,6 +11034,10 @@ mod tests {
             pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47834".into(),
             target_platform: "windows".into(),
+            modifier_remap: true,
+            modifier_control: "meta".into(),
+            modifier_alt: "alt".into(),
+            modifier_meta: "control".into(),
             transport_public_key: "peer-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_id: "scr-1".into(),
@@ -9181,6 +11093,10 @@ mod tests {
             pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47834".into(),
             target_platform: "windows".into(),
+            modifier_remap: true,
+            modifier_control: "meta".into(),
+            modifier_alt: "alt".into(),
+            modifier_meta: "control".into(),
             transport_public_key: "peer-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_id: "local-display-1".into(),
@@ -9270,6 +11186,10 @@ mod tests {
             pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47834".into(),
             target_platform: "windows".into(),
+            modifier_remap: true,
+            modifier_control: "meta".into(),
+            modifier_alt: "alt".into(),
+            modifier_meta: "control".into(),
             transport_public_key: "peer-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_id: "local-display-1".into(),
@@ -9510,6 +11430,10 @@ mod tests {
                 pair_secret: "secret-test".into(),
                 target_addr: "10.0.0.2:47834".into(),
                 target_platform: "windows".into(),
+                modifier_remap: true,
+                modifier_control: "meta".into(),
+                modifier_alt: "alt".into(),
+                modifier_meta: "control".into(),
                 transport_public_key: "peer-public-key".into(),
                 protocol_version: quic_transport::PROTOCOL_VERSION,
                 screen_id: "local-display-1".into(),
@@ -9553,6 +11477,7 @@ mod tests {
             pair_secret: "secret-test".into(),
             modifier_snapshot: None,
             key_sequence: 0,
+            heartbeat: false,
             event: InputEvent::MouseMove {
                 screen_id: "display-1".into(),
                 x: 320,
@@ -9571,6 +11496,10 @@ mod tests {
         assert_eq!(decoded.target_device_id, "peer-device");
         assert_eq!(decoded.origin_device_id, "local-device");
         assert_eq!(decoded.origin_port, 47833);
+        assert_eq!(
+            decoded.origin_protocol_version,
+            quic_transport::PROTOCOL_VERSION
+        );
         match decoded.event {
             InputEvent::MouseMove {
                 screen_id, x, y, ..
@@ -9603,6 +11532,10 @@ mod tests {
         let decoded = decode_input_packet(&legacy_payload).expect("decode legacy input packet");
         assert_eq!(decoded.modifier_snapshot, None);
         assert_eq!(decoded.key_sequence, 0);
+        assert_eq!(
+            decoded.origin_protocol_version, 0,
+            "a missing wire version must not masquerade as the current protocol"
+        );
 
         let new_packet = InputPacket {
             protocol: INPUT_PROTOCOL.into(),
@@ -9615,6 +11548,7 @@ mod tests {
             pair_secret: String::new(),
             modifier_snapshot: Some(META_MODIFIER_MASK),
             key_sequence: 9,
+            heartbeat: false,
             event: InputEvent::Key {
                 key_code: 0x41,
                 down: true,
@@ -9628,6 +11562,42 @@ mod tests {
             rmp_serde::from_slice(&new_payload).expect("legacy decoder ignores new fields");
         assert_eq!(legacy_decoded.protocol, INPUT_PROTOCOL);
         assert_eq!(legacy_decoded.event, new_packet.event);
+    }
+
+    #[test]
+    fn input_packet_heartbeat_flag_defaults_false_and_round_trips_true() {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PacketWithoutHeartbeat {
+            protocol: String,
+            event: InputEvent,
+        }
+        let payload = rmp_serde::to_vec_named(&PacketWithoutHeartbeat {
+            protocol: INPUT_PROTOCOL.into(),
+            event: InputEvent::MouseMove {
+                screen_id: "display-1".into(),
+                x: 1,
+                y: 2,
+                drag_button: None,
+                button_mask: Some(0),
+                sequence: 1,
+            },
+        })
+        .expect("encode old packet");
+        assert!(
+            !decode_input_packet(&payload)
+                .expect("decode old packet")
+                .heartbeat
+        );
+
+        let mut packet = decode_input_packet(&payload).expect("decode packet for heartbeat");
+        packet.heartbeat = true;
+        let encoded = rmp_serde::to_vec_named(&packet).expect("encode heartbeat packet");
+        assert!(
+            decode_input_packet(&encoded)
+                .expect("decode heartbeat packet")
+                .heartbeat
+        );
     }
 
     #[test]
@@ -9690,42 +11660,105 @@ mod tests {
     }
 
     #[test]
-    fn input_packet_context_never_skips_key_remapping_when_layout_is_busy() {
+    fn input_packet_context_uses_cached_key_remap_without_waiting_for_layout() {
         let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
-        let held_layout = layout_state.lock().expect("hold layout lock");
+        let _held_layout = layout_state.lock().expect("hold layout lock");
         let target = target_for_coordinate_tests();
         let layout_state_for_thread = Arc::clone(&layout_state);
         let (tx, rx) = std::sync::mpsc::channel();
 
         thread::spawn(move || {
-            let context = input_packet_context(
-                &target,
-                InputEvent::Key {
-                    key_code: 0x11,
-                    down: true,
-                },
-                Some(CONTROL_MODIFIER_MASK),
-                &layout_state_for_thread,
-            );
-            tx.send((context.event, context.modifier_snapshot))
+            let contexts = [true, false].map(|down| {
+                input_packet_context(
+                    &target,
+                    InputEvent::Key {
+                        key_code: 0x11,
+                        down,
+                    },
+                    Some(CONTROL_MODIFIER_MASK),
+                    &layout_state_for_thread,
+                )
+            });
+            tx.send(contexts.map(|context| (context.event, context.modifier_snapshot)))
                 .expect("send remapped key");
         });
 
-        thread::sleep(Duration::from_millis(10));
-        drop(held_layout);
-        let (event, modifier_snapshot) = rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("key context should finish after the short layout lock");
-        assert_eq!(modifier_snapshot, Some(META_MODIFIER_MASK));
+        let contexts = rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("key context must not wait for the held layout lock");
+        for ((event, modifier_snapshot), down) in contexts.into_iter().zip([true, false]) {
+            assert_eq!(modifier_snapshot, Some(META_MODIFIER_MASK));
+            assert_eq!(
+                event,
+                InputEvent::Key {
+                    key_code: 0x5B,
+                    down,
+                },
+                "cached Ctrl-to-Command mapping must stay identical for Down and Up"
+            );
+        }
+    }
 
-        assert_eq!(
-            event,
-            InputEvent::Key {
-                key_code: 0x5B,
-                down: true,
-            },
-            "Ctrl must not randomly bypass the configured Ctrl-to-Command mapping"
-        );
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_layout_contention_defers_crossing_without_blocking() {
+        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
+        let native_layout = layout_for_target_tests();
+        let _held_layout = layout_state.lock().expect("hold layout lock");
+
+        assert!(try_current_input_targets(&layout_state, &native_layout).is_none());
+        assert!(!target_is_online(
+            &target_for_coordinate_tests(),
+            &layout_state
+        ));
+    }
+
+    #[test]
+    fn layout_contention_clamps_remote_point_instead_of_faking_return() {
+        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
+        let target = target_for_coordinate_tests();
+        let mut active = ActiveTarget {
+            current_screen: target.remote_screen.clone(),
+            current_screen_id: target.screen_id.clone(),
+            target,
+            x: -20.0,
+            y: 400.0,
+            invert_y: false,
+        };
+        let _held_layout = layout_state.lock().expect("hold layout lock");
+
+        assert!(!update_active_remote_screen(
+            &mut active,
+            -20.0,
+            0.0,
+            &layout_state
+        ));
+        assert_eq!(active.x, 0.0);
+        assert_eq!(active.y, 400.0);
+    }
+
+    #[test]
+    fn control_clipboard_binding_uses_the_active_target_snapshot() {
+        let target = target_for_coordinate_tests();
+        let active = ActiveTarget {
+            current_screen: target.remote_screen.clone(),
+            current_screen_id: target.screen_id.clone(),
+            target: target.clone(),
+            x: 10.0,
+            y: 20.0,
+            invert_y: false,
+        };
+        let clipboard = Arc::new(Mutex::new(None));
+
+        set_control_clipboard_target(&clipboard, &active);
+
+        let bound = clipboard.lock().unwrap().clone().expect("clipboard target");
+        assert_eq!(bound.device_id, target.device_id);
+        assert_eq!(bound.addr, target.target_addr);
+        assert_eq!(bound.transport_public_key, target.transport_public_key);
+        assert_eq!(bound.protocol_version, target.protocol_version);
+        assert_eq!(bound.cluster_id, target.cluster_id);
+        assert_eq!(bound.pair_secret, target.pair_secret);
     }
 
     #[test]
@@ -9753,6 +11786,7 @@ mod tests {
             pair_secret: "wrong".into(),
             modifier_snapshot: None,
             key_sequence: 0,
+            heartbeat: false,
             event: InputEvent::MouseMove {
                 screen_id: "local-display-1".into(),
                 x: 1,
@@ -9766,6 +11800,9 @@ mod tests {
         assert!(!packet_authorized(&layout, &packet));
         packet.pair_secret = layout.pair_secret.clone();
         assert!(packet_authorized(&layout, &packet));
+        packet.origin_protocol_version = 0;
+        assert!(!packet_authorized(&layout, &packet));
+        packet.origin_protocol_version = quic_transport::PROTOCOL_VERSION;
         packet.origin_transport_public_key = "attacker-key".into();
         packet.origin_device_id = "attacker".into();
         assert!(!packet_authorized(&layout, &packet));
@@ -9799,6 +11836,7 @@ mod tests {
             pair_secret: layout.pair_secret.clone(),
             modifier_snapshot: None,
             key_sequence: 0,
+            heartbeat: false,
             event: InputEvent::MouseMove {
                 screen_id: "local-display-1".into(),
                 x: 1,
@@ -9944,6 +11982,10 @@ mod tests {
             }),
             Some(quic_transport::ReliableInputClass::ResetBoundary)
         );
+        assert_eq!(
+            input_packet_reliable_class(&normal_move, true),
+            Some(quic_transport::ReliableInputClass::State)
+        );
     }
 
     #[test]
@@ -9972,7 +12014,7 @@ mod tests {
         assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut stale_move).0);
 
         // Park is an authoritative input boundary, so older transitions cannot
-        // re-press or re-release a button after control has left.
+        // mutate a newer session's button state.
         let mut stale_button_up = InputEvent::MouseButton {
             button: MouseButton::Left,
             down: false,
@@ -10069,6 +12111,121 @@ mod tests {
     }
 
     #[test]
+    fn latest_move_does_not_erase_reliable_click_transitions() {
+        let mut state = RemoteMouseState::default();
+        let mut move_event = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 70,
+            y: 80,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 30,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut move_event).0);
+        let _ = authoritative_mouse_button_state(&mut state, "server-a", &move_event, true);
+
+        let mut down = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            screen_id: "stale-display".into(),
+            x: Some(10),
+            y: Some(20),
+            sequence: 20,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut down).0);
+        assert!(matches!(
+            down,
+            InputEvent::MouseButton {
+                screen_id,
+                x: None,
+                y: None,
+                ..
+            } if screen_id.is_empty()
+        ));
+
+        let mut up = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            screen_id: "stale-display".into(),
+            x: Some(10),
+            y: Some(20),
+            sequence: 21,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut up).0);
+    }
+
+    #[test]
+    fn park_rejects_delayed_button_transitions_from_the_old_epoch() {
+        let mut state = RemoteMouseState::default();
+        let mut park = InputEvent::CursorPark {
+            screen_id: "local-display-1".into(),
+            x: 70,
+            y: 80,
+            sequence: 30,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut park).0);
+        let _ = authoritative_mouse_button_state(&mut state, "server-a", &park, true);
+
+        let mut down = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            screen_id: String::new(),
+            x: None,
+            y: None,
+            sequence: 20,
+        };
+        assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut down).0);
+
+        let mut up = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            screen_id: String::new(),
+            x: None,
+            y: None,
+            sequence: 21,
+        };
+        assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut up).0);
+    }
+
+    #[test]
+    fn authoritative_drag_mask_suppresses_delayed_down_but_keeps_new_up() {
+        let mut state = RemoteMouseState::default();
+        let mut move_event = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 70,
+            y: 80,
+            drag_button: Some(MouseButton::Left),
+            button_mask: Some(LEFT_BUTTON_MASK),
+            sequence: 30,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut move_event).0);
+        assert_eq!(
+            authoritative_mouse_button_state(&mut state, "server-a", &move_event, true),
+            (Some((0, LEFT_BUTTON_MASK, 0, 0)), false)
+        );
+
+        let mut delayed_down = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            screen_id: String::new(),
+            x: None,
+            y: None,
+            sequence: 20,
+        };
+        assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut delayed_down).0);
+
+        let mut new_up = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            screen_id: String::new(),
+            x: None,
+            y: None,
+            sequence: 31,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut new_up).0);
+    }
+
+    #[test]
     fn mouse_motion_does_not_discard_a_reliable_scroll() {
         let mut state = RemoteMouseState::default();
         let mut move_event = InputEvent::MouseMove {
@@ -10125,6 +12282,24 @@ mod tests {
         assert_eq!(decoded.protocol, INPUT_CONTROL_PROTOCOL);
         assert_eq!(decoded.target_device_id, "local-device");
         assert_eq!(decoded.command, InputControlCommand::SecureAttention);
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ControlPacketWithoutVersion {
+            protocol: String,
+            command: InputControlCommand,
+        }
+        let legacy_payload = rmp_serde::to_vec_named(&ControlPacketWithoutVersion {
+            protocol: INPUT_CONTROL_PROTOCOL.into(),
+            command: InputControlCommand::SecureAttention,
+        })
+        .expect("encode versionless input control packet");
+        assert_eq!(
+            decode_input_control_packet(&legacy_payload)
+                .expect("decode versionless input control packet")
+                .origin_protocol_version,
+            0
+        );
     }
 
     #[test]
@@ -10155,6 +12330,9 @@ mod tests {
         assert!(!control_packet_authorized(&layout, &packet));
         packet.pair_secret = layout.pair_secret.clone();
         assert!(control_packet_authorized(&layout, &packet));
+        packet.origin_protocol_version = 0;
+        assert!(!control_packet_authorized(&layout, &packet));
+        packet.origin_protocol_version = quic_transport::PROTOCOL_VERSION;
         packet.origin_transport_public_key = "attacker-key".into();
         packet.origin_device_id = "attacker".into();
         assert!(!control_packet_authorized(&layout, &packet));
@@ -10175,6 +12353,326 @@ mod tests {
 
         assert!(current_clipboard_target(&target).is_none());
         assert!(target.lock().expect("target lock").is_none());
+    }
+
+    #[test]
+    fn clipboard_session_end_only_clears_the_matching_controller() {
+        let target = Arc::new(Mutex::new(Some(ClipboardTarget {
+            device_id: "server-b".into(),
+            addr: "10.0.0.2:47834".into(),
+            transport_public_key: "server-b-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            push_on_bind: false,
+            expires_at: None,
+        })));
+
+        assert!(!clear_clipboard_target_if_device(&target, "server-a"));
+        assert_eq!(
+            current_clipboard_target(&target)
+                .expect("B remains the active clipboard controller")
+                .device_id,
+            "server-b"
+        );
+        assert!(clear_clipboard_target_if_device(&target, "server-b"));
+        assert!(current_clipboard_target(&target).is_none());
+    }
+
+    #[test]
+    fn stale_key_only_park_cannot_rebind_clipboard_in_packet_routing() {
+        let layout = layout_for_target_tests();
+        let target = Arc::new(Mutex::new(Some(ClipboardTarget {
+            device_id: "server-b".into(),
+            addr: "10.0.0.2:47834".into(),
+            transport_public_key: "server-b-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            push_on_bind: false,
+            expires_at: None,
+        })));
+        let stale_boundary = RemoteInputOutcome {
+            injected: true,
+            admitted: true,
+            current_session_owner: false,
+            session_ended: false,
+        };
+
+        apply_remote_input_clipboard_outcome(
+            &target,
+            "server-a",
+            stale_boundary,
+            Some((
+                "server-a".into(),
+                "10.0.0.1:47834".into(),
+                "server-a-key".into(),
+                quic_transport::PROTOCOL_VERSION,
+            )),
+            &layout,
+        );
+
+        assert_eq!(
+            current_clipboard_target(&target)
+                .expect("stale Park must leave B bound")
+                .device_id,
+            "server-b"
+        );
+    }
+
+    #[test]
+    fn identical_heartbeat_clipboard_binding_is_not_reapplied() {
+        let target = Arc::new(Mutex::new(None));
+        let bind = || {
+            set_clipboard_target(
+                &target,
+                "server-a".into(),
+                "10.0.0.1:47834".into(),
+                "server-a-key".into(),
+                quic_transport::PROTOCOL_VERSION,
+                "cluster-test".into(),
+                "secret-test".into(),
+                false,
+                None,
+            )
+        };
+
+        assert!(bind());
+        assert!(!bind());
+    }
+
+    #[test]
+    fn transient_input_send_failure_does_not_override_discovery_online_state() {
+        let layout = Arc::new(Mutex::new(layout_for_target_tests()));
+        let target = target_for_coordinate_tests();
+
+        assert!(target_is_online(&target, &layout));
+        mark_target_offline(&layout, &target, "temporary transport backpressure");
+        assert!(target_is_online(&target, &layout));
+    }
+
+    #[test]
+    fn only_an_injected_accepted_park_ends_the_clipboard_session() {
+        let stale_key_only_boundary = RemoteInputAdmission {
+            inject_event: false,
+            effective_modifier_snapshot: None,
+            origin_changed: false,
+            release_keys: true,
+            carried_buttons: None,
+            mouse: Some(RemoteMouseAdmission {
+                button_reconciliation: None,
+                park_accepted: false,
+            }),
+        };
+        assert!(!remote_input_session_ended(&stale_key_only_boundary));
+
+        let accepted_park = RemoteInputAdmission {
+            inject_event: true,
+            mouse: Some(RemoteMouseAdmission {
+                button_reconciliation: None,
+                park_accepted: true,
+            }),
+            ..stale_key_only_boundary
+        };
+        assert!(remote_input_session_ended(&accepted_park));
+    }
+
+    #[test]
+    fn stale_key_only_boundary_cannot_renew_or_rebind_a_remote_session() {
+        let stale_boundary = RemoteInputOutcome {
+            injected: true,
+            admitted: true,
+            current_session_owner: false,
+            session_ended: false,
+        };
+        assert!(!stale_boundary.renews_session());
+
+        let active_move = RemoteInputOutcome {
+            current_session_owner: true,
+            ..stale_boundary
+        };
+        assert!(active_move.renews_session());
+
+        let park = RemoteInputOutcome {
+            session_ended: true,
+            ..active_move
+        };
+        assert!(!park.renews_session());
+        let started = Instant::now();
+        let mut lease = RemoteInputLease::default();
+        lease.renew("server-a", started);
+        apply_remote_input_lease_outcome(&mut lease, "server-a", park, started);
+        assert_eq!(
+            lease.expired_origin(started + REMOTE_INPUT_LEASE_TIMEOUT),
+            None
+        );
+    }
+
+    #[test]
+    fn foreign_input_cannot_extend_the_current_remote_input_lease() {
+        let started = Instant::now();
+        let mut lease = RemoteInputLease::default();
+        lease.renew("server-b", started);
+        let foreign = RemoteInputOutcome {
+            injected: false,
+            admitted: true,
+            current_session_owner: false,
+            session_ended: false,
+        };
+
+        apply_remote_input_lease_outcome(
+            &mut lease,
+            "server-a",
+            foreign,
+            started + Duration::from_secs(4),
+        );
+
+        assert_eq!(
+            lease.expired_origin(started + REMOTE_INPUT_LEASE_TIMEOUT),
+            Some("server-b")
+        );
+    }
+
+    #[test]
+    fn admitted_owner_heartbeats_keep_a_long_press_or_drag_alive() {
+        let started = Instant::now();
+        let active_heartbeat = RemoteInputOutcome {
+            injected: true,
+            admitted: true,
+            current_session_owner: true,
+            session_ended: false,
+        };
+        let mut lease = RemoteInputLease::default();
+
+        for second in 0..=30 {
+            let now = started + Duration::from_secs(second);
+            apply_remote_input_lease_outcome(&mut lease, "server-a", active_heartbeat, now);
+            assert_eq!(lease.expired_origin(now), None);
+        }
+        assert_eq!(
+            lease.expired_origin(started + Duration::from_secs(34)),
+            None
+        );
+        assert_eq!(
+            lease.expired_origin(started + Duration::from_secs(35)),
+            Some("server-a")
+        );
+    }
+
+    #[test]
+    fn remote_input_heartbeat_is_sent_at_one_second_intervals() {
+        let started = Instant::now();
+        let mut last_sent = None;
+
+        assert!(remote_input_heartbeat_due(&mut last_sent, started));
+        assert!(!remote_input_heartbeat_due(
+            &mut last_sent,
+            started + REMOTE_INPUT_HEARTBEAT_INTERVAL - Duration::from_millis(1),
+        ));
+        assert!(remote_input_heartbeat_due(
+            &mut last_sent,
+            started + REMOTE_INPUT_HEARTBEAT_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn remote_input_lease_expires_only_after_five_seconds_without_activity() {
+        let started = Instant::now();
+        let mut lease = RemoteInputLease::default();
+        lease.renew("server-a", started);
+
+        assert_eq!(lease.expired_origin(started + Duration::from_secs(4)), None);
+        assert_eq!(
+            lease.expired_origin(started + REMOTE_INPUT_LEASE_TIMEOUT),
+            Some("server-a")
+        );
+    }
+
+    #[test]
+    fn remote_input_lease_end_is_scoped_to_the_current_origin() {
+        let started = Instant::now();
+        let mut lease = RemoteInputLease::default();
+        lease.renew("server-b", started);
+
+        assert!(!lease.end("server-a"));
+        assert_eq!(
+            lease.expired_origin(started + REMOTE_INPUT_LEASE_TIMEOUT),
+            Some("server-b")
+        );
+        assert!(lease.end("server-b"));
+        assert_eq!(
+            lease.expired_origin(started + REMOTE_INPUT_LEASE_TIMEOUT),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_remote_session_releases_buttons_and_advances_sequence_boundaries() {
+        let started = Instant::now();
+        let mut lease = RemoteInputLease::default();
+        lease.renew("server-a", started);
+        let mut keys = RemoteKeySequenceState::default();
+        assert!(keys.accept_key("server-a", 0x41, 10));
+        assert!(keys.accept_key("server-a", 0x42, 15));
+        let mut mouse = RemoteMouseState {
+            x: 50,
+            y: 60,
+            buttons: LEFT_BUTTON_MASK | RIGHT_BUTTON_MASK | MIDDLE_BUTTON_MASK,
+            last_origin_id: "server-a".into(),
+            sequence_by_origin: HashMap::from([(
+                "server-a".into(),
+                RemoteMouseSequenceState {
+                    last_position_sequence: 30,
+                    last_scroll_sequence: 25,
+                    last_boundary_sequence: 5,
+                    last_button_sequence: [20, 40, 0],
+                },
+            )]),
+        };
+        let mut active_origin = "server-a".to_string();
+
+        let expired = expire_remote_input_session_with_state(
+            &mut lease,
+            &mut keys,
+            &mut mouse,
+            &mut active_origin,
+            started + REMOTE_INPUT_LEASE_TIMEOUT,
+        )
+        .expect("active lease should expire");
+
+        assert_eq!(expired.origin_id, "server-a");
+        assert_eq!(
+            expired.buttons,
+            LEFT_BUTTON_MASK | RIGHT_BUTTON_MASK | MIDDLE_BUTTON_MASK
+        );
+        assert_eq!((expired.x, expired.y), (50, 60));
+        assert!(active_origin.is_empty());
+        assert_eq!(mouse.buttons, 0);
+        assert_eq!(keys.by_origin["server-a"].boundary_sequence, 15);
+        let mouse_boundary = mouse.sequence_by_origin["server-a"];
+        assert_eq!(mouse_boundary.last_position_sequence, 40);
+        assert_eq!(mouse_boundary.last_scroll_sequence, 40);
+        assert_eq!(mouse_boundary.last_boundary_sequence, 40);
+        assert_eq!(mouse_boundary.last_button_sequence, [40; 3]);
+        assert!(!keys.accept_key("server-a", 0x43, 14));
+        assert!(keys.accept_key("server-a", 0x43, 16));
+        let mut delayed_button_down = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            screen_id: "local-display-1".into(),
+            x: Some(50),
+            y: Some(60),
+            sequence: 39,
+        };
+        assert!(!prepare_remote_mouse_event(&mut mouse, "server-a", &mut delayed_button_down,).0);
+        assert!(expire_remote_input_session_with_state(
+            &mut lease,
+            &mut keys,
+            &mut mouse,
+            &mut active_origin,
+            started + REMOTE_INPUT_LEASE_TIMEOUT + Duration::from_secs(1),
+        )
+        .is_none());
     }
 
     #[test]
@@ -10219,6 +12717,10 @@ mod tests {
             pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47833".into(),
             target_platform: "windows".into(),
+            modifier_remap: true,
+            modifier_control: "meta".into(),
+            modifier_alt: "alt".into(),
+            modifier_meta: "control".into(),
             transport_public_key: "test-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_id: "local-display-1".into(),
@@ -10255,6 +12757,10 @@ mod tests {
             pair_secret: "secret-test".into(),
             target_addr: "10.0.0.2:47833".into(),
             target_platform: "windows".into(),
+            modifier_remap: true,
+            modifier_control: "meta".into(),
+            modifier_alt: "alt".into(),
+            modifier_meta: "control".into(),
             transport_public_key: "test-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_id: "local-display-1".into(),
