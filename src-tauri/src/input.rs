@@ -11663,7 +11663,10 @@ mod tests {
     fn input_packet_context_uses_cached_key_remap_without_waiting_for_layout() {
         let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
         let _held_layout = layout_state.lock().expect("hold layout lock");
-        let target = target_for_coordinate_tests();
+        let mut target = target_for_coordinate_tests();
+        if target.target_platform == crate::current_platform() {
+            target.target_platform = "macos".into();
+        }
         let layout_state_for_thread = Arc::clone(&layout_state);
         let (tx, rx) = std::sync::mpsc::channel();
 

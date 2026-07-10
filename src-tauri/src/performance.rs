@@ -67,7 +67,7 @@ fn read_platform_process_performance() -> Result<(f64, f64), String> {
 fn read_unix_process_performance() -> Result<(f64, f64), String> {
     let pid = std::process::id().to_string();
     let output = command_stdout(Command::new("ps").args(["-p", &pid, "-o", "%cpu=,rss="]))?;
-    parse_process_metrics(&output)
+    parse_unix_process_metrics(&output)
 }
 
 #[cfg(target_os = "macos")]
@@ -187,7 +187,7 @@ fn read_windows_process_performance() -> Result<(f64, f64), String> {
     ))
 }
 
-fn parse_process_metrics(output: &str) -> Result<(f64, f64), String> {
+fn parse_unix_process_metrics(output: &str) -> Result<(f64, f64), String> {
     let values = output
         .trim()
         .split(|character: char| character == ',' || character.is_whitespace())
@@ -196,15 +196,7 @@ fn parse_process_metrics(output: &str) -> Result<(f64, f64), String> {
         .collect::<Vec<_>>();
 
     if values.len() >= 2 {
-        Ok((
-            values[0],
-            values[1]
-                / if cfg!(target_os = "windows") {
-                    1.0
-                } else {
-                    1024.0
-                },
-        ))
+        Ok((values[0], values[1] / 1024.0))
     } else {
         Err("performance command did not return process cpu and memory".into())
     }
@@ -233,7 +225,7 @@ mod tests {
 
     #[test]
     fn parses_unix_ps_cpu_and_rss_kb() {
-        let (cpu, memory_mb) = parse_process_metrics(" 2.5 115664\n").expect("metrics");
+        let (cpu, memory_mb) = parse_unix_process_metrics(" 2.5 115664\n").expect("metrics");
 
         assert_eq!(cpu, 2.5);
         assert!((memory_mb - 112.953125).abs() < f64::EPSILON);
