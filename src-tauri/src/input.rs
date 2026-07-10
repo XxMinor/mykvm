@@ -113,6 +113,10 @@ const REMOTE_INPUT_LEASE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "macos", test))]
 const MACOS_RECEIVE_CURSOR_DRIFT_PX: f64 = 24.0;
 #[cfg(any(target_os = "macos", test))]
+const MACOS_CURSOR_HIDE_OWNER_RECEIVE: u64 = 1;
+#[cfg(any(target_os = "macos", test))]
+const MACOS_CURSOR_HIDE_OWNER_CAPTURE: u64 = 1 << 1;
+#[cfg(any(target_os = "macos", test))]
 const MACOS_IOHID_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
@@ -265,6 +269,7 @@ struct RemoteMouseState {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct RemoteMouseSequenceState {
     last_position_sequence: u64,
+    last_button_snapshot_sequence: u64,
     last_scroll_sequence: u64,
     last_boundary_sequence: u64,
     last_button_sequence: [u64; 3],
@@ -339,6 +344,7 @@ fn expire_remote_input_session_with_state(
     if let Some(state) = mouse_state.sequence_by_origin.get_mut(&origin_id) {
         let boundary = state
             .last_position_sequence
+            .max(state.last_button_snapshot_sequence)
             .max(state.last_scroll_sequence)
             .max(state.last_boundary_sequence)
             .max(
@@ -349,6 +355,7 @@ fn expire_remote_input_session_with_state(
                     .unwrap_or_default(),
             );
         state.last_position_sequence = boundary;
+        state.last_button_snapshot_sequence = boundary;
         state.last_scroll_sequence = boundary;
         state.last_boundary_sequence = boundary;
         state.last_button_sequence = [boundary; 3];
@@ -372,6 +379,7 @@ fn expire_remote_input_session_with_state(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RemoteInputAdmission {
     inject_event: bool,
+    current_session_owner: bool,
     effective_modifier_snapshot: Option<u8>,
     origin_changed: bool,
     release_keys: bool,
@@ -395,7 +403,7 @@ struct RemoteInputOutcome {
 
 impl RemoteInputOutcome {
     fn renews_session(self) -> bool {
-        self.injected && self.admitted && self.current_session_owner && !self.session_ended
+        self.admitted && self.current_session_owner && !self.session_ended
     }
 }
 
@@ -1389,6 +1397,8 @@ fn start_platform_capture(
             hook_modifier_bits: AtomicU64::new(0),
             remote_anchor_x: std::sync::atomic::AtomicI64::new(0),
             remote_anchor_y: std::sync::atomic::AtomicI64::new(0),
+            warp_source_x: std::sync::atomic::AtomicI64::new(0),
+            warp_source_y: std::sync::atomic::AtomicI64::new(0),
             warp_cutoff_time: AtomicU64::new(0),
             cursor_warp_failures: AtomicU64::new(0),
             cursor_hider_hwnd: std::sync::atomic::AtomicUsize::new(cursor_hider.hwnd as usize),
@@ -1527,42 +1537,46 @@ static MACOS_RECEIVE_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MACOS_RECEIVE_PARK_POINT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 #[cfg(target_os = "macos")]
-static MACOS_RECEIVE_CURSOR_TRANSITION: Mutex<()> = Mutex::new(());
+static MACOS_CURSOR_TRANSITION: Mutex<()> = Mutex::new(());
 
-/// Control just left this macOS client: hide the local cursor where it was
-/// tucked, mirroring how the server hides its own cursor while driving a remote.
+/// Control just left this macOS client: hide the local cursor in place. macOS
+/// has a real hide primitive, so applying the sender's fallback park coordinate
+/// would visibly jump the user's physical mouse before hiding it.
 #[cfg(target_os = "macos")]
 fn macos_receive_hide_cursor(x: i32, y: i32) {
-    use core_graphics::{display::CGDisplay, geometry::CGPoint};
+    use core_graphics::display::CGDisplay;
 
-    let _transition = MACOS_RECEIVE_CURSOR_TRANSITION
+    let _transition = MACOS_CURSOR_TRANSITION
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
 
-    // Warp only — no posted mouse-move event, which the system would service by
-    // re-showing the cursor and undoing the hide below.
-    let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x as f64, y as f64));
+    // CGDisplayHideCursor is counted. Repeated reliable CursorPark packets must
+    // neither increment that count nor move/reset the local drift baseline.
+    if MACOS_RECEIVE_CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let parked = macos_current_cursor_location()
+        .map(|location| (location.x, location.y))
+        .unwrap_or((x as f64, y as f64));
     if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
-        *point = Some((x as f64, y as f64));
+        *point = Some(parked);
     }
     if let Ok(mut tracker) = macos_click_tracker().lock() {
         *tracker = MacClickTracker::default();
     }
-    // Only run the hide primitives once per hide/show cycle — CGDisplayHideCursor
-    // is counted and must pair 1:1 with show, so a repeated CursorPark must not
-    // re-hide (it just re-parks above).
-    if MACOS_RECEIVE_CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
-        return;
-    }
     // Full hide, matching the server: SetsCursorInBackground so it sticks while
     // not frontmost, transparent cursor, NSCursor hide, and hide on every display.
     enable_macos_background_cursor_hide();
-    set_macos_cursor_transparent(true);
+    set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_RECEIVE, true);
     set_macos_cursor_hidden_with_appkit(true);
     for display_id in CGDisplay::active_displays().unwrap_or_default() {
         let _ = CGDisplay::new(display_id).hide_cursor();
     }
-    log::info!("[diag] receive hide cursor at ({x},{y})");
+    log::info!(
+        "[diag] receive hide cursor in place at ({:.0},{:.0}); ignored remote park ({x},{y})",
+        parked.0,
+        parked.1
+    );
 }
 
 /// Reveal the cursor hidden by `macos_receive_hide_cursor`. The swap ensures the
@@ -1572,14 +1586,14 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
 fn macos_receive_show_cursor_if_hidden() {
     use core_graphics::display::CGDisplay;
 
-    let _transition = MACOS_RECEIVE_CURSOR_TRANSITION
+    let _transition = MACOS_CURSOR_TRANSITION
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
 
     if !MACOS_RECEIVE_CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
         return;
     }
-    set_macos_cursor_transparent(false);
+    set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_RECEIVE, false);
     set_macos_cursor_hidden_with_appkit(false);
     for display_id in CGDisplay::active_displays().unwrap_or_default() {
         let _ = CGDisplay::new(display_id).show_cursor();
@@ -2871,14 +2885,20 @@ fn admit_remote_input_packet_with_state(
     let owns_event = active_is_current || can_claim;
     let release_keys = is_park && active_is_current;
     let (mouse, mut carried_buttons) = if input_event_mouse_sequence(event).is_some() {
-        let (accepted, carried_buttons) =
-            prepare_remote_mouse_event_for_origin(mouse_state, origin_id, event, owns_event);
+        let (accepted, carried_buttons) = prepare_remote_mouse_event_for_origin(
+            mouse_state,
+            origin_id,
+            event,
+            owns_event,
+            !heartbeat,
+        );
         if !accepted {
             if !release_keys {
                 return None;
             }
             return Some(RemoteInputAdmission {
                 inject_event: false,
+                current_session_owner: false,
                 effective_modifier_snapshot: None,
                 origin_changed: false,
                 release_keys: true,
@@ -2890,7 +2910,13 @@ fn admit_remote_input_packet_with_state(
             });
         } else if owns_event {
             let (button_reconciliation, park_accepted) =
-                authoritative_mouse_button_state(mouse_state, origin_id, event, true);
+                authoritative_mouse_button_state_for_packet(
+                    mouse_state,
+                    origin_id,
+                    event,
+                    true,
+                    heartbeat,
+                );
             (
                 Some(RemoteMouseAdmission {
                     button_reconciliation,
@@ -2913,9 +2939,14 @@ fn admit_remote_input_packet_with_state(
 
     let accepted_modifier_snapshot =
         modifier_snapshot.filter(|_| sequence_state.accept_snapshot(origin_id, key_sequence));
-    let inject_event = owns_event
+    // A heartbeat is an authoritative lease/button/modifier snapshot, not a
+    // user motion. Replaying its cached MouseMove every second fights the
+    // client's physical mouse/trackpad and makes the cursor flash in place.
+    let inject_event = !heartbeat
+        && owns_event
         && (!is_park || active_is_current)
         && mouse.is_none_or(|mouse| mouse.park_accepted || !is_park);
+    let current_session_owner = inject_event || (heartbeat && active_is_current);
     let origin_changed = inject_event && can_claim;
     if origin_changed && mouse.is_none() {
         carried_buttons = switch_remote_mouse_origin(mouse_state, origin_id);
@@ -2931,7 +2962,8 @@ fn admit_remote_input_packet_with_state(
     }
     Some(RemoteInputAdmission {
         inject_event,
-        effective_modifier_snapshot: if inject_event {
+        current_session_owner,
+        effective_modifier_snapshot: if current_session_owner {
             accepted_modifier_snapshot
         } else {
             None
@@ -2976,16 +3008,27 @@ fn finish_remote_input_outcome(
     admission: &RemoteInputAdmission,
     injected: bool,
 ) -> RemoteInputOutcome {
-    let outcome = RemoteInputOutcome {
-        injected,
-        admitted: true,
-        current_session_owner: admission.inject_event,
-        session_ended: remote_input_session_ended(admission),
-    };
+    let outcome = remote_input_outcome_for_admission(admission, injected);
     if let Ok(mut lease) = remote_input_lease().lock() {
         apply_remote_input_lease_outcome(&mut lease, origin_id, outcome, Instant::now());
     }
     outcome
+}
+
+fn remote_input_outcome_for_admission(
+    admission: &RemoteInputAdmission,
+    injected: bool,
+) -> RemoteInputOutcome {
+    RemoteInputOutcome {
+        injected,
+        admitted: true,
+        // A current-owner heartbeat deliberately skips OS injection but still
+        // keeps the session alive. A real event that attempted and failed OS
+        // injection must not renew the lease or redirect the clipboard.
+        current_session_owner: admission.current_session_owner
+            && (injected || !admission.inject_event),
+        session_ended: remote_input_session_ended(admission),
+    }
 }
 
 fn update_remote_mouse_position(x: i32, y: i32) -> Option<MouseButton> {
@@ -3105,6 +3148,11 @@ fn inject_input_event(
         }
     }
     if !admission.inject_event {
+        if admission.current_session_owner {
+            // Heartbeats still repair a lost modifier state, but must never be
+            // converted into their cached MouseMove command.
+            reconcile_non_key_injected_modifier_snapshot(modifier_snapshot);
+        }
         // A stale same-origin Park can still be an accepted key-only boundary;
         // foreign/inactive input has both flags false and owns no side effects.
         return finish_remote_input_outcome(origin_id, &admission, admission.release_keys);
@@ -3202,7 +3250,7 @@ fn prepare_remote_mouse_event(
     origin_id: &str,
     event: &mut InputEvent,
 ) -> (bool, Option<(u64, i32, i32)>) {
-    prepare_remote_mouse_event_for_origin(state, origin_id, event, true)
+    prepare_remote_mouse_event_for_origin(state, origin_id, event, true, true)
 }
 
 fn prepare_remote_mouse_event_for_origin(
@@ -3210,6 +3258,7 @@ fn prepare_remote_mouse_event_for_origin(
     origin_id: &str,
     event: &mut InputEvent,
     activate: bool,
+    commit_position_sequence: bool,
 ) -> (bool, Option<(u64, i32, i32)>) {
     let Some(sequence) = input_event_mouse_sequence(event) else {
         return (
@@ -3240,7 +3289,13 @@ fn prepare_remote_mouse_event_for_origin(
             if sequence <= origin_sequence.last_position_sequence {
                 return (false, None);
             }
-            origin_sequence.last_position_sequence = sequence;
+            // Heartbeats use a reliable stream while actual moves use a
+            // latest-wins datagram. A reliable heartbeat can overtake the last
+            // real move, so it must not consume that move's position sequence
+            // when its cached coordinate is deliberately not injected.
+            if commit_position_sequence {
+                origin_sequence.last_position_sequence = sequence;
+            }
         }
         InputEvent::CursorPark { .. } => {
             if sequence <= origin_sequence.last_position_sequence {
@@ -3305,13 +3360,23 @@ fn prepare_remote_mouse_event_for_origin(
 fn authoritative_mouse_button_state(
     state: &mut RemoteMouseState,
     origin_id: &str,
-    event: &InputEvent,
+    event: &mut InputEvent,
     accepted: bool,
+) -> (Option<(u64, u64, i32, i32)>, bool) {
+    authoritative_mouse_button_state_for_packet(state, origin_id, event, accepted, false)
+}
+
+fn authoritative_mouse_button_state_for_packet(
+    state: &mut RemoteMouseState,
+    origin_id: &str,
+    event: &mut InputEvent,
+    accepted: bool,
+    heartbeat: bool,
 ) -> (Option<(u64, u64, i32, i32)>, bool) {
     if !accepted {
         return (None, false);
     }
-    let (authoritative, sequence, park) = match event {
+    let (transmitted_buttons, sequence, park) = match &*event {
         InputEvent::MouseMove {
             button_mask: Some(mask),
             sequence,
@@ -3321,6 +3386,35 @@ fn authoritative_mouse_button_state(
         _ => return (None, false),
     };
     let previous_buttons = state.buttons;
+    let last_snapshot_sequence = state
+        .sequence_by_origin
+        .get(origin_id)
+        .map(|sequence| sequence.last_button_snapshot_sequence)
+        .unwrap_or_default();
+    if heartbeat && sequence != 0 && sequence <= last_snapshot_sequence {
+        return (None, false);
+    }
+    // A heartbeat is a reliable final-state snapshot. Keep later reliable
+    // Down/Up transitions eligible (so a fast click is not erased), but do not
+    // let an older best-effort drag mask undo the heartbeat's repair.
+    let stale_button_snapshot =
+        !heartbeat && !park && sequence != 0 && sequence <= last_snapshot_sequence;
+    let authoritative = if stale_button_snapshot {
+        previous_buttons
+    } else {
+        transmitted_buttons
+    };
+    if stale_button_snapshot {
+        if let InputEvent::MouseMove {
+            drag_button,
+            button_mask,
+            ..
+        } = event
+        {
+            *drag_button = button_from_mask(authoritative);
+            *button_mask = Some(authoritative);
+        }
+    }
     let reconciliation = (previous_buttons != authoritative).then_some((
         previous_buttons,
         authoritative,
@@ -3333,6 +3427,10 @@ fn authoritative_mouse_button_state(
             .sequence_by_origin
             .entry(origin_id.to_string())
             .or_default();
+        if heartbeat || park {
+            origin_sequence.last_button_snapshot_sequence =
+                origin_sequence.last_button_snapshot_sequence.max(sequence);
+        }
         let changed = previous_buttons ^ authoritative;
         for (index, bit) in [LEFT_BUTTON_MASK, RIGHT_BUTTON_MASK, MIDDLE_BUTTON_MASK]
             .into_iter()
@@ -4363,6 +4461,8 @@ struct WindowsCaptureContext {
     hook_modifier_bits: AtomicU64,
     remote_anchor_x: std::sync::atomic::AtomicI64,
     remote_anchor_y: std::sync::atomic::AtomicI64,
+    warp_source_x: std::sync::atomic::AtomicI64,
+    warp_source_y: std::sync::atomic::AtomicI64,
     warp_cutoff_time: AtomicU64,
     cursor_warp_failures: AtomicU64,
     cursor_hider_hwnd: std::sync::atomic::AtomicUsize,
@@ -5176,9 +5276,17 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
             context.remote_anchor_x.load(Ordering::Acquire) as f64,
             context.remote_anchor_y.load(Ordering::Acquire) as f64,
         );
-        let cutoff = context.warp_cutoff_time.load(Ordering::Acquire);
-        let guard = WindowsWarpGuard {
-            ignore_through_sequence: cutoff,
+        let encoded_cutoff = context.warp_cutoff_time.load(Ordering::Acquire);
+        let guard = if let Some(cutoff) = encoded_cutoff.checked_sub(1) {
+            WindowsWarpGuard {
+                ignore_through_sequence: Some(cutoff as u32),
+                source: Some((
+                    context.warp_source_x.load(Ordering::Acquire) as f64,
+                    context.warp_source_y.load(Ordering::Acquire) as f64,
+                )),
+            }
+        } else {
+            WindowsWarpGuard::default()
         };
         if guard.should_drop(
             u64::from(event.time),
@@ -6067,19 +6175,28 @@ fn set_windows_cursor(x: i32, y: i32) {
 fn set_windows_remote_anchor(context: &WindowsCaptureContext, anchor: (f64, f64)) {
     let x = anchor.0.round() as i32;
     let y = anchor.1.round() as i32;
+    let source = windows_current_cursor_point().unwrap_or(anchor);
     context
         .remote_anchor_x
         .store(i64::from(x), Ordering::Release);
     context
         .remote_anchor_y
         .store(i64::from(y), Ordering::Release);
+    context
+        .warp_source_x
+        .store(source.0.round() as i64, Ordering::Release);
+    context
+        .warp_source_y
+        .store(source.1.round() as i64, Ordering::Release);
     hide_windows_cursor_if_needed(context);
     if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) } == 0 {
         context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
     } else {
         context
             .warp_cutoff_time
-            .store(u64::from(windows_tick_ms() as u32), Ordering::Release);
+            // Store tick+1 so zero remains the unarmed sentinel even when the
+            // DWORD tick itself wraps to zero every ~49.7 days.
+            .store(u64::from(windows_tick_ms() as u32) + 1, Ordering::Release);
     }
 }
 
@@ -6087,6 +6204,8 @@ fn set_windows_remote_anchor(context: &WindowsCaptureContext, anchor: (f64, f64)
 fn clear_windows_remote_anchor(context: &WindowsCaptureContext) {
     context.remote_anchor_x.store(0, Ordering::Release);
     context.remote_anchor_y.store(0, Ordering::Release);
+    context.warp_source_x.store(0, Ordering::Release);
+    context.warp_source_y.store(0, Ordering::Release);
     context.warp_cutoff_time.store(0, Ordering::Release);
 }
 
@@ -6230,6 +6349,12 @@ fn handle_macos_event(
             "[diag] event tap disabled by {:?} — mouse/key events are now DROPPED until re-enabled",
             event_type
         );
+        return CallbackResult::Keep;
+    }
+    if macos_event_is_mykvm_injected(event) {
+        // The event still has to reach the foreground application. We only
+        // prevent MyKVM's capture tap from forwarding its own receive-side
+        // injection back across the network.
         return CallbackResult::Keep;
     }
 
@@ -6874,19 +6999,33 @@ fn should_ignore_initial_anchor_warp_delta(edge: Edge, dx: f64, dy: f64) -> bool
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default, Clone, Copy)]
 struct WindowsWarpGuard {
-    ignore_through_sequence: u64,
+    ignore_through_sequence: Option<u32>,
+    source: Option<(f64, f64)>,
 }
 
 #[cfg(any(target_os = "windows", test))]
 impl WindowsWarpGuard {
-    fn arm(&mut self, sequence: u64) {
-        self.ignore_through_sequence = sequence;
+    fn arm(&mut self, sequence: u64, source: (f64, f64)) {
+        self.ignore_through_sequence = Some(sequence as u32);
+        self.source = Some(source);
     }
 
     fn should_drop(&self, sequence: u64, x: f64, y: f64, anchor: (f64, f64)) -> bool {
-        (self.ignore_through_sequence != 0
-            && ((sequence as u32).wrapping_sub(self.ignore_through_sequence as u32) as i32) < 0)
-            || ((x - anchor.0).abs() < 0.1 && (y - anchor.1).abs() < 0.1)
+        let relative_sequence = self
+            .ignore_through_sequence
+            .map(|cutoff| (sequence as u32).wrapping_sub(cutoff) as i32);
+        let dx = x - anchor.0;
+        let dy = y - anchor.1;
+        let same_tick_backlog = relative_sequence == Some(0)
+            && self.source.is_some_and(|source| {
+                let source_dx = x - source.0;
+                let source_dy = y - source.1;
+                source_dx * source_dx + source_dy * source_dy < dx * dx + dy * dy
+            });
+
+        relative_sequence.is_some_and(|relative| relative < 0)
+            || same_tick_backlog
+            || (dx.abs() < 0.1 && dy.abs() < 0.1)
     }
 }
 
@@ -7606,18 +7745,62 @@ fn set_macos_cursor_hidden_with_appkit(hidden: bool) {
 /// to flip: it just paints nothing, so there is nothing for WindowServer to
 /// "un-hide". `push`/`pop` modify this app's active cursor image, which is far
 /// more robust than the global hide counter when MyKVM is not frontmost.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacCursorStackAction {
+    None,
+    Push,
+    Pop,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_cursor_hide_owner_transition(
+    current: u64,
+    owner: u64,
+    hidden: bool,
+) -> (u64, MacCursorStackAction) {
+    let next = if hidden {
+        current | owner
+    } else {
+        current & !owner
+    };
+    let action = match (current == 0, next == 0) {
+        (true, false) => MacCursorStackAction::Push,
+        (false, true) => MacCursorStackAction::Pop,
+        _ => MacCursorStackAction::None,
+    };
+    (next, action)
+}
+
 #[cfg(target_os = "macos")]
-fn set_macos_cursor_transparent(transparent: bool) {
-    set_macos_cursor_transparent_inner(transparent, true);
+fn set_macos_cursor_transparent(owner: u64, transparent: bool) {
+    let current = MACOS_TRANSPARENT_CURSOR_OWNERS.load(Ordering::Relaxed);
+    let (next, action) = macos_cursor_hide_owner_transition(current, owner, transparent);
+    if next == current {
+        return;
+    }
+    let applied = match action {
+        MacCursorStackAction::Push => set_macos_cursor_transparent_inner(true, true),
+        MacCursorStackAction::Pop => set_macos_cursor_transparent_inner(false, false),
+        MacCursorStackAction::None => true,
+    };
+    if applied {
+        MACOS_TRANSPARENT_CURSOR_OWNERS.store(next, Ordering::Relaxed);
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn set_macos_cursor_transparent_current() {
-    set_macos_cursor_transparent_inner(true, false);
+    let _transition = MACOS_CURSOR_TRANSITION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if MACOS_TRANSPARENT_CURSOR_OWNERS.load(Ordering::Relaxed) != 0 {
+        let _ = set_macos_cursor_transparent_inner(true, false);
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
+fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) -> bool {
     use std::ffi::c_void;
     use std::os::raw::c_char;
 
@@ -7631,33 +7814,22 @@ fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
     unsafe {
         let nscursor = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
         if nscursor.is_null() {
-            return;
+            return false;
         }
 
         if !transparent {
-            // Never pop unless this process actually pushed the cached cursor.
-            if !MACOS_TRANSPARENT_CURSOR_PUSHED.swap(false, Ordering::Relaxed) {
-                return;
-            }
             let pop_sel = sel_registerName(b"pop\0".as_ptr() as *const c_char);
             let pop: extern "C" fn(*mut c_void, *mut c_void) =
                 std::mem::transmute(objc_msgSend as *const ());
             pop(nscursor, pop_sel);
-            return;
+            return true;
         }
 
         let Some(cursor) = macos_transparent_cursor() else {
-            return;
+            return false;
         };
 
-        let first_push = push
-            && MACOS_TRANSPARENT_CURSOR_PUSHED
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok();
-        if !first_push && !MACOS_TRANSPARENT_CURSOR_PUSHED.load(Ordering::Relaxed) {
-            return;
-        }
-        let apply_sel = if first_push {
+        let apply_sel = if push {
             sel_registerName(b"push\0".as_ptr() as *const c_char)
         } else {
             sel_registerName(b"set\0".as_ptr() as *const c_char)
@@ -7665,11 +7837,12 @@ fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
         let apply: extern "C" fn(*mut c_void, *mut c_void) =
             std::mem::transmute(objc_msgSend as *const ());
         apply(cursor, apply_sel);
+        true
     }
 }
 
 #[cfg(target_os = "macos")]
-static MACOS_TRANSPARENT_CURSOR_PUSHED: AtomicBool = AtomicBool::new(false);
+static MACOS_TRANSPARENT_CURSOR_OWNERS: AtomicU64 = AtomicU64::new(0);
 
 /// PNG signature + 1x1 RGBA IHDR + zlib-compressed filter byte and transparent
 /// pixel. Keep this outside the AppKit constructor so the unit test can decode
@@ -8018,6 +8191,9 @@ fn enable_macos_background_cursor_hide() {
 
 #[cfg(target_os = "macos")]
 fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
+    let _transition = MACOS_CURSOR_TRANSITION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let Ok(mut hidden) = context.cursor_hidden.lock() else {
         return;
     };
@@ -8032,7 +8208,7 @@ fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
     // the hide calls as a secondary belt-and-suspenders, but they are no longer
     // the thing we rely on.
     enable_macos_background_cursor_hide();
-    set_macos_cursor_transparent(true);
+    set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_CAPTURE, true);
     push_macos_cursor_hide(context);
     if let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() {
         *last_reassert = None;
@@ -8060,6 +8236,9 @@ fn push_macos_cursor_hide(context: &MacCaptureContext) {
 
 #[cfg(target_os = "macos")]
 fn show_macos_cursor_if_needed(context: &MacCaptureContext) {
+    let _transition = MACOS_CURSOR_TRANSITION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let Ok(mut hidden) = context.cursor_hidden.lock() else {
         return;
     };
@@ -8070,7 +8249,7 @@ fn show_macos_cursor_if_needed(context: &MacCaptureContext) {
     // Pop the transparent cursor first — this restores the real cursor image
     // and is the reliable inverse of the hide. The CGDisplay/NSCursor show calls
     // balance the secondary hide calls.
-    set_macos_cursor_transparent(false);
+    set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_CAPTURE, false);
     drain_macos_cursor_hide(context);
     if let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() {
         *last_reassert = None;
@@ -8445,10 +8624,28 @@ fn mac_key_to_windows_vk_pairs() -> &'static [(u16, u16)] {
 }
 
 #[cfg(target_os = "macos")]
+const MACOS_INJECTED_EVENT_TAG: i64 = 0x4D59_4B56_4D;
+
+#[cfg(target_os = "macos")]
+fn macos_event_is_mykvm_injected(event: &core_graphics::event::CGEvent) -> bool {
+    use core_graphics::event::EventField;
+
+    event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == MACOS_INJECTED_EVENT_TAG
+}
+
+#[cfg(target_os = "macos")]
+fn post_macos_injected_cg_event(event: &core_graphics::event::CGEvent) {
+    use core_graphics::event::{CGEventTapLocation, EventField};
+
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_INJECTED_EVENT_TAG);
+    event.post(CGEventTapLocation::HID);
+}
+
+#[cfg(target_os = "macos")]
 fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     use core_graphics::{
         display::CGDisplay,
-        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton},
+        event::{CGEvent, CGEventType, CGMouseButton},
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
@@ -8466,7 +8663,7 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
 
     if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
         if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
-            event.post(CGEventTapLocation::HID);
+            post_macos_injected_cg_event(&event);
         }
     }
 }
@@ -8609,7 +8806,7 @@ fn macos_click_tracker() -> &'static Mutex<MacClickTracker> {
 fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     use core_graphics::{
         display::CGDisplay,
-        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
+        event::{CGEvent, CGEventType, CGMouseButton, EventField},
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
@@ -8634,14 +8831,14 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
             EventField::MOUSE_EVENT_CLICK_STATE,
             macos_click_state(button, down, x, y),
         );
-        event.post(CGEventTapLocation::HID);
+        post_macos_injected_cg_event(&event);
     }
 }
 
 #[cfg(target_os = "macos")]
 fn inject_scroll(delta_x: i32, delta_y: i32) {
     use core_graphics::{
-        event::{CGEvent, CGEventTapLocation, ScrollEventUnit},
+        event::{CGEvent, ScrollEventUnit},
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
@@ -8651,7 +8848,7 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
     if let Ok(event) =
         CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
     {
-        event.post(CGEventTapLocation::HID);
+        post_macos_injected_cg_event(&event);
     }
 }
 
@@ -9254,7 +9451,7 @@ fn reconcile_macos_injected_modifier_snapshot(mask: u8) {
 #[cfg(target_os = "macos")]
 fn inject_key_inner(key_code: u16, down: bool) {
     use core_graphics::{
-        event::{CGEvent, CGEventFlags, CGEventTapLocation},
+        event::{CGEvent, CGEventFlags},
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
@@ -9314,7 +9511,7 @@ fn inject_key_inner(key_code: u16, down: bool) {
             // remotely-held modifiers on top instead of erasing them.
             let flags = merged_macos_event_flags(event.get_flags().bits(), fallback_flags);
             event.set_flags(CGEventFlags::from_bits_retain(flags));
-            event.post(CGEventTapLocation::HID);
+            post_macos_injected_cg_event(&event);
         }
         Err(_) => log::warn!("inject_key: failed to build keyboard event for mac code {mac_code}"),
     }
@@ -9520,7 +9717,7 @@ mod tests {
     fn windows_warp_guard_drops_pre_warp_backlog_but_keeps_real_motion() {
         let anchor = (960.0, 540.0);
         let mut guard = WindowsWarpGuard::default();
-        guard.arm(10);
+        guard.arm(10, (1919.0, 540.0));
 
         assert!(guard.should_drop(9, 1919.0, 540.0, anchor));
         assert!(!guard.should_drop(10, anchor.0 + 12.0, anchor.1, anchor));
@@ -9530,13 +9727,48 @@ mod tests {
     }
 
     #[test]
+    fn handoff_regression_same_tick_edge_backlog_does_not_jump_remote_to_center() {
+        let anchor = (960.0, 540.0);
+        let mut guard = WindowsWarpGuard::default();
+        guard.arm(10, (1919.0, 540.0));
+
+        assert!(
+            guard.should_drop(10, 1919.0, 540.0, anchor),
+            "the edge sample queued before the centre warp must not become a huge remote delta"
+        );
+        assert!(
+            guard.should_drop(10, 1919.0, 560.0, anchor),
+            "same-tick tangential backlog must still be recognized along the old edge"
+        );
+        assert!(
+            !guard.should_drop(10, anchor.0 + 12.0, anchor.1, anchor),
+            "small same-tick physical motion near the anchor must stay responsive"
+        );
+        assert!(
+            !guard.should_drop(10, anchor.0 + 200.0, anchor.1, anchor),
+            "same-tick high-DPI motion away from the old edge must not be swallowed"
+        );
+    }
+
+    #[test]
     fn windows_warp_guard_handles_dword_tick_wraparound() {
         let anchor = (960.0, 540.0);
         let mut guard = WindowsWarpGuard::default();
-        guard.arm(u64::from(u32::MAX));
+        guard.arm(u64::from(u32::MAX), (1919.0, 540.0));
 
         assert!(!guard.should_drop(0, anchor.0 + 1.0, anchor.1, anchor));
         assert!(guard.should_drop(u64::from(u32::MAX - 1), anchor.0 + 1.0, anchor.1, anchor));
+    }
+
+    #[test]
+    fn windows_warp_guard_can_arm_at_zero_after_tick_wraparound() {
+        let anchor = (960.0, 540.0);
+        let source = (1919.0, 540.0);
+        let mut guard = WindowsWarpGuard::default();
+        guard.arm(0, source);
+
+        assert!(guard.should_drop(0, source.0, source.1, anchor));
+        assert!(!guard.should_drop(0, anchor.0 + 12.0, anchor.1, anchor));
     }
 
     #[test]
@@ -9853,6 +10085,7 @@ mod tests {
                 "server-a".into(),
                 RemoteMouseSequenceState {
                     last_position_sequence: 10,
+                    last_button_snapshot_sequence: 0,
                     last_scroll_sequence: 0,
                     last_boundary_sequence: 0,
                     last_button_sequence: [10, 0, 0],
@@ -9992,8 +10225,15 @@ mod tests {
             true,
             &mut heartbeat,
         )
-        .expect("authorized heartbeat should still advance its high-water");
+        .expect("authorized heartbeat should be admitted without consuming position");
         assert!(!heartbeat_admission.inject_event);
+        assert_eq!(
+            mouse_state
+                .sequence_by_origin
+                .get("server-a")
+                .map(|state| state.last_position_sequence),
+            Some(0)
+        );
         assert!(active_origin.is_empty());
 
         let mut real_move = InputEvent::MouseMove {
@@ -10002,22 +10242,145 @@ mod tests {
             y: 20,
             drag_button: None,
             button_mask: Some(0),
-            sequence: 11,
+            sequence: 9,
         };
         let entry = admit_remote_input_packet_with_state(
             &mut sequence_state,
             &mut mouse_state,
             &mut active_origin,
             "server-a",
-            Some(0),
-            11,
+            None,
+            9,
             false,
             &mut real_move,
         )
-        .expect("real move after heartbeat should enter");
+        .expect("a delayed real move must still enter after an overtaking heartbeat");
         assert!(entry.inject_event);
         assert!(entry.origin_changed);
         assert_eq!(active_origin, "server-a");
+    }
+
+    #[test]
+    fn handoff_regression_active_heartbeat_does_not_reinject_cursor() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        let mut mouse_state = RemoteMouseState::default();
+        let mut active_origin = "server-a".to_string();
+        let mut heartbeat = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 960,
+            y: 540,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 10,
+        };
+
+        let admission = admit_remote_input_packet_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            10,
+            true,
+            &mut heartbeat,
+        )
+        .expect("the current owner's heartbeat should be admitted");
+
+        assert!(
+            !admission.inject_event,
+            "a lease heartbeat must not warp over the Mac user's physical trackpad movement"
+        );
+        assert!(
+            admission.current_session_owner,
+            "the non-injected heartbeat must still renew the active controller lease"
+        );
+        assert_eq!(
+            mouse_state.sequence_by_origin["server-a"].last_position_sequence, 0,
+            "a reliable heartbeat must not consume the delayed datagram position"
+        );
+        assert_eq!(active_origin, "server-a");
+    }
+
+    #[test]
+    fn heartbeat_button_repair_is_not_undone_by_a_delayed_drag_move() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        let mut mouse_state = RemoteMouseState {
+            x: 100,
+            y: 100,
+            buttons: LEFT_BUTTON_MASK,
+            last_origin_id: "server-a".into(),
+            sequence_by_origin: HashMap::from([(
+                "server-a".into(),
+                RemoteMouseSequenceState {
+                    last_position_sequence: 8,
+                    last_button_snapshot_sequence: 0,
+                    last_scroll_sequence: 0,
+                    last_boundary_sequence: 0,
+                    last_button_sequence: [8, 0, 0],
+                },
+            )]),
+        };
+        let mut active_origin = "server-a".to_string();
+        let mut heartbeat = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 120,
+            y: 120,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 11,
+        };
+        let repair = admit_remote_input_packet_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            11,
+            true,
+            &mut heartbeat,
+        )
+        .expect("heartbeat should repair a lost button release");
+        assert_eq!(
+            repair.mouse.and_then(|mouse| mouse.button_reconciliation),
+            Some((LEFT_BUTTON_MASK, 0, 100, 100))
+        );
+        assert_eq!(mouse_state.buttons, 0);
+
+        let mut delayed_drag = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 110,
+            y: 110,
+            drag_button: Some(MouseButton::Left),
+            button_mask: Some(LEFT_BUTTON_MASK),
+            sequence: 9,
+        };
+        let delayed = admit_remote_input_packet_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            None,
+            9,
+            false,
+            &mut delayed_drag,
+        )
+        .expect("the delayed move coordinate is still useful");
+        assert_eq!(
+            delayed.mouse.and_then(|mouse| mouse.button_reconciliation),
+            None,
+            "the stale drag mask must not re-latch a button released by heartbeat"
+        );
+        assert_eq!(mouse_state.buttons, 0);
+        let layout = layout_for_target_tests();
+        let command = input_event_to_command(&layout, &layout, delayed_drag)
+            .expect("the delayed coordinate remains mappable");
+        assert!(matches!(
+            command,
+            InputCommand::MouseMove {
+                drag_button: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -10141,6 +10504,7 @@ mod tests {
                 "server-a".into(),
                 RemoteMouseSequenceState {
                     last_position_sequence: 200,
+                    last_button_snapshot_sequence: 0,
                     last_scroll_sequence: 0,
                     last_boundary_sequence: 0,
                     last_button_sequence: [200, 0, 0],
@@ -10182,7 +10546,12 @@ mod tests {
         };
         assert!(prepare_remote_mouse_event(&mut mouse_state, "server-a", &mut continued_drag,).0);
         assert_eq!(
-            authoritative_mouse_button_state(&mut mouse_state, "server-a", &continued_drag, true,),
+            authoritative_mouse_button_state(
+                &mut mouse_state,
+                "server-a",
+                &mut continued_drag,
+                true,
+            ),
             (None, false)
         );
         assert!(matches!(
@@ -10208,6 +10577,7 @@ mod tests {
                 "server-b".into(),
                 RemoteMouseSequenceState {
                     last_position_sequence: 200,
+                    last_button_snapshot_sequence: 0,
                     last_scroll_sequence: 0,
                     last_boundary_sequence: 0,
                     last_button_sequence: [200, 0, 0],
@@ -10706,6 +11076,24 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_injected_cg_events_carry_capture_filter_tag() {
+        use core_graphics::{
+            event::CGEvent,
+            event_source::{CGEventSource, CGEventSourceStateID},
+        };
+
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .expect("create in-memory event source");
+        let event = CGEvent::new(source).expect("create in-memory event");
+        assert!(!macos_event_is_mykvm_injected(&event));
+
+        use core_graphics::event::EventField;
+        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_INJECTED_EVENT_TAG);
+        assert!(macos_event_is_mykvm_injected(&event));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_click_tracker_resets_after_timeout_button_change_or_drag() {
         let mut tracker = MacClickTracker::default();
         let start = Instant::now();
@@ -10790,6 +11178,62 @@ mod tests {
     fn hidden_macos_window_uses_a_relaxed_cursor_repin_policy() {
         assert_eq!(macos_cursor_repin_policy(true), (1.5, 8));
         assert_eq!(macos_cursor_repin_policy(false), (48.0, 50));
+    }
+
+    #[test]
+    fn macos_cursor_stack_waits_for_the_last_hide_owner() {
+        fn overlap_actions(first: u64, second: u64) -> Vec<MacCursorStackAction> {
+            let mut owners = 0;
+            [
+                (first, true),
+                (second, true),
+                (first, false),
+                (second, false),
+            ]
+            .into_iter()
+            .map(|(owner, hidden)| {
+                let (next, action) = macos_cursor_hide_owner_transition(owners, owner, hidden);
+                owners = next;
+                action
+            })
+            .collect()
+        }
+
+        let expected = vec![
+            MacCursorStackAction::Push,
+            MacCursorStackAction::None,
+            MacCursorStackAction::None,
+            MacCursorStackAction::Pop,
+        ];
+        assert_eq!(
+            overlap_actions(
+                MACOS_CURSOR_HIDE_OWNER_RECEIVE,
+                MACOS_CURSOR_HIDE_OWNER_CAPTURE
+            ),
+            expected
+        );
+        assert_eq!(
+            overlap_actions(
+                MACOS_CURSOR_HIDE_OWNER_CAPTURE,
+                MACOS_CURSOR_HIDE_OWNER_RECEIVE
+            ),
+            expected
+        );
+
+        let (owners, action) =
+            macos_cursor_hide_owner_transition(0, MACOS_CURSOR_HIDE_OWNER_RECEIVE, true);
+        assert_eq!(action, MacCursorStackAction::Push);
+        assert_eq!(
+            macos_cursor_hide_owner_transition(owners, MACOS_CURSOR_HIDE_OWNER_RECEIVE, true),
+            (owners, MacCursorStackAction::None)
+        );
+        let (owners, action) =
+            macos_cursor_hide_owner_transition(owners, MACOS_CURSOR_HIDE_OWNER_RECEIVE, false);
+        assert_eq!((owners, action), (0, MacCursorStackAction::Pop));
+        assert_eq!(
+            macos_cursor_hide_owner_transition(owners, MACOS_CURSOR_HIDE_OWNER_RECEIVE, false),
+            (0, MacCursorStackAction::None)
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -12002,7 +12446,7 @@ mod tests {
         };
         assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut park).0);
         assert_eq!(
-            authoritative_mouse_button_state(&mut state, "server-a", &park, true),
+            authoritative_mouse_button_state(&mut state, "server-a", &mut park, true),
             (None, true)
         );
 
@@ -12075,6 +12519,7 @@ mod tests {
                 "server-a".into(),
                 RemoteMouseSequenceState {
                     last_position_sequence: 10,
+                    last_button_snapshot_sequence: 0,
                     last_scroll_sequence: 0,
                     last_boundary_sequence: 0,
                     last_button_sequence: [10, 0, 0],
@@ -12093,7 +12538,7 @@ mod tests {
         };
         assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut released_move).0);
         assert_eq!(
-            authoritative_mouse_button_state(&mut state, "server-a", &released_move, true),
+            authoritative_mouse_button_state(&mut state, "server-a", &mut released_move, true),
             (Some((LEFT_BUTTON_MASK, 0, 50, 60)), false)
         );
         assert_eq!(state.buttons, 0);
@@ -12125,7 +12570,7 @@ mod tests {
             sequence: 30,
         };
         assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut move_event).0);
-        let _ = authoritative_mouse_button_state(&mut state, "server-a", &move_event, true);
+        let _ = authoritative_mouse_button_state(&mut state, "server-a", &mut move_event, true);
 
         let mut down = InputEvent::MouseButton {
             button: MouseButton::Left,
@@ -12167,7 +12612,7 @@ mod tests {
             sequence: 30,
         };
         assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut park).0);
-        let _ = authoritative_mouse_button_state(&mut state, "server-a", &park, true);
+        let _ = authoritative_mouse_button_state(&mut state, "server-a", &mut park, true);
 
         let mut down = InputEvent::MouseButton {
             button: MouseButton::Left,
@@ -12203,7 +12648,7 @@ mod tests {
         };
         assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut move_event).0);
         assert_eq!(
-            authoritative_mouse_button_state(&mut state, "server-a", &move_event, true),
+            authoritative_mouse_button_state(&mut state, "server-a", &mut move_event, true),
             (Some((0, LEFT_BUTTON_MASK, 0, 0)), false)
         );
 
@@ -12458,6 +12903,7 @@ mod tests {
     fn only_an_injected_accepted_park_ends_the_clipboard_session() {
         let stale_key_only_boundary = RemoteInputAdmission {
             inject_event: false,
+            current_session_owner: false,
             effective_modifier_snapshot: None,
             origin_changed: false,
             release_keys: true,
@@ -12512,6 +12958,30 @@ mod tests {
     }
 
     #[test]
+    fn only_keepalive_admission_can_renew_without_os_injection() {
+        let real_input = RemoteInputAdmission {
+            inject_event: true,
+            current_session_owner: true,
+            effective_modifier_snapshot: None,
+            origin_changed: false,
+            release_keys: false,
+            carried_buttons: None,
+            mouse: None,
+        };
+        let failed_real_input = remote_input_outcome_for_admission(&real_input, false);
+        assert!(!failed_real_input.current_session_owner);
+        assert!(!failed_real_input.renews_session());
+
+        let heartbeat = RemoteInputAdmission {
+            inject_event: false,
+            ..real_input
+        };
+        let heartbeat_outcome = remote_input_outcome_for_admission(&heartbeat, false);
+        assert!(heartbeat_outcome.current_session_owner);
+        assert!(heartbeat_outcome.renews_session());
+    }
+
+    #[test]
     fn foreign_input_cannot_extend_the_current_remote_input_lease() {
         let started = Instant::now();
         let mut lease = RemoteInputLease::default();
@@ -12540,11 +13010,12 @@ mod tests {
     fn admitted_owner_heartbeats_keep_a_long_press_or_drag_alive() {
         let started = Instant::now();
         let active_heartbeat = RemoteInputOutcome {
-            injected: true,
+            injected: false,
             admitted: true,
             current_session_owner: true,
             session_ended: false,
         };
+        assert!(active_heartbeat.renews_session());
         let mut lease = RemoteInputLease::default();
 
         for second in 0..=30 {
@@ -12626,6 +13097,7 @@ mod tests {
                 "server-a".into(),
                 RemoteMouseSequenceState {
                     last_position_sequence: 30,
+                    last_button_snapshot_sequence: 45,
                     last_scroll_sequence: 25,
                     last_boundary_sequence: 5,
                     last_button_sequence: [20, 40, 0],
@@ -12653,10 +13125,11 @@ mod tests {
         assert_eq!(mouse.buttons, 0);
         assert_eq!(keys.by_origin["server-a"].boundary_sequence, 15);
         let mouse_boundary = mouse.sequence_by_origin["server-a"];
-        assert_eq!(mouse_boundary.last_position_sequence, 40);
-        assert_eq!(mouse_boundary.last_scroll_sequence, 40);
-        assert_eq!(mouse_boundary.last_boundary_sequence, 40);
-        assert_eq!(mouse_boundary.last_button_sequence, [40; 3]);
+        assert_eq!(mouse_boundary.last_position_sequence, 45);
+        assert_eq!(mouse_boundary.last_button_snapshot_sequence, 45);
+        assert_eq!(mouse_boundary.last_scroll_sequence, 45);
+        assert_eq!(mouse_boundary.last_boundary_sequence, 45);
+        assert_eq!(mouse_boundary.last_button_sequence, [45; 3]);
         assert!(!keys.accept_key("server-a", 0x43, 14));
         assert!(keys.accept_key("server-a", 0x43, 16));
         let mut delayed_button_down = InputEvent::MouseButton {
@@ -12665,7 +13138,7 @@ mod tests {
             screen_id: "local-display-1".into(),
             x: Some(50),
             y: Some(60),
-            sequence: 39,
+            sequence: 44,
         };
         assert!(!prepare_remote_mouse_event(&mut mouse, "server-a", &mut delayed_button_down,).0);
         assert!(expire_remote_input_session_with_state(
