@@ -7628,12 +7628,34 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
         .map(|screen| screen.y)
         .min()
         .unwrap_or_default();
+    // The device's INTERNAL screen arrangement always mirrors the peer's real
+    // one — crossing geometry between a device's own screens must match the
+    // remote's actual coordinate space, so it is the peer's fact, not a local
+    // choice. The local user only chooses where the DEVICE sits: anchor the
+    // whole arrangement so that a screen already placed in the local layout
+    // stays fixed. This also self-heals older imports that dropped a newly
+    // announced secondary display at raw announce coordinates, stranding it
+    // on top of / beside other devices ("client's extended screen doesn't
+    // show" and phantom crossings at unrelated edges).
+    let (anchor_x, anchor_y) = peer
+        .screens
+        .iter()
+        .enumerate()
+        .find_map(|(index, peer_screen)| {
+            let id = unique_peer_screen_id(device_id, peer_screen, index);
+            existing_screens.iter().find(|screen| screen.id == id).map(|existing| {
+                (
+                    existing.x - (peer_screen.x - peer_min_x),
+                    existing.y - (peer_screen.y - peer_min_y),
+                )
+            })
+        })
+        .unwrap_or((0, 0));
     peer.screens
         .iter()
         .enumerate()
         .map(|(index, peer_screen)| {
             let id = unique_peer_screen_id(device_id, peer_screen, index);
-            let existing_screen = existing_screens.iter().find(|screen| screen.id == id);
 
             Screen {
                 id,
@@ -7643,12 +7665,8 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
                 } else {
                     peer_screen.name.clone()
                 },
-                x: existing_screen
-                    .map(|screen| screen.x)
-                    .unwrap_or(peer_screen.x - peer_min_x),
-                y: existing_screen
-                    .map(|screen| screen.y)
-                    .unwrap_or(peer_screen.y - peer_min_y),
+                x: peer_screen.x - peer_min_x + anchor_x,
+                y: peer_screen.y - peer_min_y + anchor_y,
                 width: peer_screen.width,
                 height: peer_screen.height,
                 scale: peer_screen.scale,
@@ -9079,6 +9097,67 @@ mod tests {
         assert!(layout.devices[1].input_ready);
         assert_eq!(layout.devices[1].host, "10.0.0.2");
         assert_eq!(layout.devices[1].transport_port, 52000);
+    }
+
+    #[test]
+    fn newly_announced_peer_screen_anchors_to_existing_placement() {
+        let mut peer = test_peer();
+        // The peer now announces a second display below-right of its primary.
+        peer.screens.push(LanPeerScreen {
+            id: "local-display-2".into(),
+            name: "Built-in".into(),
+            x: 579,
+            y: 1440,
+            width: 1512,
+            height: 982,
+            scale: 2.0,
+            is_primary: false,
+        });
+
+        // The user already placed the device's primary screen in the local
+        // layout at (2560, 0).
+        let existing = vec![Screen {
+            id: unique_peer_screen_id("device-1", &peer.screens[0], 0),
+            device_id: "device-1".into(),
+            name: "Display".into(),
+            x: 2560,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            is_primary: true,
+        }];
+
+        let imported = screens_from_peer(&peer, "device-1", &existing);
+        assert_eq!(imported.len(), 2);
+        // Placed screen stays put; the new screen keeps the peer's own relative
+        // arrangement anchored to it instead of landing at raw announce
+        // coordinates (which stranded it on other devices and rendered hidden).
+        assert_eq!((imported[0].x, imported[0].y), (2560, 0));
+        assert_eq!((imported[1].x, imported[1].y), (2560 + 579, 1440));
+
+        // Self-heal: a secondary screen stranded at raw announce coordinates by
+        // the older import re-anchors next to its own device on the next
+        // announce — the peer's internal arrangement always mirrors reality.
+        let mut stranded = existing.clone();
+        stranded.push(Screen {
+            id: unique_peer_screen_id("device-1", &peer.screens[1], 1),
+            device_id: "device-1".into(),
+            name: "Built-in".into(),
+            x: 579,
+            y: 1440,
+            width: 1512,
+            height: 982,
+            scale: 2.0,
+            is_primary: false,
+        });
+        let healed = screens_from_peer(&peer, "device-1", &stranded);
+        assert_eq!((healed[0].x, healed[0].y), (2560, 0));
+        assert_eq!(
+            (healed[1].x, healed[1].y),
+            (2560 + 579, 1440),
+            "a stranded secondary screen snaps back to the peer's real arrangement"
+        );
     }
 
     #[test]
