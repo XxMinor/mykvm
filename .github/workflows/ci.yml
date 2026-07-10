@@ -80,9 +80,7 @@ jobs:
       matrix:
         os:
           - macos-latest
-          # Pin the executable-test runner: the moving windows-latest image can
-          # change its MSVC runtime independently of Rust/Tauri.
-          - windows-2022
+          - windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -109,4 +107,28 @@ jobs:
         run: cargo check --manifest-path src-tauri/input-helper/Cargo.toml
 
       - name: Test Tauri backend
+        if: runner.os != 'Windows'
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Test Tauri backend (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $testExe = Get-ChildItem 'src-tauri\target\debug\deps\mykvm_lib-*.exe' |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if ($null -eq $testExe) { throw 'Windows lib-test executable was not produced' }
+
+          Copy-Item 'src-tauri\windows-test.manifest' "$($testExe.FullName).manifest" -Force
+          Push-Location 'src-tauri'
+          try {
+            & $testExe.FullName
+            $testStatus = $LASTEXITCODE
+          } finally {
+            Pop-Location
+          }
+          if ($testStatus -ne 0) { exit $testStatus }
