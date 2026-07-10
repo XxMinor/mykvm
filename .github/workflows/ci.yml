@@ -80,7 +80,9 @@ jobs:
       matrix:
         os:
           - macos-latest
-          - windows-latest
+          # Pin the executable-test runner: the moving windows-latest image can
+          # change its MSVC runtime independently of Rust/Tauri.
+          - windows-2022
 
     steps:
       - uses: actions/checkout@v4
