@@ -4017,28 +4017,43 @@ fn map_event_point_to_native(
     Some((absolute_x, absolute_y))
 }
 
-/// Records inter-arrival gaps of injected remote mouse moves and logs a
-/// compact summary every ~5s of active flow. This pins down WHERE perceived
-/// stutter lives: steady small gaps = healthy pipeline (look at the sender);
-/// spikes here = receive path stalls (lock contention, injection latency).
-fn note_move_arrival() {
-    struct MoveArrivalStats {
-        window_start: Instant,
-        last: Instant,
-        count: u32,
-        max_gap_ms: f64,
-        gaps_over_25ms: u32,
-    }
-    static STATS: Mutex<Option<MoveArrivalStats>> = Mutex::new(None);
+struct MoveArrivalStats {
+    window_start: Instant,
+    last: Instant,
+    count: u32,
+    max_gap_ms: f64,
+    gaps_over_8ms: u32,
+    gaps_over_25ms: u32,
+}
 
+static MOVE_ARRIVAL_STATS: Mutex<Option<MoveArrivalStats>> = Mutex::new(None);
+
+/// Control left this machine (CursorPark): close the measurement window so
+/// the dwell on the other machine is never reported as a pipeline stall.
+fn reset_move_arrival_stats() {
+    if let Ok(mut stats) = MOVE_ARRIVAL_STATS.lock() {
+        *stats = None;
+    }
+}
+
+/// Records inter-arrival gaps of injected remote mouse moves and logs a
+/// compact summary every ~5s of active flow. Because the window resets on
+/// CursorPark and on long idle, every reported gap happened while control was
+/// actively HERE: >8ms ≈ dropped frames on a high-refresh panel, >25ms = a
+/// visible hitch. Steady small gaps = healthy pipeline (look at the sender);
+/// spikes = receive-path stalls (lock contention, injection latency).
+fn note_move_arrival() {
     let now = Instant::now();
-    let Ok(mut stats) = STATS.lock() else { return };
+    let Ok(mut stats) = MOVE_ARRIVAL_STATS.lock() else {
+        return;
+    };
     let Some(current) = stats.as_mut() else {
         *stats = Some(MoveArrivalStats {
             window_start: now,
             last: now,
             count: 1,
             max_gap_ms: 0.0,
+            gaps_over_8ms: 0,
             gaps_over_25ms: 0,
         });
         return;
@@ -4046,13 +4061,13 @@ fn note_move_arrival() {
 
     let gap_ms = now.duration_since(current.last).as_secs_f64() * 1000.0;
     if gap_ms > 2000.0 {
-        // Idle pause / control left this machine: start a fresh window rather
-        // than reporting the pause as a pipeline stall.
+        // Idle pause: start a fresh window rather than reporting it as a stall.
         *current = MoveArrivalStats {
             window_start: now,
             last: now,
             count: 1,
             max_gap_ms: 0.0,
+            gaps_over_8ms: 0,
             gaps_over_25ms: 0,
         };
         return;
@@ -4063,6 +4078,9 @@ fn note_move_arrival() {
     if gap_ms > current.max_gap_ms {
         current.max_gap_ms = gap_ms;
     }
+    if gap_ms > 8.0 {
+        current.gaps_over_8ms += 1;
+    }
     if gap_ms > 25.0 {
         current.gaps_over_25ms += 1;
     }
@@ -4070,11 +4088,12 @@ fn note_move_arrival() {
     let window_ms = now.duration_since(current.window_start).as_secs_f64() * 1000.0;
     if window_ms >= 5000.0 {
         log::info!(
-            "[diag] move arrivals: n={} over {:.1}s avg={:.1}ms max={:.1}ms gaps>25ms={}",
+            "[diag] move arrivals: n={} over {:.1}s avg={:.1}ms max={:.1}ms gaps>8ms={} gaps>25ms={}",
             current.count,
             window_ms / 1000.0,
             window_ms / current.count.max(1) as f64,
             current.max_gap_ms,
+            current.gaps_over_8ms,
             current.gaps_over_25ms,
         );
         *current = MoveArrivalStats {
@@ -4082,6 +4101,7 @@ fn note_move_arrival() {
             last: now,
             count: 0,
             max_gap_ms: 0.0,
+            gaps_over_8ms: 0,
             gaps_over_25ms: 0,
         };
     }
@@ -4108,7 +4128,10 @@ fn inject_input_command(command: InputCommand) {
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
         InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
-        InputCommand::CursorPark { x, y } => inject_cursor_park(x, y),
+        InputCommand::CursorPark { x, y } => {
+            reset_move_arrival_stats();
+            inject_cursor_park(x, y);
+        }
         InputCommand::ReleaseAll | InputCommand::SecureAttention => {}
     }
 }
