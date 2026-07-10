@@ -3,22 +3,31 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex, OnceLock, TryLockError,
+        Arc, Condvar, Mutex, OnceLock, TryLockError,
     },
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     quic_transport,
     shared_input::{
-        button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton,
-        LEFT_BUTTON_MASK, MIDDLE_BUTTON_MASK, RIGHT_BUTTON_MASK,
+        button_from_mask, modifier_mask_for_key, modifier_mask_for_keys,
+        modifier_snapshot_transitions, mouse_button_mask, InputCommand, InputEvent, MouseButton,
+        ALT_MODIFIER_MASK, CONTROL_MODIFIER_MASK, LEFT_BUTTON_MASK, META_MODIFIER_MASK,
+        MIDDLE_BUTTON_MASK, RIGHT_BUTTON_MASK, SHIFT_MODIFIER_MASK,
     },
     Device, LayoutState, NativeStageStatus, Screen,
 };
+
+#[cfg(any(target_os = "linux", test))]
+#[path = "linux_input.rs"]
+mod linux_input;
 
 const INPUT_PROTOCOL: &str = "mykvm.input.v1";
 const INPUT_CONTROL_PROTOCOL: &str = "mykvm.input-control.v1";
@@ -33,16 +42,12 @@ const EDGE_TOLERANCE: i32 = 80;
 const CROSSING_MARGIN: f64 = 1.0;
 const MIN_CROSSING_DELTA: f64 = 1.0;
 const CROSSING_AXIS_DOMINANCE: f64 = 0.5;
+const RETURN_AXIS_DOMINANCE: f64 = 1.0;
 const CROSSING_ACTIVATION_BAND: f64 = EDGE_TOLERANCE as f64 * 2.0;
-// On return to the local machine, land the cursor flush against the entry edge
-// (0px inset) for a seamless extended-display feel, mirroring how the cursor
-// would sit at the edge of a real second monitor. Re-bounce after a fast
-// back-flick is prevented by a time-based return cooldown (last_return), not by
-// inset distance, so the cursor can sit exactly on the edge.
-const RETURN_EDGE_INSET: f64 = 0.0;
-// After returning to local, refuse to cross back into the remote for this long.
-// Lets a fast back-flick settle at the edge without bouncing into the remote.
-const RETURN_COOLDOWN_MS: u64 = 150;
+// A tiny spatial re-arm after returning is imperceptible but avoids immediately
+// bouncing back across the same edge. Unlike the old 150ms time gate it never
+// freezes deliberate movement.
+const RETURN_EDGE_INSET: f64 = 4.0;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
 #[cfg(target_os = "macos")]
@@ -100,6 +105,10 @@ const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
 const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
+static REMOTE_KEY_SEQUENCE_STATE: OnceLock<Mutex<RemoteKeySequenceState>> = OnceLock::new();
+static REMOTE_INPUT_INJECT_LOCK: Mutex<()> = Mutex::new(());
+static REMOTE_MOUSE_INJECT_LOCK: Mutex<()> = Mutex::new(());
+static REMOTE_INPUT_ORIGIN: Mutex<String> = Mutex::new(String::new());
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
@@ -153,6 +162,10 @@ pub struct ClipboardTarget {
     pub protocol_version: u16,
     pub cluster_id: String,
     pub pair_secret: String,
+    /// Controller crossings push their current clipboard immediately. The
+    /// controlled side first baselines its existing clipboard so both peers do
+    /// not race to overwrite each other with unrelated pre-session content.
+    pub push_on_bind: bool,
     pub expires_at: Option<Instant>,
 }
 
@@ -174,7 +187,20 @@ struct InputPacket {
     cluster_id: String,
     #[serde(default)]
     pair_secret: String,
+    /// Target-semantic modifier state carried with ordinary key events. This
+    /// repairs a lost modifier Up before the key is injected. `Some(0)` means
+    /// no modifiers are physically held; old peers omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modifier_snapshot: Option<u8>,
+    /// Rejects a stale/duplicate key frame that arrives from an older QUIC
+    /// connection after a reconnect. Zero is reserved for older peers.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    key_sequence: u64,
     event: InputEvent,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -202,11 +228,133 @@ enum InputControlCommand {
     SecureAttention,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default)]
 struct RemoteMouseState {
     x: i32,
     y: i32,
     buttons: u64,
+    last_origin_id: String,
+    sequence_by_origin: HashMap<String, RemoteMouseSequenceState>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RemoteMouseSequenceState {
+    last_position_sequence: u64,
+    last_scroll_sequence: u64,
+    last_boundary_sequence: u64,
+    last_button_sequence: [u64; 3],
+}
+
+#[derive(Debug, Default)]
+struct RemoteKeySequenceState {
+    by_origin: HashMap<String, RemoteOriginKeySequenceState>,
+}
+
+#[derive(Debug, Default)]
+struct RemoteOriginKeySequenceState {
+    boundary_sequence: u64,
+    latest_event_sequence: u64,
+    snapshot_sequence: u64,
+    last_by_key: HashMap<u16, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteInputAdmission {
+    inject_event: bool,
+    effective_modifier_snapshot: Option<u8>,
+    origin_changed: bool,
+    release_keys: bool,
+    carried_buttons: Option<(u64, i32, i32)>,
+    mouse: Option<RemoteMouseAdmission>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteMouseAdmission {
+    button_reconciliation: Option<(u64, u64, i32, i32)>,
+    park_accepted: bool,
+}
+
+impl RemoteKeySequenceState {
+    fn accept_key(&mut self, origin_id: &str, key_code: u16, sequence: u64) -> bool {
+        if sequence == 0 {
+            return true;
+        }
+        let state = self.by_origin.entry(origin_id.to_string()).or_default();
+        let is_modifier = modifier_mask_for_key(key_code).is_some();
+        let key_code = remote_semantic_key(key_code);
+        let last = state
+            .last_by_key
+            .get(&key_code)
+            .copied()
+            .unwrap_or_default();
+        if sequence <= state.boundary_sequence
+            || sequence <= last
+            // A newer authoritative snapshot already describes every modifier
+            // family. A delayed Ctrl/Shift/Alt/Meta transition from an older
+            // QUIC stream must not undo that newer state.
+            || (is_modifier && sequence <= state.snapshot_sequence)
+        {
+            return false;
+        }
+        state.last_by_key.insert(key_code, sequence);
+        state.latest_event_sequence = state.latest_event_sequence.max(sequence);
+        true
+    }
+
+    fn accept_boundary(&mut self, origin_id: &str, sequence: u64) -> bool {
+        if sequence == 0 {
+            return true;
+        }
+        let state = self.by_origin.entry(origin_id.to_string()).or_default();
+        if sequence <= state.boundary_sequence || sequence <= state.latest_event_sequence {
+            return false;
+        }
+        state.boundary_sequence = sequence;
+        state.latest_event_sequence = sequence;
+        true
+    }
+
+    fn accept_snapshot(&mut self, origin_id: &str, sequence: u64) -> bool {
+        if sequence == 0 {
+            return true;
+        }
+        let state = self.by_origin.entry(origin_id.to_string()).or_default();
+        if sequence <= state.boundary_sequence || sequence <= state.snapshot_sequence {
+            return false;
+        }
+        state.snapshot_sequence = sequence;
+        state.latest_event_sequence = state.latest_event_sequence.max(sequence);
+        true
+    }
+}
+
+fn remote_semantic_key(key_code: u16) -> u16 {
+    match modifier_mask_for_key(key_code) {
+        Some(SHIFT_MODIFIER_MASK) => 0x10,
+        Some(CONTROL_MODIFIER_MASK) => 0x11,
+        Some(ALT_MODIFIER_MASK) => 0x12,
+        Some(META_MODIFIER_MASK) => 0x5B,
+        _ => key_code,
+    }
+}
+
+fn next_mouse_sequence() -> u64 {
+    static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+    let sequence = SEQUENCE.get_or_init(|| {
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u128::from(u64::MAX - 1)) as u64;
+        AtomicU64::new(base.max(1))
+    });
+    sequence.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_key_sequence() -> u64 {
+    static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+    let sequence = SEQUENCE.get_or_init(|| AtomicU64::new(next_mouse_sequence()));
+    sequence.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn stopped_capture_status() -> NativeStageStatus {
@@ -615,7 +763,14 @@ pub fn input_runtime_status(
             ),
         }
     } else {
-        unsupported_capture_status()
+        #[cfg(target_os = "linux")]
+        {
+            linux_input::capture_status(targets.len())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unsupported_capture_status()
+        }
     };
 
     (capture, input_receive_status(layout, false))
@@ -644,13 +799,48 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
         };
     }
 
-    NativeStageStatus {
-        state: "ready".into(),
-        detail: format!(
-            "Receiving shared input on QUIC datagrams at UDP {}.",
-            normalize_quic_port(layout.transport_port, layout.quic_port)
-        ),
+    #[cfg(target_os = "linux")]
+    {
+        linux_input::receive_status(normalize_quic_port(layout.transport_port, layout.quic_port))
     }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        NativeStageStatus {
+            state: "ready".into(),
+            detail: format!(
+                "Receiving shared input on QUIC datagrams at UDP {}.",
+                normalize_quic_port(layout.transport_port, layout.quic_port)
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_platform_capture(
+    targets: Vec<InputTarget>,
+    layout_state: Arc<Mutex<LayoutState>>,
+    native_layout: LayoutState,
+    quic_transport: quic_transport::TransportHandle,
+    stop: Arc<AtomicBool>,
+    remote_active: Arc<AtomicBool>,
+    _main_window_visible: Arc<AtomicBool>,
+    _main_window_focused: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    input_events: Arc<AtomicU64>,
+    switch_request: Arc<Mutex<Option<SwitchDirection>>>,
+) -> NativeStageStatus {
+    linux_input::start_capture(
+        targets,
+        layout_state,
+        native_layout,
+        quic_transport,
+        stop,
+        remote_active,
+        clipboard_target,
+        input_events,
+        switch_request,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -750,6 +940,8 @@ fn start_platform_capture(
             quic_transport,
             layout_state,
             native_layout,
+            stop: Arc::clone(&stop),
+            send_gate: Mutex::new(()),
             active: Mutex::new(None),
             remote_active,
             main_window_visible,
@@ -763,7 +955,6 @@ fn start_platform_capture(
             last_cursor_hide_reassert: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
             last_cursor_repin: Mutex::new(None),
-            last_return: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_modifiers: Mutex::new(Vec::new()),
             pressed_keys: Mutex::new(Vec::new()),
@@ -851,6 +1042,9 @@ fn start_platform_capture(
                 }
             }
         }
+        if let Ok(mut current) = MAC_CAPTURE_CONTEXT.lock() {
+            *current = Some(Arc::clone(&context));
+        }
         tap.enable();
         let _ = ready_tx.send(Ok(()));
         // Belt-and-braces: ensure App Nap is suppressed from the control-side
@@ -873,7 +1067,26 @@ fn start_platform_capture(
                 )),
                 false,
             );
-            drain_switch_request_macos(&context);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            {
+                let _send_guard = context
+                    .send_gate
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if !context.stop.load(Ordering::Relaxed) {
+                    if active_target_input_failed(&context.quic_transport, &context.active) {
+                        log::warn!(
+                            "remote input transport failed; returning macOS cursor to local control"
+                        );
+                        return_to_local_macos(&context);
+                        clear_clipboard_target(&context.clipboard_target);
+                    } else {
+                        drain_switch_request_macos(&context);
+                    }
+                }
+            }
             // macOS disables a tap whose callback ran too long or that idled out.
             // Without re-enabling it the mouse and keyboard silently freeze until
             // the app restarts, which is the classic "works, then sticks after a
@@ -889,12 +1102,30 @@ fn start_platform_capture(
             // mouse with the local cursor (especially when backgrounded),
             // making the server pointer reappear and follow the mouse.
             // Re-pin it to the anchor and re-assert hide while active.
-            let is_remote_active = context.remote_active.load(Ordering::Relaxed);
-            if is_remote_active {
-                repin_macos_cursor_while_remote(&context);
+            {
+                let _send_guard = context
+                    .send_gate
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if !context.stop.load(Ordering::Relaxed)
+                    && context.remote_active.load(Ordering::Relaxed)
+                {
+                    repin_macos_cursor_while_remote(&context);
+                }
             }
         }
 
+        // Best-effort remote boundary before the capture thread disappears.
+        // App shutdown normally performs the same release synchronously, but
+        // runtime restarts and capture failures must not leave a remote button
+        // or key held when this loop is the last owner of the context.
+        {
+            let _send_guard = context
+                .send_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            return_to_local_macos(&context);
+        }
         // Critical safety: never leave the cursor decoupled after capture stops,
         // otherwise the user's mouse stays frozen until the app restarts.
         set_macos_cursor_decoupled(false);
@@ -902,6 +1133,7 @@ fn start_platform_capture(
         show_macos_cursor_if_needed(&context);
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
+        clear_macos_capture_context(&context);
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
@@ -948,6 +1180,8 @@ fn start_platform_capture(
             quic_transport,
             layout_state,
             native_layout,
+            stop: Arc::clone(&stop),
+            send_gate: Mutex::new(()),
             active: Mutex::new(None),
             remote_active,
             main_window_focused,
@@ -975,7 +1209,7 @@ fn start_platform_capture(
             Err(error) => {
                 context.remote_active.store(false, Ordering::Relaxed);
                 clear_clipboard_target(&context.clipboard_target);
-                clear_windows_capture_context();
+                clear_windows_capture_context(&context);
                 let _ = ready_tx.send(Err(error));
                 return;
             }
@@ -992,7 +1226,25 @@ fn start_platform_capture(
                     release_windows_remote_control(&context, true);
                 }
             }
-            drain_switch_request_windows(&context);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            {
+                let _send_guard = context
+                    .send_gate
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if !context.stop.load(Ordering::Relaxed) {
+                    if active_target_input_failed(&context.quic_transport, &context.active) {
+                        log::warn!(
+                            "remote input transport failed; releasing Windows remote control"
+                        );
+                        release_windows_remote_control_inner(&context, true);
+                    } else {
+                        drain_switch_request_windows(&context);
+                    }
+                }
+            }
             if last_watchdog_check.elapsed() >= Duration::from_secs(1) {
                 last_watchdog_check = Instant::now();
                 if windows_hooks_look_dead(&context, &hooks) {
@@ -1011,11 +1263,12 @@ fn start_platform_capture(
             }
         }
 
+        release_windows_remote_control(&context, true);
         hooks.uninstall();
         show_windows_cursor_if_needed(&context);
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
-        clear_windows_capture_context();
+        clear_windows_capture_context(&context);
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
@@ -1034,8 +1287,7 @@ fn start_platform_capture(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn start_platform_capture(
     _targets: Vec<InputTarget>,
     _layout_state: Arc<Mutex<LayoutState>>,
@@ -1069,6 +1321,8 @@ fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
 static MACOS_RECEIVE_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MACOS_RECEIVE_PARK_POINT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+static MACOS_RECEIVE_CURSOR_TRANSITION: Mutex<()> = Mutex::new(());
 
 /// Control just left this macOS client: hide the local cursor where it was
 /// tucked, mirroring how the server hides its own cursor while driving a remote.
@@ -1076,11 +1330,18 @@ static MACOS_RECEIVE_PARK_POINT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 fn macos_receive_hide_cursor(x: i32, y: i32) {
     use core_graphics::{display::CGDisplay, geometry::CGPoint};
 
+    let _transition = MACOS_RECEIVE_CURSOR_TRANSITION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
     // Warp only — no posted mouse-move event, which the system would service by
     // re-showing the cursor and undoing the hide below.
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x as f64, y as f64));
     if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
         *point = Some((x as f64, y as f64));
+    }
+    if let Ok(mut tracker) = macos_click_tracker().lock() {
+        *tracker = MacClickTracker::default();
     }
     // Only run the hide primitives once per hide/show cycle — CGDisplayHideCursor
     // is counted and must pair 1:1 with show, so a repeated CursorPark must not
@@ -1105,6 +1366,10 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
 #[cfg(target_os = "macos")]
 fn macos_receive_show_cursor_if_hidden() {
     use core_graphics::display::CGDisplay;
+
+    let _transition = MACOS_RECEIVE_CURSOR_TRANSITION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
 
     if !MACOS_RECEIVE_CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
         return;
@@ -1155,7 +1420,12 @@ fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
     });
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn start_platform_receive_monitor(stop: Arc<AtomicBool>) {
+    linux_input::start_receive_monitor(stop);
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 fn start_platform_receive_monitor(_stop: Arc<AtomicBool>) {}
 
 fn no_target_status(layout: &LayoutState) -> NativeStageStatus {
@@ -1340,6 +1610,25 @@ fn peer_screen_id(device: &Device, screen: &Screen) -> String {
         .to_string()
 }
 
+fn active_target_input_failed(
+    quic_transport: &quic_transport::TransportHandle,
+    active: &Mutex<Option<ActiveTarget>>,
+) -> bool {
+    let target = active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|active| active.target.clone()));
+    let Some(target) = target else {
+        return false;
+    };
+    let peer = quic_transport.peer(
+        target.target_addr,
+        target.transport_public_key,
+        target.protocol_version,
+    );
+    quic_transport.peer_input_failed(&peer)
+}
+
 fn send_packet(
     quic_transport: &quic_transport::TransportHandle,
     target: &InputTarget,
@@ -1347,18 +1636,58 @@ fn send_packet(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
-    let packet_context = input_packet_context(target, event, layout_state);
-    let event = packet_context.event;
-    // Key and mouse-button up/down MUST arrive intact and ordered: a lost
-    // "up" leaves a key or button stuck down (every keystroke then behaves like
-    // a shortcut). Route them over the reliable stream. Mouse motion and scroll
-    // stay on datagrams — losing an intermediate move is invisible, and motion
-    // wants "latest wins" over guaranteed delivery.
-    let send_reliable = matches!(
+    send_packet_with_modifier_snapshot(
+        quic_transport,
+        target,
         event,
-        InputEvent::Key { .. } | InputEvent::MouseButton { .. } | InputEvent::CursorPark { .. }
-    );
+        None,
+        layout_state,
+        input_events,
+    )
+}
+
+fn send_key_packet(
+    quic_transport: &quic_transport::TransportHandle,
+    target: &InputTarget,
+    key_code: u16,
+    down: bool,
+    modifier_snapshot: u8,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
+    send_packet_with_modifier_snapshot(
+        quic_transport,
+        target,
+        InputEvent::Key { key_code, down },
+        Some(modifier_snapshot),
+        layout_state,
+        input_events,
+    )
+}
+
+fn send_packet_with_modifier_snapshot(
+    quic_transport: &quic_transport::TransportHandle,
+    target: &InputTarget,
+    event: InputEvent,
+    modifier_snapshot: Option<u8>,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
+    let packet_context = input_packet_context(target, event, modifier_snapshot, layout_state);
+    let event = packet_context.event;
+    // State transitions ride a per-peer reliable queue. Releases can evict
+    // stale presses under back-pressure, while CursorPark is an authoritative
+    // reset boundary that discards older Down/transient state after preserving
+    // explicit Up frames for mixed v2 peers. Drag motion carries
+    // an authoritative button_mask, so it remains latest-wins just like hover
+    // motion: replaying hundreds of old drag points after a Wi-Fi pause is worse
+    // than dropping intermediate positions, and the receiver can reconcile a
+    // transition that arrives on the other QUIC channel.
+    let reliable_class = input_event_reliable_class(&event);
     let send_latest = matches!(event, InputEvent::MouseMove { .. });
+    let key_sequence = input_packet_needs_key_sequence(&event, packet_context.modifier_snapshot)
+        .then(next_key_sequence)
+        .unwrap_or(0);
     let packet = InputPacket {
         protocol: INPUT_PROTOCOL.into(),
         target_device_id: target.device_id.clone(),
@@ -1368,6 +1697,8 @@ fn send_packet(
         origin_protocol_version: quic_transport::PROTOCOL_VERSION,
         cluster_id: packet_context.cluster_id,
         pair_secret: packet_context.pair_secret,
+        modifier_snapshot: packet_context.modifier_snapshot,
+        key_sequence,
         event,
     };
     let Some(peer) = packet_context.peer else {
@@ -1386,8 +1717,8 @@ fn send_packet(
         }
     };
 
-    let send_result = if send_reliable {
-        quic_transport.send_reliable_input(peer, payload)
+    let send_result = if let Some(class) = reliable_class {
+        quic_transport.send_reliable_input_with_class(peer, payload, class)
     } else if send_latest {
         quic_transport.send_latest_datagram(peer, payload)
     } else {
@@ -1403,6 +1734,29 @@ fn send_packet(
             mark_target_offline(layout_state, target, &error);
             false
         }
+    }
+}
+
+fn input_packet_needs_key_sequence(event: &InputEvent, modifier_snapshot: Option<u8>) -> bool {
+    matches!(
+        event,
+        InputEvent::Key { .. } | InputEvent::CursorPark { .. }
+    ) || modifier_snapshot.is_some()
+}
+
+fn input_event_reliable_class(event: &InputEvent) -> Option<quic_transport::ReliableInputClass> {
+    use quic_transport::ReliableInputClass;
+
+    match event {
+        InputEvent::Key { down: true, .. } | InputEvent::MouseButton { down: true, .. } => {
+            Some(ReliableInputClass::State)
+        }
+        InputEvent::Key { down: false, .. } | InputEvent::MouseButton { down: false, .. } => {
+            Some(ReliableInputClass::Release)
+        }
+        InputEvent::CursorPark { .. } => Some(ReliableInputClass::ResetBoundary),
+        InputEvent::Scroll { .. } => Some(ReliableInputClass::Transient),
+        InputEvent::MouseMove { .. } => None,
     }
 }
 
@@ -1462,12 +1816,14 @@ struct InputPacketContext {
     cluster_id: String,
     pair_secret: String,
     peer: Option<quic_transport::PeerEndpoint>,
+    modifier_snapshot: Option<u8>,
     event: InputEvent,
 }
 
 fn input_packet_context(
     target: &InputTarget,
     event: InputEvent,
+    modifier_snapshot: Option<u8>,
     layout_state: &Arc<Mutex<LayoutState>>,
 ) -> InputPacketContext {
     let fallback_peer = || quic_transport::PeerEndpoint {
@@ -1481,11 +1837,22 @@ fn input_packet_context(
         cluster_id: target.cluster_id.clone(),
         pair_secret: target.pair_secret.clone(),
         peer: Some(fallback_peer()),
+        modifier_snapshot,
         event,
     };
 
     let layout = match layout_state.try_lock() {
         Ok(layout) => layout,
+        Err(TryLockError::WouldBlock) if matches!(&event, InputEvent::Key { .. }) => {
+            // Mouse motion must never wait on the UI/layout lock, but modifier
+            // down/up must use one consistent remap. Falling back to the raw
+            // key here could map the down and not the up (or vice versa),
+            // leaving Ctrl/Cmd stuck on the controlled machine.
+            match layout_state.lock() {
+                Ok(layout) => layout,
+                Err(_) => return fallback_context(event),
+            }
+        }
         Err(TryLockError::WouldBlock) => return fallback_context(event),
         Err(TryLockError::Poisoned(_)) => return fallback_context(event),
     };
@@ -1507,12 +1874,15 @@ fn input_packet_context(
             })
         });
     let event = remap_event_for_target_layout(event, target, &layout);
+    let modifier_snapshot = modifier_snapshot
+        .map(|mask| remap_modifier_snapshot_for_target_layout(mask, target, &layout));
 
     InputPacketContext {
         origin_device_id,
         cluster_id: layout.cluster_id.clone(),
         pair_secret: layout.pair_secret.clone(),
         peer,
+        modifier_snapshot,
         event,
     }
 }
@@ -1555,6 +1925,26 @@ fn remap_event_for_target_layout(
     }
 }
 
+fn remap_modifier_snapshot_for_target_layout(
+    mask: u8,
+    target: &InputTarget,
+    layout: &LayoutState,
+) -> u8 {
+    let target_platform = target.target_platform.as_str();
+    if !layout.modifier_remap
+        || (target_platform != "macos" && target_platform != "windows")
+        || target_platform == crate::current_platform()
+    {
+        return mask;
+    }
+    remap_modifier_mask(
+        mask,
+        &layout.modifier_map.control,
+        &layout.modifier_map.alt,
+        &layout.modifier_map.meta,
+    )
+}
+
 #[cfg(test)]
 fn remap_event_for_target(
     event: InputEvent,
@@ -1574,6 +1964,68 @@ fn classify_modifier_vk(vk: u16) -> Option<u8> {
         0x11 | 0xA2 | 0xA3 => Some(0),
         0x12 | 0xA4 | 0xA5 => Some(1),
         0x5B | 0x5C => Some(2),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn reconcile_windows_modifier_events(
+    physical_down: &[u16],
+    forwarded_pressed: &[u16],
+) -> Vec<InputEvent> {
+    let mut releases = Vec::new();
+    let mut presses = Vec::new();
+    for family in 0..4 {
+        let physical_present = physical_down
+            .iter()
+            .any(|key| windows_modifier_family(*key) == Some(family));
+        let forwarded_present = forwarded_pressed
+            .iter()
+            .any(|key| windows_modifier_family(*key) == Some(family));
+
+        if !forwarded_present {
+            for key_code in physical_down
+                .iter()
+                .copied()
+                .filter(|key| windows_modifier_family(*key) == Some(family))
+            {
+                if !presses.iter().any(|event| {
+                    matches!(event, InputEvent::Key { key_code: queued, down: true } if *queued == key_code)
+                }) {
+                    presses.push(InputEvent::Key {
+                        key_code,
+                        down: true,
+                    });
+                }
+            }
+        } else if !physical_present {
+            releases.extend(
+                forwarded_pressed
+                    .iter()
+                    .copied()
+                    .filter(|key| windows_modifier_family(*key) == Some(family))
+                    .map(|key_code| InputEvent::Key {
+                        key_code,
+                        down: false,
+                    }),
+            );
+        }
+    }
+    releases.extend(presses);
+    releases
+}
+
+/// Groups generic and sided Windows virtual-key codes by physical modifier.
+/// The low-level hook can report generic Control (0x11) while
+/// GetAsyncKeyState reports Left Control (0xA2); treating them as one family
+/// avoids sending a duplicate Down before the next ordinary key.
+#[cfg(any(target_os = "windows", test))]
+fn windows_modifier_family(vk: u16) -> Option<u8> {
+    match vk {
+        0x10 | 0xA0 | 0xA1 => Some(0), // Shift
+        0x11 | 0xA2 | 0xA3 => Some(1), // Control
+        0x12 | 0xA4 | 0xA5 => Some(2), // Alt
+        0x5B | 0x5C => Some(3),        // Windows / Command
         _ => None,
     }
 }
@@ -1598,6 +2050,24 @@ fn remap_modifier_vk(vk: u16, control: &str, alt: &str, meta: &str) -> u16 {
         _ => return vk,
     };
     logical_target_vk(target).unwrap_or(vk)
+}
+
+fn remap_modifier_mask(mask: u8, control: &str, alt: &str, meta: &str) -> u8 {
+    let mut remapped = mask & SHIFT_MODIFIER_MASK;
+    for (source_bit, target) in [
+        (CONTROL_MODIFIER_MASK, control),
+        (ALT_MODIFIER_MASK, alt),
+        (META_MODIFIER_MASK, meta),
+    ] {
+        if mask & source_bit == 0 {
+            continue;
+        }
+        let target_bit = logical_target_vk(target)
+            .and_then(modifier_mask_for_key)
+            .unwrap_or(source_bit);
+        remapped |= target_bit;
+    }
+    remapped
 }
 
 fn mark_target_offline(
@@ -1662,30 +2132,55 @@ pub fn try_inject_packet_from_source(
         return true;
     }
 
-    if packet.origin_port != 0 && !packet.origin_transport_public_key.trim().is_empty() {
-        let device_id = if packet.origin_device_id.trim().is_empty() {
-            source.ip().to_string()
+    let clipboard_peer =
+        if packet.origin_port != 0 && !packet.origin_transport_public_key.trim().is_empty() {
+            let device_id = if packet.origin_device_id.trim().is_empty() {
+                source.ip().to_string()
+            } else {
+                packet.origin_device_id.clone()
+            };
+            Some((
+                device_id,
+                format!("{}:{}", source.ip(), packet.origin_port),
+                packet.origin_transport_public_key.clone(),
+                packet.origin_protocol_version,
+            ))
         } else {
-            packet.origin_device_id.clone()
+            None
         };
-        // Persist the controller as our clipboard peer so a copy made on this
-        // machine syncs back to it immediately, without needing the remote
-        // cursor to re-enter. Refreshed on every input packet; cleared when
-        // input/clipboard stops.
-        set_clipboard_target(
-            clipboard_target,
-            device_id,
-            format!("{}:{}", source.ip(), packet.origin_port),
-            packet.origin_transport_public_key.clone(),
-            packet.origin_protocol_version,
-            layout.cluster_id.clone(),
-            layout.pair_secret.clone(),
-            None,
-        );
-    }
 
-    let injected = inject_input_event(layout, native_layout, packet.event);
-    if injected {
+    let mouse_origin_id = if packet.origin_device_id.trim().is_empty() {
+        source.ip().to_string()
+    } else {
+        packet.origin_device_id.clone()
+    };
+    let (injected, accepted) = inject_input_event(
+        layout,
+        native_layout,
+        &mouse_origin_id,
+        packet.modifier_snapshot,
+        packet.key_sequence,
+        packet.event,
+    );
+    if accepted {
+        if let Some((device_id, addr, public_key, protocol_version)) = clipboard_peer {
+            // Only the controller that won sequence/origin admission owns the
+            // clipboard return path. A stale or inactive paired controller's
+            // packet must not redirect copies before that packet is discarded.
+            set_clipboard_target(
+                clipboard_target,
+                device_id,
+                addr,
+                public_key,
+                protocol_version,
+                layout.cluster_id.clone(),
+                layout.pair_secret.clone(),
+                false,
+                None,
+            );
+        }
+    }
+    if injected && accepted {
         input_events.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1925,7 +2420,7 @@ fn map_relative_to_native_axis(
     (native_start as f64 + ratio * native_size.max(1) as f64).round() as i32
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn platform_native_screen(screen: &Screen) -> Screen {
     let scale = if screen.scale.is_finite() && screen.scale > 0.0 {
         screen.scale
@@ -1942,19 +2437,19 @@ fn platform_native_screen(screen: &Screen) -> Screen {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn platform_native_screen(screen: &Screen) -> Screen {
     screen.clone()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn scale_position(value: i32, scale: f64) -> i32 {
     (value as f64 * scale)
         .round()
         .clamp(i32::MIN as f64, i32::MAX as f64) as i32
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn scale_size(value: i32, scale: f64) -> i32 {
     (value.max(1) as f64 * scale)
         .round()
@@ -1963,6 +2458,134 @@ fn scale_size(value: i32, scale: f64) -> i32 {
 
 fn remote_mouse_state() -> &'static Mutex<RemoteMouseState> {
     REMOTE_MOUSE_STATE.get_or_init(|| Mutex::new(RemoteMouseState::default()))
+}
+
+fn remote_key_sequence_state() -> &'static Mutex<RemoteKeySequenceState> {
+    REMOTE_KEY_SEQUENCE_STATE.get_or_init(|| Mutex::new(RemoteKeySequenceState::default()))
+}
+
+fn admit_remote_input_with_state(
+    sequence_state: &mut RemoteKeySequenceState,
+    mouse_state: &mut RemoteMouseState,
+    active_origin: &mut String,
+    origin_id: &str,
+    modifier_snapshot: Option<u8>,
+    key_sequence: u64,
+    event: &mut InputEvent,
+) -> Option<RemoteInputAdmission> {
+    let is_park = matches!(event, InputEvent::CursorPark { .. });
+    let event_sequence_accepted = match &*event {
+        InputEvent::Key { key_code, .. } => {
+            sequence_state.accept_key(origin_id, *key_code, key_sequence)
+        }
+        InputEvent::CursorPark { .. } => sequence_state.accept_boundary(origin_id, key_sequence),
+        _ => true,
+    };
+    if !event_sequence_accepted {
+        return None;
+    }
+
+    let active_is_current = active_origin.as_str() == origin_id;
+    let can_claim = active_origin.is_empty() && input_event_can_claim_origin(event);
+    let owns_event = active_is_current || can_claim;
+    let release_keys = is_park && active_is_current;
+    let (mouse, mut carried_buttons) = if input_event_mouse_sequence(event).is_some() {
+        let (accepted, carried_buttons) =
+            prepare_remote_mouse_event_for_origin(mouse_state, origin_id, event, owns_event);
+        if !accepted {
+            if !release_keys {
+                return None;
+            }
+            return Some(RemoteInputAdmission {
+                inject_event: false,
+                effective_modifier_snapshot: None,
+                origin_changed: false,
+                release_keys: true,
+                carried_buttons: None,
+                mouse: Some(RemoteMouseAdmission {
+                    button_reconciliation: None,
+                    park_accepted: false,
+                }),
+            });
+        } else if owns_event {
+            let (button_reconciliation, park_accepted) =
+                authoritative_mouse_button_state(mouse_state, origin_id, event, true);
+            (
+                Some(RemoteMouseAdmission {
+                    button_reconciliation,
+                    park_accepted,
+                }),
+                carried_buttons,
+            )
+        } else {
+            (
+                Some(RemoteMouseAdmission {
+                    button_reconciliation: None,
+                    park_accepted: false,
+                }),
+                None,
+            )
+        }
+    } else {
+        (None, None)
+    };
+
+    let accepted_modifier_snapshot =
+        modifier_snapshot.filter(|_| sequence_state.accept_snapshot(origin_id, key_sequence));
+    let inject_event = owns_event
+        && (!is_park || active_is_current)
+        && mouse.is_none_or(|mouse| mouse.park_accepted || !is_park);
+    let origin_changed = inject_event && can_claim;
+    if origin_changed && mouse.is_none() {
+        carried_buttons = switch_remote_mouse_origin(mouse_state, origin_id);
+    }
+    if inject_event && mouse.is_some_and(|mouse| mouse.park_accepted) {
+        // Park is the reliable end-of-session boundary. Leaving the origin
+        // unclaimed lets another controller's first sequenced MouseMove take
+        // over, while the per-origin high-water below rejects pre-park moves.
+        active_origin.clear();
+    } else if origin_changed {
+        active_origin.clear();
+        active_origin.push_str(origin_id);
+    }
+    Some(RemoteInputAdmission {
+        inject_event,
+        effective_modifier_snapshot: if inject_event {
+            accepted_modifier_snapshot
+        } else {
+            None
+        },
+        origin_changed,
+        release_keys,
+        carried_buttons,
+        mouse,
+    })
+}
+
+fn admit_remote_input(
+    origin_id: &str,
+    modifier_snapshot: Option<u8>,
+    key_sequence: u64,
+    event: &mut InputEvent,
+) -> Option<RemoteInputAdmission> {
+    let mut sequence_state = remote_key_sequence_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut mouse_state = remote_mouse_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut active_origin = REMOTE_INPUT_ORIGIN
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    admit_remote_input_with_state(
+        &mut sequence_state,
+        &mut mouse_state,
+        &mut active_origin,
+        origin_id,
+        modifier_snapshot,
+        key_sequence,
+        event,
+    )
 }
 
 fn update_remote_mouse_position(x: i32, y: i32) -> Option<MouseButton> {
@@ -1974,10 +2597,18 @@ fn update_remote_mouse_position(x: i32, y: i32) -> Option<MouseButton> {
     primary_button_from_mask(state.buttons)
 }
 
-fn update_remote_mouse_button(button: MouseButton, down: bool) -> (i32, i32) {
+fn update_remote_mouse_button(
+    button: MouseButton,
+    down: bool,
+    transmitted_position: Option<(i32, i32)>,
+) -> (i32, i32) {
     let Ok(mut state) = remote_mouse_state().lock() else {
         return (0, 0);
     };
+    if let Some((x, y)) = transmitted_position {
+        state.x = x;
+        state.y = y;
+    }
     if down {
         state.buttons |= mouse_button_mask(button);
     } else {
@@ -1993,13 +2624,377 @@ fn primary_button_from_mask(mask: u64) -> Option<MouseButton> {
 fn inject_input_event(
     layout: &LayoutState,
     native_layout: &LayoutState,
-    event: InputEvent,
-) -> bool {
+    origin_id: &str,
+    modifier_snapshot: Option<u8>,
+    key_sequence: u64,
+    mut event: InputEvent,
+) -> (bool, bool) {
+    // QUIC datagrams and each reliable uni stream run on separate tasks. The
+    // runtime receive gate serialises their common callback, and this inner
+    // guard also makes direct callers atomic from sequence admission through
+    // the final OS event: a Park cannot reset between an older Down's admission
+    // and injection and let that Down re-latch the key afterwards.
+    let _inject_guard = REMOTE_INPUT_INJECT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let is_mouse_event = input_event_mouse_sequence(&event).is_some();
+    let _mouse_guard = is_mouse_event.then(|| {
+        REMOTE_MOUSE_INJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    });
+    let Some(admission) =
+        admit_remote_input(origin_id, modifier_snapshot, key_sequence, &mut event)
+    else {
+        log::debug!(
+            "discarded stale or inactive-origin remote input sequence {key_sequence} from {origin_id}"
+        );
+        return (true, false);
+    };
+    let modifier_snapshot = admission.effective_modifier_snapshot;
+    if let Some((buttons, x, y)) = admission.carried_buttons {
+        release_injected_mouse_buttons(buttons, x, y);
+    }
+    if admission.origin_changed {
+        reset_injected_keys();
+        #[cfg(target_os = "macos")]
+        if let Ok(mut tracker) = macos_click_tracker().lock() {
+            *tracker = MacClickTracker::default();
+        }
+    }
+    if admission.release_keys && !admission.origin_changed {
+        // Keyboard and mouse sequence channels advance independently. A newer
+        // mouse session may overtake this park and make its cursor coordinates
+        // stale, but the accepted keyboard boundary must still release old
+        // keys without releasing buttons that already belong to the new drag.
+        reset_injected_keys();
+    }
+
+    if let Some(mouse) = admission.mouse {
+        if let Some((previous, authoritative, x, y)) = mouse.button_reconciliation {
+            reconcile_injected_mouse_buttons(previous, authoritative, x, y);
+        }
+        #[cfg(target_os = "macos")]
+        if mouse.park_accepted {
+            if let Ok(mut tracker) = macos_click_tracker().lock() {
+                *tracker = MacClickTracker::default();
+            }
+        }
+    }
+    if !admission.inject_event {
+        // A stale same-origin Park can still be an accepted key-only boundary;
+        // foreign/inactive input has both flags false and owns no side effects.
+        return (true, admission.release_keys);
+    }
+
+    if let InputEvent::Key { key_code, down } = &event {
+        #[cfg(target_os = "macos")]
+        {
+            inject_macos_key_with_modifier_snapshot(*key_code, *down, modifier_snapshot);
+            return (true, true);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux_input::inject_key_with_modifier_snapshot(*key_code, *down, modifier_snapshot);
+            return (true, true);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let is_modifier = modifier_mask_for_key(*key_code).is_some();
+            if !is_modifier {
+                reconcile_windows_injected_modifier_snapshot(modifier_snapshot);
+            }
+            let injected = inject_input_command_with_platform_routing(InputCommand::Key {
+                key_code: *key_code,
+                down: *down,
+            });
+            track_windows_injected_key(*key_code, *down);
+            if is_modifier {
+                reconcile_windows_injected_modifier_snapshot(modifier_snapshot);
+            }
+            return (injected, true);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (key_code, down, modifier_snapshot);
+        }
+    }
+
+    reconcile_non_key_injected_modifier_snapshot(modifier_snapshot);
+
     let Some(command) = input_event_to_command(layout, native_layout, event) else {
-        return false;
+        return (false, true);
     };
 
-    inject_input_command_with_platform_routing(command)
+    (inject_input_command_with_platform_routing(command), true)
+}
+
+fn input_event_mouse_sequence(event: &InputEvent) -> Option<u64> {
+    Some(match event {
+        InputEvent::MouseMove { sequence, .. }
+        | InputEvent::MouseButton { sequence, .. }
+        | InputEvent::CursorPark { sequence, .. }
+        | InputEvent::Scroll { sequence, .. } => *sequence,
+        InputEvent::Key { .. } => return None,
+    })
+}
+
+fn input_event_can_claim_origin(event: &InputEvent) -> bool {
+    matches!(
+        event,
+        InputEvent::MouseMove { .. }
+            | InputEvent::Key { down: true, .. }
+            | InputEvent::MouseButton { down: true, .. }
+    )
+}
+
+fn prepare_remote_mouse_event(
+    state: &mut RemoteMouseState,
+    origin_id: &str,
+    event: &mut InputEvent,
+) -> (bool, Option<(u64, i32, i32)>) {
+    prepare_remote_mouse_event_for_origin(state, origin_id, event, true)
+}
+
+fn prepare_remote_mouse_event_for_origin(
+    state: &mut RemoteMouseState,
+    origin_id: &str,
+    event: &mut InputEvent,
+    activate: bool,
+) -> (bool, Option<(u64, i32, i32)>) {
+    let Some(sequence) = input_event_mouse_sequence(event) else {
+        return (
+            true,
+            activate
+                .then(|| switch_remote_mouse_origin(state, origin_id))
+                .flatten(),
+        );
+    };
+    if sequence == 0 {
+        return (
+            true,
+            activate
+                .then(|| switch_remote_mouse_origin(state, origin_id))
+                .flatten(),
+        );
+    }
+
+    // Sequence high-water belongs to the sender, not the currently active
+    // mouse. Validate before switching origin so a pre-handoff datagram cannot
+    // erase the new origin's buttons and high-water state.
+    let origin_sequence = state
+        .sequence_by_origin
+        .entry(origin_id.to_string())
+        .or_default();
+    match event {
+        InputEvent::MouseMove { .. } => {
+            if sequence <= origin_sequence.last_position_sequence {
+                return (false, None);
+            }
+            origin_sequence.last_position_sequence = sequence;
+        }
+        InputEvent::CursorPark { .. } => {
+            if sequence <= origin_sequence.last_position_sequence {
+                return (false, None);
+            }
+            origin_sequence.last_position_sequence = sequence;
+            origin_sequence.last_boundary_sequence = sequence;
+        }
+        InputEvent::Scroll { .. } => {
+            if sequence <= origin_sequence.last_scroll_sequence
+                || sequence <= origin_sequence.last_boundary_sequence
+            {
+                return (false, None);
+            }
+            origin_sequence.last_scroll_sequence = sequence;
+        }
+        InputEvent::MouseButton {
+            button,
+            down,
+            screen_id,
+            x,
+            y,
+            ..
+        } => {
+            // Reliable button state is never discarded merely because a newer
+            // datagram overtook it. If its coordinates are stale, release/press
+            // at the latest tracked point instead of warping backward.
+            let button_index = match button {
+                MouseButton::Left => 0,
+                MouseButton::Right => 1,
+                MouseButton::Middle => 2,
+            };
+            if sequence <= origin_sequence.last_button_sequence[button_index] {
+                return (false, None);
+            }
+            origin_sequence.last_button_sequence[button_index] = sequence;
+            if sequence > origin_sequence.last_position_sequence {
+                origin_sequence.last_position_sequence = sequence;
+            } else if *down {
+                // A press older than an already-applied park/re-entry boundary
+                // belongs to the previous control epoch. Releases still land
+                // below so a button can never remain stuck.
+                return (false, None);
+            } else {
+                screen_id.clear();
+                *x = None;
+                *y = None;
+            }
+        }
+        InputEvent::Key { .. } => unreachable!(),
+    }
+
+    (
+        true,
+        activate
+            .then(|| switch_remote_mouse_origin(state, origin_id))
+            .flatten(),
+    )
+}
+
+fn authoritative_mouse_button_state(
+    state: &mut RemoteMouseState,
+    origin_id: &str,
+    event: &InputEvent,
+    accepted: bool,
+) -> (Option<(u64, u64, i32, i32)>, bool) {
+    if !accepted {
+        return (None, false);
+    }
+    let (authoritative, sequence, park) = match event {
+        InputEvent::MouseMove {
+            button_mask: Some(mask),
+            sequence,
+            ..
+        } => (*mask, *sequence, false),
+        InputEvent::CursorPark { sequence, .. } => (0, *sequence, true),
+        _ => return (None, false),
+    };
+    let reconciliation = (state.buttons != authoritative).then_some((
+        state.buttons,
+        authoritative,
+        state.x,
+        state.y,
+    ));
+    state.buttons = authoritative;
+    if sequence != 0 {
+        let origin_sequence = state
+            .sequence_by_origin
+            .entry(origin_id.to_string())
+            .or_default();
+        for last_sequence in &mut origin_sequence.last_button_sequence {
+            *last_sequence = (*last_sequence).max(sequence);
+        }
+    }
+    (reconciliation, park)
+}
+
+fn switch_remote_mouse_origin(
+    state: &mut RemoteMouseState,
+    origin_id: &str,
+) -> Option<(u64, i32, i32)> {
+    if state.last_origin_id == origin_id {
+        return None;
+    }
+    let carried = (state.buttons != 0).then_some((state.buttons, state.x, state.y));
+    state.last_origin_id.clear();
+    state.last_origin_id.push_str(origin_id);
+    state.buttons = 0;
+    carried
+}
+
+fn release_injected_mouse_buttons(buttons: u64, x: i32, y: i32) {
+    for (bit, button) in [
+        (LEFT_BUTTON_MASK, MouseButton::Left),
+        (RIGHT_BUTTON_MASK, MouseButton::Right),
+        (MIDDLE_BUTTON_MASK, MouseButton::Middle),
+    ] {
+        if buttons & bit != 0 {
+            let _ = inject_input_command_with_platform_routing(InputCommand::MouseButton {
+                button,
+                down: false,
+                x,
+                y,
+            });
+        }
+    }
+}
+
+fn reconcile_injected_mouse_buttons(previous: u64, authoritative: u64, x: i32, y: i32) {
+    release_injected_mouse_buttons(previous & !authoritative, x, y);
+    let pressed = authoritative & !previous;
+    for (bit, button) in [
+        (LEFT_BUTTON_MASK, MouseButton::Left),
+        (RIGHT_BUTTON_MASK, MouseButton::Right),
+        (MIDDLE_BUTTON_MASK, MouseButton::Middle),
+    ] {
+        if pressed & bit != 0 {
+            let _ = inject_input_command_with_platform_routing(InputCommand::MouseButton {
+                button,
+                down: true,
+                x,
+                y,
+            });
+        }
+    }
+}
+
+/// Releases receiver-side mouse/modifier state when input sharing stops. This
+/// is deliberately broader than the per-origin reset: a missing final up event
+/// must not leave the OS latched after the runtime has been disabled.
+pub fn reset_injected_input_state() {
+    let _inject_guard = REMOTE_INPUT_INJECT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _mouse_guard = REMOTE_MOUSE_INJECT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let carried_buttons = remote_mouse_state().lock().ok().and_then(|mut state| {
+        let carried = (state.buttons != 0).then_some((state.buttons, state.x, state.y));
+        *state = RemoteMouseState::default();
+        carried
+    });
+    if let Some((buttons, x, y)) = carried_buttons {
+        release_injected_mouse_buttons(buttons, x, y);
+    }
+    if let Ok(mut origin) = REMOTE_INPUT_ORIGIN.lock() {
+        origin.clear();
+    }
+    if let Ok(mut sequence) = remote_key_sequence_state().lock() {
+        *sequence = RemoteKeySequenceState::default();
+    }
+    reset_injected_modifiers();
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsInputRoute {
+    Local,
+    Helper,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default)]
+struct WindowsInputRouteState {
+    current: Option<WindowsInputRoute>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowsInputRouteState {
+    /// Switching injectors while an input is held can split Down and Up across
+    /// independent state trackers. The caller must release both routes before
+    /// it delivers the first event to a different route.
+    fn requires_release_before(&self, next: WindowsInputRoute) -> bool {
+        self.current.is_some_and(|current| current != next)
+    }
+
+    fn commit(&mut self, route: WindowsInputRoute) {
+        self.current = Some(route);
+    }
+
+    fn clear(&mut self) {
+        self.current = None;
+    }
 }
 
 fn inject_input_command_with_platform_routing(command: InputCommand) -> bool {
@@ -2019,13 +3014,43 @@ fn inject_input_command_with_platform_routing(command: InputCommand) -> bool {
         // logged-in user at the foreground window's own integrity, so it clicks
         // and types normally. On the secure desktop the foreground is LogonUI
         // (System integrity), so the worker's equal-integrity injection works.
-        if should_route_to_windows_helper(&command) {
+        let mut route_state = windows_input_route_state()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if matches!(command, InputCommand::ReleaseAll) {
+            release_windows_injected_inputs_both_routes();
+            route_state.clear();
+            return true;
+        }
+
+        let desired_route = if should_route_to_windows_helper(&command) {
+            WindowsInputRoute::Helper
+        } else {
+            WindowsInputRoute::Local
+        };
+        if route_state.requires_release_before(desired_route) {
+            release_windows_injected_inputs_both_routes();
+        }
+
+        if desired_route == WindowsInputRoute::Helper {
             match windows_pipe_dispatcher().send(&command) {
-                Ok(()) => return true,
-                Err(error) => note_windows_helper_unavailable(&error),
+                Ok(()) => {
+                    route_state.commit(WindowsInputRoute::Helper);
+                    return true;
+                }
+                Err(error) => {
+                    note_windows_helper_unavailable(&error);
+                    // The desired helper route did not receive this event. If
+                    // prior events did, release that tracker before falling
+                    // back to the independent local injector.
+                    if route_state.requires_release_before(WindowsInputRoute::Local) {
+                        release_windows_injected_inputs_both_routes();
+                    }
+                }
             }
         }
-        inject_input_command(command);
+        inject_windows_local_command(&command);
+        route_state.commit(WindowsInputRoute::Local);
         return true;
     }
 
@@ -2033,6 +3058,159 @@ fn inject_input_command_with_platform_routing(command: InputCommand) -> bool {
     {
         inject_input_command(command);
         true
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct WindowsLocalInjectedState {
+    pressed_keys: Vec<u16>,
+    button_mask: u64,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default)]
+struct WindowsInjectedKeyState {
+    pressed_keys: Vec<u16>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowsInjectedKeyState {
+    fn track(&mut self, key_code: u16, down: bool) {
+        let key_code = match key_code {
+            0x10 => 0xA0,
+            0x11 => 0xA2,
+            0x12 => 0xA4,
+            _ => key_code,
+        };
+        if down {
+            if !self.pressed_keys.contains(&key_code) {
+                self.pressed_keys.push(key_code);
+            }
+            return;
+        }
+        if self.pressed_keys.contains(&key_code) {
+            self.pressed_keys.retain(|pressed| *pressed != key_code);
+        } else if let Some(family) = modifier_mask_for_key(key_code) {
+            // A hook/helper can report a generic Up after a sided Down. Treat
+            // the single held member of that family as the matching key.
+            let family_keys = self
+                .pressed_keys
+                .iter()
+                .copied()
+                .filter(|pressed| modifier_mask_for_key(*pressed) == Some(family))
+                .collect::<Vec<_>>();
+            if family_keys.len() == 1 {
+                self.pressed_keys
+                    .retain(|pressed| *pressed != family_keys[0]);
+            }
+        }
+    }
+
+    fn transitions(&self, mask: u8) -> Vec<(u16, bool)> {
+        modifier_snapshot_transitions(&self.pressed_keys, mask)
+    }
+
+    fn take_pressed_keys(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.pressed_keys)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_injected_key_state() -> &'static Mutex<WindowsInjectedKeyState> {
+    static STATE: OnceLock<Mutex<WindowsInjectedKeyState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(WindowsInjectedKeyState::default()))
+}
+
+#[cfg(target_os = "windows")]
+fn track_windows_injected_key(key_code: u16, down: bool) {
+    windows_injected_key_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .track(key_code, down);
+}
+
+#[cfg(target_os = "windows")]
+fn reconcile_windows_injected_modifier_snapshot(mask: Option<u8>) {
+    let Some(mask) = mask else {
+        return;
+    };
+    let transitions = windows_injected_key_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .transitions(mask);
+    if !transitions.is_empty() {
+        log::info!(
+            "reconciled remote Windows modifiers from snapshot mask={mask:#04x}: {transitions:?}"
+        );
+    }
+    for (key_code, down) in transitions {
+        let _ = inject_input_command_with_platform_routing(InputCommand::Key { key_code, down });
+        track_windows_injected_key(key_code, down);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_local_injected_state() -> &'static Mutex<WindowsLocalInjectedState> {
+    static STATE: OnceLock<Mutex<WindowsLocalInjectedState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(WindowsLocalInjectedState::default()))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_route_state() -> &'static Mutex<WindowsInputRouteState> {
+    static STATE: OnceLock<Mutex<WindowsInputRouteState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(WindowsInputRouteState::default()))
+}
+
+#[cfg(target_os = "windows")]
+fn inject_windows_local_command(command: &InputCommand) {
+    // Mouse motion is the hot path and has no held state; avoid taking a mutex
+    // for it. Keys/buttons and ReleaseAll share the helper's existing tracker so
+    // stop/origin-change can emit actual Up events on the normal desktop too.
+    if matches!(
+        command,
+        InputCommand::Key { .. } | InputCommand::MouseButton { .. } | InputCommand::ReleaseAll
+    ) {
+        let mut state = windows_local_injected_state()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let WindowsLocalInjectedState {
+            pressed_keys,
+            button_mask,
+        } = &mut *state;
+        crate::windows_input::inject_command(command, pressed_keys, button_mask);
+    } else {
+        crate::windows_input::inject_command_without_tracking(command);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn release_windows_injected_inputs_both_routes() {
+    inject_windows_local_command(&InputCommand::ReleaseAll);
+    // The secure-desktop worker owns a separate tracker. Failure simply means
+    // there is no helper state to release; the local release above still lands.
+    let _ = windows_pipe_dispatcher().send(&InputCommand::ReleaseAll);
+    *windows_injected_key_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = WindowsInjectedKeyState::default();
+}
+
+#[cfg(target_os = "windows")]
+fn release_windows_injected_keys_both_routes() {
+    let pressed = windows_injected_key_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take_pressed_keys();
+    for key_code in pressed.into_iter().rev() {
+        let command = InputCommand::Key {
+            key_code,
+            down: false,
+        };
+        // Send idempotent key-up events to both independent trackers. Unlike
+        // ReleaseAll, these preserve a mouse button already held by a newer
+        // session on either the normal or secure desktop route.
+        inject_windows_local_command(&command);
+        let _ = windows_pipe_dispatcher().send(&command);
     }
 }
 
@@ -2087,17 +3265,32 @@ fn input_event_to_command(
     event: InputEvent,
 ) -> Option<InputCommand> {
     match event {
-        InputEvent::MouseMove { screen_id, x, y } => {
+        InputEvent::MouseMove {
+            screen_id,
+            x,
+            y,
+            drag_button,
+            button_mask: _,
+            sequence,
+        } => {
             let (absolute_x, absolute_y) =
                 map_event_point_to_native(layout, native_layout, &screen_id, x, y)?;
-            let drag_button = update_remote_mouse_position(absolute_x, absolute_y);
+            let tracked_button = update_remote_mouse_position(absolute_x, absolute_y);
             Some(InputCommand::MouseMove {
                 x: absolute_x,
                 y: absolute_y,
-                drag_button,
+                drag_button: if sequence == 0 {
+                    drag_button.or(tracked_button)
+                } else {
+                    // New senders carry authoritative button state on every
+                    // move. Do not turn a late pre-click datagram into a drag.
+                    drag_button
+                },
             })
         }
-        InputEvent::CursorPark { screen_id, x, y } => {
+        InputEvent::CursorPark {
+            screen_id, x, y, ..
+        } => {
             let (absolute_x, absolute_y) =
                 map_event_point_to_native(layout, native_layout, &screen_id, x, y)?;
             Some(InputCommand::CursorPark {
@@ -2105,11 +3298,26 @@ fn input_event_to_command(
                 y: absolute_y,
             })
         }
-        InputEvent::MouseButton { button, down } => {
-            let (x, y) = update_remote_mouse_button(button, down);
+        InputEvent::MouseButton {
+            button,
+            down,
+            screen_id,
+            x,
+            y,
+            ..
+        } => {
+            let transmitted_position = match (x, y) {
+                (Some(x), Some(y)) if !screen_id.is_empty() => {
+                    map_event_point_to_native(layout, native_layout, &screen_id, x, y)
+                }
+                _ => None,
+            };
+            let (x, y) = update_remote_mouse_button(button, down, transmitted_position);
             Some(InputCommand::MouseButton { button, down, x, y })
         }
-        InputEvent::Scroll { delta_x, delta_y } => Some(InputCommand::Scroll { delta_x, delta_y }),
+        InputEvent::Scroll {
+            delta_x, delta_y, ..
+        } => Some(InputCommand::Scroll { delta_x, delta_y }),
         InputEvent::Key { key_code, down } => Some(InputCommand::Key { key_code, down }),
     }
 }
@@ -2134,17 +3342,20 @@ fn map_event_point_to_native(
 }
 
 fn inject_input_command(command: InputCommand) {
+    // A reliable button/scroll/key can overtake the first best-effort move when
+    // control re-enters this Mac. Any accepted active-control input therefore
+    // reveals the cursor; waiting only for MouseMove leaves it hidden during a
+    // perfectly normal cross-stream reorder followed by a quick click.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if input_command_reveals_parked_cursor(&command) {
+        #[cfg(target_os = "macos")]
+        macos_receive_show_cursor_if_hidden();
+        #[cfg(target_os = "linux")]
+        linux_input::receive_show_cursor_if_hidden();
+    }
+
     match command {
         InputCommand::MouseMove { x, y, drag_button } => {
-            // Control is back on this client — reveal the cursor we hid when it
-            // last left, then move it.
-            #[cfg(target_os = "macos")]
-            {
-                if MACOS_RECEIVE_CURSOR_HIDDEN.load(Ordering::Relaxed) {
-                    log::info!("[diag] inject-move show at ({x},{y})");
-                }
-                macos_receive_show_cursor_if_hidden();
-            }
             inject_mouse_move(x, y, drag_button);
         }
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
@@ -2155,15 +3366,25 @@ fn inject_input_command(command: InputCommand) {
     }
 }
 
+fn input_command_reveals_parked_cursor(command: &InputCommand) -> bool {
+    matches!(
+        command,
+        InputCommand::MouseMove { .. }
+            | InputCommand::MouseButton { down: true, .. }
+            | InputCommand::Scroll { .. }
+    )
+}
+
 /// Control has left this client. On macOS, hide the cursor (it reappears on the
 /// next injected move or when the local user moves the mouse, via the
 /// receive-monitor drift check). Elsewhere, just tuck it into the corner.
 fn inject_cursor_park(x: i32, y: i32) {
     #[cfg(target_os = "macos")]
     macos_receive_hide_cursor(x, y);
-    // Not on macOS: inject_mouse_move posts a mouse-move event that re-shows the
-    // cursor, which would defeat the hide — so only the non-macOS path uses it.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    linux_input::receive_hide_cursor(x, y);
+    // Other platforms tuck the cursor without a native hide implementation.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     inject_mouse_move(x, y, None);
 }
 
@@ -2305,6 +3526,11 @@ struct MacCaptureContext {
     quic_transport: quic_transport::TransportHandle,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
+    stop: Arc<AtomicBool>,
+    /// Serializes all sender-side packet production with final release. Once
+    /// `stop` is set, cleanup takes this gate after every in-flight callback and
+    /// no later Down event can overtake the final Park/Ups.
+    send_gate: Mutex<()>,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
@@ -2318,12 +3544,6 @@ struct MacCaptureContext {
     last_cursor_hide_reassert: Mutex<Option<Instant>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
     last_cursor_repin: Mutex<Option<Instant>>,
-    // Instant we last returned control to the local machine. We now land the
-    // cursor flush against the edge (RETURN_EDGE_INSET=0) for a seamless
-    // extended-display feel, so without a cooldown a fast back-flick would
-    // immediately re-satisfy the crossing test and bounce to the remote. During
-    // the cooldown window we refuse to cross, letting the user's slide settle.
-    last_return: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_modifiers: Mutex<Vec<u16>>,
     // Regular (non-modifier) keys we have forwarded as held, so they can be
@@ -2336,6 +3556,29 @@ struct MacCaptureContext {
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
+}
+
+#[cfg(target_os = "macos")]
+static MAC_CAPTURE_CONTEXT: Mutex<Option<Arc<MacCaptureContext>>> = Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+fn macos_capture_context() -> Option<Arc<MacCaptureContext>> {
+    MAC_CAPTURE_CONTEXT
+        .lock()
+        .ok()
+        .and_then(|context| context.clone())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_capture_context(expected: &Arc<MacCaptureContext>) {
+    if let Ok(mut context) = MAC_CAPTURE_CONTEXT.lock() {
+        if context
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            *context = None;
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2451,7 +3694,27 @@ unsafe extern "C" fn macos_raw_gesture_event_callback(
         return event;
     }
 
-    if context.remote_active.load(Ordering::Relaxed) {
+    if context.stop.load(Ordering::Relaxed) {
+        return event;
+    }
+
+    // The regular event callback may already hold send_gate and repins at its
+    // tail. Avoid a re-entrant deadlock by skipping this redundant raw-tap
+    // repin when the gate is busy. During stop, final release owns the same gate
+    // so a late gesture can never decouple/hide the cursor again afterwards.
+    let Ok(_send_guard) = context.send_gate.try_lock() else {
+        // A regular remote-input callback already owns the gate and performs
+        // the repin at its tail. Still suppress this system gesture; only final
+        // stop (which sets `stop` before taking the gate) should let it through.
+        return if !context.stop.load(Ordering::Relaxed)
+            && context.remote_active.load(Ordering::Relaxed)
+        {
+            std::ptr::null_mut()
+        } else {
+            event
+        };
+    };
+    if !context.stop.load(Ordering::Relaxed) && context.remote_active.load(Ordering::Relaxed) {
         repin_macos_cursor_while_remote(context);
         log::debug!(
             "remote-active macOS gesture/system event {} was dropped",
@@ -2481,6 +3744,8 @@ struct WindowsCaptureContext {
     quic_transport: quic_transport::TransportHandle,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
+    stop: Arc<AtomicBool>,
+    send_gate: Mutex<()>,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
     main_window_focused: Arc<AtomicBool>,
@@ -2514,9 +3779,14 @@ fn windows_capture_context() -> Option<Arc<WindowsCaptureContext>> {
 }
 
 #[cfg(target_os = "windows")]
-fn clear_windows_capture_context() {
+fn clear_windows_capture_context(expected: &Arc<WindowsCaptureContext>) {
     if let Ok(mut context) = WINDOWS_CAPTURE_CONTEXT.lock() {
-        *context = None;
+        if context
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            *context = None;
+        }
     }
 }
 
@@ -2665,6 +3935,7 @@ fn should_send_mouse_move(last_sent: &Mutex<Option<Instant>>, dragging: bool) ->
     true
 }
 
+#[cfg(target_os = "windows")]
 fn mark_mouse_move_sent(last_sent: &Mutex<Option<Instant>>) {
     if let Ok(mut last_sent) = last_sent.lock() {
         *last_sent = Some(Instant::now());
@@ -2675,10 +3946,6 @@ fn reset_mouse_move_timer(last_sent: &Mutex<Option<Instant>>) {
     if let Ok(mut last_sent) = last_sent.lock() {
         *last_sent = None;
     }
-}
-
-fn remote_button_is_down(mask: &AtomicU64) -> bool {
-    mask.load(Ordering::Relaxed) != 0
 }
 
 fn update_remote_button_mask(mask: &AtomicU64, button: MouseButton, down: bool) {
@@ -2692,6 +3959,68 @@ fn update_remote_button_mask(mask: &AtomicU64, button: MouseButton, down: bool) 
 
 fn reset_remote_button_mask(mask: &AtomicU64) {
     mask.store(0, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "windows")]
+fn physical_windows_modifiers() -> Vec<u16> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    // Query sided keys so two physically-held modifiers remain distinguishable.
+    [0xA0_u16, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C]
+        .into_iter()
+        .filter(|key_code| (unsafe { GetAsyncKeyState(i32::from(*key_code)) } as u16 & 0x8000) != 0)
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn sync_held_modifiers_windows(
+    context: &WindowsCaptureContext,
+    target: &InputTarget,
+) -> Option<u8> {
+    let physical = physical_windows_modifiers();
+    let forwarded = context
+        .pressed_keys
+        .lock()
+        .map(|pressed| pressed.clone())
+        .unwrap_or_default();
+
+    for event in reconcile_windows_modifier_events(&physical, &forwarded) {
+        let InputEvent::Key { key_code, down } = event else {
+            continue;
+        };
+        if !send_packet(
+            &context.quic_transport,
+            target,
+            InputEvent::Key { key_code, down },
+            &context.layout_state,
+            &context.input_events,
+        ) {
+            return None;
+        }
+        track_forwarded_key(&context.pressed_keys, key_code, down);
+    }
+    Some(modifier_mask_for_keys(&physical))
+}
+
+#[cfg(target_os = "macos")]
+fn sync_held_modifiers_macos(context: &MacCaptureContext, target: &InputTarget) {
+    let held = context
+        .pressed_modifiers
+        .lock()
+        .map(|modifiers| modifiers.clone())
+        .unwrap_or_default();
+    for key_code in held {
+        let _ = send_packet(
+            &context.quic_transport,
+            target,
+            InputEvent::Key {
+                key_code,
+                down: true,
+            },
+            &context.layout_state,
+            &context.input_events,
+        );
+    }
 }
 
 /// Sends button-up for every mouse button still marked down on the remote, then
@@ -2718,6 +4047,10 @@ fn release_remote_buttons(
                 InputEvent::MouseButton {
                     button,
                     down: false,
+                    screen_id: String::new(),
+                    x: None,
+                    y: None,
+                    sequence: next_mouse_sequence(),
                 },
                 layout_state,
                 input_events,
@@ -2748,9 +4081,9 @@ fn release_held_remote_inputs_macos(context: &MacCaptureContext, target: &InputT
             &context.input_events,
         );
     }
-    if let Ok(mut modifiers) = context.pressed_modifiers.lock() {
-        modifiers.clear();
-    }
+    // `pressed_modifiers` is the physical state cache. Keep it intact while
+    // returning local so re-entry before key release can re-send held modifiers;
+    // the next local FlagsChanged event refreshes it naturally.
     let held_keys = context
         .pressed_keys
         .lock()
@@ -2842,6 +4175,7 @@ fn set_clipboard_target(
     protocol_version: u16,
     cluster_id: String,
     pair_secret: String,
+    push_on_bind: bool,
     expires_in: Option<Duration>,
 ) {
     if let Ok(mut target) = target.lock() {
@@ -2852,6 +4186,7 @@ fn set_clipboard_target(
             protocol_version,
             cluster_id,
             pair_secret,
+            push_on_bind,
             expires_at: expires_in.map(|duration| Instant::now() + duration),
         });
     }
@@ -2886,6 +4221,7 @@ fn set_control_clipboard_target(
         device.protocol_version,
         layout.cluster_id.clone(),
         layout.pair_secret.clone(),
+        true,
         None,
     );
 }
@@ -2909,6 +4245,13 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
         .store(windows_tick_ms(), Ordering::Relaxed);
     if !cached_windows_input_desktop_is_default() {
         release_windows_remote_control(&context, true);
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    let _send_guard = context
+        .send_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if context.stop.load(Ordering::Relaxed) {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
@@ -2949,6 +4292,13 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
+    let _send_guard = context
+        .send_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if context.stop.load(Ordering::Relaxed) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
 
     let message = wparam as u32;
 
@@ -2967,16 +4317,43 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
         if down && windows_event_matches_screen_switch_hotkey(&context, key_code) {
             log::info!("screen switch hotkey returning to local from keyboard hook");
-            release_windows_remote_control(&context, false);
+            release_windows_remote_control_inner(&context, false);
             return 1;
         }
-        if send_packet(
-            &context.quic_transport,
-            &target,
-            InputEvent::Key { key_code, down },
-            &context.layout_state,
-            &context.input_events,
-        ) {
+        // Windows may consume the Win-key hook callback while still delivering
+        // the Arrow callback (shell shortcuts and keyboard utilities can do
+        // this). Reconcile the physical modifier state before the ordinary
+        // KeyDown so the reliable input queue always contains Win-down before
+        // Arrow-down. The target-layout remapper then turns Win into macOS
+        // Control according to the user's mapping.
+        let modifier_snapshot = if down && windows_modifier_family(key_code).is_none() {
+            let Some(mask) = sync_held_modifiers_windows(&context, &target) else {
+                return 1;
+            };
+            Some(mask)
+        } else {
+            None
+        };
+        let sent = if let Some(snapshot) = modifier_snapshot {
+            send_key_packet(
+                &context.quic_transport,
+                &target,
+                key_code,
+                down,
+                snapshot,
+                &context.layout_state,
+                &context.input_events,
+            )
+        } else {
+            send_packet(
+                &context.quic_transport,
+                &target,
+                InputEvent::Key { key_code, down },
+                &context.layout_state,
+                &context.input_events,
+            )
+        };
+        if sent {
             track_forwarded_key(&context.pressed_keys, key_code, down);
             return 1;
         }
@@ -3017,7 +4394,7 @@ fn windows_current_hotkey_modifiers() -> HotkeyModifiers {
 
 /// Remembers which keys we have forwarded as pressed so they can be released if
 /// the cursor returns to the local machine while a key is still held.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn track_forwarded_key(pressed: &Mutex<Vec<u16>>, key_code: u16, down: bool) {
     if let Ok(mut pressed) = pressed.lock() {
         if down {
@@ -3059,18 +4436,35 @@ fn release_forwarded_keys_windows(context: &WindowsCaptureContext, target: &Inpu
 
 #[cfg(target_os = "windows")]
 fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboard: bool) {
-    let target = context
+    let _send_guard = context
+        .send_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    release_windows_remote_control_inner(context, clear_clipboard);
+}
+
+#[cfg(target_os = "windows")]
+fn release_windows_remote_control_inner(context: &WindowsCaptureContext, clear_clipboard: bool) {
+    let active = context
         .active
         .lock()
         .ok()
-        .and_then(|mut active| active.take().map(|active| active.target));
+        .and_then(|mut active| active.take());
 
-    if let Some(target) = target {
-        release_forwarded_keys_windows(context, &target);
+    if let Some(active) = active {
+        release_forwarded_keys_windows(context, &active.target);
         release_remote_buttons(
             &context.quic_transport,
-            &target,
+            &active.target,
             &context.remote_button_mask,
+            &context.layout_state,
+            &context.input_events,
+        );
+        // Park last: it is the receiver's authoritative handoff boundary and
+        // must remain the final reliable mouse event after any synthetic Ups.
+        let _ = send_remote_cursor_park(
+            &context.quic_transport,
+            &active,
             &context.layout_state,
             &context.input_events,
         );
@@ -3094,6 +4488,34 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
     if clear_clipboard {
         clear_clipboard_target(&context.clipboard_target);
     }
+}
+
+/// Synchronously enqueue the final remote boundary before a runtime stop or
+/// process exit can tear down the QUIC transport. Capture-thread cleanup calls
+/// the same functions as a fallback, but this path runs while the transport is
+/// still known to be alive.
+pub fn release_active_remote_control() {
+    #[cfg(target_os = "macos")]
+    if let Some(context) = macos_capture_context() {
+        let _send_guard = context
+            .send_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        return_to_local_macos(&context);
+        context.remote_active.store(false, Ordering::Relaxed);
+        set_macos_cursor_decoupled(false);
+        set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+        show_macos_cursor_if_needed(&context);
+        clear_clipboard_target(&context.clipboard_target);
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(context) = windows_capture_context() {
+        release_windows_remote_control(&context, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    linux_input::release_active_remote_control();
 }
 
 #[cfg(target_os = "windows")]
@@ -3163,13 +4585,17 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         let dy = y - anchor.1;
 
         if dx.abs() < 0.1 && dy.abs() < 0.1 {
+            // This is the SetCursorPos anchor event, not user motion. Consume
+            // the one-shot guard here so the next real movement is never lost.
+            context.just_crossed.store(false, Ordering::Relaxed);
             return true;
         }
 
-        if context.just_crossed.swap(false, Ordering::Relaxed) {
-            // First real movement after crossing carries the flick's residual
-            // velocity; re-pin to the anchor and swallow it so the cursor stays
-            // at the entry edge instead of darting inward.
+        if context.just_crossed.swap(false, Ordering::Relaxed)
+            && should_ignore_initial_anchor_warp_delta(active_target.target.edge, dx, dy)
+        {
+            // Only suppress a synthetic delta that points straight back toward
+            // the entry edge. Forward genuine movement into the remote.
             set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
             return true;
         }
@@ -3180,15 +4606,6 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
             let point = local_return_point(active_target);
             let target = active_target.target.clone();
-            // Control is returning to the local machine: park the controlled
-            // cursor in a corner so it doesn't visibly linger at the shared edge.
-            let _ = send_remote_cursor_park(
-                &context.quic_transport,
-                active_target,
-                &context.layout_state,
-                &context.input_events,
-            );
-            *active = None;
             context.remote_active.store(false, Ordering::Relaxed);
             // Keep the clipboard peer so copies still sync after returning.
             release_forwarded_keys_windows(context, &target);
@@ -3199,6 +4616,15 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
                 &context.layout_state,
                 &context.input_events,
             );
+            // Park after all releases so no trailing ButtonUp can re-show the
+            // remote cursor or supersede this authoritative boundary.
+            let _ = send_remote_cursor_park(
+                &context.quic_transport,
+                active_target,
+                &context.layout_state,
+                &context.input_events,
+            );
+            *active = None;
             reset_mouse_move_timer(&context.last_mouse_move_sent);
             show_windows_cursor_if_needed(context);
             set_windows_cursor(point.0.round() as i32, point.1.round() as i32);
@@ -3214,11 +4640,13 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         active_target.y = active_target
             .y
             .clamp(0.0, (active_target.current_screen.height - 1) as f64);
-        let dragging = remote_button_is_down(&context.remote_button_mask);
+        let button_mask = context.remote_button_mask.load(Ordering::Relaxed);
+        let dragging = button_mask != 0;
         if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
-            if !send_remote_mouse_move(
+            if !send_remote_mouse_move_with_drag(
                 &context.quic_transport,
                 active_target,
+                button_mask,
                 &context.layout_state,
                 &context.input_events,
             ) {
@@ -3274,6 +4702,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         mark_mouse_move_sent(&context.last_mouse_move_sent);
         reset_remote_button_mask(&context.remote_button_mask);
         context.remote_active.store(true, Ordering::Relaxed);
+        let _ = sync_held_modifiers_windows(context, &active_target.target);
         set_control_clipboard_target(
             &context.clipboard_target,
             &active_target,
@@ -3314,20 +4743,22 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
         _ => return false,
     };
 
-    if !send_remote_mouse_move(
-        &context.quic_transport,
-        &active_target,
-        &context.layout_state,
-        &context.input_events,
-    ) {
+    let Some(modifier_snapshot) = sync_held_modifiers_windows(context, &active_target.target)
+    else {
         return false;
-    }
-    mark_mouse_move_sent(&context.last_mouse_move_sent);
-
-    let sent = send_packet(
+    };
+    let sent = send_packet_with_modifier_snapshot(
         &context.quic_transport,
         &active_target.target,
-        InputEvent::MouseButton { button, down },
+        InputEvent::MouseButton {
+            button,
+            down,
+            screen_id: active_target.current_screen_id.clone(),
+            x: Some(active_target.x.round() as i32),
+            y: Some(active_target.y.round() as i32),
+            sequence: next_mouse_sequence(),
+        },
+        Some(modifier_snapshot),
         &context.layout_state,
         &context.input_events,
     );
@@ -3358,20 +4789,19 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
         return false;
     };
 
-    if !send_remote_mouse_move(
-        &context.quic_transport,
-        &active_target,
-        &context.layout_state,
-        &context.input_events,
-    ) {
+    let Some(modifier_snapshot) = sync_held_modifiers_windows(context, &active_target.target)
+    else {
         return false;
-    }
-    mark_mouse_move_sent(&context.last_mouse_move_sent);
-
-    send_packet(
+    };
+    send_packet_with_modifier_snapshot(
         &context.quic_transport,
         &active_target.target,
-        InputEvent::Scroll { delta_x, delta_y },
+        InputEvent::Scroll {
+            delta_x,
+            delta_y,
+            sequence: next_mouse_sequence(),
+        },
+        Some(modifier_snapshot),
         &context.layout_state,
         &context.input_events,
     )
@@ -3435,21 +4865,20 @@ fn send_macos_mouse_button(
     active_target: &ActiveTarget,
     button: MouseButton,
     down: bool,
+    modifier_snapshot: u8,
 ) -> bool {
-    if !send_remote_mouse_move(
-        &context.quic_transport,
-        active_target,
-        &context.layout_state,
-        &context.input_events,
-    ) {
-        return false;
-    }
-    mark_mouse_move_sent(&context.last_mouse_move_sent);
-
-    let sent = send_packet(
+    let sent = send_packet_with_modifier_snapshot(
         &context.quic_transport,
         &active_target.target,
-        InputEvent::MouseButton { button, down },
+        InputEvent::MouseButton {
+            button,
+            down,
+            screen_id: active_target.current_screen_id.clone(),
+            x: Some(active_target.x.round() as i32),
+            y: Some(active_target.y.round() as i32),
+            sequence: next_mouse_sequence(),
+        },
+        Some(modifier_snapshot),
         &context.layout_state,
         &context.input_events,
     );
@@ -3481,6 +4910,14 @@ fn handle_macos_event(
         return CallbackResult::Keep;
     }
 
+    let _send_guard = context
+        .send_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if context.stop.load(Ordering::Relaxed) {
+        return CallbackResult::Keep;
+    }
+
     let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f64;
     let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64;
 
@@ -3503,45 +4940,65 @@ fn handle_macos_event(
     };
     drop(active);
     let target = active_target.target.clone();
+    let event_modifier_snapshot = modifier_mask_for_keys(&mac_modifier_vks(event));
 
     let sent = match event_type {
-        CGEventType::LeftMouseDown => {
-            send_macos_mouse_button(context, &active_target, MouseButton::Left, true)
-        }
-        CGEventType::LeftMouseUp => {
-            send_macos_mouse_button(context, &active_target, MouseButton::Left, false)
-        }
-        CGEventType::RightMouseDown => {
-            send_macos_mouse_button(context, &active_target, MouseButton::Right, true)
-        }
-        CGEventType::RightMouseUp => {
-            send_macos_mouse_button(context, &active_target, MouseButton::Right, false)
-        }
-        CGEventType::OtherMouseDown => {
-            send_macos_mouse_button(context, &active_target, MouseButton::Middle, true)
-        }
-        CGEventType::OtherMouseUp => {
-            send_macos_mouse_button(context, &active_target, MouseButton::Middle, false)
-        }
+        CGEventType::LeftMouseDown => send_macos_mouse_button(
+            context,
+            &active_target,
+            MouseButton::Left,
+            true,
+            event_modifier_snapshot,
+        ),
+        CGEventType::LeftMouseUp => send_macos_mouse_button(
+            context,
+            &active_target,
+            MouseButton::Left,
+            false,
+            event_modifier_snapshot,
+        ),
+        CGEventType::RightMouseDown => send_macos_mouse_button(
+            context,
+            &active_target,
+            MouseButton::Right,
+            true,
+            event_modifier_snapshot,
+        ),
+        CGEventType::RightMouseUp => send_macos_mouse_button(
+            context,
+            &active_target,
+            MouseButton::Right,
+            false,
+            event_modifier_snapshot,
+        ),
+        CGEventType::OtherMouseDown => send_macos_mouse_button(
+            context,
+            &active_target,
+            MouseButton::Middle,
+            true,
+            event_modifier_snapshot,
+        ),
+        CGEventType::OtherMouseUp => send_macos_mouse_button(
+            context,
+            &active_target,
+            MouseButton::Middle,
+            false,
+            event_modifier_snapshot,
+        ),
         CGEventType::ScrollWheel => {
             let delta_y =
                 event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as i32;
             let delta_x =
                 event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32;
-            if !send_remote_mouse_move(
-                &context.quic_transport,
-                &active_target,
-                &context.layout_state,
-                &context.input_events,
-            ) {
-                repin_macos_cursor_while_remote(context);
-                return CallbackResult::Drop;
-            }
-            mark_mouse_move_sent(&context.last_mouse_move_sent);
-            send_packet(
+            send_packet_with_modifier_snapshot(
                 &context.quic_transport,
                 &target,
-                InputEvent::Scroll { delta_x, delta_y },
+                InputEvent::Scroll {
+                    delta_x,
+                    delta_y,
+                    sequence: next_mouse_sequence(),
+                },
+                Some(event_modifier_snapshot),
                 &context.layout_state,
                 &context.input_events,
             )
@@ -3557,10 +5014,12 @@ fn handle_macos_event(
             let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
             if let Some(key_code) = mac_key_to_windows_vk(mac_code) {
                 let down = matches!(event_type, CGEventType::KeyDown);
-                let sent = send_packet(
+                let sent = send_key_packet(
                     &context.quic_transport,
                     &target,
-                    InputEvent::Key { key_code, down },
+                    key_code,
+                    down,
+                    modifier_mask_for_keys(&mac_modifier_vks(event)),
                     &context.layout_state,
                     &context.input_events,
                 );
@@ -3643,9 +5102,13 @@ fn handle_macos_mouse_move(
                 let point = local_return_point(active_target);
                 let invert_y = active_target.invert_y;
                 let target = active_target.target.clone();
-                // Control is returning to the local machine: park the controlled
-                // cursor in a corner so it doesn't visibly linger at the shared
-                // edge of the controlled (client) screen.
+                context.remote_active.store(false, Ordering::Relaxed);
+                context.just_crossed.store(false, Ordering::Relaxed);
+                context
+                    .suppress_next_mouse_delta
+                    .store(false, Ordering::Relaxed);
+                // Keep the clipboard peer so copies still sync after returning.
+                release_held_remote_inputs_macos(context, &target);
                 let _ = send_remote_cursor_park(
                     &context.quic_transport,
                     active_target,
@@ -3653,19 +5116,6 @@ fn handle_macos_mouse_move(
                     &context.input_events,
                 );
                 *active = None;
-                context.remote_active.store(false, Ordering::Relaxed);
-                context.just_crossed.store(false, Ordering::Relaxed);
-                context
-                    .suppress_next_mouse_delta
-                    .store(false, Ordering::Relaxed);
-                // Record the return instant so the crossing test can enforce a
-                // short cooldown — without it, landing flush on the edge (inset
-                // 0) would let a fast back-flick immediately re-cross.
-                if let Ok(mut last_return) = context.last_return.lock() {
-                    *last_return = Some(Instant::now());
-                }
-                // Keep the clipboard peer so copies still sync after returning.
-                release_held_remote_inputs_macos(context, &target);
                 reset_mouse_move_timer(&context.last_mouse_move_sent);
                 reset_cursor_repin_timer(context);
                 if let Ok(mut anchor) = context.anchor.lock() {
@@ -3694,11 +5144,13 @@ fn handle_macos_mouse_move(
             active_target.y = active_target
                 .y
                 .clamp(0.0, (active_target.current_screen.height - 1) as f64);
-            let dragging = remote_button_is_down(&context.remote_button_mask);
+            let button_mask = context.remote_button_mask.load(Ordering::Relaxed);
+            let dragging = button_mask != 0;
             if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
-                if !send_remote_mouse_move(
+                if !send_remote_mouse_move_with_drag(
                     &context.quic_transport,
                     active_target,
+                    button_mask,
                     &context.layout_state,
                     &context.input_events,
                 ) {
@@ -3712,9 +5164,6 @@ fn handle_macos_mouse_move(
                     reset_mouse_move_timer(&context.last_mouse_move_sent);
                     reset_cursor_repin_timer(context);
                     reset_remote_button_mask(&context.remote_button_mask);
-                    if let Ok(mut modifiers) = context.pressed_modifiers.lock() {
-                        modifiers.clear();
-                    }
                     if let Ok(mut anchor) = context.anchor.lock() {
                         *anchor = None;
                     }
@@ -3736,17 +5185,6 @@ fn handle_macos_mouse_move(
     }
 
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
-    // Return cooldown: the cursor now lands flush on the edge (inset 0) on
-    // return, so without this gate a fast back-flick immediately re-satisfies
-    // the crossing test and bounces into the remote. Ignore crossings for a
-    // short window after returning so the user's slide settles locally.
-    if let Ok(last_return) = context.last_return.lock() {
-        if let Some(when) = *last_return {
-            if when.elapsed() < Duration::from_millis(RETURN_COOLDOWN_MS) {
-                return CallbackResult::Keep;
-            }
-        }
-    }
     if let Some(active_target) =
         mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
     {
@@ -3787,6 +5225,7 @@ fn handle_macos_mouse_move(
         reset_cursor_repin_timer(context);
         reset_remote_button_mask(&context.remote_button_mask);
         context.remote_active.store(true, Ordering::Relaxed);
+        sync_held_modifiers_macos(context, &active_target.target);
         set_control_clipboard_target(
             &context.clipboard_target,
             &active_target,
@@ -4100,10 +5539,22 @@ fn point_in_screen(screen: &Screen, global_x: f64, global_y: f64) -> bool {
 /// return-to-local test, applied to the entry screen.
 fn exited_entry_edge(edge: Edge, screen: &Screen, x: f64, y: f64, dx: f64, dy: f64) -> bool {
     match edge {
-        Edge::Right => x <= 0.0 && dx < 0.0,
-        Edge::Left => x >= (screen.width - 1) as f64 && dx > 0.0,
-        Edge::Bottom => y <= 0.0 && dy < 0.0,
-        Edge::Top => y >= (screen.height - 1) as f64 && dy > 0.0,
+        Edge::Right => {
+            x <= 0.0 && dx <= -MIN_CROSSING_DELTA && dx.abs() >= dy.abs() * RETURN_AXIS_DOMINANCE
+        }
+        Edge::Left => {
+            x >= (screen.width - 1) as f64
+                && dx >= MIN_CROSSING_DELTA
+                && dx.abs() >= dy.abs() * RETURN_AXIS_DOMINANCE
+        }
+        Edge::Bottom => {
+            y <= 0.0 && dy <= -MIN_CROSSING_DELTA && dy.abs() >= dx.abs() * RETURN_AXIS_DOMINANCE
+        }
+        Edge::Top => {
+            y >= (screen.height - 1) as f64
+                && dy >= MIN_CROSSING_DELTA
+                && dy.abs() >= dx.abs() * RETURN_AXIS_DOMINANCE
+        }
     }
 }
 
@@ -4156,10 +5607,8 @@ fn local_return_point(active: &ActiveTarget) -> (f64, f64) {
     let native_x = local.x as f64 + ratio_x * local.width.max(1) as f64;
     let native_y = local.y as f64 + ratio_y * local.height.max(1) as f64;
 
-    // Land the cursor flush on the entry edge (RETURN_EDGE_INSET=0) for a
-    // seamless extended-display feel. A fast back-flick can no longer bounce
-    // straight back into the remote because the crossing test is gated by a
-    // time-based cooldown (RETURN_COOLDOWN_MS), not by inset distance.
+    // Land just inside the entry edge. This is the spatial re-arm that prevents
+    // an immediate bounce without imposing any time-based input freeze.
     let inset = RETURN_EDGE_INSET.min((local.width.max(1) - 1) as f64 / 2.0);
     let inset_v = RETURN_EDGE_INSET.min((local.height.max(1) - 1) as f64 / 2.0);
     match active.target.edge {
@@ -4205,6 +5654,17 @@ fn send_remote_mouse_move(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    send_remote_mouse_move_with_drag(quic_transport, active, 0, layout_state, input_events)
+}
+
+fn send_remote_mouse_move_with_drag(
+    quic_transport: &quic_transport::TransportHandle,
+    active: &ActiveTarget,
+    button_mask: u64,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
+    let drag_button = button_from_mask(button_mask);
     send_packet(
         quic_transport,
         &active.target,
@@ -4212,6 +5672,9 @@ fn send_remote_mouse_move(
             screen_id: active.current_screen_id.clone(),
             x: active.x.round() as i32,
             y: active.y.round() as i32,
+            drag_button,
+            button_mask: Some(button_mask),
+            sequence: next_mouse_sequence(),
         },
         layout_state,
         input_events,
@@ -4252,6 +5715,7 @@ fn send_remote_cursor_park(
             screen_id: active.current_screen_id.clone(),
             x: park_x,
             y: park_y,
+            sequence: next_mouse_sequence(),
         },
         layout_state,
         input_events,
@@ -4297,6 +5761,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
     reset_cursor_repin_timer(context);
     reset_remote_button_mask(&context.remote_button_mask);
     context.remote_active.store(true, Ordering::Relaxed);
+    sync_held_modifiers_macos(context, &active_target.target);
     set_control_clipboard_target(
         &context.clipboard_target,
         &active_target,
@@ -4335,21 +5800,18 @@ fn return_to_local_macos(context: &MacCaptureContext) {
     let point = local_hotkey_return_point(&active_target, recorded_point);
     let invert_y = active_target.invert_y;
     let target = active_target.target.clone();
+    context.remote_active.store(false, Ordering::Relaxed);
+    context.just_crossed.store(false, Ordering::Relaxed);
+    context
+        .suppress_next_mouse_delta
+        .store(false, Ordering::Relaxed);
+    release_held_remote_inputs_macos(context, &target);
     let _ = send_remote_cursor_park(
         &context.quic_transport,
         &active_target,
         &context.layout_state,
         &context.input_events,
     );
-    context.remote_active.store(false, Ordering::Relaxed);
-    context.just_crossed.store(false, Ordering::Relaxed);
-    context
-        .suppress_next_mouse_delta
-        .store(false, Ordering::Relaxed);
-    if let Ok(mut last_return) = context.last_return.lock() {
-        *last_return = Some(Instant::now());
-    }
-    release_held_remote_inputs_macos(context, &target);
     reset_mouse_move_timer(&context.last_mouse_move_sent);
     reset_cursor_repin_timer(context);
     if let Ok(mut anchor) = context.anchor.lock() {
@@ -4495,6 +5957,7 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
                 &context.input_events,
             ) {
                 context.remote_active.store(true, Ordering::Relaxed);
+                let _ = sync_held_modifiers_windows(context, &active_target.target);
                 set_control_clipboard_target(
                     &context.clipboard_target,
                     &active_target,
@@ -4517,7 +5980,8 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         }
         SwitchOutcome::Return => {
             log::info!("screen switch returning to local");
-            release_windows_remote_control(context, false);
+            // The capture-loop caller already holds send_gate.
+            release_windows_remote_control_inner(context, false);
         }
         SwitchOutcome::LocalMove {
             from_screen_id,
@@ -4736,7 +6200,7 @@ fn set_macos_cursor_transparent_current() {
 #[cfg(target_os = "macos")]
 fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
     use std::ffi::c_void;
-    use std::os::raw::{c_char, c_double};
+    use std::os::raw::c_char;
 
     #[link(name = "objc")]
     extern "C" {
@@ -4745,22 +6209,17 @@ fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
         fn objc_msgSend();
     }
 
-    // A 16x16 fully-transparent RGBA bitmap. NSImage created from this paints
-    // nothing, so the cursor is visually absent without a hide/show call.
-    const SIZE: usize = 16;
-    static TRANSPARENT_BYTES: [u8; SIZE * SIZE * 4] = [0; SIZE * SIZE * 4];
-
     unsafe {
         let nscursor = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
-        let nsimage = objc_getClass(b"NSImage\0".as_ptr() as *const c_char);
-        let nsdata = objc_getClass(b"NSData\0".as_ptr() as *const c_char);
-        let nssize = objc_getClass(b"NSSize\0".as_ptr() as *const c_char);
-        if nscursor.is_null() || nsimage.is_null() || nsdata.is_null() || nssize.is_null() {
+        if nscursor.is_null() {
             return;
         }
 
         if !transparent {
-            // Pop our transparent cursor to restore the previous cursor image.
+            // Never pop unless this process actually pushed the cached cursor.
+            if !MACOS_TRANSPARENT_CURSOR_PUSHED.swap(false, Ordering::Relaxed) {
+                return;
+            }
             let pop_sel = sel_registerName(b"pop\0".as_ptr() as *const c_char);
             let pop: extern "C" fn(*mut c_void, *mut c_void) =
                 std::mem::transmute(objc_msgSend as *const ());
@@ -4768,59 +6227,18 @@ fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
             return;
         }
 
-        // NSData dataWithBytes:length:
-        let data_sel = sel_registerName(b"dataWithBytes:length:\0".as_ptr() as *const c_char);
-        let data_with: extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as *const ());
-        let data = data_with(
-            nsdata,
-            data_sel,
-            TRANSPARENT_BYTES.as_ptr(),
-            TRANSPARENT_BYTES.len(),
-        );
-        if data.is_null() {
+        let Some(cursor) = macos_transparent_cursor() else {
+            return;
+        };
+
+        let first_push = push
+            && MACOS_TRANSPARENT_CURSOR_PUSHED
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        if !first_push && !MACOS_TRANSPARENT_CURSOR_PUSHED.load(Ordering::Relaxed) {
             return;
         }
-
-        // NSImage initWithData:
-        let alloc_sel = sel_registerName(b"alloc\0".as_ptr() as *const c_char);
-        let init_sel = sel_registerName(b"initWithData:\0".as_ptr() as *const c_char);
-        let alloc: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as *const ());
-        let init: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as *const ());
-        let image_obj = alloc(nsimage, alloc_sel);
-        let image = init(image_obj, init_sel, data);
-        if image.is_null() {
-            return;
-        }
-
-        // NSSize { width, height } value type, laid out as two doubles.
-        let size_sel = sel_registerName(b"setSize:\0".as_ptr() as *const c_char);
-        let set_size: extern "C" fn(*mut c_void, *mut c_void, c_double, c_double) =
-            std::mem::transmute(objc_msgSend as *const ());
-        set_size(image, size_sel, SIZE as c_double, SIZE as c_double);
-
-        // NSCursor initWithImage:hotSpot: — hot spot at (0,0), anywhere is fine
-        // since the cursor is invisible. hotSpot is an NSPoint (two CGFloats),
-        // passed by value; on arm64 that lands in the float argument registers as
-        // two doubles after the object-pointer argument.
-        let cursor_init_sel =
-            sel_registerName(b"initWithImage:hotSpot:\0".as_ptr() as *const c_char);
-        let cursor_init: extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            c_double,
-            c_double,
-        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
-        let cursor_obj = alloc(nscursor, alloc_sel);
-        let cursor = cursor_init(cursor_obj, cursor_init_sel, image, 0.0, 0.0);
-        if cursor.is_null() {
-            return;
-        }
-
-        let apply_sel = if push {
+        let apply_sel = if first_push {
             sel_registerName(b"push\0".as_ptr() as *const c_char)
         } else {
             sel_registerName(b"set\0".as_ptr() as *const c_char)
@@ -4832,12 +6250,88 @@ fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
 }
 
 #[cfg(target_os = "macos")]
+static MACOS_TRANSPARENT_CURSOR_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// PNG signature + 1x1 RGBA IHDR + zlib-compressed filter byte and transparent
+/// pixel. Keep this outside the AppKit constructor so the unit test can decode
+/// the exact bytes passed to `NSImage initWithData:`.
+#[cfg(target_os = "macos")]
+const MACOS_TRANSPARENT_PNG: [u8; 68] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60, 0x00, 0x02, 0x00,
+    0x00, 0x05, 0x00, 0x01, 0xe9, 0xfa, 0xdc, 0xd8, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
+
+#[cfg(target_os = "macos")]
+fn macos_transparent_cursor() -> Option<*mut std::ffi::c_void> {
+    use std::ffi::c_void;
+    use std::os::raw::{c_char, c_double};
+
+    static CURSOR: OnceLock<usize> = OnceLock::new();
+
+    let cursor = *CURSOR.get_or_init(|| unsafe {
+        #[link(name = "objc")]
+        extern "C" {
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+
+        let nscursor = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
+        let nsimage = objc_getClass(b"NSImage\0".as_ptr() as *const c_char);
+        let nsdata = objc_getClass(b"NSData\0".as_ptr() as *const c_char);
+        if nscursor.is_null() || nsimage.is_null() || nsdata.is_null() {
+            return 0;
+        }
+
+        let data_sel = sel_registerName(b"dataWithBytes:length:\0".as_ptr() as *const c_char);
+        let data_with: extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let data = data_with(
+            nsdata,
+            data_sel,
+            MACOS_TRANSPARENT_PNG.as_ptr(),
+            MACOS_TRANSPARENT_PNG.len(),
+        );
+        if data.is_null() {
+            return 0;
+        }
+
+        let alloc_sel = sel_registerName(b"alloc\0".as_ptr() as *const c_char);
+        let alloc: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let init_image_sel = sel_registerName(b"initWithData:\0".as_ptr() as *const c_char);
+        let init_image: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let image = init_image(alloc(nsimage, alloc_sel), init_image_sel, data);
+        if image.is_null() {
+            return 0;
+        }
+
+        let init_cursor_sel =
+            sel_registerName(b"initWithImage:hotSpot:\0".as_ptr() as *const c_char);
+        let init_cursor: extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            c_double,
+            c_double,
+        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+        init_cursor(alloc(nscursor, alloc_sel), init_cursor_sel, image, 0.0, 0.0) as usize
+    });
+
+    (cursor != 0).then_some(cursor as *mut c_void)
+}
+
+#[cfg(target_os = "macos")]
 fn repin_macos_cursor_if_drifted(
     context: &MacCaptureContext,
     location: core_graphics::geometry::CGPoint,
 ) -> bool {
-    const DRIFT_THRESHOLD_PX: f64 = 1.5;
-    const REPIN_INTERVAL_MS: u64 = 8;
+    let (drift_threshold_px, repin_interval_ms) =
+        macos_cursor_repin_policy(context.main_window_visible.load(Ordering::Relaxed));
 
     let Ok(anchor) = context.anchor.lock() else {
         return false;
@@ -4849,11 +6343,11 @@ fn repin_macos_cursor_if_drifted(
 
     let dx = location.x - x;
     let dy = location.y - y;
-    if dx.abs() <= DRIFT_THRESHOLD_PX && dy.abs() <= DRIFT_THRESHOLD_PX {
+    if dx.abs() <= drift_threshold_px && dy.abs() <= drift_threshold_px {
         return false;
     }
 
-    if !macos_cursor_repin_due(context, Duration::from_millis(REPIN_INTERVAL_MS)) {
+    if !macos_cursor_repin_due(context, Duration::from_millis(repin_interval_ms)) {
         return false;
     }
 
@@ -4863,6 +6357,18 @@ fn repin_macos_cursor_if_drifted(
     set_macos_cursor_decoupled(true);
     move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
     true
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cursor_repin_policy(main_window_visible: bool) -> (f64, u64) {
+    if main_window_visible {
+        (1.5, 8)
+    } else {
+        // A hidden/background app can observe tiny WindowServer cursor drift
+        // continuously. Re-warping for every 1-2px wobble creates the visible
+        // edge hitch; only correct meaningful drift and cap it at 20Hz.
+        (48.0, 50)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4944,10 +6450,12 @@ fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext, transparent_
     *last_reassert = Some(now);
     drop(last_reassert);
 
-    // SetsCursorInBackground is armed once in hide_macos_cursor_if_needed; do not
-    // re-set it here — re-setting the connection property repaints the cursor.
-    set_macos_cursor_transparent_current();
-    push_macos_cursor_hide(context);
+    // SetsCursorInBackground and the global hide counter are armed exactly once
+    // in hide_macos_cursor_if_needed. Reassert only the cached cursor image;
+    // repeatedly pushing hide layers made return latency grow with session time.
+    if !transparent_now {
+        set_macos_cursor_transparent_current();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5545,10 +7053,144 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct MacClickDown {
+    button: MouseButton,
+    x: i32,
+    y: i32,
+    at: Instant,
+    count: u8,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacClickTracker {
+    last_down: Option<MacClickDown>,
+    pressed: [Option<MacClickDown>; 3],
+}
+
+#[cfg(target_os = "macos")]
+impl MacClickTracker {
+    const MAX_DISTANCE_PX: i32 = 8;
+
+    fn event_count(
+        &mut self,
+        button: MouseButton,
+        down: bool,
+        x: i32,
+        y: i32,
+        now: Instant,
+        double_click_interval: Duration,
+    ) -> i64 {
+        let index = match button {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            MouseButton::Middle => 2,
+        };
+
+        if down {
+            let count = self
+                .last_down
+                .filter(|last| {
+                    last.button == button
+                        && now.saturating_duration_since(last.at) <= double_click_interval
+                        && click_points_are_near(last.x, last.y, x, y, Self::MAX_DISTANCE_PX)
+                })
+                .map(|last| last.count.saturating_add(1).min(3))
+                .unwrap_or(1);
+            let click = MacClickDown {
+                button,
+                x,
+                y,
+                at: now,
+                count,
+            };
+            self.last_down = Some(click);
+            self.pressed[index] = Some(click);
+            return i64::from(count);
+        }
+
+        let Some(click) = self.pressed[index].take() else {
+            return 0;
+        };
+        if click_points_are_near(click.x, click.y, x, y, Self::MAX_DISTANCE_PX) {
+            i64::from(click.count)
+        } else {
+            self.last_down = None;
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn click_points_are_near(x1: i32, y1: i32, x2: i32, y2: i32, max_distance: i32) -> bool {
+    let dx = i64::from(x1) - i64::from(x2);
+    let dy = i64::from(y1) - i64::from(y2);
+    let max = i64::from(max_distance);
+    dx * dx + dy * dy <= max * max
+}
+
+#[cfg(target_os = "macos")]
+fn macos_double_click_interval() -> Duration {
+    static INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        use std::ffi::c_void;
+        use std::os::raw::c_char;
+
+        #[link(name = "objc")]
+        extern "C" {
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+
+        let seconds = unsafe {
+            let class = objc_getClass(b"NSEvent\0".as_ptr() as *const c_char);
+            if class.is_null() {
+                0.5
+            } else {
+                let selector = sel_registerName(b"doubleClickInterval\0".as_ptr() as *const c_char);
+                let get_interval: extern "C" fn(*mut c_void, *mut c_void) -> f64 =
+                    std::mem::transmute(objc_msgSend as *const ());
+                get_interval(class, selector)
+            }
+        };
+        Duration::from_secs_f64(if seconds.is_finite() && (0.1..=2.0).contains(&seconds) {
+            seconds
+        } else {
+            0.5
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_click_state(button: MouseButton, down: bool, x: i32, y: i32) -> i64 {
+    macos_click_tracker()
+        .lock()
+        .map(|mut tracker| {
+            tracker.event_count(
+                button,
+                down,
+                x,
+                y,
+                Instant::now(),
+                macos_double_click_interval(),
+            )
+        })
+        .unwrap_or(if down { 1 } else { 0 })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_click_tracker() -> &'static Mutex<MacClickTracker> {
+    static TRACKER: OnceLock<Mutex<MacClickTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(MacClickTracker::default()))
+}
+
+#[cfg(target_os = "macos")]
 fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     use core_graphics::{
         display::CGDisplay,
-        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton},
+        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
@@ -5569,6 +7211,10 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     let _ = CGDisplay::warp_mouse_cursor_position(point);
 
     if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
+        event.set_integer_value_field(
+            EventField::MOUSE_EVENT_CLICK_STATE,
+            macos_click_state(button, down, x, y),
+        );
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -5590,20 +7236,140 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
     }
 }
 
-/// Held modifier flags to stamp on injected macOS events. Posting a bare
+/// Held keys and modifier flags for injected macOS events. Posting a bare
 /// modifier *keycode* does not make the window server apply that modifier to the
 /// key events posted after it, so capitals, shifted symbols and every shortcut
-/// (including the Ctrl<->Cmd remap) silently failed. We instead track the
-/// modifier key-downs/ups we inject and set the matching CGEventFlags on each
-/// event.
+/// (including the Ctrl<->Cmd remap) silently failed. Tracking every key also lets
+/// an origin/park/runtime reset post the missing Up for an ordinary key after a
+/// controller disappears mid-press.
 #[cfg(target_os = "macos")]
 static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static MAC_INJECT_KEY_LOCK: Mutex<()> = Mutex::new(());
 
-/// Clears the tracked injected-modifier flags. Called when receiving stops so a
-/// dropped modifier key-up cannot leave Shift/Ctrl/Cmd stuck on for later keys.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacInjectedKeyState {
+    pressed_keys: Vec<u16>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacInjectedKeyTransition {
+    tracked_flags: u64,
+    device_flags: u32,
+    should_post: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacInjectedKeyState {
+    fn transition(
+        &mut self,
+        key_code: u16,
+        down: bool,
+        is_modifier: bool,
+    ) -> MacInjectedKeyTransition {
+        let tracked_key = if is_modifier {
+            normalize_macos_injected_modifier_vk(key_code)
+        } else {
+            key_code
+        };
+        let tracked_key = if is_modifier && !down && !self.pressed_keys.contains(&tracked_key) {
+            let family = modifier_mask_for_key(tracked_key);
+            let mut held_family = self
+                .pressed_keys
+                .iter()
+                .copied()
+                .filter(|pressed| modifier_mask_for_key(*pressed) == family);
+            match (held_family.next(), held_family.next()) {
+                // A snapshot may synthesize the canonical left key while the
+                // real Up later arrives as the right-side VK. If there is one
+                // unambiguous held member, release that family member.
+                (Some(held), None) => held,
+                _ => tracked_key,
+            }
+        } else {
+            tracked_key
+        };
+        let already_pressed = self.pressed_keys.contains(&tracked_key);
+        if down && !already_pressed {
+            self.pressed_keys.push(tracked_key);
+        } else if !down && already_pressed {
+            self.pressed_keys.retain(|pressed| *pressed != tracked_key);
+        }
+
+        let tracked_flags = self
+            .pressed_keys
+            .iter()
+            .filter_map(|pressed| windows_vk_to_mac_flag(*pressed))
+            .fold(0, |flags, flag| flags | flag);
+        let device_flags = self
+            .pressed_keys
+            .iter()
+            .filter_map(|pressed| windows_vk_to_mac_device_flag(*pressed))
+            .fold(0, |flags, flag| flags | flag);
+        MacInjectedKeyTransition {
+            tracked_flags,
+            device_flags,
+            // Ordinary repeated KeyDown events carry native key repeat and must
+            // still be posted. A modifier Up is also always posted: it is an
+            // idempotent repair when the matching Down was tracked under a
+            // generic/sided alias or WindowServer retained stale global flags.
+            should_post: !is_modifier || !down || !already_pressed,
+        }
+    }
+
+    fn pressed_keys(&self) -> &[u16] {
+        &self.pressed_keys
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_injected_modifier_vk(key_code: u16) -> u16 {
+    match key_code {
+        0x10 => 0xA0,
+        0x11 => 0xA2,
+        0x12 => 0xA4,
+        _ => key_code,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_injected_key_state() -> &'static Mutex<MacInjectedKeyState> {
+    static STATE: OnceLock<Mutex<MacInjectedKeyState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(MacInjectedKeyState::default()))
+}
+
+/// Releases and clears every tracked injected key. Clearing Rust bookkeeping
+/// alone is insufficient: WindowServer keeps a synthetic key latched until it
+/// receives the matching key-up event.
+#[cfg(target_os = "macos")]
+fn reset_injected_keys() {
+    let _inject_guard = MAC_INJECT_KEY_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let pressed = macos_injected_key_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .pressed_keys()
+        .to_vec();
+    // Release in reverse press order: for Ctrl+A this posts A-up while Control
+    // is still held, then the final Control-up, matching a physical keyboard.
+    for key_code in pressed.into_iter().rev() {
+        inject_key_inner(key_code, false);
+    }
+    MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
+    *macos_injected_key_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = MacInjectedKeyState::default();
+}
+
 #[cfg(target_os = "macos")]
 pub fn reset_injected_modifiers() {
-    MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
+    reset_injected_keys();
+    *macos_click_tracker()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = MacClickTracker::default();
 }
 
 /// Switch to the next enabled keyboard input source, replicating the user's
@@ -5708,7 +7474,9 @@ fn macos_do_switch_input_source() {
             log::info!("[diag] caps: no opposite-ASCII selectable keyboard (current_ascii={current_ascii}, count={count})");
         } else {
             let result = TISSelectInputSource(target);
-            log::info!("[diag] caps: toggled input source (was_ascii={current_ascii}, TISSelect={result})");
+            log::info!(
+                "[diag] caps: toggled input source (was_ascii={current_ascii}, TISSelect={result})"
+            );
         }
 
         CFRelease(current);
@@ -5716,9 +7484,49 @@ fn macos_do_switch_input_source() {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn reset_injected_keys() {
+    release_windows_injected_keys_both_routes();
+}
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub fn reset_injected_modifiers() {
+    let mut route_state = windows_input_route_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    release_windows_injected_inputs_both_routes();
+    route_state.clear();
+}
+
+#[cfg(target_os = "linux")]
+fn reset_injected_keys() {
+    linux_input::reset_injected_keys();
+}
+
+#[cfg(target_os = "linux")]
+pub fn reset_injected_modifiers() {
+    linux_input::reset_injected_inputs();
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn reset_injected_keys() {}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn reset_injected_modifiers() {}
+
+fn reconcile_non_key_injected_modifier_snapshot(mask: Option<u8>) {
+    let Some(mask) = mask else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    reconcile_macos_injected_modifier_snapshot(mask);
+    #[cfg(target_os = "windows")]
+    reconcile_windows_injected_modifier_snapshot(Some(mask));
+    #[cfg(target_os = "linux")]
+    linux_input::reconcile_injected_modifier_snapshot(mask);
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let _ = mask;
+}
 
 /// Maps a Windows virtual-key modifier (the wire format) to its macOS event
 /// flag bits, or `None` for non-modifier keys.
@@ -5735,8 +7543,224 @@ fn windows_vk_to_mac_flag(vk: u16) -> Option<u64> {
     Some(flag.bits())
 }
 
+/// Device-dependent bits are required on NX_FLAGSCHANGED events. Without them,
+/// WindowServer can show Control in a Quartz event while Mission Control and
+/// Spaces still ignore the synthetic modifier.
+#[cfg(target_os = "macos")]
+fn windows_vk_to_mac_device_flag(vk: u16) -> Option<u32> {
+    match vk {
+        0x10 | 0xA0 => Some(0x0000_0002), // left Shift
+        0xA1 => Some(0x0000_0004),        // right Shift
+        0x11 | 0xA2 => Some(0x0000_0001), // left Control
+        0xA3 => Some(0x0000_2000),        // right Control
+        0x12 | 0xA4 => Some(0x0000_0020), // left Option
+        0xA5 => Some(0x0000_0040),        // right Option
+        0x5B => Some(0x0000_0008),        // left Command
+        0x5C => Some(0x0000_0010),        // right Command
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn update_macos_injected_key(
+    key_code: u16,
+    down: bool,
+    is_modifier: bool,
+) -> MacInjectedKeyTransition {
+    let transition = macos_injected_key_state()
+        .lock()
+        .map(|mut state| state.transition(key_code, down, is_modifier))
+        .unwrap_or(MacInjectedKeyTransition {
+            tracked_flags: MAC_INJECT_FLAGS.load(Ordering::Relaxed),
+            device_flags: 0,
+            should_post: true,
+        });
+    MAC_INJECT_FLAGS.store(transition.tracked_flags, Ordering::Relaxed);
+    transition
+}
+
+#[cfg(target_os = "macos")]
+fn merged_macos_event_flags(intrinsic: u64, tracked_modifiers: u64) -> u64 {
+    intrinsic | tracked_modifiers
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacHidKeyEventPlan {
+    event_type: u32,
+    key_code: u16,
+    event_flags: u32,
+    options: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_hid_key_event_plan(
+    key_code: u16,
+    down: bool,
+    is_modifier: bool,
+    tracked_flags: u64,
+    device_flags: u32,
+) -> MacHidKeyEventPlan {
+    if is_modifier {
+        MacHidKeyEventPlan {
+            event_type: 12, // NX_FLAGSCHANGED
+            key_code,
+            event_flags: tracked_flags as u32 | device_flags,
+            options: 1, // kIOHIDSetGlobalEventFlags
+        }
+    } else {
+        MacHidKeyEventPlan {
+            event_type: if down { 10 } else { 11 }, // NX_KEYDOWN / NX_KEYUP
+            key_code,
+            // IOHID applies the global state established by FLAGSCHANGED. This
+            // mirrors a real keyboard and is what system shortcuts consume.
+            event_flags: 0,
+            options: 0,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Debug, Default)]
+struct MacNxKeyEventData {
+    orig_char_set: u16,
+    repeat: i16,
+    char_set: u16,
+    char_code: u16,
+    key_code: u16,
+    orig_char_code: u16,
+    reserved1: i32,
+    keyboard_type: u32,
+    reserved2: i32,
+    reserved3: i32,
+    reserved4: i32,
+    reserved5: [i32; 4],
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct MacIoGPoint {
+    x: i16,
+    y: i16,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOServiceMatching(name: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+    fn IOServiceGetMatchingService(main_port: u32, matching: *mut std::ffi::c_void) -> u32;
+    fn IOServiceOpen(service: u32, owning_task: u32, kind: u32, connect: *mut u32) -> i32;
+    fn IOObjectRelease(object: u32) -> i32;
+    fn IOHIDPostEvent(
+        connect: u32,
+        event_type: u32,
+        location: MacIoGPoint,
+        event_data: *const MacNxKeyEventData,
+        event_data_version: u32,
+        event_flags: u32,
+        options: u32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    static mach_task_self_: u32;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_iohid_connection() -> Option<u32> {
+    static CONNECTION: OnceLock<Option<u32>> = OnceLock::new();
+    *CONNECTION.get_or_init(|| unsafe {
+        let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
+        if matching.is_null() {
+            return None;
+        }
+        // kIOMainPortDefault is the null Mach port. The matching dictionary is
+        // consumed by IOServiceGetMatchingService.
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            return None;
+        }
+        let mut connection = 0;
+        let result = IOServiceOpen(service, mach_task_self_, 1, &mut connection);
+        let _ = IOObjectRelease(service);
+        (result == 0 && connection != 0).then_some(connection)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn post_macos_hid_key_event(plan: MacHidKeyEventPlan) -> bool {
+    let Some(connection) = macos_iohid_connection() else {
+        return false;
+    };
+    let event = MacNxKeyEventData {
+        key_code: plan.key_code,
+        ..MacNxKeyEventData::default()
+    };
+    unsafe {
+        IOHIDPostEvent(
+            connection,
+            plan.event_type,
+            MacIoGPoint::default(),
+            &event,
+            2, // kNXEventDataVersion
+            plan.event_flags,
+            plan.options,
+        ) == 0
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn inject_key(key_code: u16, down: bool) {
+    inject_macos_key_with_modifier_snapshot(key_code, down, None);
+}
+
+#[cfg(target_os = "macos")]
+fn inject_macos_key_with_modifier_snapshot(key_code: u16, down: bool, modifier_mask: Option<u8>) {
+    let _inject_guard = MAC_INJECT_KEY_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if modifier_mask_for_key(key_code).is_some() {
+        inject_key_inner(key_code, down);
+        if let Some(mask) = modifier_mask {
+            reconcile_macos_injected_modifier_snapshot_inner(mask);
+        }
+        return;
+    }
+    if let Some(mask) = modifier_mask {
+        reconcile_macos_injected_modifier_snapshot_inner(mask);
+    }
+    inject_key_inner(key_code, down);
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_macos_injected_modifier_snapshot_inner(mask: u8) {
+    let pressed = macos_injected_key_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .pressed_keys()
+        .to_vec();
+    let repairs = modifier_snapshot_transitions(&pressed, mask);
+    if !repairs.is_empty() {
+        log::info!("reconciled remote macOS modifiers from snapshot mask={mask:#04x}: {repairs:?}");
+    }
+    for (modifier, modifier_down) in repairs {
+        inject_key_inner(modifier, modifier_down);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_macos_injected_modifier_snapshot(mask: u8) {
+    let _inject_guard = MAC_INJECT_KEY_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    reconcile_macos_injected_modifier_snapshot_inner(mask);
+}
+
+#[cfg(target_os = "macos")]
+fn inject_key_inner(key_code: u16, down: bool) {
     use core_graphics::{
         event::{CGEvent, CGEventFlags, CGEventTapLocation},
         event_source::{CGEventSource, CGEventSourceStateID},
@@ -5753,35 +7777,51 @@ fn inject_key(key_code: u16, down: bool) {
         return;
     }
 
-    // Keep the running modifier state in sync, so the modifier event itself and
-    // every later key carry the right flags.
-    if let Some(flag) = windows_vk_to_mac_flag(key_code) {
-        let mut flags = MAC_INJECT_FLAGS.load(Ordering::Relaxed);
-        if down {
-            flags |= flag;
-        } else {
-            flags &= !flag;
-        }
-        MAC_INJECT_FLAGS.store(flags, Ordering::Relaxed);
-    }
-
     let Some(mac_code) = windows_vk_to_mac_key(key_code) else {
         log::debug!("inject_key: no mac keycode for windows vk {key_code:#04x}; dropping");
         return;
     };
-    log::info!(
+    let is_modifier = windows_vk_to_mac_flag(key_code).is_some();
+    // Track ordinary keys as well as modifiers so ReleaseAll can repair a lost
+    // KeyUp. Repeated ordinary KeyDowns are still posted for native key repeat;
+    // duplicate modifier transitions are suppressed.
+    let transition = update_macos_injected_key(key_code, down, is_modifier);
+    if !transition.should_post {
+        return;
+    }
+    let tracked_flags = transition.tracked_flags;
+    let fallback_flags = tracked_flags | u64::from(transition.device_flags);
+    log::debug!(
         "[diag] inject key vk={key_code:#04x} down={down} mac={mac_code} flags={:#x}",
-        MAC_INJECT_FLAGS.load(Ordering::Relaxed)
+        tracked_flags
     );
+    let hid_plan = macos_hid_key_event_plan(
+        mac_code,
+        down,
+        is_modifier,
+        tracked_flags,
+        transition.device_flags,
+    );
+    if post_macos_hid_key_event(hid_plan) {
+        return;
+    }
+    static HID_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+    if !HID_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "IOHID keyboard injection unavailable; falling back to CGEvent (system shortcuts may be limited)"
+        );
+    }
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         log::warn!("inject_key: failed to create CGEventSource");
         return;
     };
     match CGEvent::new_keyboard_event(source, mac_code, down) {
         Ok(event) => {
-            event.set_flags(CGEventFlags::from_bits_truncate(
-                MAC_INJECT_FLAGS.load(Ordering::Relaxed),
-            ));
+            // Keyboard constructors add semantic bits for arrows, function
+            // keys, and keypad keys. Keep those intrinsic bits and layer the
+            // remotely-held modifiers on top instead of erasing them.
+            let flags = merged_macos_event_flags(event.get_flags().bits(), fallback_flags);
+            event.set_flags(CGEventFlags::from_bits_retain(flags));
             event.post(CGEventTapLocation::HID);
         }
         Err(_) => log::warn!("inject_key: failed to build keyboard event for mac code {mac_code}"),
@@ -5808,21 +7848,727 @@ fn inject_key(key_code: u16, down: bool) {
     crate::windows_input::inject_key(key_code, down);
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+fn inject_mouse_move(x: i32, y: i32, _drag_button: Option<MouseButton>) {
+    linux_input::inject_mouse_move(x, y);
+}
+
+#[cfg(target_os = "linux")]
+fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
+    linux_input::inject_mouse_button(button, down, x, y);
+}
+
+#[cfg(target_os = "linux")]
+fn inject_scroll(delta_x: i32, delta_y: i32) {
+    linux_input::inject_scroll(delta_x, delta_y);
+}
+
+#[cfg(target_os = "linux")]
+fn inject_key(key_code: u16, down: bool) {
+    linux_input::inject_key(key_code, down);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_mouse_move(_x: i32, _y: i32, _drag_button: Option<MouseButton>) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_mouse_button(_button: MouseButton, _down: bool, _x: i32, _y: i32) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_scroll(_delta_x: i32, _delta_y: i32) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_key(_key_code: u16, _down: bool) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_windows_key_hook_modifier_is_recovered_before_arrow() {
+        let recovered = reconcile_windows_modifier_events(&[0x5B], &[]);
+        assert_eq!(
+            recovered,
+            vec![InputEvent::Key {
+                key_code: 0x5B,
+                down: true,
+            }]
+        );
+
+        let map = crate::default_modifier_map();
+        let wire = recovered
+            .into_iter()
+            .chain([
+                InputEvent::Key {
+                    key_code: 0x25,
+                    down: true,
+                },
+                InputEvent::Key {
+                    key_code: 0x25,
+                    down: false,
+                },
+                InputEvent::Key {
+                    key_code: 0x5B,
+                    down: false,
+                },
+            ])
+            .map(|event| match event {
+                InputEvent::Key { key_code, down } => InputEvent::Key {
+                    key_code: remap_modifier_vk(key_code, &map.control, &map.alt, &map.meta),
+                    down,
+                },
+                event => event,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            wire,
+            vec![
+                InputEvent::Key {
+                    key_code: 0x11,
+                    down: true,
+                },
+                InputEvent::Key {
+                    key_code: 0x25,
+                    down: true,
+                },
+                InputEvent::Key {
+                    key_code: 0x25,
+                    down: false,
+                },
+                InputEvent::Key {
+                    key_code: 0x11,
+                    down: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_forwarded_windows_modifier_is_released_before_next_key() {
+        assert_eq!(
+            reconcile_windows_modifier_events(&[], &[0xA2]),
+            vec![InputEvent::Key {
+                key_code: 0xA2,
+                down: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn authoritative_empty_modifier_snapshot_releases_stuck_command() {
+        assert_eq!(
+            crate::shared_input::modifier_snapshot_transitions(&[0x41, 0x5B], 0),
+            vec![(0x5B, false)]
+        );
+    }
+
+    #[test]
+    fn authoritative_modifier_snapshot_releases_stale_before_restoring_missing_down() {
+        assert_eq!(
+            modifier_snapshot_transitions(&[0x41, 0x5B], CONTROL_MODIFIER_MASK),
+            vec![(0x5B, false), (0x11, true)]
+        );
+        assert!(modifier_snapshot_transitions(&[0xA1], SHIFT_MODIFIER_MASK).is_empty());
+    }
+
+    #[test]
+    fn windows_modifier_tracker_converges_generic_and_sided_events() {
+        let mut state = WindowsInjectedKeyState::default();
+        state.track(0x5B, true);
+        assert_eq!(state.transitions(0), vec![(0x5B, false)]);
+        state.track(0x5B, false);
+        assert_eq!(state.transitions(CONTROL_MODIFIER_MASK), vec![(0x11, true)]);
+        state.track(0x11, true);
+        assert!(state.transitions(CONTROL_MODIFIER_MASK).is_empty());
+        state.track(0x11, false);
+        assert!(state.pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn windows_key_only_reset_tracks_plain_keys_without_mouse_state() {
+        let mut state = WindowsInjectedKeyState::default();
+        state.track(0xA2, true);
+        state.track(0x41, true);
+        assert_eq!(state.take_pressed_keys(), vec![0xA2, 0x41]);
+        assert!(state.pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn key_sequence_rejects_reconnect_duplicates_and_resets_for_new_origin() {
+        let mut state = RemoteKeySequenceState::default();
+        assert!(state.accept_key("server-a", 0x41, 100));
+        assert!(!state.accept_key("server-a", 0x41, 100));
+        assert!(!state.accept_key("server-a", 0x41, 99));
+        assert!(state.accept_key("server-a", 0x41, 101));
+        assert!(state.accept_key("server-b", 0x41, 1));
+        assert!(state.accept_key("legacy", 0x41, 0));
+    }
+
+    #[test]
+    fn key_sequence_boundary_rejects_delayed_keys_without_rejecting_newer_input() {
+        let mut state = RemoteKeySequenceState::default();
+        assert!(state.accept_key("server-a", 0x41, 10));
+        assert!(state.accept_boundary("server-a", 20));
+        assert!(!state.accept_key("server-a", 0x42, 15));
+        assert!(state.accept_key("server-a", 0x42, 21));
+        assert!(!state.accept_boundary("server-a", 20));
+    }
+
+    #[test]
+    fn key_sequence_high_water_is_kept_per_origin() {
+        let mut state = RemoteKeySequenceState::default();
+        assert!(state.accept_boundary("server-a", 20));
+        assert!(state.accept_key("server-b", 0x41, 5));
+        assert!(!state.accept_key("server-a", 0x41, 19));
+        assert!(state.accept_key("server-a", 0x41, 21));
+    }
+
+    #[test]
+    fn key_sequence_is_ordered_per_semantic_key_across_reconnected_streams() {
+        let mut state = RemoteKeySequenceState::default();
+        assert!(state.accept_key("server-a", 0xA2, 10)); // Ctrl Down
+        assert!(state.accept_key("server-a", 0x41, 20)); // unrelated A
+        assert!(state.accept_key("server-a", 0x11, 15)); // delayed Ctrl Up
+        assert!(state.accept_key("server-a", 0xA2, 30)); // new Ctrl Down
+        assert!(!state.accept_key("server-a", 0xA3, 15)); // old Ctrl Up
+    }
+
+    #[test]
+    fn newer_modifier_snapshot_blocks_delayed_modifier_keys_but_not_plain_keys() {
+        let mut state = RemoteKeySequenceState::default();
+        assert!(state.accept_key("server-a", 0xA2, 10)); // Ctrl Down
+        assert!(state.accept_snapshot("server-a", 30)); // authoritative modifier state
+
+        // These transitions came from an older uni stream and would otherwise
+        // undo the already-applied snapshot in either direction.
+        assert!(!state.accept_key("server-a", 0xA3, 15));
+        assert!(!state.accept_key("server-a", 0xA0, 29));
+
+        // Snapshot ordering applies only to modifier families. Unrelated plain
+        // keys retain their independent ordering across reconnected streams.
+        assert!(state.accept_key("server-a", 0x41, 20));
+        assert!(state.accept_key("server-a", 0xA2, 31));
+    }
+
+    #[test]
+    fn dropped_key_event_does_not_consume_modifier_snapshot_sequence() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        assert!(sequence_state.accept_key("server-a", 0xA2, 30));
+        let mut mouse_state = RemoteMouseState::default();
+        let mut active_origin = "server-a".to_string();
+        let mut stale_ctrl_up = InputEvent::Key {
+            key_code: 0x11,
+            down: false,
+        };
+        assert!(admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            15,
+            &mut stale_ctrl_up,
+        )
+        .is_none());
+        assert_eq!(sequence_state.by_origin["server-a"].snapshot_sequence, 0);
+
+        let mut delayed_other_key = InputEvent::Key {
+            key_code: 0x41,
+            down: false,
+        };
+        let admission = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            20,
+            &mut delayed_other_key,
+        )
+        .expect("different-key event remains valid");
+        assert_eq!(admission.effective_modifier_snapshot, Some(0));
+    }
+
+    #[test]
+    fn button_up_uses_per_button_sequence_when_modifier_snapshot_is_old() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        assert!(sequence_state.accept_snapshot("server-a", 20));
+        let mut active_origin = "server-a".to_string();
+        let mut mouse_state = RemoteMouseState {
+            x: 50,
+            y: 60,
+            buttons: LEFT_BUTTON_MASK,
+            last_origin_id: "server-a".into(),
+            sequence_by_origin: HashMap::from([(
+                "server-a".into(),
+                RemoteMouseSequenceState {
+                    last_position_sequence: 10,
+                    last_scroll_sequence: 0,
+                    last_boundary_sequence: 0,
+                    last_button_sequence: [10, 0, 0],
+                },
+            )]),
+        };
+        let mut button_up = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            screen_id: "local-display-1".into(),
+            x: Some(50),
+            y: Some(60),
+            sequence: 11,
+        };
+        let admission = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            15,
+            &mut button_up,
+        )
+        .expect("per-button Up must survive an older snapshot sequence");
+        assert!(admission.inject_event);
+        assert_eq!(admission.effective_modifier_snapshot, None);
+    }
+
+    #[test]
+    fn only_explicit_enter_events_can_claim_an_empty_origin() {
+        assert!(input_event_can_claim_origin(&InputEvent::MouseMove {
+            screen_id: String::new(),
+            x: 0,
+            y: 0,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 1,
+        }));
+        assert!(input_event_can_claim_origin(&InputEvent::Key {
+            key_code: 0x41,
+            down: true,
+        }));
+        assert!(input_event_can_claim_origin(&InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            screen_id: String::new(),
+            x: None,
+            y: None,
+            sequence: 1,
+        }));
+        assert!(!input_event_can_claim_origin(&InputEvent::Key {
+            key_code: 0x41,
+            down: false,
+        }));
+        assert!(!input_event_can_claim_origin(&InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            screen_id: String::new(),
+            x: None,
+            y: None,
+            sequence: 1,
+        }));
+        assert!(!input_event_can_claim_origin(&InputEvent::Scroll {
+            delta_x: 0,
+            delta_y: 1,
+            sequence: 1,
+        }));
+        assert!(!input_event_can_claim_origin(&InputEvent::CursorPark {
+            screen_id: String::new(),
+            x: 0,
+            y: 0,
+            sequence: 1,
+        }));
+
+        let mut sequence_state = RemoteKeySequenceState::default();
+        let mut mouse_state = RemoteMouseState::default();
+        let mut active_origin = String::new();
+        let mut key_up = InputEvent::Key {
+            key_code: 0x41,
+            down: false,
+        };
+        let cleanup = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            10,
+            &mut key_up,
+        )
+        .expect("idle KeyUp should advance sequence state idempotently");
+        assert!(!cleanup.inject_event);
+        assert_eq!(cleanup.effective_modifier_snapshot, None);
+        assert!(active_origin.is_empty());
+
+        let mut key_down = InputEvent::Key {
+            key_code: 0x41,
+            down: true,
+        };
+        let entry = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            Some(0),
+            11,
+            &mut key_down,
+        )
+        .expect("KeyDown should explicitly enter from idle");
+        assert!(entry.inject_event);
+        assert!(entry.origin_changed);
+        assert_eq!(entry.effective_modifier_snapshot, Some(0));
+        assert_eq!(active_origin, "server-a");
+    }
+
+    #[test]
+    fn stale_origin_sequence_is_rejected_before_it_can_replace_the_active_origin() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        assert!(sequence_state.accept_key("server-a", 0x41, 100));
+        assert!(sequence_state.accept_key("server-b", 0x41, 10));
+        let mut active_origin = "server-b".to_string();
+        let mut mouse_state = RemoteMouseState::default();
+        let mut stale_key = InputEvent::Key {
+            key_code: 0x41,
+            down: false,
+        };
+
+        assert_eq!(
+            admit_remote_input_with_state(
+                &mut sequence_state,
+                &mut mouse_state,
+                &mut active_origin,
+                "server-a",
+                None,
+                99,
+                &mut stale_key,
+            ),
+            None
+        );
+        assert_eq!(active_origin, "server-b");
+    }
+
+    #[test]
+    fn park_allows_new_origin_move_but_rejects_old_origin_datagram() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        let mut mouse_state = RemoteMouseState::default();
+        let mut active_origin = "server-a".to_string();
+        let mut park = InputEvent::CursorPark {
+            screen_id: "local-display-1".into(),
+            x: 100,
+            y: 100,
+            sequence: 100,
+        };
+        let park_admission = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            None,
+            100,
+            &mut park,
+        )
+        .expect("A park should establish the release boundary");
+        assert!(park_admission.release_keys);
+        assert!(park_admission
+            .mouse
+            .is_some_and(|mouse| mouse.park_accepted));
+        assert!(active_origin.is_empty());
+
+        let mut first_b_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 1,
+            y: 2,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 1,
+        };
+        let b_admission = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-b",
+            None,
+            0,
+            &mut first_b_move,
+        )
+        .expect("B's first sequenced move should claim the released session");
+        assert!(b_admission.origin_changed);
+        assert_eq!(active_origin, "server-b");
+        assert_eq!(mouse_state.last_origin_id, "server-b");
+
+        let mut delayed_a_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 99,
+            y: 99,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 99,
+        };
+        assert_eq!(
+            admit_remote_input_with_state(
+                &mut sequence_state,
+                &mut mouse_state,
+                &mut active_origin,
+                "server-a",
+                None,
+                0,
+                &mut delayed_a_move,
+            ),
+            None
+        );
+        assert_eq!(active_origin, "server-b");
+        assert_eq!(mouse_state.last_origin_id, "server-b");
+        assert_eq!(
+            mouse_state.sequence_by_origin["server-a"].last_boundary_sequence,
+            100
+        );
+        assert_eq!(
+            mouse_state.sequence_by_origin["server-b"].last_position_sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn accepted_key_boundary_survives_stale_mouse_park_without_ending_new_drag() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        let mut active_origin = "server-a".to_string();
+        let mut mouse_state = RemoteMouseState {
+            x: 200,
+            y: 200,
+            buttons: LEFT_BUTTON_MASK,
+            last_origin_id: "server-a".into(),
+            sequence_by_origin: HashMap::from([(
+                "server-a".into(),
+                RemoteMouseSequenceState {
+                    last_position_sequence: 200,
+                    last_scroll_sequence: 0,
+                    last_boundary_sequence: 0,
+                    last_button_sequence: [200, 0, 0],
+                },
+            )]),
+        };
+        let mut park = InputEvent::CursorPark {
+            screen_id: "local-display-1".into(),
+            x: 100,
+            y: 100,
+            sequence: 100,
+        };
+        let admission = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            None,
+            100,
+            &mut park,
+        )
+        .expect("keyboard boundary should be accepted");
+        assert!(!admission.origin_changed);
+        assert!(admission.release_keys);
+        assert!(!admission.inject_event);
+
+        // A new drag on the mouse channel already overtook the park. Rejecting
+        // only its stale coordinates must not erase that new held-button state.
+        assert_eq!(mouse_state.buttons, LEFT_BUTTON_MASK);
+
+        let mut continued_drag = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 201,
+            y: 201,
+            drag_button: Some(MouseButton::Left),
+            button_mask: Some(LEFT_BUTTON_MASK),
+            sequence: 201,
+        };
+        assert!(prepare_remote_mouse_event(&mut mouse_state, "server-a", &mut continued_drag,).0);
+        assert_eq!(
+            authoritative_mouse_button_state(&mut mouse_state, "server-a", &continued_drag, true,),
+            (None, false)
+        );
+        assert!(matches!(
+            continued_drag,
+            InputEvent::MouseMove {
+                drag_button: Some(MouseButton::Left),
+                ..
+            }
+        ));
+        assert_eq!(mouse_state.buttons, LEFT_BUTTON_MASK);
+    }
+
+    #[test]
+    fn foreign_key_mouse_and_park_cannot_interrupt_active_drag() {
+        let mut sequence_state = RemoteKeySequenceState::default();
+        let mut active_origin = "server-b".to_string();
+        let mut mouse_state = RemoteMouseState {
+            x: 300,
+            y: 400,
+            buttons: LEFT_BUTTON_MASK,
+            last_origin_id: "server-b".into(),
+            sequence_by_origin: HashMap::from([(
+                "server-b".into(),
+                RemoteMouseSequenceState {
+                    last_position_sequence: 200,
+                    last_scroll_sequence: 0,
+                    last_boundary_sequence: 0,
+                    last_button_sequence: [200, 0, 0],
+                },
+            )]),
+        };
+
+        for (key_sequence, down) in [(1, true), (2, false)] {
+            let mut foreign_key = InputEvent::Key {
+                key_code: 0x41,
+                down,
+            };
+            let admission = admit_remote_input_with_state(
+                &mut sequence_state,
+                &mut mouse_state,
+                &mut active_origin,
+                "server-a",
+                Some(0),
+                key_sequence,
+                &mut foreign_key,
+            )
+            .expect("foreign key high-water should advance while the event is dropped");
+            assert!(!admission.inject_event);
+            assert!(!admission.origin_changed);
+            assert!(!admission.release_keys);
+        }
+
+        let mut foreign_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 10,
+            y: 20,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 10,
+        };
+        let move_admission = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            None,
+            0,
+            &mut foreign_move,
+        )
+        .expect("foreign mouse high-water should advance while the event is dropped");
+        assert!(!move_admission.inject_event);
+        assert!(!move_admission.origin_changed);
+
+        let mut delayed_park = InputEvent::CursorPark {
+            screen_id: "local-display-1".into(),
+            x: 100,
+            y: 100,
+            sequence: 11,
+        };
+        let park_admission = admit_remote_input_with_state(
+            &mut sequence_state,
+            &mut mouse_state,
+            &mut active_origin,
+            "server-a",
+            None,
+            3,
+            &mut delayed_park,
+        )
+        .expect("foreign park high-water should advance while the event is dropped");
+        assert!(!park_admission.inject_event);
+        assert!(!park_admission.origin_changed);
+        assert!(!park_admission.release_keys);
+
+        assert_eq!(active_origin, "server-b");
+        assert_eq!(mouse_state.last_origin_id, "server-b");
+        assert_eq!(mouse_state.buttons, LEFT_BUTTON_MASK);
+        assert_eq!((mouse_state.x, mouse_state.y), (300, 400));
+        assert_eq!(sequence_state.by_origin["server-a"].boundary_sequence, 3);
+        assert_eq!(
+            mouse_state.sequence_by_origin["server-a"].last_boundary_sequence,
+            11
+        );
+        assert_eq!(
+            mouse_state.sequence_by_origin["server-b"].last_position_sequence,
+            200
+        );
+    }
+
+    #[test]
+    fn reset_and_modifier_snapshots_share_the_key_sequence_high_water() {
+        assert!(input_packet_needs_key_sequence(
+            &InputEvent::CursorPark {
+                screen_id: "main".into(),
+                x: 1,
+                y: 2,
+                sequence: 1,
+            },
+            None,
+        ));
+        assert!(input_packet_needs_key_sequence(
+            &InputEvent::MouseButton {
+                button: MouseButton::Left,
+                down: true,
+                screen_id: "main".into(),
+                x: Some(1),
+                y: Some(2),
+                sequence: 2,
+            },
+            Some(0),
+        ));
+        assert!(!input_packet_needs_key_sequence(
+            &InputEvent::MouseMove {
+                screen_id: "main".into(),
+                x: 1,
+                y: 2,
+                drag_button: None,
+                button_mask: Some(0),
+                sequence: 3,
+            },
+            None,
+        ));
+    }
+
+    #[test]
+    fn default_modifier_snapshot_remap_swaps_control_and_meta() {
+        let map = crate::default_modifier_map();
+        assert_eq!(
+            remap_modifier_mask(
+                CONTROL_MODIFIER_MASK | SHIFT_MODIFIER_MASK,
+                &map.control,
+                &map.alt,
+                &map.meta,
+            ),
+            META_MODIFIER_MASK | SHIFT_MODIFIER_MASK
+        );
+        assert_eq!(
+            remap_modifier_mask(
+                META_MODIFIER_MASK | ALT_MODIFIER_MASK,
+                &map.control,
+                &map.alt,
+                &map.meta,
+            ),
+            CONTROL_MODIFIER_MASK | ALT_MODIFIER_MASK
+        );
+    }
+
+    #[test]
+    fn windows_modifier_reconciliation_treats_generic_and_sided_keys_as_one_family() {
+        assert!(reconcile_windows_modifier_events(&[0xA2], &[0x11]).is_empty());
+        assert!(reconcile_windows_modifier_events(&[0x5B], &[0x5B]).is_empty());
+    }
+
+    #[test]
+    fn windows_modifier_reconciliation_releases_stale_state_before_new_downs() {
+        assert_eq!(
+            reconcile_windows_modifier_events(&[0x5B], &[0x11, 0x25]),
+            vec![
+                InputEvent::Key {
+                    key_code: 0x11,
+                    down: false,
+                },
+                InputEvent::Key {
+                    key_code: 0x5B,
+                    down: true,
+                },
+            ]
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -5837,6 +8583,308 @@ mod tests {
         // Ordinary keys carry no modifier flag.
         assert!(windows_vk_to_mac_flag(0x41).is_none()); // 'A'
         assert!(windows_vk_to_mac_flag(0x20).is_none()); // Space
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keyboard_flags_preserve_intrinsic_arrow_identity() {
+        const ARROW_INTRINSIC_FLAGS: u64 = 0x20A0_0000;
+        const CONTROL_FLAG: u64 = 0x0004_0000;
+
+        let merged = merged_macos_event_flags(ARROW_INTRINSIC_FLAGS, CONTROL_FLAG);
+        assert_eq!(merged & ARROW_INTRINSIC_FLAGS, ARROW_INTRINSIC_FLAGS);
+        assert_eq!(merged & CONTROL_FLAG, CONTROL_FLAG);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_control_arrow_uses_hid_global_modifier_state() {
+        let mut state = MacInjectedKeyState::default();
+        let control_down = state.transition(0x11, true, true);
+        let left_down = state.transition(0x25, true, false);
+        let left_up = state.transition(0x25, false, false);
+        let control_up = state.transition(0x11, false, true);
+
+        assert_eq!(
+            [
+                macos_hid_key_event_plan(
+                    59,
+                    true,
+                    true,
+                    control_down.tracked_flags,
+                    control_down.device_flags,
+                ),
+                macos_hid_key_event_plan(
+                    123,
+                    true,
+                    false,
+                    left_down.tracked_flags,
+                    left_down.device_flags,
+                ),
+                macos_hid_key_event_plan(
+                    123,
+                    false,
+                    false,
+                    left_up.tracked_flags,
+                    left_up.device_flags,
+                ),
+                macos_hid_key_event_plan(
+                    59,
+                    false,
+                    true,
+                    control_up.tracked_flags,
+                    control_up.device_flags,
+                ),
+            ],
+            [
+                MacHidKeyEventPlan {
+                    event_type: 12,
+                    key_code: 59,
+                    event_flags: 0x0004_0001,
+                    options: 1,
+                },
+                MacHidKeyEventPlan {
+                    event_type: 10,
+                    key_code: 123,
+                    event_flags: 0,
+                    options: 0,
+                },
+                MacHidKeyEventPlan {
+                    event_type: 11,
+                    key_code: 123,
+                    event_flags: 0,
+                    options: 0,
+                },
+                MacHidKeyEventPlan {
+                    event_type: 12,
+                    key_code: 59,
+                    event_flags: 0,
+                    options: 1,
+                },
+            ]
+        );
+        assert!(state.pressed_keys().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_hid_plain_key_repeat_remains_a_keydown() {
+        let mut state = MacInjectedKeyState::default();
+        let first = state.transition(0x41, true, false);
+        let repeat = state.transition(0x41, true, false);
+        let up = state.transition(0x41, false, false);
+
+        let plans = [
+            macos_hid_key_event_plan(0, true, false, first.tracked_flags, first.device_flags),
+            macos_hid_key_event_plan(0, true, false, repeat.tracked_flags, repeat.device_flags),
+            macos_hid_key_event_plan(0, false, false, up.tracked_flags, up.device_flags),
+        ];
+        assert_eq!(plans.map(|plan| plan.event_type), [10, 10, 11]);
+        assert!(plans
+            .iter()
+            .all(|plan| plan.event_flags == 0 && plan.options == 0));
+        assert!(state.pressed_keys().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_iohid_ffi_layout_matches_xcode_sdk() {
+        assert_eq!(std::mem::size_of::<MacIoGPoint>(), 4);
+        assert_eq!(std::mem::align_of::<MacIoGPoint>(), 2);
+        assert_eq!(std::mem::size_of::<MacNxKeyEventData>(), 48);
+        assert_eq!(std::mem::align_of::<MacNxKeyEventData>(), 4);
+
+        let data = MacNxKeyEventData::default();
+        let base = std::ptr::addr_of!(data) as usize;
+        let key_code = std::ptr::addr_of!(data.key_code) as usize;
+        assert_eq!(key_code - base, 8);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_macos_modifier_down_is_ignored_but_repair_up_is_posted() {
+        let mut state = MacInjectedKeyState::default();
+        let control = windows_vk_to_mac_flag(0x11).expect("Control flag");
+        let transition = state.transition(0xA2, true, true);
+        assert!(transition.should_post);
+        assert_eq!(transition.tracked_flags, control);
+        assert!(!state.transition(0xA2, true, true).should_post);
+        assert!(state.transition(0xA3, true, true).should_post);
+        assert_eq!(state.transition(0xA2, false, true).tracked_flags, control);
+        assert_eq!(state.transition(0xA3, false, true).tracked_flags, 0);
+        assert!(state.transition(0xA3, false, true).should_post);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_generic_and_left_modifier_aliases_clear_each_other() {
+        let mut state = MacInjectedKeyState::default();
+        assert!(state.transition(0x11, true, true).should_post);
+        assert_eq!(state.pressed_keys(), &[0xA2]);
+        let up = state.transition(0xA2, false, true);
+        assert!(up.should_post);
+        assert_eq!(up.tracked_flags, 0);
+        assert!(state.pressed_keys().is_empty());
+
+        assert!(state.transition(0x12, true, true).should_post);
+        assert_eq!(state.pressed_keys(), &[0xA4]);
+        assert!(state.transition(0xA4, false, true).should_post);
+        assert!(state.pressed_keys().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unambiguous_modifier_family_up_clears_snapshot_synthetic_key() {
+        let mut state = MacInjectedKeyState::default();
+        assert!(state.transition(0x5B, true, true).should_post);
+        assert_eq!(state.pressed_keys(), &[0x5B]);
+        let right_command_up = state.transition(0x5C, false, true);
+        assert!(right_command_up.should_post);
+        assert_eq!(right_command_up.tracked_flags, 0);
+        assert!(state.pressed_keys().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_injected_key_state_tracks_plain_keys_without_suppressing_repeat() {
+        let mut state = MacInjectedKeyState::default();
+
+        let first = state.transition(0x41, true, false);
+        let repeat = state.transition(0x41, true, false);
+
+        assert!(first.should_post);
+        assert!(
+            repeat.should_post,
+            "ordinary key repeat must still be posted"
+        );
+        assert_eq!(state.pressed_keys(), &[0x41]);
+        assert!(state.transition(0x41, false, false).should_post);
+        assert!(state.pressed_keys().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_injected_key_state_deduplicates_modifier_downs_and_snapshots_every_key() {
+        let mut state = MacInjectedKeyState::default();
+
+        assert!(state.transition(0xA2, true, true).should_post);
+        assert!(!state.transition(0xA2, true, true).should_post);
+        assert!(state.transition(0x28, true, false).should_post);
+        assert_eq!(state.pressed_keys(), &[0xA2, 0x28]);
+
+        assert!(state.transition(0xA2, false, true).should_post);
+        assert!(state.transition(0xA2, false, true).should_post);
+        assert_eq!(state.pressed_keys(), &[0x28]);
+    }
+
+    #[test]
+    fn windows_route_state_requires_release_before_switching_injectors() {
+        let mut state = WindowsInputRouteState::default();
+
+        assert!(!state.requires_release_before(WindowsInputRoute::Local));
+        state.commit(WindowsInputRoute::Local);
+        assert!(!state.requires_release_before(WindowsInputRoute::Local));
+        assert!(state.requires_release_before(WindowsInputRoute::Helper));
+
+        state.commit(WindowsInputRoute::Helper);
+        assert!(!state.requires_release_before(WindowsInputRoute::Helper));
+        assert!(state.requires_release_before(WindowsInputRoute::Local));
+
+        state.clear();
+        assert!(!state.requires_release_before(WindowsInputRoute::Local));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_click_tracker_emits_matching_double_click_counts() {
+        let mut tracker = MacClickTracker::default();
+        let start = Instant::now();
+        let interval = Duration::from_millis(500);
+
+        assert_eq!(
+            tracker.event_count(MouseButton::Left, true, 100, 200, start, interval),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                100,
+                200,
+                start + Duration::from_millis(40),
+                interval,
+            ),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                true,
+                102,
+                201,
+                start + Duration::from_millis(180),
+                interval,
+            ),
+            2
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                102,
+                201,
+                start + Duration::from_millis(220),
+                interval,
+            ),
+            2
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_click_tracker_resets_after_timeout_button_change_or_drag() {
+        let mut tracker = MacClickTracker::default();
+        let start = Instant::now();
+        let interval = Duration::from_millis(500);
+
+        assert_eq!(
+            tracker.event_count(MouseButton::Left, true, 10, 10, start, interval),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                30,
+                30,
+                start + Duration::from_millis(40),
+                interval,
+            ),
+            0,
+            "a drag release is not a click"
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Right,
+                true,
+                10,
+                10,
+                start + Duration::from_millis(100),
+                interval,
+            ),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                true,
+                10,
+                10,
+                start + Duration::from_millis(800),
+                interval,
+            ),
+            1
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -5871,6 +8919,58 @@ mod tests {
             MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS,
             MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hidden_macos_window_uses_a_relaxed_cursor_repin_policy() {
+        assert_eq!(macos_cursor_repin_policy(true), (1.5, 8));
+        assert_eq!(macos_cursor_repin_policy(false), (48.0, 50));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_transparent_cursor_uses_valid_encoded_image_data() {
+        let rgba = image::load_from_memory(&MACOS_TRANSPARENT_PNG)
+            .expect("transparent cursor PNG must decode")
+            .to_rgba8();
+        assert_eq!(rgba.dimensions(), (1, 1));
+        assert_eq!(rgba.as_raw(), &[0, 0, 0, 0]);
+        assert!(macos_transparent_cursor().is_some());
+    }
+
+    #[test]
+    fn only_active_mouse_input_reveals_a_parked_cursor() {
+        assert!(input_command_reveals_parked_cursor(
+            &InputCommand::MouseMove {
+                x: 10,
+                y: 20,
+                drag_button: None,
+            }
+        ));
+        assert!(input_command_reveals_parked_cursor(
+            &InputCommand::MouseButton {
+                button: MouseButton::Left,
+                down: true,
+                x: 10,
+                y: 20,
+            }
+        ));
+        assert!(!input_command_reveals_parked_cursor(
+            &InputCommand::MouseButton {
+                button: MouseButton::Left,
+                down: false,
+                x: 10,
+                y: 20,
+            }
+        ));
+        assert!(!input_command_reveals_parked_cursor(&InputCommand::Key {
+            key_code: 0x11,
+            down: false,
+        }));
+        assert!(!input_command_reveals_parked_cursor(
+            &InputCommand::CursorPark { x: 10, y: 20 }
+        ));
     }
 
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {
@@ -6108,6 +9208,47 @@ mod tests {
             -2.0,
             0.0,
             &layout_state
+        ));
+    }
+
+    #[test]
+    fn tangential_edge_motion_does_not_return_to_local() {
+        let entry = screen(
+            "peer-device",
+            "peer-device-local-display-1",
+            1920,
+            0,
+            1920,
+            1080,
+        );
+
+        assert!(
+            !exited_entry_edge(Edge::Right, &entry, -1.0, 512.0, -1.0, 12.0),
+            "a mostly vertical slide at the shared edge is not return intent"
+        );
+        assert!(!exited_entry_edge(
+            Edge::Right,
+            &entry,
+            -2.0,
+            512.0,
+            -2.0,
+            3.0
+        ));
+        assert!(exited_entry_edge(
+            Edge::Right,
+            &entry,
+            -2.0,
+            512.0,
+            -2.0,
+            1.0
+        ));
+        assert!(exited_entry_edge(
+            Edge::Right,
+            &entry,
+            -1.0,
+            512.0,
+            -1.0,
+            0.0
         ));
     }
 
@@ -6410,27 +9551,83 @@ mod tests {
             origin_protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: "cluster-test".into(),
             pair_secret: "secret-test".into(),
+            modifier_snapshot: None,
+            key_sequence: 0,
             event: InputEvent::MouseMove {
                 screen_id: "display-1".into(),
                 x: 320,
                 y: 240,
+                drag_button: None,
+                button_mask: Some(0),
+                sequence: 1,
             },
         };
         let payload = rmp_serde::to_vec_named(&packet).expect("encode input packet");
         let decoded = decode_input_packet(&payload).expect("decode input packet");
+        assert_eq!(decoded.modifier_snapshot, None);
+        assert_eq!(decoded.key_sequence, 0);
 
         assert_eq!(decoded.protocol, INPUT_PROTOCOL);
         assert_eq!(decoded.target_device_id, "peer-device");
         assert_eq!(decoded.origin_device_id, "local-device");
         assert_eq!(decoded.origin_port, 47833);
         match decoded.event {
-            InputEvent::MouseMove { screen_id, x, y } => {
+            InputEvent::MouseMove {
+                screen_id, x, y, ..
+            } => {
                 assert_eq!(screen_id, "display-1");
                 assert_eq!(x, 320);
                 assert_eq!(y, 240);
             }
             _ => panic!("decoded the wrong input event"),
         }
+    }
+
+    #[test]
+    fn input_packet_modifier_fields_are_backward_compatible() {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyInputPacket {
+            protocol: String,
+            event: InputEvent,
+        }
+
+        let legacy_payload = rmp_serde::to_vec_named(&LegacyInputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            event: InputEvent::Key {
+                key_code: 0x41,
+                down: true,
+            },
+        })
+        .expect("encode legacy input packet");
+        let decoded = decode_input_packet(&legacy_payload).expect("decode legacy input packet");
+        assert_eq!(decoded.modifier_snapshot, None);
+        assert_eq!(decoded.key_sequence, 0);
+
+        let new_packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            target_device_id: String::new(),
+            origin_device_id: String::new(),
+            origin_port: 0,
+            origin_transport_public_key: String::new(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: String::new(),
+            pair_secret: String::new(),
+            modifier_snapshot: Some(META_MODIFIER_MASK),
+            key_sequence: 9,
+            event: InputEvent::Key {
+                key_code: 0x41,
+                down: true,
+            },
+        };
+        let new_payload = rmp_serde::to_vec_named(&new_packet).expect("encode new input packet");
+        let new_decoded = decode_input_packet(&new_payload).expect("decode new input packet");
+        assert_eq!(new_decoded.modifier_snapshot, Some(META_MODIFIER_MASK));
+        assert_eq!(new_decoded.key_sequence, 9);
+        let legacy_decoded: LegacyInputPacket =
+            rmp_serde::from_slice(&new_payload).expect("legacy decoder ignores new fields");
+        assert_eq!(legacy_decoded.protocol, INPUT_PROTOCOL);
+        assert_eq!(legacy_decoded.event, new_packet.event);
     }
 
     #[test]
@@ -6446,7 +9643,11 @@ mod tests {
                 screen_id: "local-display-1".into(),
                 x: 10,
                 y: 20,
+                drag_button: None,
+                button_mask: Some(0),
+                sequence: 1,
             },
+            None,
             &layout_state,
         );
 
@@ -6469,7 +9670,11 @@ mod tests {
                     screen_id: "local-display-1".into(),
                     x: 10,
                     y: 20,
+                    drag_button: None,
+                    button_mask: Some(0),
+                    sequence: 1,
                 },
+                None,
                 &layout_state_for_thread,
             );
             tx.send(context).expect("send packet context");
@@ -6482,6 +9687,45 @@ mod tests {
         assert_eq!(context.cluster_id, "cluster-test");
         assert_eq!(context.pair_secret, "secret-test");
         assert!(context.peer.is_some());
+    }
+
+    #[test]
+    fn input_packet_context_never_skips_key_remapping_when_layout_is_busy() {
+        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
+        let held_layout = layout_state.lock().expect("hold layout lock");
+        let target = target_for_coordinate_tests();
+        let layout_state_for_thread = Arc::clone(&layout_state);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let context = input_packet_context(
+                &target,
+                InputEvent::Key {
+                    key_code: 0x11,
+                    down: true,
+                },
+                Some(CONTROL_MODIFIER_MASK),
+                &layout_state_for_thread,
+            );
+            tx.send((context.event, context.modifier_snapshot))
+                .expect("send remapped key");
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        drop(held_layout);
+        let (event, modifier_snapshot) = rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("key context should finish after the short layout lock");
+        assert_eq!(modifier_snapshot, Some(META_MODIFIER_MASK));
+
+        assert_eq!(
+            event,
+            InputEvent::Key {
+                key_code: 0x5B,
+                down: true,
+            },
+            "Ctrl must not randomly bypass the configured Ctrl-to-Command mapping"
+        );
     }
 
     #[test]
@@ -6507,10 +9751,15 @@ mod tests {
             origin_protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             pair_secret: "wrong".into(),
+            modifier_snapshot: None,
+            key_sequence: 0,
             event: InputEvent::MouseMove {
                 screen_id: "local-display-1".into(),
                 x: 1,
                 y: 1,
+                drag_button: None,
+                button_mask: Some(0),
+                sequence: 1,
             },
         };
 
@@ -6548,10 +9797,15 @@ mod tests {
             origin_protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             pair_secret: layout.pair_secret.clone(),
+            modifier_snapshot: None,
+            key_sequence: 0,
             event: InputEvent::MouseMove {
                 screen_id: "local-display-1".into(),
                 x: 1,
                 y: 1,
+                drag_button: None,
+                button_mask: Some(0),
+                sequence: 1,
             },
         };
 
@@ -6584,6 +9838,9 @@ mod tests {
                 screen_id: "local-display-1".into(),
                 x: 960,
                 y: 540,
+                drag_button: None,
+                button_mask: Some(0),
+                sequence: 1,
             },
         )
         .expect("mouse move should map to command");
@@ -6596,6 +9853,258 @@ mod tests {
                 drag_button: None,
             }
         );
+    }
+
+    #[test]
+    fn mouse_button_uses_its_reliable_coordinates_not_a_stale_datagram() {
+        let layout = layout_for_target_tests();
+        let mut native_layout = layout.clone();
+        native_layout.devices[0].screens[0].width = 3840;
+        native_layout.devices[0].screens[0].height = 2160;
+        update_remote_mouse_position(12, 34);
+
+        let command = input_event_to_command(
+            &layout,
+            &native_layout,
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                down: true,
+                screen_id: "local-display-1".into(),
+                x: Some(960),
+                y: Some(540),
+                sequence: 1,
+            },
+        )
+        .expect("mouse button should map");
+
+        assert_eq!(
+            command,
+            InputCommand::MouseButton {
+                button: MouseButton::Left,
+                down: true,
+                x: 1920,
+                y: 1080,
+            }
+        );
+        update_remote_mouse_button(MouseButton::Left, false, None);
+    }
+
+    #[test]
+    fn reliable_input_classes_prioritize_releases_and_keep_drag_latest_wins() {
+        let normal_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 1,
+            y: 2,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 1,
+        };
+        let drag_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 2,
+            y: 3,
+            drag_button: Some(MouseButton::Left),
+            button_mask: Some(LEFT_BUTTON_MASK),
+            sequence: 2,
+        };
+        let button = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            screen_id: "local-display-1".into(),
+            x: Some(1),
+            y: Some(2),
+            sequence: 3,
+        };
+
+        assert_eq!(input_event_reliable_class(&normal_move), None);
+        assert_eq!(input_event_reliable_class(&drag_move), None);
+        assert_eq!(
+            input_event_reliable_class(&button),
+            Some(quic_transport::ReliableInputClass::State)
+        );
+
+        let button_up = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            screen_id: "remote-screen".into(),
+            x: Some(12),
+            y: Some(34),
+            sequence: 4,
+        };
+        assert_eq!(
+            input_event_reliable_class(&button_up),
+            Some(quic_transport::ReliableInputClass::Release)
+        );
+        assert_eq!(
+            input_event_reliable_class(&InputEvent::CursorPark {
+                screen_id: "remote-screen".into(),
+                x: 99,
+                y: 99,
+                sequence: 5,
+            }),
+            Some(quic_transport::ReliableInputClass::ResetBoundary)
+        );
+    }
+
+    #[test]
+    fn stale_mouse_events_cannot_cross_a_reliable_handoff_boundary() {
+        let mut state = RemoteMouseState::default();
+        let mut park = InputEvent::CursorPark {
+            screen_id: "local-display-1".into(),
+            x: 100,
+            y: 100,
+            sequence: 100,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut park).0);
+        assert_eq!(
+            authoritative_mouse_button_state(&mut state, "server-a", &park, true),
+            (None, true)
+        );
+
+        let mut stale_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 90,
+            y: 90,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 99,
+        };
+        assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut stale_move).0);
+
+        // Park is an authoritative input boundary, so older transitions cannot
+        // re-press or re-release a button after control has left.
+        let mut stale_button_up = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            screen_id: "local-display-1".into(),
+            x: Some(80),
+            y: Some(80),
+            sequence: 98,
+        };
+        assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut stale_button_up).0);
+
+        let mut stale_button_down = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+            screen_id: "local-display-1".into(),
+            x: Some(70),
+            y: Some(70),
+            sequence: 99,
+        };
+        assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut stale_button_down).0);
+
+        let mut other_controller_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 1,
+            y: 2,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 1,
+        };
+        state.buttons = LEFT_BUTTON_MASK;
+        state.x = 80;
+        state.y = 90;
+        let (accepted, carried) =
+            prepare_remote_mouse_event(&mut state, "server-b", &mut other_controller_move);
+        assert!(accepted);
+        assert_eq!(carried, Some((LEFT_BUTTON_MASK, 80, 90)));
+        assert_eq!(state.buttons, 0);
+
+        let mut legacy_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 3,
+            y: 4,
+            drag_button: None,
+            button_mask: None,
+            sequence: 0,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "legacy", &mut legacy_move).0);
+    }
+
+    #[test]
+    fn authoritative_mouse_move_repairs_a_lost_button_transition() {
+        let mut state = RemoteMouseState {
+            buttons: LEFT_BUTTON_MASK,
+            last_origin_id: "server-a".into(),
+            sequence_by_origin: HashMap::from([(
+                "server-a".into(),
+                RemoteMouseSequenceState {
+                    last_position_sequence: 10,
+                    last_scroll_sequence: 0,
+                    last_boundary_sequence: 0,
+                    last_button_sequence: [10, 0, 0],
+                },
+            )]),
+            x: 50,
+            y: 60,
+        };
+        let mut released_move = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 51,
+            y: 61,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 12,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut released_move).0);
+        assert_eq!(
+            authoritative_mouse_button_state(&mut state, "server-a", &released_move, true),
+            (Some((LEFT_BUTTON_MASK, 0, 50, 60)), false)
+        );
+        assert_eq!(state.buttons, 0);
+        assert_eq!(
+            state.sequence_by_origin["server-a"].last_button_sequence[0],
+            12
+        );
+
+        let mut delayed_up = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            screen_id: "local-display-1".into(),
+            x: Some(50),
+            y: Some(60),
+            sequence: 11,
+        };
+        assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut delayed_up).0);
+    }
+
+    #[test]
+    fn mouse_motion_does_not_discard_a_reliable_scroll() {
+        let mut state = RemoteMouseState::default();
+        let mut move_event = InputEvent::MouseMove {
+            screen_id: "local-display-1".into(),
+            x: 10,
+            y: 20,
+            drag_button: None,
+            button_mask: Some(0),
+            sequence: 20,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut move_event).0);
+
+        let mut earlier_scroll = InputEvent::Scroll {
+            delta_x: 0,
+            delta_y: 1,
+            sequence: 19,
+        };
+        assert!(
+            prepare_remote_mouse_event(&mut state, "server-a", &mut earlier_scroll).0,
+            "a faster latest-move datagram must not erase a discrete scroll"
+        );
+
+        let mut park = InputEvent::CursorPark {
+            screen_id: "local-display-1".into(),
+            x: 100,
+            y: 100,
+            sequence: 21,
+        };
+        assert!(prepare_remote_mouse_event(&mut state, "server-a", &mut park).0);
+
+        let mut stale_scroll = InputEvent::Scroll {
+            delta_x: 0,
+            delta_y: 1,
+            sequence: 18,
+        };
+        assert!(!prepare_remote_mouse_event(&mut state, "server-a", &mut stale_scroll).0);
     }
 
     #[test]
@@ -6660,6 +10169,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: "cluster-test".into(),
             pair_secret: "secret-test".into(),
+            push_on_bind: true,
             expires_at: Some(Instant::now() - Duration::from_millis(1)),
         })));
 
@@ -6921,6 +10431,7 @@ mod tests {
             InputEvent::Scroll {
                 delta_x: 1,
                 delta_y: -2,
+                sequence: 1,
             },
             &target,
             &layout,
@@ -6929,7 +10440,8 @@ mod tests {
             event,
             InputEvent::Scroll {
                 delta_x: 1,
-                delta_y: -2
+                delta_y: -2,
+                ..
             }
         ));
     }

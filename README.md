@@ -33,13 +33,13 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 - **macOS (server).** Grant MyKVM both **Accessibility** and **Input Monitoring** under System Settings → Privacy & Security. These are required to capture and inject keyboard/mouse input. Signed builds keep the grant across updates; if it ever drops, toggle it off and on.
 - **macOS first launch.** Builds are free self-signed (not Apple-notarized), so Gatekeeper warns the first time. Right-click the app → **Open** → **Open** to allow it once.
 - **Windows.** No special permission for normal use. Run as Administrator only if you need to control elevated/admin windows.
-- **Linux.** If you use the AppImage, mark it executable (`chmod +x`).
+- **Linux.** Keyboard/mouse sharing currently requires an **Xorg/X11 session**; native Wayland is detected but not yet supported. Choose an Xorg session at the login screen and restart MyKVM. If you use the AppImage, mark it executable (`chmod +x`).
 
 ## Limitations
 
-- **Trusted LAN only.** There is no user pairing/PIN yet, and LAN discovery is plaintext and unauthenticated. Do not expose the ports to public or untrusted networks.
-- Input and clipboard ride an **encrypted QUIC/TLS** connection pinned to the peer's advertised certificate, but MyKVM is a prototype and is not hardened for hostile networks.
-- The clipboard syncs **text and images**, not files.
+- **Trusted LAN only.** Pairing uses a confirmation code, but LAN discovery remains plaintext and unauthenticated. Do not expose the ports to public or untrusted networks.
+- Input and clipboard ride an **encrypted QUIC/TLS** connection authorized by the saved pairing secret and pinned certificate, but MyKVM is not hardened for hostile networks.
+- The clipboard syncs **text and images**, not files. On Linux, a single rich item that contains both image and text currently preserves the image representation and logs the text-format degradation.
 - macOS builds are **self-signed, not notarized** — expect a Gatekeeper prompt on first open.
 - Experimental software: the protocol and behavior may change between versions.
 
@@ -78,7 +78,7 @@ MyKVM runs two channels. LAN discovery uses a plain UDP port; input and clipboar
 | Channel | Default port | Transport | Marker | Purpose |
 | --- | --- | --- | --- | --- |
 | Discovery | UDP `47833` | UDP datagrams | `mykvm.discovery.v1` | LAN discovery, peer probe/reply, host info, and display metadata |
-| Input | UDP `47834` | QUIC datagrams | `mykvm.input.v1` | Mouse movement, mouse buttons, scroll, and keyboard events (low latency, loss tolerant) |
+| Input | UDP `47834` | QUIC datagrams + ordered stream | `mykvm.input.v1` | Latest-wins mouse motion plus reliable key, button, scroll, and handoff boundaries |
 | Clipboard | UDP `47834` | QUIC streams | `mykvm.clipboard.v1` | Clipboard text and image sync (reliable, ordered) |
 
 The discovery port is configurable in Settings (default UDP `47833`); the QUIC transport port defaults to the discovery port + 1 (UDP `47834`). Both auto-fall-back through nearby ports if a port is taken, and can use a system-selected port if needed. Peers advertise their active discovery port, QUIC port, transport public key, and protocol version, so discovered and manually added devices connect to the right port and pin the right certificate.

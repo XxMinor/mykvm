@@ -71,6 +71,16 @@ const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const FILE_TRANSFER_MAX_ID_BYTES: usize = 256;
+const FILE_TRANSFER_MAX_FILE_NAME_BYTES: usize = 1024;
+const FILE_TRANSFER_MAX_AUTH_FIELD_BYTES: usize = 1024;
+const FILE_TRANSFER_MAX_DESTINATION_HINT_BYTES: usize = 32;
+const FILE_TRANSFER_MAX_ACTIVE_TRANSFERS: usize = 16;
+const FILE_TRANSFER_MAX_ACTIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const FILE_TRANSFER_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+const FILE_TRANSFER_MAX_TRACKED_CHUNKS: usize =
+    ((FILE_TRANSFER_MAX_FILE_BYTES + FILE_TRANSFER_CHUNK_BYTES as u64 - 1)
+        / FILE_TRANSFER_CHUNK_BYTES as u64) as usize;
 const FILE_TRANSFER_DESTINATION_POINTER: &str = "pointer";
 // How many chunks are in flight at once. Each rides its own reliable QUIC
 // stream, so several fill the link's bandwidth-delay product instead of one
@@ -482,13 +492,19 @@ struct IncomingFileTransfer {
     file_name: String,
     total_bytes: u64,
     received_bytes: u64,
-    // Offsets already written, so a duplicate or retried chunk is ignored
-    // without double-counting received_bytes. Chunks may arrive out of order
-    // (concurrent senders), so completion is judged by received_bytes, not by a
-    // running index.
-    written_offsets: std::collections::HashSet<u64>,
+    // Non-overlapping [start, end) ranges already written. A map keeps
+    // out-of-order chunks cheap while preventing overlapping lengths from
+    // falsely adding up to total_bytes with a hole still in the file.
+    written_ranges: std::collections::BTreeMap<u64, u64>,
     temp_path: PathBuf,
     final_path: PathBuf,
+    last_activity: Instant,
+}
+
+impl Drop for IncomingFileTransfer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temp_path);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -575,12 +591,14 @@ struct AppRuntime {
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
     clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    clipboard_receive_gate: Arc<Mutex<()>>,
     remote_input_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
     main_window_focused: Arc<AtomicBool>,
     allow_explicit_quit: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     input_receive_enabled: Arc<AtomicBool>,
+    input_receive_gate: Arc<Mutex<()>>,
     upgrading: Arc<AtomicBool>,
     clipboard_receive_enabled: Arc<AtomicBool>,
     transport_packets: Arc<AtomicU64>,
@@ -614,12 +632,14 @@ impl AppRuntime {
             clipboard_seen_text: Arc::new(Mutex::new(None)),
             clipboard_echo_until: Arc::new(Mutex::new(None)),
             clipboard_last_sequences: Arc::new(Mutex::new(HashMap::new())),
+            clipboard_receive_gate: Arc::new(Mutex::new(())),
             remote_input_active: Arc::new(AtomicBool::new(false)),
             main_window_visible: Arc::new(AtomicBool::new(false)),
             main_window_focused: Arc::new(AtomicBool::new(false)),
             allow_explicit_quit: Arc::new(AtomicBool::new(false)),
             clipboard_target: Arc::new(Mutex::new(None)),
             input_receive_enabled: Arc::new(AtomicBool::new(false)),
+            input_receive_gate: Arc::new(Mutex::new(())),
             upgrading: Arc::new(AtomicBool::new(false)),
             clipboard_receive_enabled: Arc::new(AtomicBool::new(false)),
             transport_packets: Arc::new(AtomicU64::new(0)),
@@ -773,10 +793,12 @@ impl AppRuntime {
         let layout_for_pairing = Arc::clone(&self.layout);
         let native_layout_for_input = self.native_layout();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
+        let input_receive_gate = Arc::clone(&self.input_receive_gate);
         let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
         let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
         let clipboard_last_sequences = Arc::clone(&self.clipboard_last_sequences);
+        let clipboard_receive_gate = Arc::clone(&self.clipboard_receive_gate);
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let app_handle_for_file_transfer = self.app_handle.clone();
         let file_transfers = Arc::clone(&self.file_transfers);
@@ -789,6 +811,9 @@ impl AppRuntime {
         let peers_for_pairing = Arc::clone(&self.peers);
 
         let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
+            let _receive_guard = input_receive_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             if !input_receive_enabled.load(Ordering::Relaxed) {
                 return;
             }
@@ -862,6 +887,7 @@ impl AppRuntime {
                 &payload,
                 &layout,
                 &current_peer.id,
+                &clipboard_receive_gate,
                 &clipboard_seen_text,
                 &clipboard_echo_until,
                 &clipboard_last_sequences,
@@ -938,6 +964,7 @@ impl AppRuntime {
         let peers = Arc::clone(&self.peers);
         let layout_state = Arc::clone(&self.layout);
         let pairing_challenge = Arc::clone(&self.pairing_challenge);
+        let file_transfers = Arc::clone(&self.file_transfers);
         let app_handle = self.app_handle.clone();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let upgrading = Arc::clone(&self.upgrading);
@@ -1100,6 +1127,7 @@ impl AppRuntime {
 
                 prune_stale_peers(&peers);
                 sync_layout_peer_presence(&layout_state, &peers);
+                cleanup_stale_incoming_file_transfers(&file_transfers);
             }
         });
 
@@ -1109,10 +1137,10 @@ impl AppRuntime {
 
     fn start_input(&self, layout: LayoutState) -> (NativeStageStatus, NativeStageStatus) {
         sync_layout_peer_presence(&self.layout, &self.peers);
-        self.input_receive_enabled
-            .store(layout.input_mode == "receive", Ordering::Relaxed);
+        let input_mode = layout.input_mode.clone();
         let native_layout = self.native_layout();
         let Ok(mut input_stop) = self.input_stop.lock() else {
+            self.input_receive_enabled.store(false, Ordering::Relaxed);
             return (
                 NativeStageStatus {
                     state: "error".into(),
@@ -1130,6 +1158,7 @@ impl AppRuntime {
         }
 
         let Some(quic_transport) = self.quic_transport_handle() else {
+            self.input_receive_enabled.store(false, Ordering::Relaxed);
             return (
                 NativeStageStatus {
                     state: "error".into(),
@@ -1152,6 +1181,10 @@ impl AppRuntime {
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
             Arc::clone(&self.screen_switch_request),
+        );
+        self.input_receive_enabled.store(
+            input_receive_is_ready(&input_mode, &statuses.1),
+            Ordering::Relaxed,
         );
         *input_stop = Some(stop);
         statuses
@@ -1258,16 +1291,24 @@ impl AppRuntime {
 
     fn stop_input(&self) {
         self.input_receive_enabled.store(false, Ordering::Relaxed);
+        let _receive_guard = self
+            .input_receive_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if let Ok(mut stop) = self.input_stop.lock() {
             if let Some(signal) = stop.take() {
                 signal.store(true, Ordering::Relaxed);
             }
         }
+        // Enqueue CursorPark plus all held key/button releases while QUIC is
+        // still alive. Relying only on capture-thread teardown races process
+        // exit and can leave the controlled machine with a stuck modifier.
+        input::release_active_remote_control();
         self.remote_input_active.store(false, Ordering::Relaxed);
         input::clear_clipboard_target(&self.clipboard_target);
         // Drop any modifier flags we were holding for injection so a lost
         // key-up cannot leave Shift/Ctrl/Cmd stuck for the next session.
-        input::reset_injected_modifiers();
+        input::reset_injected_input_state();
     }
 
     fn stop_clipboard(&self) {
@@ -1337,6 +1378,10 @@ fn save_layout(
         if previous_layout.transport_port_mode != saved_layout.transport_port_mode
             || previous_layout.transport_port != saved_layout.transport_port
         {
+            // Final Park/Ups must use the old live transport before the port
+            // change closes it. restart_runtime_if_running repeats this stop
+            // safely after discovery is rebound.
+            state.stop_input();
             state.stop_discovery();
             thread::sleep(Duration::from_millis(200));
         }
@@ -3260,7 +3305,18 @@ fn spawn_instance_event_listener(name: &str, app: AppHandle, event_kind: Instanc
 
 fn request_app_quit(app: &AppHandle) {
     mark_explicit_quit(app);
+    prepare_app_exit(app);
     app.exit(0);
+}
+
+fn prepare_app_exit(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        // Order matters: the input stop sends its final reliable boundary over
+        // the live transport; only then may clipboard/discovery shut it down.
+        state.stop_input();
+        state.stop_clipboard();
+        state.stop_discovery();
+    }
 }
 
 fn mark_explicit_quit(app: &AppHandle) {
@@ -3625,6 +3681,10 @@ pub fn run() {
                 if !should_allow_app_exit(app, code) {
                     api.prevent_exit();
                     let _ = hide_main_window_handle(app);
+                } else {
+                    // Also cover framework-driven restart exits that do not go
+                    // through request_app_quit(). Cleanup is idempotent.
+                    prepare_app_exit(app);
                 }
             }
             #[cfg(target_os = "macos")]
@@ -4841,6 +4901,8 @@ pub(crate) fn current_platform() -> &'static str {
         "windows"
     } else if cfg!(target_os = "macos") {
         "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
     } else {
         "unknown"
     }
@@ -5132,10 +5194,9 @@ fn choose_available_transport_port(preferred: u16) -> u16 {
 fn bind_available_udp_port(preferred: u16) -> Result<(UdpSocket, u16), String> {
     let start = normalize_transport_port(preferred);
     for offset in 0..64_u16 {
-        let candidate = start.saturating_add(offset);
-        if candidate > TRANSPORT_PORT_MAX {
+        let Some(candidate) = start.checked_add(offset) else {
             break;
-        }
+        };
 
         if let Ok(socket) = bind_reusable_udp_port(candidate) {
             return Ok((socket, candidate));
@@ -5230,9 +5291,10 @@ fn clipboard_contents_signature(contents: &[ClipboardContent]) -> String {
         .join("|")
 }
 
-/// Builds a packet carrying *all* representations. The legacy `text`/`image`
-/// fields are filled from the first of each kind so a pre-multi-format peer
-/// still gets something usable.
+/// Builds a packet carrying *all* representations. A pure image uses its legacy
+/// field plus a lightweight format marker to avoid duplication; a rich copy
+/// keeps the image in `formats` (for rolling-upgrade peers) and legacy text (for
+/// pre-multi-format peers).
 fn clipboard_packet_from_contents(
     contents: Vec<ClipboardContent>,
     origin_id: String,
@@ -5242,6 +5304,13 @@ fn clipboard_packet_from_contents(
     sequence: u64,
 ) -> ClipboardPacket {
     let signature = clipboard_contents_signature(&contents);
+    let has_text = contents
+        .iter()
+        .any(|content| matches!(content, ClipboardContent::Text(text) if !text.is_empty()));
+    let image_count = contents
+        .iter()
+        .filter(|content| matches!(content, ClipboardContent::Image(_)))
+        .count();
     let mut formats = Vec::with_capacity(contents.len());
     let mut legacy_text = String::new();
     let mut legacy_image: Option<ClipboardImage> = None;
@@ -5258,14 +5327,34 @@ fn clipboard_packet_from_contents(
                 });
             }
             ClipboardContent::Image(image) => {
-                if legacy_image.is_none() {
-                    legacy_image = Some(image.clone());
+                if has_text || image_count > 1 {
+                    // Previous multi-format receivers return as soon as any
+                    // format decodes. Put rich-copy images in the envelope so
+                    // a rolling upgrade still receives the image; very old
+                    // flat-only peers retain the cheap legacy text fallback.
+                    formats.push(ClipboardFormat {
+                        kind: "imageRgba".into(),
+                        text: String::new(),
+                        image: Some(image),
+                    });
+                } else if legacy_image.is_none() {
+                    // Keep the first image in the legacy field so old peers can
+                    // still receive it. A marker preserves its position in the
+                    // multi-format envelope without serializing the large
+                    // base64 body twice.
+                    legacy_image = Some(image);
+                    formats.push(ClipboardFormat {
+                        kind: "imageRgba".into(),
+                        text: String::new(),
+                        image: None,
+                    });
+                } else {
+                    formats.push(ClipboardFormat {
+                        kind: "imageRgba".into(),
+                        text: String::new(),
+                        image: Some(image),
+                    });
                 }
-                formats.push(ClipboardFormat {
-                    kind: "imageRgba".into(),
-                    text: String::new(),
-                    image: Some(image),
-                });
             }
         }
     }
@@ -5283,6 +5372,7 @@ fn clipboard_packet_from_contents(
     }
 }
 
+#[cfg(test)]
 fn clipboard_packet_from_content(
     content: ClipboardContent,
     origin_id: String,
@@ -5291,41 +5381,14 @@ fn clipboard_packet_from_content(
     pair_secret: String,
     sequence: u64,
 ) -> ClipboardPacket {
-    let signature = content.signature();
-    match content {
-        ClipboardContent::Text(text) => ClipboardPacket {
-            protocol: CLIPBOARD_PROTOCOL.into(),
-            origin_id,
-            target_id,
-            cluster_id,
-            pair_secret,
-            signature,
-            formats: vec![ClipboardFormat {
-                kind: "plainText".into(),
-                text: text.clone(),
-                image: None,
-            }],
-            text,
-            image: None,
-            sequence,
-        },
-        ClipboardContent::Image(image) => ClipboardPacket {
-            protocol: CLIPBOARD_PROTOCOL.into(),
-            origin_id,
-            target_id,
-            cluster_id,
-            pair_secret,
-            signature,
-            formats: vec![ClipboardFormat {
-                kind: "imageRgba".into(),
-                text: String::new(),
-                image: Some(image.clone()),
-            }],
-            text: String::new(),
-            image: Some(image),
-            sequence,
-        },
-    }
+    clipboard_packet_from_contents(
+        vec![content],
+        origin_id,
+        target_id,
+        cluster_id,
+        pair_secret,
+        sequence,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5341,6 +5404,7 @@ fn run_clipboard_sync(
 ) {
     let mut last_sent: Option<(String, String, String)> = None;
     let mut last_failed: Option<(String, String, String, Instant)> = None;
+    let mut empty_retry: Option<(String, String, Option<u64>, u8, Instant)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut sequence = now_ms();
     // Cheap change gate: when the OS exposes a clipboard change counter we only
@@ -5371,20 +5435,103 @@ fn run_clipboard_sync(
         last_poll = Instant::now();
 
         let target_key = (target.device_id.clone(), target.addr.clone());
-        let token = clipboard::change_token();
-        if token.is_some() && token == last_token && last_target_key.as_ref() == Some(&target_key) {
-            continue;
+        let token_before = clipboard::change_token();
+        let same_target = last_target_key.as_ref() == Some(&target_key);
+        let retry_due = last_failed
+            .as_ref()
+            .map(|(device_id, addr, _, failed_at)| {
+                device_id == &target.device_id
+                    && addr == &target.addr
+                    && failed_at.elapsed() >= Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
+            })
+            .unwrap_or(false);
+        let empty_retry_due = empty_retry
+            .as_ref()
+            .map(|(device_id, addr, token, attempts, last_attempt)| {
+                *attempts >= 3
+                    && device_id == &target.device_id
+                    && addr == &target.addr
+                    && token == &token_before
+                    && last_attempt.elapsed() >= Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
+            })
+            .unwrap_or(false);
+        if !should_read_clipboard(token_before, last_token, same_target, retry_due) {
+            if !empty_retry_due {
+                continue;
+            }
         }
 
         let contents = clipboard::read_contents();
-        if contents.is_empty() {
-            last_token = token;
-            last_target_key = Some(target_key);
+        let token_after = clipboard::change_token();
+        if matches!((token_before, token_after), (Some(before), Some(after)) if before != after) {
+            // The clipboard changed between the text and image reads. Do not
+            // send a ghost snapshot made from two different copy operations.
             continue;
         }
-        last_token = token;
+        if contents.is_empty() {
+            // A busy pasteboard and an actually-empty pasteboard are both
+            // reported as an empty Vec by the platform layer. Retry a short
+            // burst before treating it as truly empty.
+            let observed_token = token_after.or(token_before);
+            let attempts = empty_retry
+                .as_ref()
+                .filter(|(device_id, addr, token, _, _)| {
+                    device_id == &target.device_id
+                        && addr == &target.addr
+                        && token == &observed_token
+                })
+                .map(|(_, _, _, attempts, _)| attempts.saturating_add(1))
+                .unwrap_or(1);
+            empty_retry = Some((
+                target.device_id.clone(),
+                target.addr.clone(),
+                observed_token,
+                attempts,
+                Instant::now(),
+            ));
+            if attempts >= 3 {
+                // Three stable empty reads mean this is probably a genuinely
+                // empty clipboard. Commit the token to stop a 20Hz full-read
+                // loop, but probe again after the normal retry interval in
+                // case the platform was busy for longer.
+                last_token = observed_token;
+                last_target_key = Some(target_key);
+                if last_failed
+                    .as_ref()
+                    .map(|(device_id, addr, _, _)| {
+                        device_id == &target.device_id && addr == &target.addr
+                    })
+                    .unwrap_or(false)
+                {
+                    last_failed = None;
+                }
+            }
+            continue;
+        }
+        empty_retry = None;
+        last_token = token_after.or(token_before);
         last_target_key = Some(target_key);
         let signature = clipboard_contents_signature(&contents);
+
+        // The controller owns the initial clipboard push when a control
+        // session starts.  The controlled peer only starts watching from its
+        // current contents; otherwise both sides race to send their stale
+        // clipboard and whichever ACK finishes last unexpectedly wins.
+        if should_baseline_clipboard_target(target.push_on_bind, same_target) {
+            last_failed = None;
+            last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
+            continue;
+        }
+
+        if last_failed
+            .as_ref()
+            .map(|(device_id, addr, previous, _)| {
+                device_id != &target.device_id || addr != &target.addr || previous != &signature
+            })
+            .unwrap_or(false)
+        {
+            last_failed = None;
+        }
 
         // If this is the content we just wrote after receiving a peer packet,
         // suppress it. A different signature during the grace window is treated
@@ -5425,10 +5572,6 @@ fn run_clipboard_sync(
             })
             .unwrap_or(false)
         {
-            // Keep the unchanged-token gate off while a retry is pending, or
-            // the gate would skip every poll after the cooldown and the retry
-            // would never fire.
-            last_token = None;
             continue;
         }
 
@@ -5475,9 +5618,6 @@ fn run_clipboard_sync(
                 if let Err(error) = send_result {
                     log::warn!("clipboard send failed: {error}");
                 }
-                // Force a re-evaluation on the next poll: the unchanged-token
-                // gate must not swallow the retry (pacing stays on last_failed).
-                last_token = None;
                 last_failed = Some((
                     target.device_id.clone(),
                     target.addr.clone(),
@@ -5487,6 +5627,19 @@ fn run_clipboard_sync(
             }
         }
     }
+}
+
+fn should_read_clipboard(
+    observed_token: Option<u64>,
+    committed_token: Option<u64>,
+    same_target: bool,
+    retry_due: bool,
+) -> bool {
+    observed_token.is_none() || observed_token != committed_token || !same_target || retry_due
+}
+
+fn should_baseline_clipboard_target(push_on_bind: bool, same_target: bool) -> bool {
+    !push_on_bind && !same_target
 }
 
 /// True while we are inside the post-write grace window (see
@@ -5545,10 +5698,43 @@ fn handle_clipboard_packet(
     payload: &[u8],
     layout: &LayoutState,
     local_peer_id: &str,
+    clipboard_receive_gate: &Arc<Mutex<()>>,
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> bool {
+    handle_clipboard_packet_serialized_with_writer(
+        payload,
+        layout,
+        local_peer_id,
+        clipboard_receive_gate,
+        clipboard_seen_text,
+        clipboard_echo_until,
+        clipboard_last_sequences,
+        write_clipboard_contents_with_retry,
+        clipboard::read_contents,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_clipboard_packet_serialized_with_writer<F, R>(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    clipboard_receive_gate: &Arc<Mutex<()>>,
+    clipboard_seen_text: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+    clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    write_contents: F,
+    mut read_contents: R,
+) -> bool
+where
+    F: FnMut(&[ClipboardContent]) -> Result<(), String>,
+    R: FnMut() -> Vec<ClipboardContent>,
+{
+    let _receive_guard = clipboard_receive_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let written = handle_clipboard_packet_with_writer(
         payload,
         layout,
@@ -5556,7 +5742,7 @@ fn handle_clipboard_packet(
         clipboard_seen_text,
         clipboard_echo_until,
         clipboard_last_sequences,
-        write_clipboard_contents_with_retry,
+        write_contents,
     );
 
     if written {
@@ -5566,7 +5752,7 @@ fn handle_clipboard_packet(
         // once the grace window passed — bouncing the image back to the peer
         // and overwriting anything they had copied since ("paste gives the
         // previous value"). The read-back signature makes the echo check exact.
-        let read_back = clipboard::read_contents();
+        let read_back = read_contents();
         if !read_back.is_empty() {
             if let Ok(mut seen) = clipboard_seen_text.lock() {
                 *seen = Some(clipboard_contents_signature(&read_back));
@@ -5704,31 +5890,44 @@ fn clipboard_packet_targets_local(
 }
 
 fn clipboard_contents_from_packet(packet: ClipboardPacket) -> Vec<ClipboardContent> {
-    let contents: Vec<ClipboardContent> = packet
-        .formats
-        .into_iter()
-        .filter_map(clipboard_content_from_format)
-        .collect();
-    if !contents.is_empty() {
-        return contents;
+    let mut contents = Vec::new();
+    let mut legacy_image = packet.image;
+    let legacy_text = packet.text;
+
+    for format in packet.formats {
+        match format.kind.as_str() {
+            "plainText" if !format.text.is_empty() => {
+                contents.push(ClipboardContent::Text(format.text));
+            }
+            "imageRgba" => {
+                if let Some(image) = format.image.or_else(|| legacy_image.take()) {
+                    contents.push(ClipboardContent::Image(image));
+                }
+            }
+            _ => {}
+        }
     }
 
-    // Legacy single-representation peers: fall back to the flat text/image fields.
-    if let Some(image) = packet.image {
-        vec![ClipboardContent::Image(image)]
-    } else if !packet.text.is_empty() {
-        vec![ClipboardContent::Text(packet.text)]
-    } else {
-        Vec::new()
+    // Supplement missing representations from legacy flat fields. This keeps
+    // old packets readable and lets a rich packet carry its large first image
+    // only once while text remains in the formats envelope.
+    if !legacy_text.is_empty()
+        && !contents
+            .iter()
+            .any(|content| matches!(content, ClipboardContent::Text(_)))
+    {
+        contents.push(ClipboardContent::Text(legacy_text));
     }
-}
+    if let Some(image) = legacy_image {
+        if !contents
+            .iter()
+            .any(|content| matches!(content, ClipboardContent::Image(_)))
+        {
+            contents.push(ClipboardContent::Image(image));
+        }
+    }
 
-fn clipboard_content_from_format(format: ClipboardFormat) -> Option<ClipboardContent> {
-    match format.kind.as_str() {
-        "plainText" if !format.text.is_empty() => Some(ClipboardContent::Text(format.text)),
-        "imageRgba" => format.image.map(ClipboardContent::Image),
-        _ => None,
-    }
+    contents
 }
 
 fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -> bool {
@@ -5902,7 +6101,7 @@ fn send_transfer_file(
 ) -> Result<u64, String> {
     let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
 
-    send_file_transfer_packet(
+    if let Err(error) = send_file_transfer_packet(
         quic_transport,
         target,
         file_transfer_packet(
@@ -5917,7 +6116,17 @@ fn send_transfer_file(
             destination_hint,
             Vec::new(),
         ),
-    )?;
+    ) {
+        send_file_transfer_abort(
+            quic_transport,
+            origin_id,
+            target,
+            file,
+            &transfer_id,
+            destination_hint,
+        );
+        return Err(error);
+    }
     emit_file_transfer_progress(app_handle, &transfer_id, file, target, 0, false);
 
     // Fan chunks out to a small pool of workers so several are in flight at
@@ -6035,10 +6244,18 @@ fn send_transfer_file(
     });
 
     if let Some(error) = error_slot.lock().ok().and_then(|mut slot| slot.take()) {
+        send_file_transfer_abort(
+            quic_transport,
+            origin_id,
+            target,
+            file,
+            &transfer_id,
+            destination_hint,
+        );
         return Err(error);
     }
 
-    send_file_transfer_packet(
+    if let Err(error) = send_file_transfer_packet(
         quic_transport,
         target,
         file_transfer_packet(
@@ -6053,7 +6270,17 @@ fn send_transfer_file(
             destination_hint,
             Vec::new(),
         ),
-    )?;
+    ) {
+        send_file_transfer_abort(
+            quic_transport,
+            origin_id,
+            target,
+            file,
+            &transfer_id,
+            destination_hint,
+        );
+        return Err(error);
+    }
     emit_file_transfer_progress(
         app_handle,
         &transfer_id,
@@ -6065,6 +6292,31 @@ fn send_transfer_file(
 
     // start + chunks + finish
     Ok(chunk_count.load(Ordering::Relaxed).saturating_add(2))
+}
+
+fn send_file_transfer_abort(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: &str,
+    target: &FileTransferTarget,
+    file: &TransferFile,
+    transfer_id: &str,
+    destination_hint: Option<&str>,
+) {
+    let packet = file_transfer_packet(
+        "abort",
+        transfer_id,
+        origin_id,
+        target,
+        &file.name,
+        file.total_bytes,
+        0,
+        0,
+        destination_hint,
+        Vec::new(),
+    );
+    if let Err(error) = send_file_transfer_packet(quic_transport, target, packet) {
+        log::warn!("file transfer abort failed: {error}");
+    }
 }
 
 fn progress_emit_due(last_emit: &Mutex<Instant>) -> bool {
@@ -6305,6 +6557,9 @@ fn handle_decoded_file_transfer_packet(
     if packet.protocol != FILE_TRANSFER_PROTOCOL {
         return false;
     }
+    if !file_transfer_packet_fields_valid(&packet) {
+        return false;
+    }
     if !layout.file_transfer_enabled {
         return false;
     }
@@ -6317,6 +6572,8 @@ fn handle_decoded_file_transfer_packet(
     if packet.origin_id == local_peer_id {
         return true;
     }
+
+    cleanup_stale_incoming_file_transfers(transfers);
 
     let destination_root =
         file_transfer_destination_root(&packet, receive_root, pointer_receive_root);
@@ -6335,8 +6592,48 @@ fn handle_decoded_file_transfer_packet(
         }
         "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
         "finish" => finish_incoming_file_transfer(packet, transfers),
+        "abort" => abort_incoming_file_transfer(packet, transfers),
         _ => false,
     }
+}
+
+fn cleanup_stale_incoming_file_transfers(
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+) {
+    let now = Instant::now();
+    if let Ok(mut transfers) = transfers.lock() {
+        transfers.retain(|transfer_id, transfer| {
+            let keep =
+                now.saturating_duration_since(transfer.last_activity) <= FILE_TRANSFER_IDLE_TTL;
+            if !keep {
+                log::warn!("discarding stale incoming file transfer {transfer_id}");
+            }
+            keep
+        });
+    }
+}
+
+fn file_transfer_packet_fields_valid(packet: &FileTransferPacket) -> bool {
+    !packet.transfer_id.trim().is_empty()
+        && packet.transfer_id.len() <= FILE_TRANSFER_MAX_ID_BYTES
+        && !packet.origin_id.trim().is_empty()
+        && packet.origin_id.len() <= FILE_TRANSFER_MAX_ID_BYTES
+        && packet.target_id.len() <= FILE_TRANSFER_MAX_ID_BYTES
+        && !packet.file_name.trim().is_empty()
+        && packet.file_name.len() <= FILE_TRANSFER_MAX_FILE_NAME_BYTES
+        && packet.cluster_id.len() <= FILE_TRANSFER_MAX_AUTH_FIELD_BYTES
+        && packet.pair_secret.len() <= FILE_TRANSFER_MAX_AUTH_FIELD_BYTES
+        && packet.data.len() <= FILE_TRANSFER_CHUNK_BYTES
+        && packet.total_bytes <= FILE_TRANSFER_MAX_FILE_BYTES
+        && packet
+            .destination_hint
+            .as_deref()
+            .map(|hint| {
+                hint.len() <= FILE_TRANSFER_MAX_DESTINATION_HINT_BYTES
+                    && hint == FILE_TRANSFER_DESTINATION_POINTER
+            })
+            .unwrap_or(true)
+        && matches!(packet.kind.as_str(), "start" | "chunk" | "finish" | "abort")
 }
 
 fn file_transfer_destination_root<'a>(
@@ -6468,32 +6765,41 @@ fn start_incoming_file_transfer(
         );
         return false;
     }
+    cleanup_stale_orphan_transfer_parts_once(receive_root, transfers);
 
-    let final_path = unique_transfer_destination(receive_root, &file_name);
-    let temp_path = receive_root.join(format!(
-        ".mykvm-{}-{}.part",
-        sanitize_transfer_id(&packet.transfer_id),
-        file_name
-    ));
-
-    if let Ok(mut transfers) = transfers.lock() {
-        if let Some(previous) = transfers.remove(&packet.transfer_id) {
-            let _ = fs::remove_file(previous.temp_path);
+    let Ok(mut transfers) = transfers.lock() else {
+        return false;
+    };
+    if let Some(existing) = transfers.get_mut(&packet.transfer_id) {
+        // A retransmitted start after a lost ACK is idempotent. A different
+        // sender or shape may not replace another active receive with the same id.
+        let matches = existing.origin_id == packet.origin_id
+            && existing.target_id == packet.target_id
+            && existing.file_name == file_name
+            && existing.total_bytes == packet.total_bytes
+            && existing.final_path.parent() == Some(receive_root);
+        if matches {
+            existing.last_activity = Instant::now();
         }
-    } else {
+        return matches;
+    }
+    let active_bytes = transfers.values().fold(0_u64, |total, transfer| {
+        total.saturating_add(transfer.total_bytes)
+    });
+    if transfers.len() >= FILE_TRANSFER_MAX_ACTIVE_TRANSFERS
+        || active_bytes.saturating_add(packet.total_bytes) > FILE_TRANSFER_MAX_ACTIVE_BYTES
+    {
         return false;
     }
 
-    // Preallocate the full size so concurrent chunks can seek to their offset
-    // and write in any order.
-    match fs::File::create(&temp_path) {
-        Ok(file) => {
-            if packet.total_bytes > 0 && file.set_len(packet.total_bytes).is_err() {
-                return false;
-            }
-        }
-        Err(_) => return false,
-    }
+    let Some(final_path) = unique_transfer_destination(receive_root, &file_name, &transfers, None)
+    else {
+        return false;
+    };
+
+    let Ok(temp_path) = create_incoming_transfer_temp(receive_root, packet.total_bytes) else {
+        return false;
+    };
 
     let transfer = IncomingFileTransfer {
         origin_id: packet.origin_id.clone(),
@@ -6501,18 +6807,66 @@ fn start_incoming_file_transfer(
         file_name,
         total_bytes: packet.total_bytes,
         received_bytes: 0,
-        written_offsets: std::collections::HashSet::new(),
+        written_ranges: std::collections::BTreeMap::new(),
         temp_path,
         final_path,
+        last_activity: Instant::now(),
     };
 
-    transfers
+    transfers.insert(packet.transfer_id, transfer);
+    true
+}
+
+fn cleanup_stale_orphan_transfer_parts_once(
+    receive_root: &Path,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+) {
+    static CLEANED_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let root_key = fs::canonicalize(receive_root).unwrap_or_else(|_| receive_root.to_path_buf());
+    let should_scan = CLEANED_ROOTS
+        .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .map(|mut transfers| {
-            transfers.insert(packet.transfer_id, transfer);
-            true
+        .map(|mut roots| roots.insert(root_key))
+        .unwrap_or(false);
+    if !should_scan {
+        return;
+    }
+
+    let active_paths = transfers
+        .lock()
+        .map(|transfers| {
+            transfers
+                .values()
+                .map(|transfer| transfer.temp_path.clone())
+                .collect::<HashSet<_>>()
         })
-        .unwrap_or(false)
+        .unwrap_or_default();
+    let Some(cutoff) = SystemTime::now().checked_sub(FILE_TRANSFER_IDLE_TTL) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(receive_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name.starts_with(".mykvm-") || !file_name.ends_with(".part") {
+            continue;
+        }
+        let path = entry.path();
+        if active_paths.contains(&path) {
+            continue;
+        }
+        let is_stale = fs::symlink_metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| modified <= cutoff)
+            .unwrap_or(false);
+        if is_stale {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn append_incoming_file_transfer_chunk(
@@ -6530,19 +6884,38 @@ fn append_incoming_file_transfer_chunk(
     let Some(transfer) = transfers.get_mut(&packet.transfer_id) else {
         return false;
     };
-    if packet.origin_id != transfer.origin_id
-        || packet.target_id != transfer.target_id
-        || packet.file_name != transfer.file_name
-        || packet.total_bytes != transfer.total_bytes
-        || packet.offset.saturating_add(packet.data.len() as u64) > transfer.total_bytes
-    {
+    if !file_transfer_packet_matches_active(&packet, transfer) {
         return false;
     }
 
-    // A chunk already written (duplicate / retransmit) is accepted idempotently
-    // so received_bytes is not double-counted.
-    if transfer.written_offsets.contains(&packet.offset) {
-        return true;
+    let Some(end) = packet.offset.checked_add(packet.data.len() as u64) else {
+        return false;
+    };
+    if end > transfer.total_bytes {
+        return false;
+    }
+
+    // An exact duplicate/retransmit is idempotent. Same start with a different
+    // length, or any partial overlap with a neighbour, is malformed.
+    if let Some(previous_end) = transfer.written_ranges.get(&packet.offset) {
+        transfer.last_activity = Instant::now();
+        return *previous_end == end;
+    }
+    if transfer
+        .written_ranges
+        .range(..packet.offset)
+        .next_back()
+        .is_some_and(|(_, previous_end)| *previous_end > packet.offset)
+        || transfer
+            .written_ranges
+            .range(packet.offset..)
+            .next()
+            .is_some_and(|(next_start, _)| *next_start < end)
+    {
+        return false;
+    }
+    if transfer.written_ranges.len() >= FILE_TRANSFER_MAX_TRACKED_CHUNKS {
+        return false;
     }
 
     let write_result = fs::OpenOptions::new()
@@ -6554,13 +6927,15 @@ fn append_incoming_file_transfer_chunk(
         });
     if let Err(error) = write_result {
         log::warn!("file transfer chunk write failed: {error}");
+        transfers.remove(&packet.transfer_id);
         return false;
     }
 
-    transfer.written_offsets.insert(packet.offset);
+    transfer.written_ranges.insert(packet.offset, end);
     transfer.received_bytes = transfer
         .received_bytes
         .saturating_add(packet.data.len() as u64);
+    transfer.last_activity = Instant::now();
     true
 }
 
@@ -6571,47 +6946,144 @@ fn finish_incoming_file_transfer(
     if !packet.data.is_empty() {
         return false;
     }
-    let (temp_path, final_path, file_name, total_bytes) = {
-        let Ok(transfers) = transfers.lock() else {
-            return false;
-        };
-        let Some(transfer) = transfers.get(&packet.transfer_id) else {
-            return false;
-        };
-        if packet.origin_id != transfer.origin_id
-            || packet.target_id != transfer.target_id
-            || packet.file_name != transfer.file_name
-            || packet.total_bytes != transfer.total_bytes
-            || transfer.received_bytes != transfer.total_bytes
-        {
-            return false;
-        }
-        (
-            transfer.temp_path.clone(),
-            transfer.final_path.clone(),
-            transfer.file_name.clone(),
-            transfer.total_bytes,
-        )
-    };
-
-    match fs::rename(&temp_path, &final_path) {
-        Ok(()) => {
-            if let Ok(mut transfers) = transfers.lock() {
-                transfers.remove(&packet.transfer_id);
+    for _ in 0..32 {
+        let (temp_path, final_path, file_name, total_bytes) = {
+            let Ok(transfers) = transfers.lock() else {
+                return false;
+            };
+            let Some(transfer) = transfers.get(&packet.transfer_id) else {
+                return false;
+            };
+            if !file_transfer_packet_matches_active(&packet, transfer)
+                || transfer.received_bytes != transfer.total_bytes
+            {
+                return false;
             }
-            log::info!(
-                "received file transfer {} bytes={} path={}",
-                file_name,
-                total_bytes,
-                final_path.display()
-            );
-            true
-        }
-        Err(error) => {
-            log::warn!("file transfer finalize failed: {error}");
-            false
+            (
+                transfer.temp_path.clone(),
+                transfer.final_path.clone(),
+                transfer.file_name.clone(),
+                transfer.total_bytes,
+            )
+        };
+
+        match commit_transfer_file_no_clobber(&temp_path, &final_path) {
+            Ok(()) => {
+                if let Ok(mut transfers) = transfers.lock() {
+                    transfers.remove(&packet.transfer_id);
+                }
+                let _ = fs::remove_file(&temp_path);
+                log::info!(
+                    "received file transfer {} bytes={} path={}",
+                    file_name,
+                    total_bytes,
+                    final_path.display()
+                );
+                return true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let Some(directory) = final_path.parent() else {
+                    return false;
+                };
+                let Ok(mut transfers) = transfers.lock() else {
+                    return false;
+                };
+                let Some(next_path) = unique_transfer_destination(
+                    directory,
+                    &file_name,
+                    &transfers,
+                    Some(&packet.transfer_id),
+                ) else {
+                    return false;
+                };
+                let Some(transfer) = transfers.get_mut(&packet.transfer_id) else {
+                    return false;
+                };
+                if transfer.temp_path != temp_path {
+                    return false;
+                }
+                transfer.final_path = next_path;
+            }
+            Err(error) => {
+                log::warn!("file transfer finalize failed: {error}");
+                discard_incoming_file_transfer(transfers, &packet.transfer_id, &temp_path);
+                return false;
+            }
         }
     }
+
+    if let Ok(mut transfers) = transfers.lock() {
+        transfers.remove(&packet.transfer_id);
+    }
+    false
+}
+
+fn discard_incoming_file_transfer(
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    transfer_id: &str,
+    expected_temp_path: &Path,
+) {
+    if let Ok(mut transfers) = transfers.lock() {
+        let matches = transfers
+            .get(transfer_id)
+            .map(|transfer| transfer.temp_path == expected_temp_path)
+            .unwrap_or(false);
+        if matches {
+            transfers.remove(transfer_id);
+        }
+    }
+}
+
+fn abort_incoming_file_transfer(
+    packet: FileTransferPacket,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+) -> bool {
+    if !packet.data.is_empty() {
+        return false;
+    }
+    let Ok(mut transfers) = transfers.lock() else {
+        return false;
+    };
+    let Some(transfer) = transfers.get(&packet.transfer_id) else {
+        return true;
+    };
+    if !file_transfer_packet_matches_active(&packet, transfer) {
+        return false;
+    }
+    transfers.remove(&packet.transfer_id);
+    true
+}
+
+fn file_transfer_packet_matches_active(
+    packet: &FileTransferPacket,
+    transfer: &IncomingFileTransfer,
+) -> bool {
+    packet.origin_id == transfer.origin_id
+        && packet.target_id == transfer.target_id
+        && packet.total_bytes == transfer.total_bytes
+        && sanitize_transfer_file_name(&packet.file_name).as_deref()
+            == Some(transfer.file_name.as_str())
+}
+
+fn commit_transfer_file_no_clobber(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    match fs::hard_link(temp_path, final_path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
+        Err(_) => {}
+    }
+
+    let mut source = fs::File::open(temp_path)?;
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(final_path)?;
+    let copied = std::io::copy(&mut source, &mut destination).and_then(|_| destination.sync_all());
+    drop(destination);
+    if let Err(error) = copied {
+        let _ = fs::remove_file(final_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn file_transfer_packet_authorized(layout: &LayoutState, packet: &FileTransferPacket) -> bool {
@@ -6669,23 +7141,46 @@ fn sanitize_transfer_file_name(name: &str) -> Option<String> {
     }
 }
 
-fn sanitize_transfer_id(transfer_id: &str) -> String {
-    let id = transfer_id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .take(80)
-        .collect::<String>();
-    if id.is_empty() {
-        random_hex(8)
-    } else {
-        id
+fn create_incoming_transfer_temp(directory: &Path, total_bytes: u64) -> Result<PathBuf, String> {
+    for _ in 0..32 {
+        let path = directory.join(format!(".mykvm-{}.part", random_hex(16)));
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("failed to create transfer temp file: {error}")),
+        };
+        if let Err(error) = file.set_len(total_bytes) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(format!("failed to size transfer temp file: {error}"));
+        }
+        return Ok(path);
     }
+
+    Err("failed to reserve a unique transfer temp file".into())
 }
 
-fn unique_transfer_destination(directory: &Path, file_name: &str) -> PathBuf {
+fn unique_transfer_destination(
+    directory: &Path,
+    file_name: &str,
+    transfers: &HashMap<String, IncomingFileTransfer>,
+    skip_transfer_id: Option<&str>,
+) -> Option<PathBuf> {
+    let available = |candidate: &Path| {
+        matches!(
+            fs::symlink_metadata(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) && !transfers.iter().any(|(transfer_id, transfer)| {
+            Some(transfer_id.as_str()) != skip_transfer_id && transfer.final_path == candidate
+        })
+    };
     let first = directory.join(file_name);
-    if !first.exists() {
-        return first;
+    if available(&first) {
+        return Some(first);
     }
 
     let path = Path::new(file_name);
@@ -6701,12 +7196,18 @@ fn unique_transfer_destination(directory: &Path, file_name: &str) -> PathBuf {
 
     for index in 1..10_000 {
         let candidate = directory.join(format!("{stem} ({index}){extension}"));
-        if !candidate.exists() {
-            return candidate;
+        if available(&candidate) {
+            return Some(candidate);
         }
     }
 
-    directory.join(format!("{stem}-{}{extension}", random_hex(4)))
+    for index in 0..32 {
+        let candidate = directory.join(format!("{stem}-{}-{index}{extension}", random_hex(4)));
+        if available(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -7101,6 +7602,10 @@ fn advertised_cluster_id(layout: &LayoutState) -> String {
 
 fn advertised_input_ready(layout: &LayoutState, input_ready: bool) -> bool {
     input_ready && !pairing_required(layout) && !layout.cluster_id.trim().is_empty()
+}
+
+fn input_receive_is_ready(input_mode: &str, inject_status: &NativeStageStatus) -> bool {
+    input_mode == "receive" && inject_status.state == "ready"
 }
 
 fn should_send_public_announce(layout: &LayoutState) -> bool {
@@ -7926,9 +8431,6 @@ fn discovery_target_ports(base: u16) -> Vec<u16> {
         let Some(port) = base.checked_add(offset) else {
             break;
         };
-        if port > TRANSPORT_PORT_MAX {
-            break;
-        }
         ports.push(port);
     }
     ports
@@ -8200,6 +8702,32 @@ mod tests {
             Some(tauri::RESTART_EXIT_CODE),
             false
         ));
+    }
+
+    #[test]
+    fn input_receive_advertisement_requires_a_ready_injector() {
+        let ready = NativeStageStatus {
+            state: "ready".into(),
+            detail: "ready".into(),
+        };
+        let error = NativeStageStatus {
+            state: "error".into(),
+            detail: "permission denied".into(),
+        };
+        let stubbed = NativeStageStatus {
+            state: "stubbed".into(),
+            detail: "unsupported".into(),
+        };
+
+        assert!(input_receive_is_ready("receive", &ready));
+        assert!(!input_receive_is_ready("receive", &error));
+        assert!(!input_receive_is_ready("receive", &stubbed));
+        assert!(!input_receive_is_ready("control", &ready));
+    }
+
+    #[test]
+    fn supported_desktop_platform_never_advertises_unknown() {
+        assert!(matches!(current_platform(), "macos" | "windows" | "linux"));
     }
 
     #[test]
@@ -8852,15 +9380,40 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_change_gate_waits_for_retry_without_redecoding() {
+        assert!(!should_read_clipboard(Some(7), Some(7), true, false));
+        assert!(should_read_clipboard(Some(7), Some(7), true, true));
+        assert!(should_read_clipboard(Some(8), Some(7), true, false));
+        assert!(should_read_clipboard(Some(7), Some(7), false, false));
+        assert!(should_read_clipboard(None, None, true, false));
+    }
+
+    #[test]
+    fn clipboard_binding_has_one_initial_sender() {
+        assert!(!should_baseline_clipboard_target(true, false));
+        assert!(should_baseline_clipboard_target(false, false));
+        assert!(!should_baseline_clipboard_target(false, true));
+    }
+
+    #[test]
     fn clipboard_image_packet_fits_transport_stream_budget() {
-        let raw_rgba_bytes = 800 * 600 * 4;
+        // A 3024x1964 screenshot is below the decoded 32 MiB clipboard cap,
+        // but it still has to fit the 48 MiB QUIC stream after base64 + packet
+        // framing. This specifically exercises the production multi-format
+        // builder so the same image cannot silently be serialized twice.
+        let raw_rgba_bytes = 3024 * 1964 * 4;
         let encoded_len = raw_rgba_bytes / 3 * 4;
-        let packet = clipboard_packet_from_content(
-            ClipboardContent::Image(ClipboardImage {
-                width: 800,
-                height: 600,
-                rgba_base64: "A".repeat(encoded_len),
-            }),
+        let content = ClipboardContent::Image(ClipboardImage {
+            width: 3024,
+            height: 1964,
+            rgba_base64: "A".repeat(encoded_len),
+        });
+        assert!(
+            !content.is_oversized(),
+            "the regression fixture must stay inside the clipboard image cap"
+        );
+        let packet = clipboard_packet_from_contents(
+            vec![content],
             "local-device".into(),
             "peer-device".into(),
             "cluster-test".into(),
@@ -8965,7 +9518,16 @@ mod tests {
         );
         assert_eq!(rebuilt.formats.len(), 2);
         assert_eq!(rebuilt.text, "看图");
-        assert!(rebuilt.image.is_some());
+        assert!(rebuilt.image.is_none());
+        assert!(
+            rebuilt.formats[1].image.is_some(),
+            "rolling-upgrade peers must see the rich-copy image in formats"
+        );
+
+        let round_trip = clipboard_contents_from_packet(rebuilt);
+        assert_eq!(round_trip.len(), 2);
+        assert!(matches!(&round_trip[0], ClipboardContent::Text(text) if text == "看图"));
+        assert!(matches!(&round_trip[1], ClipboardContent::Image(_)));
     }
 
     #[test]
@@ -9148,6 +9710,139 @@ mod tests {
         }
 
         assert_eq!(written, vec!["new"]);
+    }
+
+    #[test]
+    fn clipboard_receive_gate_prevents_older_write_from_landing_last() {
+        let layout = test_layout();
+        let older = clipboard_packet_from_content(
+            ClipboardContent::Text("old".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            100,
+        );
+        let newer = clipboard_packet_from_content(
+            ClipboardContent::Text("new".into()),
+            "peer-client-10-0-0-2".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            101,
+        );
+        let older_payload = encode_wire_packet(&older).expect("older packet should encode");
+        let newer_payload = encode_wire_packet(&newer).expect("newer packet should encode");
+        let receive_gate = Arc::new(Mutex::new(()));
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let stored = Arc::new(Mutex::new(String::new()));
+        let (older_entered_tx, older_entered_rx) = std::sync::mpsc::channel();
+        let (newer_attempting_tx, newer_attempting_rx) = std::sync::mpsc::channel();
+        let (newer_entered_tx, newer_entered_rx) = std::sync::mpsc::channel();
+        let release_older = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let older_thread = {
+            let layout = layout.clone();
+            let receive_gate = Arc::clone(&receive_gate);
+            let clipboard_seen_text = Arc::clone(&clipboard_seen_text);
+            let clipboard_echo_until = Arc::clone(&clipboard_echo_until);
+            let clipboard_last_sequences = Arc::clone(&clipboard_last_sequences);
+            let stored = Arc::clone(&stored);
+            let release_older = Arc::clone(&release_older);
+            thread::spawn(move || {
+                handle_clipboard_packet_serialized_with_writer(
+                    &older_payload,
+                    &layout,
+                    "local-device",
+                    &receive_gate,
+                    &clipboard_seen_text,
+                    &clipboard_echo_until,
+                    &clipboard_last_sequences,
+                    |contents| {
+                        older_entered_tx.send(()).expect("signal older writer");
+                        let (lock, condition) = &*release_older;
+                        let released = lock.lock().expect("release lock");
+                        let _released = condition
+                            .wait_while(released, |released| !*released)
+                            .expect("release wait");
+                        if let Some(text) = contents.iter().find_map(|content| match content {
+                            ClipboardContent::Text(text) => Some(text.clone()),
+                            ClipboardContent::Image(_) => None,
+                        }) {
+                            *stored.lock().expect("stored clipboard") = text;
+                        }
+                        Ok(())
+                    },
+                    Vec::new,
+                )
+            })
+        };
+        older_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("older writer entered");
+
+        let newer_thread = {
+            let layout = layout.clone();
+            let receive_gate = Arc::clone(&receive_gate);
+            let clipboard_seen_text = Arc::clone(&clipboard_seen_text);
+            let clipboard_echo_until = Arc::clone(&clipboard_echo_until);
+            let clipboard_last_sequences = Arc::clone(&clipboard_last_sequences);
+            let stored = Arc::clone(&stored);
+            thread::spawn(move || {
+                newer_attempting_tx
+                    .send(())
+                    .expect("signal newer receive attempt");
+                handle_clipboard_packet_serialized_with_writer(
+                    &newer_payload,
+                    &layout,
+                    "local-device",
+                    &receive_gate,
+                    &clipboard_seen_text,
+                    &clipboard_echo_until,
+                    &clipboard_last_sequences,
+                    |contents| {
+                        newer_entered_tx.send(()).expect("signal newer writer");
+                        if let Some(text) = contents.iter().find_map(|content| match content {
+                            ClipboardContent::Text(text) => Some(text.clone()),
+                            ClipboardContent::Image(_) => None,
+                        }) {
+                            *stored.lock().expect("stored clipboard") = text;
+                        }
+                        Ok(())
+                    },
+                    Vec::new,
+                )
+            })
+        };
+
+        newer_attempting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("newer receive attempted");
+        let newer_entered_while_older_was_writing = newer_entered_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+        let (lock, condition) = &*release_older;
+        *lock.lock().expect("release lock") = true;
+        condition.notify_all();
+        if !newer_entered_while_older_was_writing {
+            newer_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("newer writer entered after older completed");
+        }
+
+        assert!(older_thread.join().expect("older receive thread"));
+        assert!(newer_thread.join().expect("newer receive thread"));
+        assert!(!newer_entered_while_older_was_writing);
+        assert_eq!(stored.lock().expect("stored clipboard").as_str(), "new");
+        assert_eq!(
+            clipboard_last_sequences
+                .lock()
+                .expect("sequence lock")
+                .get("peer-client-10-0-0-2"),
+            Some(&101),
+        );
     }
 
     #[test]
@@ -9427,6 +10122,607 @@ mod tests {
     }
 
     #[test]
+    fn file_transfer_write_error_discards_the_broken_receive() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-write-error");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let start = test_file_transfer_packet("start", "broken", "note.txt", 1, 0, 0, b"");
+        let payload = encode_wire_packet(&start).expect("start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        let temp_path = transfers
+            .lock()
+            .expect("transfer lock")
+            .get("broken")
+            .expect("active transfer")
+            .temp_path
+            .clone();
+        fs::remove_file(&temp_path).expect("force the next chunk write to fail");
+
+        let chunk = test_file_transfer_packet("chunk", "broken", "note.txt", 1, 0, 0, b"x");
+        let payload = encode_wire_packet(&chunk).expect("chunk should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        assert!(transfers.lock().expect("transfer lock").is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_abort_removes_the_partial_receive() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-abort");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let send = |packet: FileTransferPacket| {
+            let payload = encode_wire_packet(&packet).expect("packet should encode");
+            handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            )
+        };
+        assert!(send(test_file_transfer_packet(
+            "start", "abort-me", "note.txt", 1, 0, 0, b""
+        )));
+        let temp_path = transfers
+            .lock()
+            .expect("transfer lock")
+            .get("abort-me")
+            .expect("active transfer")
+            .temp_path
+            .clone();
+
+        assert!(send(test_file_transfer_packet(
+            "abort", "abort-me", "note.txt", 1, 0, 0, b""
+        )));
+        assert!(transfers.lock().expect("transfer lock").is_empty());
+        assert!(!temp_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_finalize_error_discards_the_broken_receive() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-finish-error");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let send = |packet: FileTransferPacket| {
+            let payload = encode_wire_packet(&packet).expect("packet should encode");
+            handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            )
+        };
+        assert!(send(test_file_transfer_packet(
+            "start",
+            "finish-broken",
+            "note.txt",
+            1,
+            0,
+            0,
+            b""
+        )));
+        assert!(send(test_file_transfer_packet(
+            "chunk",
+            "finish-broken",
+            "note.txt",
+            1,
+            0,
+            0,
+            b"x"
+        )));
+        let temp_path = transfers
+            .lock()
+            .expect("transfer lock")
+            .get("finish-broken")
+            .expect("active transfer")
+            .temp_path
+            .clone();
+        fs::remove_file(temp_path).expect("force finalization to fail");
+
+        assert!(!send(test_file_transfer_packet(
+            "finish",
+            "finish-broken",
+            "note.txt",
+            1,
+            1,
+            1,
+            b""
+        )));
+        assert!(transfers.lock().expect("transfer lock").is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_rejects_oversized_transfer_id_without_creating_a_part_file() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-long-id");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let transfer_id = "x".repeat(257);
+        let packet = test_file_transfer_packet("start", &transfer_id, "note.txt", 4, 0, 0, b"");
+        let payload = encode_wire_packet(&packet).expect("start should encode");
+
+        assert!(!handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        assert!(transfers.lock().expect("transfer lock").is_empty());
+        assert_eq!(fs::read_dir(&root).expect("read receive root").count(), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_caps_the_number_of_active_receives() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-active-count");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for index in 0..16 {
+            let packet = test_file_transfer_packet(
+                "start",
+                &format!("transfer-{index}"),
+                &format!("note-{index}.txt"),
+                1,
+                0,
+                0,
+                b"",
+            );
+            let payload = encode_wire_packet(&packet).expect("start should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        let overflow =
+            test_file_transfer_packet("start", "transfer-over-cap", "overflow.txt", 1, 0, 0, b"");
+        let payload = encode_wire_packet(&overflow).expect("overflow start should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        assert_eq!(transfers.lock().expect("transfer lock").len(), 16);
+
+        drop(transfers);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_caps_total_declared_active_bytes() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-active-bytes");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for index in 0..2 {
+            let packet = test_file_transfer_packet(
+                "start",
+                &format!("large-{index}"),
+                &format!("large-{index}.bin"),
+                FILE_TRANSFER_MAX_FILE_BYTES,
+                0,
+                0,
+                b"",
+            );
+            let payload = encode_wire_packet(&packet).expect("large start should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        let overflow = test_file_transfer_packet("start", "large-2", "large-2.bin", 1, 0, 0, b"");
+        let payload = encode_wire_packet(&overflow).expect("overflow start should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        drop(transfers);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_incoming_transfer_is_evicted_with_its_part_file() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-stale");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let stale = test_file_transfer_packet("start", "stale", "stale.txt", 1, 0, 0, b"");
+        let payload = encode_wire_packet(&stale).expect("stale start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        let stale_path = {
+            let mut active = transfers.lock().expect("transfer lock");
+            let transfer = active.get_mut("stale").expect("stale transfer");
+            transfer.last_activity =
+                Instant::now() - FILE_TRANSFER_IDLE_TTL - Duration::from_secs(1);
+            transfer.temp_path.clone()
+        };
+
+        let fresh = test_file_transfer_packet("start", "fresh", "fresh.txt", 1, 0, 0, b"");
+        let payload = encode_wire_packet(&fresh).expect("fresh start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        let active = transfers.lock().expect("transfer lock");
+        assert!(!active.contains_key("stale"));
+        assert!(active.contains_key("fresh"));
+        drop(active);
+        assert!(!stale_path.exists());
+
+        drop(transfers);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_receive_root_use_removes_only_stale_mykvm_part_files() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-orphan-cleanup");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let stale_part = root.join(".mykvm-crashed.part");
+        let fresh_part = root.join(".mykvm-fresh.part");
+        let unrelated_part = root.join("other.part");
+        let wrong_suffix = root.join(".mykvm-keep.tmp");
+        for path in [&stale_part, &fresh_part, &unrelated_part, &wrong_suffix] {
+            fs::write(path, b"sentinel").expect("seed receive-root file");
+        }
+        let old_time = SystemTime::now()
+            .checked_sub(FILE_TRANSFER_IDLE_TTL + Duration::from_secs(1))
+            .expect("old timestamp");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&stale_part)
+            .expect("open stale part")
+            .set_times(fs::FileTimes::new().set_modified(old_time))
+            .expect("age stale part");
+
+        let start = test_file_transfer_packet("start", "fresh", "note.txt", 1, 0, 0, b"");
+        let payload = encode_wire_packet(&start).expect("start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        assert!(!stale_part.exists());
+        assert!(fresh_part.exists());
+        assert!(unrelated_part.exists());
+        assert!(wrong_suffix.exists());
+
+        drop(transfers);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_start_never_truncates_an_existing_part_path() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-create-new");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let existing = root.join(".mykvm-transfer-collision-note.txt.part");
+        fs::write(&existing, b"keep me").expect("seed existing part path");
+        let packet =
+            test_file_transfer_packet("start", "transfer-collision", "note.txt", 4, 0, 0, b"");
+        let payload = encode_wire_packet(&packet).expect("start should encode");
+
+        assert!(handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        assert_eq!(
+            fs::read(&existing).expect("existing part survives"),
+            b"keep me"
+        );
+        assert_ne!(
+            transfers
+                .lock()
+                .expect("transfer lock")
+                .get("transfer-collision")
+                .expect("active transfer")
+                .temp_path,
+            existing,
+        );
+
+        drop(transfers);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_same_name_transfers_keep_both_files() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-same-name");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let send = |packet: FileTransferPacket| {
+            let payload = encode_wire_packet(&packet).expect("packet should encode");
+            handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            )
+        };
+
+        assert!(send(test_file_transfer_packet(
+            "start", "same-a", "same.txt", 1, 0, 0, b""
+        )));
+        assert!(send(test_file_transfer_packet(
+            "start", "same-b", "same.txt", 1, 0, 0, b""
+        )));
+        assert!(send(test_file_transfer_packet(
+            "chunk", "same-a", "same.txt", 1, 0, 0, b"A"
+        )));
+        assert!(send(test_file_transfer_packet(
+            "chunk", "same-b", "same.txt", 1, 0, 0, b"B"
+        )));
+        assert!(send(test_file_transfer_packet(
+            "finish", "same-a", "same.txt", 1, 1, 1, b""
+        )));
+        assert!(send(test_file_transfer_packet(
+            "finish", "same-b", "same.txt", 1, 1, 1, b""
+        )));
+
+        let mut contents = [
+            fs::read(root.join("same.txt")).expect("first same-name file"),
+            fs::read(root.join("same (1).txt")).expect("second same-name file"),
+        ];
+        contents.sort();
+        assert_eq!(contents, [b"A".to_vec(), b"B".to_vec()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_created_after_start_is_never_overwritten_on_finish() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-late-collision");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let send = |packet: FileTransferPacket| {
+            let payload = encode_wire_packet(&packet).expect("packet should encode");
+            handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            )
+        };
+
+        assert!(send(test_file_transfer_packet(
+            "start", "late", "note.txt", 6, 0, 0, b""
+        )));
+        fs::write(root.join("note.txt"), b"local").expect("create local collision");
+        assert!(send(test_file_transfer_packet(
+            "chunk", "late", "note.txt", 6, 0, 0, b"remote"
+        )));
+        assert!(send(test_file_transfer_packet(
+            "finish", "late", "note.txt", 6, 1, 6, b""
+        )));
+
+        assert_eq!(
+            fs::read(root.join("note.txt")).expect("local file"),
+            b"local"
+        );
+        assert_eq!(
+            fs::read(root.join("note (1).txt")).expect("received file"),
+            b"remote"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_at_destination_is_never_reused() {
+        use std::os::unix::fs::symlink;
+
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-dangling-symlink");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let destination = root.join("note.txt");
+        symlink(root.join("missing-target"), &destination).expect("create dangling symlink");
+        let send = |packet: FileTransferPacket| {
+            let payload = encode_wire_packet(&packet).expect("packet should encode");
+            handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            )
+        };
+
+        assert!(send(test_file_transfer_packet(
+            "start", "symlink", "note.txt", 6, 0, 0, b""
+        )));
+        assert!(send(test_file_transfer_packet(
+            "chunk", "symlink", "note.txt", 6, 0, 0, b"remote"
+        )));
+        assert!(send(test_file_transfer_packet(
+            "finish", "symlink", "note.txt", 6, 1, 6, b""
+        )));
+
+        assert!(fs::symlink_metadata(&destination)
+            .expect("destination link remains")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read(root.join("note (1).txt")).expect("received file"),
+            b"remote"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_rejects_overlapping_chunks() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-overlap");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let send = |packet: FileTransferPacket| {
+            let payload = encode_wire_packet(&packet).expect("packet should encode");
+            handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            )
+        };
+
+        assert!(send(test_file_transfer_packet(
+            "start",
+            "transfer-overlap",
+            "note.txt",
+            10,
+            0,
+            0,
+            b""
+        )));
+        assert!(send(test_file_transfer_packet(
+            "chunk",
+            "transfer-overlap",
+            "note.txt",
+            10,
+            0,
+            0,
+            b"abcdef"
+        )));
+        // Starts inside the first chunk. Counting both lengths would claim all
+        // ten bytes arrived even though offsets 8..10 remain unwritten.
+        assert!(!send(test_file_transfer_packet(
+            "chunk",
+            "transfer-overlap",
+            "note.txt",
+            10,
+            1,
+            4,
+            b"ghij"
+        )));
+        assert!(!send(test_file_transfer_packet(
+            "finish",
+            "transfer-overlap",
+            "note.txt",
+            10,
+            2,
+            8,
+            b""
+        )));
+        assert!(!root.join("note.txt").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_caps_tracked_chunk_ranges() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-range-cap");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let total_bytes = FILE_TRANSFER_MAX_TRACKED_CHUNKS as u64 + 1;
+        let start = test_file_transfer_packet(
+            "start",
+            "too-fragmented",
+            "fragmented.bin",
+            total_bytes,
+            0,
+            0,
+            b"",
+        );
+        let payload = encode_wire_packet(&start).expect("start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        {
+            let mut active = transfers.lock().expect("transfer lock");
+            let transfer = active.get_mut("too-fragmented").expect("active transfer");
+            for offset in 0..FILE_TRANSFER_MAX_TRACKED_CHUNKS as u64 {
+                transfer.written_ranges.insert(offset, offset + 1);
+            }
+            transfer.received_bytes = FILE_TRANSFER_MAX_TRACKED_CHUNKS as u64;
+        }
+
+        let overflow = test_file_transfer_packet(
+            "chunk",
+            "too-fragmented",
+            "fragmented.bin",
+            total_bytes,
+            FILE_TRANSFER_MAX_TRACKED_CHUNKS as u64,
+            FILE_TRANSFER_MAX_TRACKED_CHUNKS as u64,
+            b"x",
+        );
+        let payload = encode_wire_packet(&overflow).expect("chunk should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        assert_eq!(
+            transfers
+                .lock()
+                .expect("transfer lock")
+                .get("too-fragmented")
+                .expect("active transfer")
+                .written_ranges
+                .len(),
+            FILE_TRANSFER_MAX_TRACKED_CHUNKS,
+        );
+
+        drop(transfers);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn file_transfer_sanitizes_received_file_names() {
         assert_eq!(
             sanitize_transfer_file_name("../bad:name?.txt").as_deref(),
@@ -9434,6 +10730,34 @@ mod tests {
         );
         assert!(sanitize_transfer_file_name("..").is_none());
         assert!(sanitize_transfer_file_name("  ").is_none());
+    }
+
+    #[test]
+    fn file_transfer_uses_the_same_sanitized_name_for_every_packet() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-sanitized-packets");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet("start", "sanitized", "bad:name?.txt", 2, 0, 0, b""),
+            test_file_transfer_packet("chunk", "sanitized", "bad:name?.txt", 2, 0, 0, b"ok"),
+            test_file_transfer_packet("finish", "sanitized", "bad:name?.txt", 2, 1, 2, b""),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        assert_eq!(
+            fs::read(root.join("bad_name_.txt")).expect("sanitized receive"),
+            b"ok"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_test_dir(name: &str) -> PathBuf {

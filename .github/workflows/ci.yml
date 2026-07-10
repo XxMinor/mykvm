@@ -30,7 +30,9 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            xvfb \
+            xauth
 
       - name: Install Rust stable
         run: rustup default stable
@@ -46,3 +48,61 @@ jobs:
 
       - name: Check Tauri backend
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Test Tauri backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Test Linux X11 input backend under Xvfb
+        run: >-
+          xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml --lib
+          input::linux_input::tests::x11_xtest_grab_round_trip --
+          --ignored --nocapture --test-threads=1
+
+      - name: Test Linux X11 clipboard backend under Xvfb
+        run: >-
+          xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml --lib
+          clipboard::tests::linux_ --
+          --ignored --nocapture --test-threads=1
+
+      - name: Test reliable input over live loopback QUIC
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+          quic_transport::tests::reliable_input_delivers_end_to_end_in_order --
+          --ignored --nocapture --test-threads=1
+
+  cross-platform-backend:
+    name: Backend check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        run: rustup default stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Check Tauri backend
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Check Windows secure-desktop input helper
+        if: runner.os == 'Windows'
+        run: cargo check --manifest-path src-tauri/input-helper/Cargo.toml
+
+      - name: Test Tauri backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
