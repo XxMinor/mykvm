@@ -3634,6 +3634,7 @@ pub fn run() {
                 detected_layout,
             );
             app.manage(runtime);
+            spawn_display_watcher(app.handle().clone());
 
             // Eagerly start discovery + input BEFORE the WebView2/frontend is
             // ready. The old flow waited for the frontend to call
@@ -4687,6 +4688,93 @@ fn apply_windows_window_chrome(window: &tauri::WebviewWindow, theme: &str) -> Re
 #[cfg(target_os = "windows")]
 pub(crate) fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Displays appear and disappear while the app runs — lid open/close, monitor
+/// hot-plug — but detection used to run only at startup, so the discovery
+/// announce kept advertising a stale screen list until the next app restart
+/// ("opened the MacBook lid but the peer still shows one screen"). Poll for
+/// changes and refresh the layout's local device (preserving user-placed
+/// positions), the native layout used for injection mapping, and the running
+/// input runtime.
+fn spawn_display_watcher(app: AppHandle) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(3));
+        let app_for_main = app.clone();
+        // Screen enumeration touches AppKit on macOS and must run on the main
+        // thread; the work itself is a no-op unless the display set changed.
+        let _ = app.run_on_main_thread(move || {
+            let Some(state) = app_for_main.try_state::<AppRuntime>() else {
+                return;
+            };
+            refresh_detected_screens(&app_for_main, state.inner());
+        });
+    });
+}
+
+fn detected_screens_equivalent(current: &[Screen], detected: &[Screen]) -> bool {
+    current.len() == detected.len()
+        && detected.iter().all(|d| {
+            current.iter().any(|c| {
+                c.id == d.id
+                    && c.width == d.width
+                    && c.height == d.height
+                    && (c.scale - d.scale).abs() < f64::EPSILON
+                    && c.is_primary == d.is_primary
+            })
+        })
+}
+
+fn refresh_detected_screens(app: &AppHandle, state: &AppRuntime) {
+    let detected_layout = detect_local_layout(app);
+    let Some(detected_device) = detected_layout.devices.first() else {
+        return;
+    };
+
+    let snapshot = {
+        let Ok(mut layout) = state.layout.lock() else {
+            return;
+        };
+        let Some(local_index) = layout
+            .devices
+            .iter()
+            .position(|device| device.role == "local")
+        else {
+            return;
+        };
+        if detected_screens_equivalent(
+            &layout.devices[local_index].screens,
+            &detected_device.screens,
+        ) {
+            return;
+        }
+        let merged = merge_detected_local_device(&layout, detected_device.clone());
+        layout.devices[local_index] = merged;
+        if let Err(error) = write_layout_to_disk(&state.config_path, &layout) {
+            log::warn!("display change: failed to persist layout: {error}");
+        }
+        layout.clone()
+    };
+
+    log::info!(
+        "display change detected: local screens now {}",
+        detected_device.screens.len()
+    );
+    if let Ok(mut native) = state.native_layout.lock() {
+        *native = detected_layout;
+    }
+    // The inject path holds a clone of the native layout taken at input start;
+    // restart input (only if it was running) so the new display becomes a
+    // valid injection target.
+    let input_running = state
+        .input_stop
+        .lock()
+        .map(|stop| stop.is_some())
+        .unwrap_or(false);
+    if input_running {
+        state.stop_input();
+        let _ = state.start_input(snapshot);
+    }
 }
 
 fn detect_local_layout(app: &AppHandle) -> LayoutState {
