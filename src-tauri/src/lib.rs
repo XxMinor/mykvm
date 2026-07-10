@@ -841,15 +841,34 @@ impl AppRuntime {
             if !input_receive_enabled.load(Ordering::Relaxed) {
                 return;
             }
-            let Ok(layout) = layout_for_input.lock() else {
-                return;
+            // Never stall input injection behind the layout mutex: saves,
+            // discovery presence and the UI hold it for milliseconds (disk
+            // writes), and a blocking lock here froze every arriving move —
+            // rhythmic cursor hitches no LAN latency explains. Moves are
+            // latest-wins, so dropping one under contention is invisible (the
+            // next lands within milliseconds); keys/buttons/parks must not be
+            // lost, so only they wait for the lock.
+            let layout = match layout_for_input.try_lock() {
+                Ok(layout) => layout,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if input::packet_is_droppable_move(&payload) {
+                        return;
+                    }
+                    let Ok(layout) = layout_for_input.lock() else {
+                        return;
+                    };
+                    layout
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => return,
             };
-            let current_peer = local_peer_from_layout(&layout);
+            // The id, not the whole announce peer: building LanPeer resolved
+            // hostname + local IP (socket syscalls) for every packet.
+            let local_peer_id = cached_local_peer_id();
             if input::try_handle_control_packet_from_source(
                 &layout,
                 &payload,
                 source,
-                &current_peer.id,
+                &local_peer_id,
             ) {
                 transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -860,7 +879,7 @@ impl AppRuntime {
                 &payload,
                 source,
                 &input_events,
-                &current_peer.id,
+                &local_peer_id,
                 &clipboard_target_for_input,
             ) {
                 transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
@@ -891,12 +910,12 @@ impl AppRuntime {
                 };
                 layout.clone()
             };
-            let current_peer = local_peer_from_layout(&layout);
+            let local_peer_id = cached_local_peer_id();
 
             if handle_file_transfer_packet(
                 &payload,
                 &layout,
-                &current_peer.id,
+                &local_peer_id,
                 &file_transfers,
                 &app_handle_for_file_transfer,
             ) {
@@ -910,7 +929,7 @@ impl AppRuntime {
             if handle_clipboard_packet(
                 &payload,
                 &layout,
-                &current_peer.id,
+                &local_peer_id,
                 &clipboard_target_for_stream,
                 &clipboard_receive_gate,
                 &clipboard_seen_text,
@@ -4983,6 +5002,25 @@ fn local_ip_address() -> Option<String> {
     socket.connect("8.8.8.8:80").ok()?;
     let address = socket.local_addr().ok()?;
     Some(address.ip().to_string())
+}
+
+/// The local peer id derives from hostname + IP, and resolving those costs
+/// real syscalls (a UDP socket + connect per lookup). The input receive path
+/// needs the id for EVERY packet — hundreds of times per second while the
+/// mouse moves — so cache it briefly instead of re-resolving per packet.
+fn cached_local_peer_id() -> String {
+    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some((resolved_at, id)) = cache.as_ref() {
+        if resolved_at.elapsed() < Duration::from_secs(5) {
+            return id.clone();
+        }
+    }
+    let host = hostname().unwrap_or_else(|| "localhost".into());
+    let ip = local_ip_address().unwrap_or_else(|| "127.0.0.1".into());
+    let id = local_peer_id(&host, &ip);
+    *cache = Some((Instant::now(), id.clone()));
+    id
 }
 
 fn local_ipv4_addresses() -> Vec<Ipv4Addr> {

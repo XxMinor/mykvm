@@ -59,12 +59,13 @@ const RETURN_EXIT_DEPTH_PX: f64 = 6.0;
 // bouncing back across the same edge. Unlike the old 150ms time gate it never
 // freezes deliberate movement.
 const RETURN_EDGE_INSET: f64 = 4.0;
-// 4ms ≈ 250Hz cap. 8ms (125Hz) visibly juddered against high-refresh displays
-// (the remote cursor updates at half the rate of a 180Hz panel); datagrams are
-// latest-wins and ~100 bytes, so the extra rate is free on a LAN and the queue
-// coalesces under back-pressure.
-const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 4;
-const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 4;
+// 1ms = effectively one datagram per input event for any real mouse (their
+// polling tops out around 1000Hz). Throttling below the device rate quantizes
+// remote motion visibly on high-refresh panels; ~100-byte latest-wins
+// datagrams at device rate are nothing on a LAN, and the send queue coalesces
+// under genuine back-pressure.
+const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 1;
+const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 1;
 #[cfg(target_os = "macos")]
 const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
 #[cfg(target_os = "macos")]
@@ -2804,6 +2805,18 @@ fn decode_input_packet(payload: &[u8]) -> Option<InputPacket> {
     rmp_serde::from_slice::<InputPacket>(payload).ok()
 }
 
+/// True when `payload` is a latest-wins mouse-move frame that may be dropped
+/// under receive-side lock contention: real moves supersede each other within
+/// milliseconds and heartbeats repeat every second, so losing one is
+/// invisible. Keys, buttons and parks must never be dropped, and anything
+/// undecodable would be rejected later anyway.
+pub(crate) fn packet_is_droppable_move(payload: &[u8]) -> bool {
+    match decode_input_packet(payload) {
+        Some(packet) => matches!(packet.event, InputEvent::MouseMove { .. }),
+        None => true,
+    }
+}
+
 fn decode_input_control_packet(payload: &[u8]) -> Option<InputControlPacket> {
     rmp_serde::from_slice::<InputControlPacket>(payload).ok()
 }
@@ -4004,6 +4017,76 @@ fn map_event_point_to_native(
     Some((absolute_x, absolute_y))
 }
 
+/// Records inter-arrival gaps of injected remote mouse moves and logs a
+/// compact summary every ~5s of active flow. This pins down WHERE perceived
+/// stutter lives: steady small gaps = healthy pipeline (look at the sender);
+/// spikes here = receive path stalls (lock contention, injection latency).
+fn note_move_arrival() {
+    struct MoveArrivalStats {
+        window_start: Instant,
+        last: Instant,
+        count: u32,
+        max_gap_ms: f64,
+        gaps_over_25ms: u32,
+    }
+    static STATS: Mutex<Option<MoveArrivalStats>> = Mutex::new(None);
+
+    let now = Instant::now();
+    let Ok(mut stats) = STATS.lock() else { return };
+    let Some(current) = stats.as_mut() else {
+        *stats = Some(MoveArrivalStats {
+            window_start: now,
+            last: now,
+            count: 1,
+            max_gap_ms: 0.0,
+            gaps_over_25ms: 0,
+        });
+        return;
+    };
+
+    let gap_ms = now.duration_since(current.last).as_secs_f64() * 1000.0;
+    if gap_ms > 2000.0 {
+        // Idle pause / control left this machine: start a fresh window rather
+        // than reporting the pause as a pipeline stall.
+        *current = MoveArrivalStats {
+            window_start: now,
+            last: now,
+            count: 1,
+            max_gap_ms: 0.0,
+            gaps_over_25ms: 0,
+        };
+        return;
+    }
+
+    current.last = now;
+    current.count += 1;
+    if gap_ms > current.max_gap_ms {
+        current.max_gap_ms = gap_ms;
+    }
+    if gap_ms > 25.0 {
+        current.gaps_over_25ms += 1;
+    }
+
+    let window_ms = now.duration_since(current.window_start).as_secs_f64() * 1000.0;
+    if window_ms >= 5000.0 {
+        log::info!(
+            "[diag] move arrivals: n={} over {:.1}s avg={:.1}ms max={:.1}ms gaps>25ms={}",
+            current.count,
+            window_ms / 1000.0,
+            window_ms / current.count.max(1) as f64,
+            current.max_gap_ms,
+            current.gaps_over_25ms,
+        );
+        *current = MoveArrivalStats {
+            window_start: now,
+            last: now,
+            count: 0,
+            max_gap_ms: 0.0,
+            gaps_over_25ms: 0,
+        };
+    }
+}
+
 fn inject_input_command(command: InputCommand) {
     // A reliable button/scroll/key can overtake the first best-effort move when
     // control re-enters this Mac. Any accepted active-control input therefore
@@ -4019,6 +4102,7 @@ fn inject_input_command(command: InputCommand) {
 
     match command {
         InputCommand::MouseMove { x, y, drag_button } => {
+            note_move_arrival();
             inject_mouse_move(x, y, drag_button);
         }
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
