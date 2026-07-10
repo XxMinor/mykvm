@@ -44,9 +44,17 @@ const EDGE_TOLERANCE: i32 = 80;
 // that push is what triggers the handoff.
 const CROSSING_MARGIN: f64 = 1.0;
 const MIN_CROSSING_DELTA: f64 = 1.0;
-const CROSSING_AXIS_DOMINANCE: f64 = 0.5;
-const RETURN_AXIS_DOMINANCE: f64 = 1.0;
+// 0.2, not 0.5: a circle arc cuts the boundary at an arbitrary angle. At 0.5
+// any stroke steeper than ~63° from the crossing axis was rejected and the
+// cursor rode the edge, flattening the arc; 0.2 admits up to ~79° while still
+// disambiguating corner flicks between two adjacent targets.
+const CROSSING_AXIS_DOMINANCE: f64 = 0.2;
 const CROSSING_ACTIVATION_BAND: f64 = EDGE_TOLERANCE as f64 * 2.0;
+// Return-to-local requires this much accumulated outward travel PAST the entry
+// edge, at any angle. Deep enough that 1-2px resting jitter (which resets on
+// any inward frame) never hands control back, shallow enough that a deliberate
+// push or a circle arc exits within one or two events.
+const RETURN_EXIT_DEPTH_PX: f64 = 6.0;
 // A tiny spatial re-arm after returning is imperceptible but avoids immediately
 // bouncing back across the same edge. Unlike the old 150ms time gate it never
 // freezes deliberate movement.
@@ -176,6 +184,13 @@ struct ActiveTarget {
     y: f64,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     invert_y: bool,
+    // Accumulated outward travel past the entry edge. Control returns to local
+    // once this clears a small depth, REGARDLESS of approach angle — an
+    // angle/dominance gate flattened any circle arc that cut the boundary
+    // steeply (the cursor rode the edge and the circle lost a chord), while a
+    // depth requirement lets arcs cross where they actually exit and still
+    // ignores 1-2px resting jitter (moving back inside resets it).
+    edge_overshoot: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -757,6 +772,7 @@ fn request_screen_switch_from_point(
         x: remote_x,
         y: remote_y,
         invert_y: false,
+        edge_overshoot: 0.0,
     })
 }
 
@@ -6896,6 +6912,7 @@ fn crossing_target_with_transform(
                 x: remote_x,
                 y: remote_y,
                 invert_y,
+                edge_overshoot: 0.0,
             }
         })
 }
@@ -7054,8 +7071,11 @@ fn update_active_remote_screen(
     dy: f64,
     layout_state: &Arc<Mutex<LayoutState>>,
 ) -> bool {
-    // Still within the screen we're already on: nothing to reconcile.
+    // Still within the screen we're already on: nothing to reconcile. The
+    // cursor is not pressing past the entry edge, so the return accumulator
+    // resets — resting jitter can never add up to a handoff.
     if point_in_local_bounds(&active.current_screen, active.x, active.y) {
+        active.edge_overshoot = 0.0;
         return false;
     }
 
@@ -7087,26 +7107,36 @@ fn update_active_remote_screen(
         active.y = global_y - screen.y as f64;
         active.current_screen_id = screen.id.clone();
         active.current_screen = screen.clone();
+        active.edge_overshoot = 0.0;
         return false;
     }
 
     // Off the edge with no neighbor there. Only the entry screen borders the
     // local machine, so only it can hand control back; every other outer edge
-    // just clamps the cursor in place.
-    let returned_to_local = active.current_screen_id == active.target.screen_id
-        && exited_entry_edge(
+    // just clamps the cursor in place. The handoff itself is positional:
+    // accumulate outward travel past the entry edge and return once it clears
+    // a small depth, at ANY approach angle — the previous per-event
+    // delta/dominance gate rejected steep strokes, so a circle arc crossing
+    // the boundary rode the edge and lost its chord.
+    if active.current_screen_id == active.target.screen_id
+        && beyond_entry_edge(
             active.target.edge,
             &active.current_screen,
             active.x,
             active.y,
-            dx,
-            dy,
-        );
-    if returned_to_local {
-        pin_active_to_entry_edge(active);
+        )
+    {
+        active.edge_overshoot += outward_push(active.target.edge, dx, dy);
+        if active.edge_overshoot >= RETURN_EXIT_DEPTH_PX {
+            active.edge_overshoot = 0.0;
+            pin_active_to_entry_edge(active);
+            return true;
+        }
+    } else {
+        active.edge_overshoot = 0.0;
     }
 
-    returned_to_local
+    false
 }
 
 fn should_ignore_initial_anchor_warp_delta(edge: Edge, dx: f64, dy: f64) -> bool {
@@ -7178,27 +7208,27 @@ fn point_in_screen(screen: &Screen, global_x: f64, global_y: f64) -> bool {
         && global_y <= (screen.y + screen.height - 1) as f64
 }
 
-/// Whether the cursor has crossed back over the edge it originally entered from
-/// (the side bordering the local machine). Mirrors the classic single-screen
-/// return-to-local test, applied to the entry screen.
-fn exited_entry_edge(edge: Edge, screen: &Screen, x: f64, y: f64, dx: f64, dy: f64) -> bool {
+/// True when the cursor position sits at or beyond the edge it originally
+/// entered from (the side bordering the local machine). Purely positional —
+/// the angle of approach must not matter, or circle arcs cutting the boundary
+/// steeply get stuck riding the edge.
+fn beyond_entry_edge(edge: Edge, screen: &Screen, x: f64, y: f64) -> bool {
     match edge {
-        Edge::Right => {
-            x <= 0.0 && dx <= -MIN_CROSSING_DELTA && dx.abs() >= dy.abs() * RETURN_AXIS_DOMINANCE
-        }
-        Edge::Left => {
-            x >= (screen.width - 1) as f64
-                && dx >= MIN_CROSSING_DELTA
-                && dx.abs() >= dy.abs() * RETURN_AXIS_DOMINANCE
-        }
-        Edge::Bottom => {
-            y <= 0.0 && dy <= -MIN_CROSSING_DELTA && dy.abs() >= dx.abs() * RETURN_AXIS_DOMINANCE
-        }
-        Edge::Top => {
-            y >= (screen.height - 1) as f64
-                && dy >= MIN_CROSSING_DELTA
-                && dy.abs() >= dx.abs() * RETURN_AXIS_DOMINANCE
-        }
+        Edge::Right => x <= 0.0,
+        Edge::Left => x >= (screen.width - 1) as f64,
+        Edge::Bottom => y <= 0.0,
+        Edge::Top => y >= (screen.height - 1) as f64,
+    }
+}
+
+/// Magnitude of the movement component pointing outward through the entry
+/// edge, back toward the local machine.
+fn outward_push(edge: Edge, dx: f64, dy: f64) -> f64 {
+    match edge {
+        Edge::Right => (-dx).max(0.0),
+        Edge::Left => dx.max(0.0),
+        Edge::Bottom => (-dy).max(0.0),
+        Edge::Top => dy.max(0.0),
     }
 }
 
@@ -9944,13 +9974,13 @@ mod tests {
 
     #[test]
     fn windows_delta_batch_stops_before_a_direction_reversal() {
-        let outward = WindowsCapturedEvent::RemoteMouseDelta { dx: -4, dy: 0 };
-        let inward = WindowsCapturedEvent::RemoteMouseDelta { dx: 4, dy: 0 };
+        let outward = WindowsCapturedEvent::RemoteMouseDelta { dx: -8, dy: 0 };
+        let inward = WindowsCapturedEvent::RemoteMouseDelta { dx: 8, dy: 0 };
         let mut batch = (0, 0);
 
         assert!(accumulate_windows_delta(&mut batch, &outward));
         assert!(!accumulate_windows_delta(&mut batch, &inward));
-        assert_eq!(batch, (-4, 0));
+        assert_eq!(batch, (-8, 0));
 
         let layout = Arc::new(Mutex::new(layout_for_target_tests()));
         let mut active = crossing_target(
@@ -10073,13 +10103,13 @@ mod tests {
             &layout,
         ));
 
-        // A real reverse excursion returns, then lands far enough inside the
-        // local screen that the return warp and continued outward motion cannot
-        // immediately enter the remote again.
+        // A real reverse excursion (clearing the return depth) returns, then
+        // lands far enough inside the local screen that the return warp and
+        // continued outward motion cannot immediately enter the remote again.
         active.x = 1.0;
         active.y = 500.0;
-        active.x -= 2.0;
-        assert!(update_active_remote_screen(&mut active, -2.0, 0.0, &layout,));
+        active.x -= 8.0;
+        assert!(update_active_remote_screen(&mut active, -8.0, 0.0, &layout,));
         let returned = local_return_point(&active);
         assert!(crossing_target(&targets, returned.0, returned.1, 0.0, 0.0, &layout).is_none());
         assert!(
@@ -11657,6 +11687,7 @@ mod tests {
             x: 100.0,
             y: 1079.0,
             invert_y: false,
+            edge_overshoot: 0.0,
         };
 
         // Pushing down past the primary's bottom edge roams onto the secondary.
@@ -11716,58 +11747,52 @@ mod tests {
             x: 0.0,
             y: 500.0,
             invert_y: false,
+            edge_overshoot: 0.0,
         };
 
-        // Crossed in via the right edge; moving back left off the entry edge
-        // hands control back to the local machine.
-        active.x -= 2.0;
+        // Crossed in via the right edge; a deliberate outward push past the
+        // return depth hands control back regardless of angle.
+        active.x -= 8.0;
         assert!(update_active_remote_screen(
             &mut active,
-            -2.0,
+            -8.0,
             0.0,
             &layout_state
         ));
-    }
 
-    #[test]
-    fn tangential_edge_motion_does_not_return_to_local() {
-        let entry = screen(
-            "peer-device",
-            "peer-device-local-display-1",
-            1920,
-            0,
-            1920,
-            1080,
-        );
-
+        // Resting jitter at the edge never accumulates to a handoff: a small
+        // outward nudge followed by a frame back inside resets the depth.
+        let mut resting = active.clone();
+        resting.x = 0.0;
+        resting.x -= 2.0;
         assert!(
-            !exited_entry_edge(Edge::Right, &entry, -1.0, 512.0, -1.0, 12.0),
-            "a mostly vertical slide at the shared edge is not return intent"
+            !update_active_remote_screen(&mut resting, -2.0, 0.0, &layout_state),
+            "2px of outward jitter is below the return depth"
         );
-        assert!(!exited_entry_edge(
-            Edge::Right,
-            &entry,
-            -2.0,
-            512.0,
-            -2.0,
-            3.0
-        ));
-        assert!(exited_entry_edge(
-            Edge::Right,
-            &entry,
-            -2.0,
-            512.0,
-            -2.0,
-            1.0
-        ));
-        assert!(exited_entry_edge(
-            Edge::Right,
-            &entry,
-            -1.0,
-            512.0,
-            -1.0,
-            0.0
-        ));
+        resting.x = 1.0; // back inside
+        assert!(!update_active_remote_screen(&mut resting, 3.0, 0.0, &layout_state));
+        assert_eq!(resting.edge_overshoot, 0.0, "inside frame resets the depth");
+        resting.x = -2.0;
+        assert!(
+            !update_active_remote_screen(&mut resting, -3.0, 0.0, &layout_state),
+            "depth restarts from zero after the reset"
+        );
+
+        // A steep circle arc (mostly vertical, small outward component each
+        // event) still crosses once its accumulated depth clears — the old
+        // axis-dominance gate rejected these and flattened the arc.
+        let mut arc = active.clone();
+        arc.x = 0.0;
+        arc.edge_overshoot = 0.0;
+        arc.x -= 3.0;
+        arc.y += 14.0;
+        assert!(!update_active_remote_screen(&mut arc, -3.0, 14.0, &layout_state));
+        arc.x -= 4.0;
+        arc.y += 12.0;
+        assert!(
+            update_active_remote_screen(&mut arc, -4.0, 12.0, &layout_state),
+            "a steep arc returns once 6px of outward travel accumulates"
+        );
     }
 
     #[test]
@@ -11809,6 +11834,7 @@ mod tests {
             x: 1.0,
             y: 500.0,
             invert_y: false,
+            edge_overshoot: 0.0,
         };
         // Simulate the small leftward delta the entry-anchor warp can inject.
         // (Was -RETURN_EDGE_INSET; now that the inset is 0 for edge-flush returns,
@@ -12058,6 +12084,7 @@ mod tests {
                 x: x + dx,
                 y: y + dy,
                 invert_y: false,
+                edge_overshoot: 0.0,
             };
 
             assert!(update_active_remote_screen(
@@ -12334,6 +12361,7 @@ mod tests {
             x: -20.0,
             y: 400.0,
             invert_y: false,
+            edge_overshoot: 0.0,
         };
         let _held_layout = layout_state.lock().expect("hold layout lock");
 
@@ -12357,6 +12385,7 @@ mod tests {
             x: 10.0,
             y: 20.0,
             invert_y: false,
+            edge_overshoot: 0.0,
         };
         let clipboard = Arc::new(Mutex::new(None));
 
