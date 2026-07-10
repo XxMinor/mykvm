@@ -135,7 +135,7 @@ export const TEXT = {
         "将文件或文件夹拖到相邻屏幕即可跨设备传输，落在哪个设备上就送到哪台。",
       modifierTitle: "跨平台改键",
       modifierCopy:
-        "本机作为控制端时，发往不同系统对端的修饰键映射（仅 Win↔Mac 跨平台时生效）。默认 Ctrl↔Command 对调，让复制、粘贴、全选等快捷键沿用各自系统习惯；此时 Win+方向键对应 Mac 的 Control+方向键。若想用物理 Ctrl，请将 Ctrl 设为“原样”。",
+        "别的机器控制本机时，对方按键如何映射到本机（仅 Win↔Mac 跨平台时生效，在被控的这台机器上配置，设置会自动同步给控制端）。默认 Ctrl↔Command 对调，让复制、粘贴、全选等快捷键沿用各自系统习惯；此时 Win+方向键对应 Mac 的 Control+方向键。若想用物理 Ctrl，请将 Ctrl 设为“原样”。",
       modifierRowControl: "Ctrl 键 →",
       modifierRowAlt: "Alt / Option →",
       modifierRowMeta: "Win 键 / ⌘ →",
@@ -386,7 +386,7 @@ export const TEXT = {
         "Drag files or folders onto an adjacent screen to transfer them across devices — wherever they land is where they go.",
       modifierTitle: "Cross-platform Keys",
       modifierCopy:
-        "When this machine controls a peer on a different OS, remap modifier keys (only applies across Win↔Mac). The default swaps Ctrl↔Command, so Win+Arrow sends Mac Control+Arrow. Set Ctrl to Keep if physical Ctrl should remain Mac Control.",
+        "How keys from a controlling peer are remapped when they arrive on THIS machine (only applies across Win↔Mac; configure on the controlled machine — the preference syncs to controllers automatically). The default swaps Ctrl↔Command, so Win+Arrow sends Mac Control+Arrow. Set Ctrl to Keep if physical Ctrl should remain Mac Control.",
       modifierRowControl: "Ctrl key →",
       modifierRowAlt: "Alt / Option →",
       modifierRowMeta: "Win key / ⌘ →",

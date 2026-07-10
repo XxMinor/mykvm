@@ -1471,13 +1471,30 @@ fn start_platform_capture(
                 last_modifier_snapshot = Instant::now();
                 let physical = physical_windows_modifiers();
                 let snapshot = windows_modifier_bits_for_keys(&physical);
-                let previous = context.hook_modifier_bits.swap(snapshot, Ordering::AcqRel);
-                if previous != snapshot && context.remote_active.load(Ordering::Acquire) {
-                    let _ = context
-                        .event_tx
-                        .send(WindowsCapturedEvent::ModifierSnapshot {
-                            modifier_bits: snapshot,
-                        });
+                if context.remote_active.load(Ordering::Acquire) {
+                    // While a remote session is active the hooks SWALLOW key
+                    // events, so GetAsyncKeyState never sees them: a modifier
+                    // the user is physically holding reads as released, and
+                    // treating that reading as authoritative released it on
+                    // the client within 100ms — Shift then Enter typed a bare
+                    // Enter while Shift+Enter pressed together worked. The
+                    // hook cache is the authority while remote; only ADD keys
+                    // the async state knows about (held from before the hooks
+                    // engaged), never clear hook-tracked bits from here.
+                    let previous = context.hook_modifier_bits.load(Ordering::Acquire);
+                    let merged = previous | snapshot;
+                    if merged != previous {
+                        context.hook_modifier_bits.store(merged, Ordering::Release);
+                        let _ = context
+                            .event_tx
+                            .send(WindowsCapturedEvent::ModifierSnapshot {
+                                modifier_bits: merged,
+                            });
+                    }
+                } else {
+                    // Local use: nothing is swallowed, so the async state is
+                    // truthful and repairs a stuck hook-tracked modifier.
+                    context.hook_modifier_bits.store(snapshot, Ordering::Release);
                 }
             }
         }
@@ -5841,6 +5858,9 @@ fn release_windows_remote_control_inner(context: &WindowsCaptureContext) {
         .as_ref()
         .map(|active| active.target.device_id.clone());
     let return_point = active.as_ref().map(local_return_point);
+    if let Some(point) = return_point {
+        retarget_windows_remote_anchor(context, point);
+    }
 
     if let Some(active) = active {
         release_forwarded_keys_windows(context, &active.target);
@@ -5974,6 +5994,7 @@ fn handle_windows_remote_mouse_delta(context: &WindowsCaptureContext, dx: f64, d
 
     if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
         let point = local_return_point(active_target);
+        retarget_windows_remote_anchor(context, point);
         let target = active_target.target.clone();
         release_forwarded_keys_windows(context, &target);
         release_remote_buttons(
@@ -6285,6 +6306,22 @@ fn clear_windows_remote_anchor(context: &WindowsCaptureContext) {
     context.warp_source_x.store(0, Ordering::Release);
     context.warp_source_y.store(0, Ordering::Release);
     context.warp_cutoff_time.store(0, Ordering::Release);
+}
+
+/// Point the anchor at the return position BEFORE `remote_active` flips off.
+/// The hook thread re-pins the cursor to the anchor for every event captured
+/// while `remote_active` still reads true; without this, a straggler event
+/// processed concurrently with the return yanks the just-revealed cursor back
+/// to the (centre) anchor — the "cursor sometimes ends up in the middle of the
+/// server screen after crossing back" bug.
+#[cfg(target_os = "windows")]
+fn retarget_windows_remote_anchor(context: &WindowsCaptureContext, point: (f64, f64)) {
+    context
+        .remote_anchor_x
+        .store(point.0.round() as i64, Ordering::Release);
+    context
+        .remote_anchor_y
+        .store(point.1.round() as i64, Ordering::Release);
 }
 
 #[cfg(target_os = "windows")]
@@ -7096,12 +7133,26 @@ impl WindowsWarpGuard {
     }
 
     fn should_drop(&self, sequence: u64, x: f64, y: f64, anchor: (f64, f64)) -> bool {
+        // Hook timestamps are GetTickCount milliseconds with ~16ms granularity,
+        // so backlog queued before the entry warp regularly lands on a LATER
+        // tick than the cutoff. Gating the geometric backlog test on tick
+        // equality alone let those samples through as "real" deltas of
+        // (entry edge − centre anchor) — a huge jump that threw the remote
+        // cursor toward the middle of the client screen right after crossing
+        // and corrupted the tracked position (returns then landed at a stale
+        // height). Treat any sample within this window that is still closer to
+        // the pre-warp source than to the anchor as backlog: genuine post-warp
+        // motion starts at the freshly re-pinned anchor, so it is always
+        // closer to the anchor.
+        const BACKLOG_WINDOW_MS: i32 = 100;
+
         let relative_sequence = self
             .ignore_through_sequence
             .map(|cutoff| (sequence as u32).wrapping_sub(cutoff) as i32);
         let dx = x - anchor.0;
         let dy = y - anchor.1;
-        let same_tick_backlog = relative_sequence == Some(0)
+        let stale_backlog = relative_sequence
+            .is_some_and(|relative| (0..=BACKLOG_WINDOW_MS).contains(&relative))
             && self.source.is_some_and(|source| {
                 let source_dx = x - source.0;
                 let source_dy = y - source.1;
@@ -7109,7 +7160,7 @@ impl WindowsWarpGuard {
             });
 
         relative_sequence.is_some_and(|relative| relative < 0)
-            || same_tick_backlog
+            || stale_backlog
             || (dx.abs() < 0.1 && dy.abs() < 0.1)
     }
 }
@@ -9834,6 +9885,20 @@ mod tests {
         assert!(
             !guard.should_drop(10, anchor.0 + 200.0, anchor.1, anchor),
             "same-tick high-DPI motion away from the old edge must not be swallowed"
+        );
+        // GetTickCount granularity (~16ms) regularly stamps pre-warp backlog
+        // with a LATER tick than the cutoff; it is still backlog.
+        assert!(
+            guard.should_drop(12, 1919.0, 540.0, anchor),
+            "backlog stamped a couple of ticks late must not become a huge remote delta"
+        );
+        assert!(
+            guard.should_drop(60, 1919.0, 560.0, anchor),
+            "late-tick tangential backlog along the old edge is still backlog"
+        );
+        assert!(
+            !guard.should_drop(10 + 150, 1919.0, 540.0, anchor),
+            "an edge position beyond the backlog window is genuine user motion"
         );
     }
 
