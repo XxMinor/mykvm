@@ -201,6 +201,13 @@ struct Device {
     #[serde(default = "default_device_source")]
     source: String,
     screens: Vec<Screen>,
+    // The device's advertised modifier-remap preference (how IT wants keys
+    // injected into it remapped), learned from discovery announces. `None`
+    // until the peer announces one (older builds never do).
+    #[serde(default)]
+    modifier_remap: Option<bool>,
+    #[serde(default)]
+    modifier_map: Option<ModifierMap>,
 }
 
 /// Per-direction hotkeys for jumping between adjacent screens without moving
@@ -350,6 +357,14 @@ struct LanPeer {
     upgrading: bool,
     #[serde(default)]
     screens: Vec<LanPeerScreen>,
+    // This machine's modifier-remap preference for input INJECTED INTO IT.
+    // Broadcast so a controlling server applies the TARGET's preference —
+    // settings edited on the mac govern how others control the mac. `None`
+    // (older peer) keeps the server's own local setting as the fallback.
+    #[serde(default)]
+    modifier_remap: Option<bool>,
+    #[serde(default)]
+    modifier_map: Option<ModifierMap>,
     app_version: String,
     last_seen_ms: u64,
 }
@@ -4704,6 +4719,8 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
             role: "local".into(),
             source: "detected".into(),
             screens,
+            modifier_remap: None,
+            modifier_map: None,
         }],
     }
 }
@@ -7584,6 +7601,14 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
         device.upgrading_until_ms = now_ms() + 120_000;
     }
     device.upgrading = peer.upgrading;
+    // Adopt the peer's advertised remap preference; keep the last known value
+    // when an older build (which never announces it) is on the other end.
+    if peer.modifier_remap.is_some() {
+        device.modifier_remap = peer.modifier_remap;
+    }
+    if peer.modifier_map.is_some() {
+        device.modifier_map = peer.modifier_map.clone();
+    }
 }
 
 fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen]) -> Vec<Screen> {
@@ -7730,6 +7755,8 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         screens: local_device
             .map(|device| device.screens.iter().map(screen_to_peer_screen).collect())
             .unwrap_or_default(),
+        modifier_remap: Some(layout.modifier_remap),
+        modifier_map: Some(layout.modifier_map.clone()),
         app_version: env!("CARGO_PKG_VERSION").into(),
         last_seen_ms: now_ms(),
     }
@@ -8790,6 +8817,8 @@ mod tests {
                     role: "local".into(),
                     source: "detected".into(),
                     screens: vec![test_screen("local-device")],
+                    modifier_remap: None,
+                    modifier_map: None,
                 },
                 Device {
                     id: "peer-client-10-0-0-2".into(),
@@ -8808,6 +8837,8 @@ mod tests {
                     role: "client".into(),
                     source: "detected".into(),
                     screens: vec![test_screen("peer-client-10-0-0-2")],
+                    modifier_remap: None,
+                    modifier_map: None,
                 },
             ],
             active_device_id: "local-device".into(),
@@ -8902,6 +8933,8 @@ mod tests {
                 scale: 1.0,
                 is_primary: true,
             }],
+            modifier_remap: None,
+            modifier_map: None,
             app_version: "test".into(),
             last_seen_ms: now_ms(),
         }
@@ -10325,6 +10358,8 @@ mod tests {
             screens: vec![],
             app_version: "0.1.0".into(),
             last_seen_ms: now_ms(),
+            modifier_remap: None,
+            modifier_map: None,
         }];
 
         let target =

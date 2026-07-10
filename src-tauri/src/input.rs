@@ -51,8 +51,12 @@ const CROSSING_ACTIVATION_BAND: f64 = EDGE_TOLERANCE as f64 * 2.0;
 // bouncing back across the same edge. Unlike the old 150ms time gate it never
 // freezes deliberate movement.
 const RETURN_EDGE_INSET: f64 = 4.0;
-const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
-const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
+// 4ms ≈ 250Hz cap. 8ms (125Hz) visibly juddered against high-refresh displays
+// (the remote cursor updates at half the rate of a 180Hz panel); datagrams are
+// latest-wins and ~100 bytes, so the extra rate is free on a LAN and the queue
+// coalesces under back-pressure.
+const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 4;
+const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 4;
 #[cfg(target_os = "macos")]
 const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
 #[cfg(target_os = "macos")]
@@ -1403,6 +1407,7 @@ fn start_platform_capture(
             cursor_warp_failures: AtomicU64::new(0),
             cursor_hider_hwnd: std::sync::atomic::AtomicUsize::new(cursor_hider.hwnd as usize),
             cursor_hider_visible: AtomicBool::new(false),
+            cursor_hider_reassert_ms: AtomicU64::new(0),
             local_screen_points: Mutex::new(HashMap::new()),
             last_hook_event_ms: AtomicU64::new(0),
         });
@@ -1737,10 +1742,27 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
                         pair_secret: layout.pair_secret.clone(),
                         target_addr: format!("{}:{}", device.host, quic_port),
                         target_platform: device.platform.clone(),
-                        modifier_remap: layout.modifier_remap,
-                        modifier_control: layout.modifier_map.control.clone(),
-                        modifier_alt: layout.modifier_map.alt.clone(),
-                        modifier_meta: layout.modifier_map.meta.clone(),
+                        // Prefer the TARGET device's advertised remap settings
+                        // (edited on that machine, broadcast via discovery) so
+                        // "改键" configured on the mac applies when Windows is
+                        // the server. Fall back to the local layout for peers
+                        // running builds that don't announce a preference.
+                        modifier_remap: device.modifier_remap.unwrap_or(layout.modifier_remap),
+                        modifier_control: device
+                            .modifier_map
+                            .as_ref()
+                            .map(|map| map.control.clone())
+                            .unwrap_or_else(|| layout.modifier_map.control.clone()),
+                        modifier_alt: device
+                            .modifier_map
+                            .as_ref()
+                            .map(|map| map.alt.clone())
+                            .unwrap_or_else(|| layout.modifier_map.alt.clone()),
+                        modifier_meta: device
+                            .modifier_map
+                            .as_ref()
+                            .map(|map| map.meta.clone())
+                            .unwrap_or_else(|| layout.modifier_map.meta.clone()),
                         transport_public_key: device.transport_public_key.clone(),
                         protocol_version: device.protocol_version,
                         screen_id: peer_screen_id(device, remote_screen),
@@ -4467,6 +4489,8 @@ struct WindowsCaptureContext {
     cursor_warp_failures: AtomicU64,
     cursor_hider_hwnd: std::sync::atomic::AtomicUsize,
     cursor_hider_visible: AtomicBool,
+    // GetTickCount64 of the last periodic cover re-assert (reassert_windows_cursor_hider).
+    cursor_hider_reassert_ms: AtomicU64,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     // GetTickCount64 of the last time either low-level hook callback fired.
     // The pump loop compares this against system-wide input activity to detect
@@ -4483,6 +4507,12 @@ fn try_windows_capture_context() -> Option<Arc<WindowsCaptureContext>> {
         .and_then(|context| context.clone())
 }
 
+// Side length of the blank-cursor cover window, centred on the anchor. Larger
+// than 1px so DPI rounding or an off-by-one between SetWindowPos and
+// SetCursorPos coordinates cannot leave the cursor hotspot outside the cover.
+#[cfg(target_os = "windows")]
+const WINDOWS_CURSOR_HIDER_SIZE: i32 = 16;
+
 #[cfg(target_os = "windows")]
 struct WindowsCursorHider {
     hwnd: windows_sys::Win32::Foundation::HWND,
@@ -4498,8 +4528,7 @@ impl WindowsCursorHider {
             System::LibraryLoader::GetModuleHandleW,
             UI::WindowsAndMessaging::{
                 CreateCursor, CreateWindowExW, DefWindowProcW, GetSystemMetrics, RegisterClassW,
-                SM_CXCURSOR, SM_CYCURSOR, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-                WS_EX_TRANSPARENT, WS_POPUP,
+                SM_CXCURSOR, SM_CYCURSOR, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         };
 
@@ -4548,16 +4577,22 @@ impl WindowsCursorHider {
         }
 
         let title = crate::wide_null("MyKVM Cursor Hider");
+        // NO WS_EX_TRANSPARENT: that style makes the window transparent to
+        // hit-testing, so WM_SETCURSOR routes to whatever is underneath and the
+        // blank class cursor never applies — the pinned cursor stays visible at
+        // the anchor. This window must WIN hit-testing at the anchor pixel.
+        // Click-through doesn't matter: it is only shown while every input
+        // event is being swallowed by the hooks.
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 class_name.as_ptr(),
                 title.as_ptr(),
                 WS_POPUP,
                 0,
                 0,
-                1,
-                1,
+                WINDOWS_CURSOR_HIDER_SIZE,
+                WINDOWS_CURSOR_HIDER_SIZE,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 instance,
@@ -5970,6 +6005,7 @@ fn handle_windows_remote_mouse_delta(context: &WindowsCaptureContext, dx: f64, d
     active_target.y = active_target
         .y
         .clamp(0.0, (active_target.current_screen.height - 1) as f64);
+    reassert_windows_cursor_hider(context);
     let button_mask = context.remote_button_mask.load(Ordering::Relaxed);
     let dragging = button_mask != 0;
     if should_send_mouse_move(&context.last_mouse_move_sent, dragging)
@@ -6028,13 +6064,12 @@ fn handle_windows_local_mouse_move(
             }
         });
     if let Some(active_target) = active_target {
-        let anchor = windows_remote_anchor_point(&active_target);
         if let Ok(mut active) = context.active.lock() {
             *active = Some(active_target.clone());
         } else {
             return false;
         }
-        set_windows_remote_anchor(context, anchor);
+        set_windows_remote_anchor(context, &active_target);
         context.remote_active.store(true, Ordering::Release);
         if !send_remote_mouse_move(
             &context.quic_transport,
@@ -6172,10 +6207,30 @@ fn set_windows_cursor(x: i32, y: i32) {
 }
 
 #[cfg(target_os = "windows")]
-fn set_windows_remote_anchor(context: &WindowsCaptureContext, anchor: (f64, f64)) {
-    let x = anchor.0.round() as i32;
-    let y = anchor.1.round() as i32;
-    let source = windows_current_cursor_point().unwrap_or(anchor);
+fn set_windows_remote_anchor(context: &WindowsCaptureContext, active: &ActiveTarget) {
+    // Preferred anchor is the local screen centre: maximum headroom for raw
+    // deltas in every direction before the OS clamps the pinned cursor at a
+    // screen bound. But centre is only safe while the blank-cursor cover
+    // actually hides the pinned cursor — verify it truly wins hit-testing
+    // there. If it doesn't (cover window missing, outranked by a higher
+    // topmost, positioning failure), fall back to pinning at the entry edge:
+    // a visible cursor resting where the user just crossed is benign, one
+    // teleported to the middle of the screen is the "jumps to the centre" bug.
+    let preferred = windows_remote_anchor_point(active);
+    let mut x = preferred.0.round() as i32;
+    let mut y = preferred.1.round() as i32;
+    let covered =
+        position_windows_cursor_hider(context, x, y) && windows_cursor_hider_covers(context, x, y);
+    if !covered {
+        let edge = local_anchor_point(active);
+        x = edge.0.round() as i32;
+        y = edge.1.round() as i32;
+        let _ = position_windows_cursor_hider(context, x, y);
+        log::warn!(
+            "[input-win] cursor hider ineffective at centre; anchoring at entry edge ({x},{y})"
+        );
+    }
+    let source = windows_current_cursor_point().unwrap_or((x as f64, y as f64));
     context
         .remote_anchor_x
         .store(i64::from(x), Ordering::Release);
@@ -6188,7 +6243,6 @@ fn set_windows_remote_anchor(context: &WindowsCaptureContext, anchor: (f64, f64)
     context
         .warp_source_y
         .store(source.1.round() as i64, Ordering::Release);
-    hide_windows_cursor_if_needed(context);
     if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) } == 0 {
         context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -6198,6 +6252,30 @@ fn set_windows_remote_anchor(context: &WindowsCaptureContext, anchor: (f64, f64)
             // DWORD tick itself wraps to zero every ~49.7 days.
             .store(u64::from(windows_tick_ms() as u32) + 1, Ordering::Release);
     }
+}
+
+/// Periodically re-assert the blank-cursor cover while a remote session is
+/// active: re-raise it to the top of the topmost band and re-show it, so a
+/// window that later claimed a higher topmost slot cannot leave the pinned
+/// cursor visible at the anchor for the rest of the session.
+#[cfg(target_os = "windows")]
+fn reassert_windows_cursor_hider(context: &WindowsCaptureContext) {
+    const REASSERT_INTERVAL_MS: u64 = 500;
+
+    if !context.cursor_hider_visible.load(Ordering::Acquire) {
+        return;
+    }
+    let now = windows_tick_ms();
+    let last = context.cursor_hider_reassert_ms.load(Ordering::Acquire);
+    if now.saturating_sub(last) < REASSERT_INTERVAL_MS {
+        return;
+    }
+    context
+        .cursor_hider_reassert_ms
+        .store(now, Ordering::Release);
+    let x = context.remote_anchor_x.load(Ordering::Acquire) as i32;
+    let y = context.remote_anchor_y.load(Ordering::Acquire) as i32;
+    let _ = position_windows_cursor_hider(context, x, y);
 }
 
 #[cfg(target_os = "windows")]
@@ -6223,18 +6301,6 @@ fn windows_current_cursor_point() -> Option<(f64, f64)> {
 }
 
 #[cfg(target_os = "windows")]
-fn hide_windows_cursor_if_needed(context: &WindowsCaptureContext) {
-    if context.cursor_hider_visible.load(Ordering::Acquire) {
-        return;
-    }
-    let x = context.remote_anchor_x.load(Ordering::Acquire) as i32;
-    let y = context.remote_anchor_y.load(Ordering::Acquire) as i32;
-    if position_windows_cursor_hider(context, x, y) {
-        log::debug!("[input-win] cursor hider shown");
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn position_windows_cursor_hider(context: &WindowsCaptureContext, x: i32, y: i32) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
@@ -6248,15 +6314,17 @@ fn position_windows_cursor_hider(context: &WindowsCaptureContext, x: i32, y: i32
     }
     // This blank-cursor window is MyKVM's only Windows hide mechanism. Keep it
     // above always-on-top and borderless-fullscreen windows without activating
-    // it; HWND_TOP alone only raises within the non-topmost band.
+    // it; HWND_TOP alone only raises within the non-topmost band. Centre the
+    // cover on the target point so the cursor hotspot lands well inside it.
+    let half = WINDOWS_CURSOR_HIDER_SIZE / 2;
     if unsafe {
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
-            x,
-            y,
-            1,
-            1,
+            x - half,
+            y - half,
+            WINDOWS_CURSOR_HIDER_SIZE,
+            WINDOWS_CURSOR_HIDER_SIZE,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
     } == 0
@@ -6268,6 +6336,23 @@ fn position_windows_cursor_hider(context: &WindowsCaptureContext, x: i32, y: i32
         context.cursor_hider_visible.store(true, Ordering::Release);
         true
     }
+}
+
+/// True when the blank-cursor cover window actually wins hit-testing at
+/// (x, y) — i.e. the pinned cursor there is really invisible. Detects covers
+/// defeated by a higher topmost window or a positioning failure so the caller
+/// can avoid parking a visible cursor at the screen centre.
+#[cfg(target_os = "windows")]
+fn windows_cursor_hider_covers(context: &WindowsCaptureContext, x: i32, y: i32) -> bool {
+    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::WindowFromPoint};
+
+    let hwnd =
+        context.cursor_hider_hwnd.load(Ordering::Acquire) as windows_sys::Win32::Foundation::HWND;
+    if hwnd.is_null() {
+        return false;
+    }
+    let hit = unsafe { WindowFromPoint(POINT { x, y }) };
+    hit == hwnd
 }
 
 #[cfg(target_os = "windows")]
@@ -7153,7 +7238,10 @@ fn local_hotkey_return_point(
     active: &ActiveTarget,
     recorded_point: Option<(f64, f64)>,
 ) -> (f64, f64) {
-    recorded_point.unwrap_or_else(|| local_center_point(active))
+    // Fall back to the edge-mapped return point, not the screen centre: this
+    // path also runs on mid-session errors (e.g. a failed send), where a warp
+    // to the centre reads as the cursor teleporting for no reason.
+    recorded_point.unwrap_or_else(|| local_return_point(active))
 }
 
 fn send_remote_mouse_move(
@@ -7514,13 +7602,12 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
             // Mirror the Windows mouse-crossing enter path. Hotkey entry has no
             // physical mouse position at the edge, so we explicitly pin to the
             // local anchor and start sending deltas from there.
-            let anchor = windows_remote_anchor_point(&active_target);
             if let Ok(mut active) = context.active.lock() {
                 *active = Some(active_target.clone());
             } else {
                 return;
             }
-            set_windows_remote_anchor(context, anchor);
+            set_windows_remote_anchor(context, &active_target);
             context.remote_active.store(true, Ordering::Release);
             if send_remote_mouse_move(
                 &context.quic_transport,
@@ -11351,6 +11438,8 @@ mod tests {
                     role: "local".into(),
                     source: "detected".into(),
                     screens: vec![screen("local-device", "local-display-1", 0, 0, 1920, 1080)],
+                    modifier_remap: None,
+                    modifier_map: None,
                 },
                 Device {
                     id: "peer-device".into(),
@@ -11376,6 +11465,8 @@ mod tests {
                         1920,
                         1080,
                     )],
+                    modifier_remap: None,
+                    modifier_map: None,
                 },
             ],
             active_device_id: "local-device".into(),
@@ -11464,6 +11555,8 @@ mod tests {
                 screen("peer-device", "peer-device-scr-1", 1920, 0, 1920, 1080),
                 screen("peer-device", "peer-device-scr-2", 1920, 1080, 1920, 1080),
             ],
+            modifier_remap: None,
+            modifier_map: None,
         };
         let mut layout = layout_for_target_tests();
         layout.devices.retain(|device| device.id != "peer-device");
@@ -11831,7 +11924,7 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_return_uses_recorded_point_then_local_screen_center() {
+    fn hotkey_return_uses_recorded_point_then_edge_mapped_point() {
         let active = crossing_target(
             &[target_for_coordinate_tests()],
             1919.0,
@@ -11846,7 +11939,12 @@ mod tests {
             local_hotkey_return_point(&active, Some((321.0, 654.0))),
             (321.0, 654.0)
         );
-        assert_eq!(local_hotkey_return_point(&active, None), (960.0, 540.0));
+        // No recorded point: land at the edge-mapped return point, never the
+        // screen centre (this fallback also runs on mid-session send errors).
+        assert_eq!(
+            local_hotkey_return_point(&active, None),
+            local_return_point(&active)
+        );
     }
 
     #[test]
