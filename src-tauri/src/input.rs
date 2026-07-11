@@ -55,6 +55,18 @@ const CROSSING_ACTIVATION_BAND: f64 = EDGE_TOLERANCE as f64 * 2.0;
 // any inward frame) never hands control back, shallow enough that a deliberate
 // push or a circle arc exits within one or two events.
 const RETURN_EXIT_DEPTH_PX: f64 = 6.0;
+// Deliberate outward push (accumulated raw delta) required at a shared edge
+// before control crosses to the remote device. Merely touching the boundary —
+// menu bar, Dock, window controls that live at the edge — must not switch
+// devices; a fast flick clears this in a single event, so intentional
+// crossings still feel instant. macOS only: a Windows low-level hook reports
+// clamped coordinates, so outward depth cannot be measured there.
+#[cfg(target_os = "macos")]
+const CROSSING_ENTRY_DEPTH_PX: f64 = 24.0;
+// Push-through progress older than this is stale (the hand paused): restart
+// the accumulation instead of resuming a depth from a long-gone approach.
+#[cfg(target_os = "macos")]
+const CROSSING_ENTRY_DEPTH_STALE: Duration = Duration::from_millis(150);
 // A tiny spatial re-arm after returning is imperceptible but avoids immediately
 // bouncing back across the same edge. Unlike the old 150ms time gate it never
 // freezes deliberate movement.
@@ -1148,6 +1160,7 @@ fn start_platform_capture(
             just_crossed: AtomicBool::new(false),
             suppress_next_mouse_delta: AtomicBool::new(false),
             hotkey_return_point: Mutex::new(None),
+            edge_entry_depth: Mutex::new(None),
             local_screen_points: Mutex::new(HashMap::new()),
             local_y_bounds,
             display_snapshots,
@@ -4334,6 +4347,10 @@ struct MacCaptureContext {
     just_crossed: AtomicBool,
     suppress_next_mouse_delta: AtomicBool,
     hotkey_return_point: Mutex<Option<(f64, f64)>>,
+    // Accumulated outward push toward one crossing candidate: ((remote screen
+    // id, edge), depth so far, last update). Cleared on any event without a
+    // candidate, so resting jitter alternating in/out never adds up.
+    edge_entry_depth: Mutex<Option<((String, Edge), f64, Instant)>>,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
@@ -5479,6 +5496,24 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
             event.pt.y as f64,
             anchor,
         ) {
+            // Re-pin even for dropped backlog: if the entry warp failed or has
+            // not landed yet, the physical cursor is still sitting near the
+            // entry edge, so EVERY event for the whole backlog window keeps
+            // matching the closer-to-source test — motion freezes, and the
+            // first event after the window applies one huge stale delta that
+            // slams the tracked position back to the entry point (the "return
+            // lands where I crossed in" bug). Pinning here makes genuine
+            // post-warp motion start at the anchor immediately. Do not disarm
+            // the cutoff: more backlog may still be queued.
+            if unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
+                    anchor.0 as i32,
+                    anchor.1 as i32,
+                )
+            } == 0
+            {
+                context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
+            }
             return 1;
         }
 
@@ -6898,6 +6933,10 @@ fn handle_macos_mouse_move(
     if let Some(active_target) =
         mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
     {
+        if !edge_entry_depth_reached(context, &active_target, dx, dy) {
+            // Not enough deliberate push past the edge yet: stay local.
+            return CallbackResult::Keep;
+        }
         let anchor = mac_cursor_point(
             context,
             local_anchor_point(&active_target),
@@ -6947,7 +6986,59 @@ fn handle_macos_mouse_move(
         return CallbackResult::Drop;
     }
 
+    // No crossing candidate this event: abandon any push-through progress.
+    if let Ok(mut depth) = context.edge_entry_depth.lock() {
+        *depth = None;
+    }
     CallbackResult::Keep
+}
+
+/// Magnitude of the movement component pushing inward through a shared edge,
+/// toward the remote device on the other side.
+#[cfg(target_os = "macos")]
+fn entry_push(edge: Edge, dx: f64, dy: f64) -> f64 {
+    match edge {
+        Edge::Right => dx.max(0.0),
+        Edge::Left => (-dx).max(0.0),
+        Edge::Bottom => dy.max(0.0),
+        Edge::Top => (-dy).max(0.0),
+    }
+}
+
+/// Accumulates outward push toward `active_target`'s edge and reports whether
+/// the crossing is deliberate enough to commit. Consumes the accumulator on
+/// success so the next approach starts from zero.
+#[cfg(target_os = "macos")]
+fn edge_entry_depth_reached(
+    context: &MacCaptureContext,
+    active_target: &ActiveTarget,
+    dx: f64,
+    dy: f64,
+) -> bool {
+    let dy = if active_target.invert_y { -dy } else { dy };
+    let push = entry_push(active_target.target.edge, dx, dy);
+    let key = (
+        active_target.target.screen_id.clone(),
+        active_target.target.edge,
+    );
+    let now = Instant::now();
+    let Ok(mut state) = context.edge_entry_depth.lock() else {
+        return true;
+    };
+    let depth = match state.take() {
+        Some((prev_key, prev_depth, at))
+            if prev_key == key && now.duration_since(at) < CROSSING_ENTRY_DEPTH_STALE =>
+        {
+            prev_depth + push
+        }
+        _ => push,
+    };
+    if depth >= CROSSING_ENTRY_DEPTH_PX {
+        true
+    } else {
+        *state = Some((key, depth, now));
+        false
+    }
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -8242,9 +8333,12 @@ fn macos_cursor_repin_policy(main_window_visible: bool) -> (f64, u64) {
         (1.5, 8)
     } else {
         // A hidden/background app can observe tiny WindowServer cursor drift
-        // continuously. Re-warping for every 1-2px wobble creates the visible
-        // edge hitch; only correct meaningful drift and cap it at 20Hz.
-        (48.0, 50)
+        // continuously; stay above that 1-2px wobble. Beyond it, re-pin
+        // aggressively: warp suppression is zero for the whole remote session,
+        // so re-pins are cheap, and the local cursor visibly trailing the
+        // mouse (Mission Control, fast strokes) is the worse failure — the
+        // old 48px/20Hz policy let it wander half an icon before correction.
+        (4.0, 8)
     }
 }
 
@@ -11474,9 +11568,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn hidden_macos_window_uses_a_relaxed_cursor_repin_policy() {
+    fn hidden_macos_window_uses_a_wobble_tolerant_cursor_repin_policy() {
         assert_eq!(macos_cursor_repin_policy(true), (1.5, 8));
-        assert_eq!(macos_cursor_repin_policy(false), (48.0, 50));
+        // Hidden must stay above the 1-2px WindowServer wobble but re-pin
+        // fast enough that the local cursor cannot visibly trail the mouse.
+        let (drift, interval) = macos_cursor_repin_policy(false);
+        assert!(drift > 2.0 && drift <= 8.0, "drift {drift}");
+        assert!(interval <= 16, "interval {interval}");
     }
 
     #[test]
