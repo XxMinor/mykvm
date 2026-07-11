@@ -1596,8 +1596,6 @@ static MACOS_CURSOR_TRANSITION: Mutex<()> = Mutex::new(());
 /// would visibly jump the user's physical mouse before hiding it.
 #[cfg(target_os = "macos")]
 fn macos_receive_hide_cursor(x: i32, y: i32) {
-    use core_graphics::display::CGDisplay;
-
     let _transition = MACOS_CURSOR_TRANSITION
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1617,13 +1615,14 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
         *tracker = MacClickTracker::default();
     }
     // Full hide, matching the server: SetsCursorInBackground so it sticks while
-    // not frontmost, transparent cursor, NSCursor hide, and hide on every display.
-    enable_macos_background_cursor_hide();
-    set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_RECEIVE, true);
-    set_macos_cursor_hidden_with_appkit(true);
-    for display_id in CGDisplay::active_displays().unwrap_or_default() {
-        let _ = CGDisplay::new(display_id).hide_cursor();
-    }
+    // not frontmost, transparent cursor, NSCursor hide, and hide on every
+    // display. Run the visuals on the main thread: injection happens on QUIC
+    // worker threads, and AppKit cursor calls made off-main are silently
+    // dropped sometimes — a dropped un-hide left the arrow transparent until
+    // the next natural cursor-image update ("invisible for a while after
+    // control returns"). The main queue is FIFO and both hide and show enqueue
+    // under MACOS_CURSOR_TRANSITION, so visual order matches flag order.
+    macos_dispatch_main(macos_receive_hide_visuals_thunk);
     log::info!(
         "[diag] receive hide cursor in place at ({:.0},{:.0}); ignored remote park ({x},{y})",
         parked.0,
@@ -1636,8 +1635,6 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
 /// and stack-based NSCursor calls stay paired.
 #[cfg(target_os = "macos")]
 fn macos_receive_show_cursor_if_hidden() {
-    use core_graphics::display::CGDisplay;
-
     let _transition = MACOS_CURSOR_TRANSITION
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1645,15 +1642,53 @@ fn macos_receive_show_cursor_if_hidden() {
     if !MACOS_RECEIVE_CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
         return;
     }
+    macos_dispatch_main(macos_receive_show_visuals_thunk);
+    if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
+        *point = None;
+    }
+    log::info!("[diag] receive show cursor");
+}
+
+/// Enqueue a parameterless work item on the GCD main queue. AppKit cursor
+/// calls and TIS are only reliable there; QUIC worker and monitor threads
+/// must hop before touching them.
+#[cfg(target_os = "macos")]
+fn macos_dispatch_main(work: extern "C" fn(*mut std::os::raw::c_void)) {
+    use std::os::raw::c_void;
+    extern "C" {
+        fn dispatch_async_f(
+            queue: *const c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+        static _dispatch_main_q: c_void;
+    }
+    unsafe {
+        dispatch_async_f(&_dispatch_main_q as *const c_void, std::ptr::null_mut(), work);
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn macos_receive_hide_visuals_thunk(_: *mut std::os::raw::c_void) {
+    use core_graphics::display::CGDisplay;
+
+    enable_macos_background_cursor_hide();
+    set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_RECEIVE, true);
+    set_macos_cursor_hidden_with_appkit(true);
+    for display_id in CGDisplay::active_displays().unwrap_or_default() {
+        let _ = CGDisplay::new(display_id).hide_cursor();
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn macos_receive_show_visuals_thunk(_: *mut std::os::raw::c_void) {
+    use core_graphics::display::CGDisplay;
+
     set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_RECEIVE, false);
     set_macos_cursor_hidden_with_appkit(false);
     for display_id in CGDisplay::active_displays().unwrap_or_default() {
         let _ = CGDisplay::new(display_id).show_cursor();
     }
-    if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
-        *point = None;
-    }
-    log::info!("[diag] receive show cursor");
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -9415,22 +9450,7 @@ pub fn reset_injected_modifiers() {
 /// QUIC worker thread — calling it there traps (SIGTRAP). Hop to the main thread.
 #[cfg(target_os = "macos")]
 fn macos_switch_to_next_input_source() {
-    use std::os::raw::c_void;
-    extern "C" {
-        fn dispatch_async_f(
-            queue: *const c_void,
-            context: *mut c_void,
-            work: extern "C" fn(*mut c_void),
-        );
-        static _dispatch_main_q: c_void;
-    }
-    unsafe {
-        dispatch_async_f(
-            &_dispatch_main_q as *const c_void,
-            std::ptr::null_mut(),
-            macos_switch_input_source_thunk,
-        );
-    }
+    macos_dispatch_main(macos_switch_input_source_thunk);
 }
 
 #[cfg(target_os = "macos")]
