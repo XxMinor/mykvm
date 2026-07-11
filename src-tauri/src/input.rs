@@ -6315,10 +6315,10 @@ fn handle_windows_local_mouse_move(
         );
         set_control_clipboard_target(&context.clipboard_target, &active_target);
         log::debug!(
-            "[input-win] entered remote device={} anchor=({:.0},{:.0})",
+            "[input-win] entered remote device={} anchor=({},{})",
             active_target.target.device_id,
-            anchor.0,
-            anchor.1
+            context.remote_anchor_x.load(Ordering::Acquire),
+            context.remote_anchor_y.load(Ordering::Acquire)
         );
         return true;
     }
