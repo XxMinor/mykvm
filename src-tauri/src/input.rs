@@ -4176,9 +4176,38 @@ fn inject_cursor_park(x: i32, y: i32) {
     macos_receive_hide_cursor(x, y);
     #[cfg(target_os = "linux")]
     linux_input::receive_hide_cursor(x, y);
+    // Windows has no reliable global cursor hide for a background process
+    // without a cover window; tuck the cursor into the exact bottom-right
+    // pixel of its monitor instead — the arrow glyph hangs down-right of the
+    // hotspot, so at the corner it clips to a near-invisible sliver.
+    // ponytail: cover-window hide (like the capture side) if the sliver still bothers.
+    #[cfg(target_os = "windows")]
+    {
+        let (px, py) = windows_park_point(x, y);
+        inject_mouse_move(px, py, None);
+    }
     // Other platforms tuck the cursor without a native hide implementation.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     inject_mouse_move(x, y, None);
+}
+
+/// Bottom-right-most pixel of the monitor containing the sender's park point.
+#[cfg(target_os = "windows")]
+fn windows_park_point(x: i32, y: i32) -> (i32, i32) {
+    use windows_sys::Win32::{
+        Foundation::POINT,
+        Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+    };
+
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if monitor.is_null() || GetMonitorInfoW(monitor, &mut info) == 0 {
+            return (x, y);
+        }
+        (info.rcMonitor.right - 1, info.rcMonitor.bottom - 1)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -5496,33 +5525,41 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
             event.pt.y as f64,
             anchor,
         ) {
-            // Re-pin even for dropped backlog: if the entry warp failed or has
-            // not landed yet, the physical cursor is still sitting near the
-            // entry edge, so EVERY event for the whole backlog window keeps
-            // matching the closer-to-source test — motion freezes, and the
-            // first event after the window applies one huge stale delta that
-            // slams the tracked position back to the entry point (the "return
-            // lands where I crossed in" bug). Pinning here makes genuine
-            // post-warp motion start at the anchor immediately. Do not disarm
-            // the cutoff: more backlog may still be queued.
-            if unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
-                    anchor.0 as i32,
-                    anchor.1 as i32,
-                )
-            } == 0
-            {
-                context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
+            // Re-pin dropped backlog, but only while the entry warp-guard is
+            // still armed: if the entry warp failed or has not landed yet, the
+            // physical cursor is still sitting near the entry edge, so EVERY
+            // event for the whole backlog window keeps matching the
+            // closer-to-source test — motion freezes, and the first event
+            // after the window applies one huge stale delta that slams the
+            // tracked position back to the entry point (the "return lands
+            // where I crossed in" bug). Once the guard is disarmed the only
+            // drops are at-anchor duplicates, and warping those during a
+            // concurrent return risks pinning a straggler to a stale anchor.
+            // Do not disarm the cutoff: more backlog may still be queued.
+            if encoded_cutoff != 0 {
+                if unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
+                        context.remote_anchor_x.load(Ordering::Acquire) as i32,
+                        context.remote_anchor_y.load(Ordering::Acquire) as i32,
+                    )
+                } == 0
+                {
+                    context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
+                }
             }
             return 1;
         }
 
         let dx = i64::from(event.pt.x) - anchor.0 as i64;
         let dy = i64::from(event.pt.y) - anchor.1 as i64;
+        // Warp to a FRESH anchor read, not the copy used for the delta math: a
+        // concurrent return may have just retargeted the anchor to the reveal
+        // point, and pinning this straggler to the stale centre is the
+        // "cursor flies to the middle of the server screen" bug.
         if unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
-                anchor.0 as i32,
-                anchor.1 as i32,
+                context.remote_anchor_x.load(Ordering::Acquire) as i32,
+                context.remote_anchor_y.load(Ordering::Acquire) as i32,
             )
         } == 0
         {
@@ -6469,8 +6506,10 @@ fn reassert_windows_cursor_hider(context: &WindowsCaptureContext) {
 
 #[cfg(target_os = "windows")]
 fn clear_windows_remote_anchor(context: &WindowsCaptureContext) {
-    context.remote_anchor_x.store(0, Ordering::Release);
-    context.remote_anchor_y.store(0, Ordering::Release);
+    // Deliberately leave remote_anchor_x/y at the last retargeted point: a
+    // straggler hook event that raced past the remote_active flip then
+    // re-pins to where the cursor just revealed (harmless) instead of to
+    // (0,0) in the top-left corner. The next session overwrites the anchor.
     context.warp_source_x.store(0, Ordering::Release);
     context.warp_source_y.store(0, Ordering::Release);
     context.warp_cutoff_time.store(0, Ordering::Release);
