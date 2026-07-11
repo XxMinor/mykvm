@@ -1987,12 +1987,40 @@ fn spawn_datagram_reader(
 ) {
     tokio::spawn(async move {
         loop {
-            match connection.read_datagram().await {
-                Ok(payload) => on_datagram(payload.to_vec(), remote),
+            let first = match connection.read_datagram().await {
+                Ok(payload) => payload,
                 Err(error) => {
                     log::debug!("QUIC datagram reader stopped for {remote}: {error}");
                     break;
                 }
+            };
+
+            // Wi-Fi delay bursts hand the receiver a bunch of queued datagrams
+            // at once; injecting them sequentially replays the stale cursor
+            // path ("floaty" motion). Drain whatever is already buffered,
+            // forward non-move packets in arrival order, and inject only the
+            // newest move.
+            let mut latest_move: Option<Vec<u8>> = None;
+            let mut next = Some(first.to_vec());
+            let mut drained = 0_usize;
+            while let Some(payload) = next.take() {
+                if crate::input::packet_is_coalescible_move(&payload) {
+                    latest_move = Some(payload);
+                } else {
+                    on_datagram(payload, remote);
+                }
+                drained += 1;
+                if drained >= 64 {
+                    break;
+                }
+                next = match tokio::time::timeout(Duration::ZERO, connection.read_datagram()).await
+                {
+                    Ok(Ok(buffered)) => Some(buffered.to_vec()),
+                    _ => None,
+                };
+            }
+            if let Some(payload) = latest_move {
+                on_datagram(payload, remote);
             }
         }
     });

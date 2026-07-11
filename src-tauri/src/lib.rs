@@ -3228,7 +3228,35 @@ pub fn acquire_single_instance() -> bool {
 
 #[cfg(not(target_os = "windows"))]
 pub fn acquire_single_instance() -> bool {
-    true
+    // The launchd autostart entry execs the raw bundle binary, bypassing
+    // LaunchServices' built-in single-app behavior, so a manual launch used to
+    // stack a second live process (two tray icons). flock releases on any
+    // process exit, including crashes.
+    #[cfg(target_os = "macos")]
+    let dir = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support/com.xzhpl.mykvm"))
+        .unwrap_or_else(std::env::temp_dir);
+    #[cfg(not(target_os = "macos"))]
+    let dir = std::env::temp_dir();
+
+    let _ = fs::create_dir_all(&dir);
+    match fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(dir.join("instance.lock"))
+    {
+        Ok(file) => match file.try_lock() {
+            Ok(()) => {
+                // Hold the flock for the process lifetime.
+                std::mem::forget(file);
+                true
+            }
+            Err(_) => false,
+        },
+        // Cannot even create the bookkeeping file (odd sandbox/permissions):
+        // start anyway rather than brick launch.
+        Err(_) => true,
+    }
 }
 
 #[cfg(target_os = "windows")]

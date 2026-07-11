@@ -2055,29 +2055,6 @@ fn send_packet_with_options(
             quic_transport.send_reliable_input_with_class(peer, payload, class)
         }
     } else if send_latest {
-        // Wi-Fi loss bursts eat best-effort datagrams wholesale and the remote
-        // cursor freezes until the burst passes. Mirror the current position
-        // onto the reliable channel a few times per second: QUIC retransmits
-        // it through the loss so motion degrades to ~25Hz instead of stopping,
-        // and the receiver's position-sequence dedupe discards whichever copy
-        // arrives second.
-        if reliable_move_mirror_due() {
-            let mirror_peer = peer.clone();
-            let mirror_payload = payload.clone();
-            let _ = if admission == InputSendAdmission::Nonblocking {
-                quic_transport.send_reliable_input_with_class_nonblocking(
-                    mirror_peer,
-                    mirror_payload,
-                    quic_transport::ReliableInputClass::State,
-                )
-            } else {
-                quic_transport.send_reliable_input_with_class(
-                    mirror_peer,
-                    mirror_payload,
-                    quic_transport::ReliableInputClass::State,
-                )
-            };
-        }
         if admission == InputSendAdmission::Nonblocking {
             quic_transport.send_latest_datagram_nonblocking(peer, payload)
         } else {
@@ -2097,25 +2074,6 @@ fn send_packet_with_options(
             false
         }
     }
-}
-
-/// Rate-limits the reliable mirror of latest-wins move datagrams to ~25Hz.
-fn reliable_move_mirror_due() -> bool {
-    const MIRROR_INTERVAL: Duration = Duration::from_millis(40);
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-
-    let Ok(mut last) = LAST.lock() else {
-        return false;
-    };
-    let now = Instant::now();
-    if last
-        .map(|at| now.duration_since(at) < MIRROR_INTERVAL)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    *last = Some(now);
-    true
 }
 
 fn input_packet_needs_key_sequence(event: &InputEvent, modifier_snapshot: Option<u8>) -> bool {
@@ -2857,6 +2815,16 @@ pub(crate) fn packet_is_droppable_move(payload: &[u8]) -> bool {
         Some(packet) => matches!(packet.event, InputEvent::MouseMove { .. }),
         None => true,
     }
+}
+
+/// True only for a decodable latest-wins mouse-move frame. Stricter than
+/// [`packet_is_droppable_move`]: undecodable payloads (probes, foreign data)
+/// must be forwarded untouched, never coalesced away.
+pub(crate) fn packet_is_coalescible_move(payload: &[u8]) -> bool {
+    matches!(
+        decode_input_packet(payload).map(|packet| packet.event),
+        Some(InputEvent::MouseMove { .. })
+    )
 }
 
 fn decode_input_control_packet(payload: &[u8]) -> Option<InputControlPacket> {
