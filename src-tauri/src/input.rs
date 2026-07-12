@@ -6515,26 +6515,22 @@ fn set_windows_cursor(x: i32, y: i32) {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn repin_windows_cursor_with_return_repair<Anchor, Active, Warp>(
+fn repin_windows_cursor_with_return_repair<Anchor, Warp>(
     mut current_anchor: Anchor,
-    mut remote_active: Active,
     mut warp: Warp,
 ) -> bool
 where
     Anchor: FnMut() -> (i32, i32),
-    Active: FnMut() -> bool,
     Warp: FnMut(i32, i32) -> bool,
 {
     let first = current_anchor();
     let mut success = warp(first.0, first.1);
-    // The return thread stores the edge anchor before publishing remote=false.
-    // If it won the race while this hook was inside SetCursorPos, repair the
-    // stale centre warp with the now-authoritative edge point.
-    if !remote_active() {
-        let current = current_anchor();
-        if current != first {
-            success &= warp(current.0, current.1);
-        }
+    // If return retargeted the anchor while SetCursorPos was running, repair
+    // the stale centre warp. Do not depend on observing remote_active=false:
+    // an atomic load may still see the previous true value.
+    let current = current_anchor();
+    if current != first {
+        success &= warp(current.0, current.1);
     }
     success
 }
@@ -6548,7 +6544,6 @@ fn repin_windows_remote_cursor(context: &WindowsCaptureContext) -> bool {
                 context.remote_anchor_y.load(Ordering::Acquire) as i32,
             )
         },
-        || context.remote_active.load(Ordering::Acquire),
         |x, y| unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) != 0 },
     )
 }
@@ -10289,16 +10284,14 @@ mod tests {
     }
 
     #[test]
-    fn windows_repin_repairs_return_between_anchor_read_and_warp() {
+    fn windows_repin_repairs_anchor_change_when_active_read_is_stale() {
         use std::cell::{Cell, RefCell};
 
         let anchor = Cell::new((1280, 720));
-        let remote_active = Cell::new(true);
         let warped = RefCell::new(Vec::new());
 
         assert!(repin_windows_cursor_with_return_repair(
             || anchor.get(),
-            || remote_active.get(),
             |x, y| {
                 let first = {
                     let mut warped = warped.borrow_mut();
@@ -10307,7 +10300,6 @@ mod tests {
                 };
                 if first {
                     anchor.set((2555, 797));
-                    remote_active.set(false);
                 }
                 true
             },
