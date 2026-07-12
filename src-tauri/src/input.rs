@@ -5629,13 +5629,7 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
             // concurrent return risks pinning a straggler to a stale anchor.
             // Do not disarm the cutoff: more backlog may still be queued.
             if encoded_cutoff != 0 {
-                if unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
-                        context.remote_anchor_x.load(Ordering::Acquire) as i32,
-                        context.remote_anchor_y.load(Ordering::Acquire) as i32,
-                    )
-                } == 0
-                {
+                if !repin_windows_remote_cursor(&context) {
                     context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -5648,13 +5642,7 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
         // concurrent return may have just retargeted the anchor to the reveal
         // point, and pinning this straggler to the stale centre is the
         // "cursor flies to the middle of the server screen" bug.
-        if unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(
-                context.remote_anchor_x.load(Ordering::Acquire) as i32,
-                context.remote_anchor_y.load(Ordering::Acquire) as i32,
-            )
-        } == 0
-        {
+        if !repin_windows_remote_cursor(&context) {
             context.cursor_warp_failures.fetch_add(1, Ordering::Relaxed);
         } else {
             // Once the first post-entry real event is newer than the cutoff,
@@ -6183,13 +6171,11 @@ fn release_windows_remote_control_inner(context: &WindowsCaptureContext) {
         }
     }
 
+    clear_windows_local_mouse_history(&context.last_point);
     context.remote_active.store(false, Ordering::Release);
     reset_mouse_move_timer(&context.last_mouse_move_sent);
     reveal_windows_cursor_at(context, return_point);
     clear_windows_remote_anchor(context);
-    if let Ok(mut last_point) = context.last_point.lock() {
-        *last_point = None;
-    }
     if let Some(device_id) = clipboard_device_id {
         clear_clipboard_target_if_device(&context.clipboard_target, &device_id);
     } else {
@@ -6308,6 +6294,7 @@ fn handle_windows_remote_mouse_delta(context: &WindowsCaptureContext, dx: f64, d
             &context.input_events,
         );
         *active = None;
+        clear_windows_local_mouse_history(&context.last_point);
         context.remote_active.store(false, Ordering::Release);
         reset_mouse_move_timer(&context.last_mouse_move_sent);
         clear_clipboard_target_if_device(&context.clipboard_target, &target.device_id);
@@ -6524,6 +6511,52 @@ fn handle_windows_scroll(
 fn set_windows_cursor(x: i32, y: i32) {
     unsafe {
         let _ = windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn repin_windows_cursor_with_return_repair<Anchor, Active, Warp>(
+    mut current_anchor: Anchor,
+    mut remote_active: Active,
+    mut warp: Warp,
+) -> bool
+where
+    Anchor: FnMut() -> (i32, i32),
+    Active: FnMut() -> bool,
+    Warp: FnMut(i32, i32) -> bool,
+{
+    let first = current_anchor();
+    let mut success = warp(first.0, first.1);
+    // The return thread stores the edge anchor before publishing remote=false.
+    // If it won the race while this hook was inside SetCursorPos, repair the
+    // stale centre warp with the now-authoritative edge point.
+    if !remote_active() {
+        let current = current_anchor();
+        if current != first {
+            success &= warp(current.0, current.1);
+        }
+    }
+    success
+}
+
+#[cfg(target_os = "windows")]
+fn repin_windows_remote_cursor(context: &WindowsCaptureContext) -> bool {
+    repin_windows_cursor_with_return_repair(
+        || {
+            (
+                context.remote_anchor_x.load(Ordering::Acquire) as i32,
+                context.remote_anchor_y.load(Ordering::Acquire) as i32,
+            )
+        },
+        || context.remote_active.load(Ordering::Acquire),
+        |x, y| unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) != 0 },
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn clear_windows_local_mouse_history(last_point: &Mutex<Option<(f64, f64)>>) {
+    if let Ok(mut last_point) = last_point.lock() {
+        *last_point = None;
     }
 }
 
@@ -9721,7 +9754,8 @@ fn update_macos_injected_key(
 
 #[cfg(target_os = "macos")]
 fn merged_macos_event_flags(intrinsic: u64, tracked_modifiers: u64) -> u64 {
-    intrinsic | tracked_modifiers
+    const MANAGED_MODIFIERS: u64 = 0x001F_0000;
+    (intrinsic & !MANAGED_MODIFIERS) | tracked_modifiers
 }
 
 #[cfg(target_os = "macos")]
@@ -10039,7 +10073,9 @@ fn inject_key_inner(key_code: u16, down: bool) {
             );
         }
     }
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+    // Remote-control keys must not inherit Caps/Command/etc. from the Mac's
+    // physical HID state; the packet's modifier snapshot is authoritative.
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::Private) else {
         log::warn!("inject_key: failed to create CGEventSource");
         return;
     };
@@ -10250,6 +10286,42 @@ mod tests {
             windows_remote_anchor_point(&active),
             local_center_point(&active)
         );
+    }
+
+    #[test]
+    fn windows_repin_repairs_return_between_anchor_read_and_warp() {
+        use std::cell::{Cell, RefCell};
+
+        let anchor = Cell::new((1280, 720));
+        let remote_active = Cell::new(true);
+        let warped = RefCell::new(Vec::new());
+
+        assert!(repin_windows_cursor_with_return_repair(
+            || anchor.get(),
+            || remote_active.get(),
+            |x, y| {
+                let first = {
+                    let mut warped = warped.borrow_mut();
+                    warped.push((x, y));
+                    warped.len() == 1
+                };
+                if first {
+                    anchor.set((2555, 797));
+                    remote_active.set(false);
+                }
+                true
+            },
+        ));
+        assert_eq!(warped.into_inner(), vec![(1280, 720), (2555, 797)]);
+    }
+
+    #[test]
+    fn windows_return_clears_edge_sample_before_local_motion_resumes() {
+        let last_point = Mutex::new(Some((2555.0, 797.0)));
+
+        clear_windows_local_mouse_history(&last_point);
+
+        assert_eq!(*last_point.lock().unwrap(), None);
     }
 
     #[test]
@@ -11309,10 +11381,16 @@ mod tests {
     fn macos_keyboard_flags_preserve_intrinsic_arrow_identity() {
         const ARROW_INTRINSIC_FLAGS: u64 = 0x20A0_0000;
         const CONTROL_FLAG: u64 = 0x0004_0000;
+        const INHERITED_COMMAND_FLAGS: u64 = 0x2010_0000;
 
         let merged = merged_macos_event_flags(ARROW_INTRINSIC_FLAGS, CONTROL_FLAG);
         assert_eq!(merged & ARROW_INTRINSIC_FLAGS, ARROW_INTRINSIC_FLAGS);
         assert_eq!(merged & CONTROL_FLAG, CONTROL_FLAG);
+        assert_eq!(
+            merged_macos_event_flags(INHERITED_COMMAND_FLAGS, 0),
+            0x2000_0000,
+            "a remote key with an empty modifier snapshot must clear inherited Command"
+        );
     }
 
     #[cfg(target_os = "macos")]
