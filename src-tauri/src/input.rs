@@ -9397,6 +9397,8 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
 static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MAC_INJECT_KEY_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(target_os = "macos")]
+const WINDOWS_VK_CAPITAL: u16 = 0x14;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
@@ -9463,10 +9465,12 @@ impl MacInjectedKeyState {
             tracked_flags,
             device_flags,
             // Ordinary repeated KeyDown events carry native key repeat and must
-            // still be posted. A modifier Up is also always posted: it is an
-            // idempotent repair when the matching Down was tracked under a
-            // generic/sided alias or WindowServer retained stale global flags.
-            should_post: !is_modifier || !down || !already_pressed,
+            // still be posted. Caps is a toggle, so suppress its repeated Down
+            // until Up just like macOS does for a physical press. A modifier Up
+            // is always posted as an idempotent repair.
+            should_post: (!is_modifier && key_code != WINDOWS_VK_CAPITAL)
+                || !down
+                || !already_pressed,
         }
     }
 
@@ -9718,6 +9722,19 @@ fn update_macos_injected_key(
 #[cfg(target_os = "macos")]
 fn merged_macos_event_flags(intrinsic: u64, tracked_modifiers: u64) -> u64 {
     intrinsic | tracked_modifiers
+}
+
+#[cfg(target_os = "macos")]
+fn macos_printable_windows_vk(key_code: u16) -> bool {
+    matches!(
+        key_code,
+        0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_key_uses_hid(key_code: u16, is_modifier: bool) -> bool {
+    is_modifier || !macos_printable_windows_vk(key_code)
 }
 
 #[cfg(target_os = "macos")]
@@ -9978,9 +9995,9 @@ fn inject_key_inner(key_code: u16, down: bool) {
     // Caps Lock: neither injecting keycode 57 nor IOKit's IOHIDSetModifierLockState
     // works on modern macOS (the OS only reacts to the physical key / needs
     // privileges), so drive the user's "switch input source" behaviour directly.
-    const VK_CAPITAL: u16 = 0x14;
-    if key_code == VK_CAPITAL {
-        if down {
+    if key_code == WINDOWS_VK_CAPITAL {
+        let transition = update_macos_injected_key(key_code, down, false);
+        if down && transition.should_post {
             macos_switch_to_next_input_source();
         }
         return;
@@ -10004,21 +10021,23 @@ fn inject_key_inner(key_code: u16, down: bool) {
         "[diag] inject key vk={key_code:#04x} down={down} mac={mac_code} flags={:#x}",
         tracked_flags
     );
-    let hid_plan = macos_hid_key_event_plan(
-        mac_code,
-        down,
-        is_modifier,
-        tracked_flags,
-        transition.device_flags,
-    );
-    if post_macos_hid_key_event(hid_plan) {
-        return;
-    }
-    static HID_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
-    if !HID_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
-        log::warn!(
-            "IOHID keyboard injection unavailable; falling back to CGEvent (system shortcuts may be limited)"
+    if macos_key_uses_hid(key_code, is_modifier) {
+        let hid_plan = macos_hid_key_event_plan(
+            mac_code,
+            down,
+            is_modifier,
+            tracked_flags,
+            transition.device_flags,
         );
+        if post_macos_hid_key_event(hid_plan) {
+            return;
+        }
+        static HID_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+        if !HID_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "IOHID keyboard injection unavailable; falling back to CGEvent (system shortcuts may be limited)"
+            );
+        }
     }
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         log::warn!("inject_key: failed to create CGEventSource");
@@ -11298,6 +11317,17 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_printable_keys_use_cg_event_but_system_keys_keep_hid() {
+        assert!(!macos_key_uses_hid(0x41, false));
+        assert!(!macos_key_uses_hid(0x20, false));
+        assert!(!macos_key_uses_hid(0x61, false));
+        assert!(!macos_key_uses_hid(0xBA, false));
+        assert!(macos_key_uses_hid(0x25, false));
+        assert!(macos_key_uses_hid(0x11, true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_control_arrow_uses_hid_global_modifier_state() {
         let mut state = MacInjectedKeyState::default();
         let control_down = state.transition(0x11, true, true);
@@ -11368,16 +11398,16 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_hid_plain_key_repeat_remains_a_keydown() {
+    fn macos_hid_non_printable_key_repeat_remains_a_keydown() {
         let mut state = MacInjectedKeyState::default();
-        let first = state.transition(0x41, true, false);
-        let repeat = state.transition(0x41, true, false);
-        let up = state.transition(0x41, false, false);
+        let first = state.transition(0x25, true, false);
+        let repeat = state.transition(0x25, true, false);
+        let up = state.transition(0x25, false, false);
 
         let plans = [
-            macos_hid_key_event_plan(0, true, false, first.tracked_flags, first.device_flags),
-            macos_hid_key_event_plan(0, true, false, repeat.tracked_flags, repeat.device_flags),
-            macos_hid_key_event_plan(0, false, false, up.tracked_flags, up.device_flags),
+            macos_hid_key_event_plan(123, true, false, first.tracked_flags, first.device_flags),
+            macos_hid_key_event_plan(123, true, false, repeat.tracked_flags, repeat.device_flags),
+            macos_hid_key_event_plan(123, false, false, up.tracked_flags, up.device_flags),
         ];
         assert_eq!(plans.map(|plan| plan.event_type), [10, 10, 11]);
         assert!(plans
@@ -11528,6 +11558,17 @@ mod tests {
         assert_eq!(state.pressed_keys(), &[0x41]);
         assert!(state.transition(0x41, false, false).should_post);
         assert!(state.pressed_keys().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_caps_lock_toggles_once_until_key_up() {
+        let mut state = MacInjectedKeyState::default();
+
+        assert!(state.transition(0x14, true, false).should_post);
+        assert!(!state.transition(0x14, true, false).should_post);
+        assert!(state.transition(0x14, false, false).should_post);
+        assert!(state.transition(0x14, true, false).should_post);
     }
 
     #[cfg(target_os = "macos")]
