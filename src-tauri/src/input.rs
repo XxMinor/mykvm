@@ -1614,14 +1614,21 @@ fn macos_receive_hide_cursor(x: i32, y: i32) {
     if let Ok(mut tracker) = macos_click_tracker().lock() {
         *tracker = MacClickTracker::default();
     }
-    // Full hide, matching the server: SetsCursorInBackground so it sticks while
-    // not frontmost, transparent cursor, NSCursor hide, and hide on every
-    // display. Run the visuals on the main thread: injection happens on QUIC
-    // worker threads, and AppKit cursor calls made off-main are silently
-    // dropped sometimes — a dropped un-hide left the arrow transparent until
-    // the next natural cursor-image update ("invisible for a while after
-    // control returns"). The main queue is FIFO and both hide and show enqueue
-    // under MACOS_CURSOR_TRANSITION, so visual order matches flag order.
+    // Instant hide: CGDisplay hide/show are thread-safe CG connection calls —
+    // run them right here. Dispatching them to the main queue added visible
+    // lag between the park arriving and the arrow disappearing (main-queue
+    // latency while the app is backgrounded). Only the AppKit pieces
+    // (transparent cursor image + NSCursor) hop to the main thread, where
+    // they are reliable; called off-main they are sometimes silently dropped,
+    // which left the arrow transparent after control returned. The main queue
+    // is FIFO and transitions serialize under MACOS_CURSOR_TRANSITION, so
+    // AppKit order matches flag order.
+    {
+        use core_graphics::display::CGDisplay;
+        for display_id in CGDisplay::active_displays().unwrap_or_default() {
+            let _ = CGDisplay::new(display_id).hide_cursor();
+        }
+    }
     macos_dispatch_main(macos_receive_hide_visuals_thunk);
     log::info!(
         "[diag] receive hide cursor in place at ({:.0},{:.0}); ignored remote park ({x},{y})",
@@ -1641,6 +1648,12 @@ fn macos_receive_show_cursor_if_hidden() {
 
     if !MACOS_RECEIVE_CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
         return;
+    }
+    {
+        use core_graphics::display::CGDisplay;
+        for display_id in CGDisplay::active_displays().unwrap_or_default() {
+            let _ = CGDisplay::new(display_id).show_cursor();
+        }
     }
     macos_dispatch_main(macos_receive_show_visuals_thunk);
     if let Ok(mut point) = MACOS_RECEIVE_PARK_POINT.lock() {
@@ -1670,25 +1683,15 @@ fn macos_dispatch_main(work: extern "C" fn(*mut std::os::raw::c_void)) {
 
 #[cfg(target_os = "macos")]
 extern "C" fn macos_receive_hide_visuals_thunk(_: *mut std::os::raw::c_void) {
-    use core_graphics::display::CGDisplay;
-
     enable_macos_background_cursor_hide();
     set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_RECEIVE, true);
     set_macos_cursor_hidden_with_appkit(true);
-    for display_id in CGDisplay::active_displays().unwrap_or_default() {
-        let _ = CGDisplay::new(display_id).hide_cursor();
-    }
 }
 
 #[cfg(target_os = "macos")]
 extern "C" fn macos_receive_show_visuals_thunk(_: *mut std::os::raw::c_void) {
-    use core_graphics::display::CGDisplay;
-
     set_macos_cursor_transparent(MACOS_CURSOR_HIDE_OWNER_RECEIVE, false);
     set_macos_cursor_hidden_with_appkit(false);
-    for display_id in CGDisplay::active_displays().unwrap_or_default() {
-        let _ = CGDisplay::new(display_id).show_cursor();
-    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2562,6 +2565,7 @@ pub fn try_inject_packet_from_source(
     if packet.protocol != INPUT_PROTOCOL {
         return false;
     }
+    note_input_rx();
 
     if !packet_authorized(layout, &packet) {
         warn_unauthorized_packet(layout, &packet);
@@ -2873,6 +2877,32 @@ pub(crate) fn packet_is_coalescible_move(payload: &[u8]) -> bool {
         decode_input_packet(payload).map(|packet| packet.event),
         Some(InputEvent::MouseMove { .. })
     )
+}
+
+/// Counts decoded input packets reaching this receiver (before authorization)
+/// and logs the total every 5s while any arrive. Splits "packets never
+/// arrived" from "arrived but were rejected" — compare against the
+/// post-injection `[diag] move arrivals` line.
+fn note_input_rx() {
+    static WINDOW: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+    let Ok(mut window) = WINDOW.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    match window.as_mut() {
+        Some((start, count)) => {
+            *count += 1;
+            let elapsed = now.duration_since(*start);
+            if elapsed >= Duration::from_secs(5) {
+                log::info!(
+                    "[diag] input rx: n={count} over {:.1}s",
+                    elapsed.as_secs_f64()
+                );
+                *window = None;
+            }
+        }
+        None => *window = Some((now, 1)),
+    }
 }
 
 fn decode_input_control_packet(payload: &[u8]) -> Option<InputControlPacket> {
@@ -6256,7 +6286,7 @@ fn handle_windows_remote_mouse_delta(context: &WindowsCaptureContext, dx: f64, d
         clear_clipboard_target_if_device(&context.clipboard_target, &target.device_id);
         reveal_windows_cursor_at(context, Some(point));
         clear_windows_remote_anchor(context);
-        log::debug!("[input-win] returned to local from shared edge");
+        log::info!("[input-win] returned to local from shared edge");
         return true;
     }
 
@@ -6349,7 +6379,10 @@ fn handle_windows_local_mouse_move(
             Some(snapshot.modifier_bits),
         );
         set_control_clipboard_target(&context.clipboard_target, &active_target);
-        log::debug!(
+        // info, not debug: handoffs are rare and this line is the primary
+        // breadcrumb for "did the server ever cross" when the client looks
+        // unreachable (locked screen, asleep, Wi-Fi power save).
+        log::info!(
             "[input-win] entered remote device={} anchor=({},{})",
             active_target.target.device_id,
             context.remote_anchor_x.load(Ordering::Acquire),
@@ -7156,6 +7189,12 @@ fn crossing_target_with_transform(
         .iter()
         .find_map(|target| {
             if !target_is_online(target, layout_state) {
+                // Only when the cursor is actually pushing through this
+                // target's edge: that is a real blocked crossing attempt, not
+                // idle motion near an offline device.
+                if crossing_layout_point(target, x, y, dx, dy).is_some() {
+                    note_crossing_blocked_offline(&target.device_id);
+                }
                 return None;
             }
 
@@ -7197,6 +7236,22 @@ fn crossing_target_with_transform(
                 edge_overshoot: 0.0,
             }
         })
+}
+
+/// Rate-limited breadcrumb for a crossing attempt refused because the target
+/// device is not marked online — the decisive line when "the mouse won't go
+/// over" (peer locked/asleep, discovery announces stopped, Wi-Fi power save).
+fn note_crossing_blocked_offline(device_id: &str) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < Duration::from_secs(5)) {
+        return;
+    }
+    *last = Some(now);
+    log::info!("[diag] crossing blocked: target device {device_id} is offline");
 }
 
 fn crossing_layout_point(
