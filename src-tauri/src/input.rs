@@ -984,15 +984,24 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
         };
     }
 
-    // When Secure Keyboard Entry is active anywhere on the system, macOS silently
-    // drops *every* synthetic key event while still delivering synthetic mouse
-    // events. That is exactly the "clicks work but the keyboard does nothing"
-    // symptom, so we surface it instead of failing silently.
+    // When Secure Keyboard Entry is active anywhere on the system, macOS
+    // silently drops synthetic KEY events while still delivering synthetic
+    // mouse events. It is almost always transient — a focused password field
+    // (Chrome/Safari autofill) turns it on and unfocusing turns it back off —
+    // so it must NOT be a hard "error": that both popped a blocking modal on
+    // the 2 s status poll and flipped input_receive_is_ready to false, which
+    // closes the receive gate and drops MOUSE packets too ("mykvm 不能用了").
+    // Keep the stage ready so the mouse keeps working. The frontend only
+    // surfaces inject.detail through the error modal, so a "ready" detail is
+    // effectively silent to the user (correct for a self-healing condition);
+    // diagnosis for the rare stuck case (a terminal "Secure Keyboard Entry"
+    // left checked) rides the throttled log line below.
     #[cfg(target_os = "macos")]
     if macos_secure_input_enabled() {
+        note_macos_secure_input_active();
         return NativeStageStatus {
-            state: "error".into(),
-            detail: "检测到 macOS 安全键盘输入(Secure Keyboard Entry)已开启，系统会拦截所有注入的键盘事件（鼠标点击不受影响）。请退出正在占用安全输入的应用——常见来源：终端里勾选的“安全键盘输入”、聚焦中的密码输入框、部分密码管理器；必要时注销重新登录，然后重试。".into(),
+            state: "ready".into(),
+            detail: "注意：macOS 安全键盘输入(Secure Keyboard Entry)当前开启，键盘注入会被系统拦截（鼠标不受影响）。通常由聚焦的密码输入框临时触发，移开焦点即恢复；若持续存在，请退出终端里勾选的“安全键盘输入”或相关密码管理器。".into(),
         };
     }
 
@@ -1067,6 +1076,24 @@ fn macos_accessibility_trusted(request_permission: bool) -> bool {
 /// Reports whether macOS Secure Keyboard Entry is currently enabled by any
 /// process. While it is on, synthetic keyboard events posted via CGEvent are
 /// discarded by the window server (mouse events are unaffected).
+/// Throttled breadcrumb (once per 30s) that Secure Keyboard Entry is currently
+/// swallowing injected keystrokes. Info-level so a genuinely stuck SEI is
+/// diagnosable from the log without spamming it on every transient password
+/// prompt.
+#[cfg(target_os = "macos")]
+fn note_macos_secure_input_active() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < Duration::from_secs(30)) {
+        return;
+    }
+    *last = Some(now);
+    log::info!("[diag] Secure Keyboard Entry active; injected keystrokes are being dropped (mouse unaffected)");
+}
+
 #[cfg(target_os = "macos")]
 fn macos_secure_input_enabled() -> bool {
     #[link(name = "Carbon", kind = "framework")]
