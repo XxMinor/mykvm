@@ -323,6 +323,7 @@ jobs:
               data.plugins.updater.endpoints = [
                 'https://github.com/aceleisureman/mykvm/releases/download/beta/latest.json',
               ];
+              data.bundle.macOS.signingIdentity = '-';
             }
             fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
           }
@@ -335,7 +336,7 @@ jobs:
           NODE
 
       - name: Validate Apple signing secrets
-        if: matrix.name == 'macos'
+        if: matrix.name == 'macos' && needs.prepare.outputs.channel != 'beta'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -379,7 +380,7 @@ jobs:
           exit "$missing"
 
       - name: Configure Apple notarization
-        if: matrix.name == 'macos'
+        if: matrix.name == 'macos' && needs.prepare.outputs.channel != 'beta'
         shell: bash
         env:
           APPLE_API_KEY_PRIVATE_KEY: ${{ secrets.APPLE_API_KEY_PRIVATE_KEY }}
@@ -423,7 +424,7 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
       - name: Set up self-signed signing keychain
-        if: matrix.name == 'macos'
+        if: matrix.name == 'macos' && needs.prepare.outputs.channel != 'beta'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -473,7 +474,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           # Notarization credentials are NOT wired in here: passing unset secrets
           # injects empty strings, which Tauri reads as "present" and tries to
           # notarize with blank creds. The "Configure Apple notarization" step
