@@ -3,8 +3,7 @@ name: Release
 on:
   push:
     branches:
-      - main
-      - bate
+      - dev
   workflow_dispatch:
     inputs:
       channel:
@@ -66,7 +65,7 @@ jobs:
           subject="$(git log -1 --pretty=%s)"
           channel="${REQUESTED_CHANNEL:-}"
           if [[ -z "$channel" ]]; then
-            if [[ "$REF_NAME" == "bate" ]]; then
+            if [[ "$REF_NAME" == "dev" ]]; then
               channel="beta"
             else
               channel="stable"

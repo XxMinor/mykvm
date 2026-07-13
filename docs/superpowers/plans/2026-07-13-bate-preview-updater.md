@@ -1,10 +1,10 @@
-# Bate Preview Updater Implementation Plan
+# Dev Preview Updater Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Publish and update stable and `bate` preview builds from `aceleisureman/mykvm`.
+**Goal:** Publish and update `dev` preview builds from `aceleisureman/mykvm` without operating on `main`.
 
-**Architecture:** Keep the existing Tauri updater and GitHub Actions release pipeline. Replace hard-coded upstream repository URLs with the user's repository while preserving the stable `latest` and beta `beta/latest.json` channels.
+**Architecture:** Keep the existing Tauri updater and GitHub Actions release pipeline. Trigger automatic releases only from `dev`, using the beta `beta/latest.json` channel in the user's repository.
 
 **Tech Stack:** GitHub Actions, Tauri Updater v2, TypeScript, JSON
 
@@ -26,7 +26,7 @@
 - Modify: `.github/workflows/release.yml`
 
 - [x] Change the beta updater endpoint to `https://github.com/aceleisureman/mykvm/releases/download/beta/latest.json`.
-- [x] Confirm the workflow still triggers for both `main` and `bate`.
+- [x] Confirm the workflow triggers only for `dev` pushes.
 - [x] Validate the YAML parses successfully.
 
 ### Task 3: Verify and commit
