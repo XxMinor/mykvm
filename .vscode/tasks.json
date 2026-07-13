@@ -33,6 +33,22 @@
       }
     },
     {
+      "label": "tauri:dev-build",
+      "type": "cargo",
+      "command": "build",
+      "args": [
+        "--manifest-path",
+        "${workspaceFolder}/src-tauri/Cargo.toml"
+      ],
+      "problemMatcher": ["$rustc"],
+      "group": "build",
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
+      }
+    },
+    {
       "label": "check-dev-env",
       "type": "shell",
       "command": "npm.cmd",
@@ -76,6 +92,38 @@
       "windows": {
         "command": "npm.cmd",
         "args": ["run", "tauri:build"]
+      }
+    },
+    {
+      "label": "cargo:check",
+      "type": "cargo",
+      "command": "check",
+      "args": [
+        "--manifest-path",
+        "${workspaceFolder}/src-tauri/Cargo.toml"
+      ],
+      "problemMatcher": ["$rustc"],
+      "group": "build",
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
+      }
+    },
+    {
+      "label": "cargo:test",
+      "type": "cargo",
+      "command": "test",
+      "args": [
+        "--manifest-path",
+        "${workspaceFolder}/src-tauri/Cargo.toml"
+      ],
+      "problemMatcher": ["$rustc"],
+      "group": "test",
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
       }
     }
   ]

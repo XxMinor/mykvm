@@ -1,10 +1,10 @@
 {
   "name": "mykvm",
-  "version": "0.1.0",
+  "version": "0.9.8",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/XxMinor/mykvm.git"
+    "url": "https://github.com/aceleisureman/mykvm.git"
   },
   "type": "module",
   "scripts": {

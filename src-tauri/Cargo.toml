@@ -1,10 +1,10 @@
 [package]
 name = "mykvm"
-version = "0.1.0"
+version = "0.9.8"
 description = "A cross-platform software KVM prototype"
 authors = ["XxMinor"]
 license = "MIT"
-repository = "https://github.com/XxMinor/mykvm"
+repository = "https://github.com/aceleisureman/mykvm"
 edition = "2021"
 rust-version = "1.77.2"
 default-run = "mykvm"
@@ -46,6 +46,7 @@ socket2 = "0.6"
 if-addrs = "0.13"
 tokio = { version = "1.52", features = ["rt-multi-thread", "io-util", "sync", "time"] }
 tauri-plugin-global-shortcut = "2"
+flate2 = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

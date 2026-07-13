@@ -2,7 +2,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env, fs,
     hash::{Hash, Hasher},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
@@ -43,8 +43,8 @@ const TRANSPORT_PORT_MAX: u16 = 65_535;
 // ports starting from the configured base, so two peers that landed on different
 // ports (e.g. 47833 and 47834) still reach each other.
 const DISCOVERY_PORT_SPAN: u16 = 8;
-const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
-const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
+const REPOSITORY_URL: &str = "https://github.com/aceleisureman/mykvm";
+const RELEASES_URL: &str = "https://github.com/aceleisureman/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 // UDP discovery is a heartbeat, not the transport itself. Keep peers through
 // short announce gaps so online clients do not flicker offline in the UI.
@@ -58,12 +58,13 @@ const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 // pasteboard is not always byte-identical to what we wrote (macOS re-encodes
 // it), so a pure content-signature check can ping-pong; this window guarantees
 // we never echo received content straight back.
-const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
+const CLIPBOARD_ECHO_GRACE_MS: u64 = 3000;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
-const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
-const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
+const CLIPBOARD_BACKOFF_MAX_MS: u64 = 30_000;
+const CLIPBOARD_WRITE_ATTEMPTS: usize = 10;
+const CLIPBOARD_WRITE_RETRY_DELAY_BASE_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -93,6 +94,10 @@ static HOSTNAME_CACHE: OnceLock<Option<String>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 static WINDOWS_FIREWALL_ENSURED: AtomicBool = AtomicBool::new(false);
+/// Signals that a clipboard write (from remote peer) is in progress.
+/// The local clipboard polling thread checks this to avoid racing on
+/// OpenClipboard (Windows OS error 1418).
+static CLIPBOARD_WRITE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 static SINGLE_INSTANCE_MUTEX: OnceLock<Mutex<Option<SingleInstanceGuard>>> = OnceLock::new();
@@ -390,6 +395,7 @@ struct DiagnosticInfo {
     config_dir: String,
     network_hint: String,
     firewall_hint: String,
+    input_debug: input::InputDebugInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,7 +471,10 @@ struct IncomingFileTransfer {
     next_chunk_index: u64,
     temp_path: PathBuf,
     final_path: PathBuf,
+    started_at: Instant,
 }
+
+const FILE_TRANSFER_STALE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -533,6 +542,7 @@ struct AppRuntime {
     pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
     file_transfers: Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     edge_drop_targets: Arc<Mutex<HashMap<String, String>>>,
+    edge_drop_stop: Arc<AtomicBool>,
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
@@ -572,6 +582,7 @@ impl AppRuntime {
             pairing_challenge: Arc::new(Mutex::new(None)),
             file_transfers: Arc::new(Mutex::new(HashMap::new())),
             edge_drop_targets: Arc::new(Mutex::new(HashMap::new())),
+            edge_drop_stop: Arc::new(AtomicBool::new(false)),
             quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
             input_stop: Mutex::new(None),
@@ -633,7 +644,11 @@ impl AppRuntime {
     }
 
     fn runtime_status_for_layout(&self, layout: &LayoutState) -> RuntimeStatus {
-        let mut runtime = self.runtime.lock().unwrap().clone();
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         runtime.discovery = self.discovery_status_for_layout(layout);
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
@@ -655,7 +670,12 @@ impl AppRuntime {
         local_peer.input_ready =
             advertised_input_ready(layout, self.input_receive_enabled.load(Ordering::Relaxed));
         let peers = active_peers(&self.peers, &local_peer.id);
-        let state = if self.discovery_stop.lock().unwrap().is_some() {
+        let state = if self
+            .discovery_stop
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             "ready"
         } else {
             "idle"
@@ -843,7 +863,7 @@ impl AppRuntime {
         let mut stored = self
             .quic_transport
             .lock()
-            .map_err(|_| "QUIC transport lock poisoned".to_string())?;
+            .unwrap_or_else(|e| e.into_inner());
         *stored = Some(transport.clone());
         Ok(transport)
     }
@@ -852,7 +872,7 @@ impl AppRuntime {
         let mut discovery_stop = self
             .discovery_stop
             .lock()
-            .map_err(|_| "discovery state lock poisoned".to_string())?;
+            .unwrap_or_else(|e| e.into_inner());
 
         if discovery_stop.is_some() {
             return Ok(());
@@ -867,7 +887,7 @@ impl AppRuntime {
         let mut layout = self
             .layout
             .lock()
-            .map_err(|_| "layout state lock poisoned".to_string())?
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
         let desired_port = if layout.transport_port_mode == "auto" {
             default_transport_port()
@@ -1261,6 +1281,169 @@ fn read_diagnostic_info(
     diagnostic_info(&app, state.inner())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncRecord {
+    timestamp: String,
+    kind: String,
+    direction: String,
+    target: String,
+    content_type: String,
+    preview: String,
+    detail: String,
+}
+
+#[tauri::command]
+async fn read_sync_history(
+    app: AppHandle,
+    count: Option<usize>,
+) -> Result<Vec<SyncRecord>, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("failed to resolve log dir: {e}"))?;
+    let log_file = log_dir.join("mykvm.log");
+    tokio::task::spawn_blocking(move || -> Result<Vec<SyncRecord>, String> {
+        if !log_file.exists() {
+            return Ok(vec![]);
+        }
+        let content =
+            fs::read_to_string(&log_file).map_err(|e| format!("failed to read log file: {e}"))?;
+        let mut records: Vec<SyncRecord> = Vec::new();
+        for line in content.lines() {
+            if let Some(rec) = parse_sync_line(line) {
+                records.push(rec);
+            }
+        }
+        let max = count.unwrap_or(100);
+        let start = if records.len() > max {
+            records.len() - max
+        } else {
+            0
+        };
+        Ok(records[start..].to_vec())
+    })
+    .await
+    .map_err(|e| format!("sync history task failed: {e}"))?
+}
+
+fn parse_sync_line(line: &str) -> Option<SyncRecord> {
+    let ts = line.get(1..20)?.to_string();
+    if line.contains("sync:clipboard:sent") {
+        let to = extract_kv(line, "to=");
+        let content_raw = extract_kv(line, "content=");
+        let (ct, preview) = split_content_field(&content_raw);
+        Some(SyncRecord {
+            timestamp: ts,
+            kind: "clipboard".into(),
+            direction: "sent".into(),
+            target: to,
+            content_type: ct,
+            preview,
+            detail: String::new(),
+        })
+    } else if line.contains("sync:clipboard:received") {
+        let from = extract_kv(line, "from=");
+        let content_raw = extract_kv(line, "content=");
+        let (ct, preview) = split_content_field(&content_raw);
+        Some(SyncRecord {
+            timestamp: ts,
+            kind: "clipboard".into(),
+            direction: "received".into(),
+            target: from,
+            content_type: ct,
+            preview,
+            detail: String::new(),
+        })
+    } else if line.contains("sync:file:sent") {
+        let to = extract_kv(line, "to=");
+        let files = extract_kv(line, "files=");
+        let bytes = extract_kv(line, "bytes=");
+        let detail = format!("{} files, {} bytes", files, bytes);
+        Some(SyncRecord {
+            timestamp: ts,
+            kind: "file".into(),
+            direction: "sent".into(),
+            target: to,
+            content_type: "file".into(),
+            preview: String::new(),
+            detail,
+        })
+    } else if line.contains("received file transfer") {
+        let rest = line
+            .split("received file transfer ")
+            .nth(1)
+            .unwrap_or("")
+            .trim();
+        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+        let file_name = parts.first().unwrap_or(&"").to_string();
+        let detail = parts.get(1).unwrap_or(&"").to_string();
+        Some(SyncRecord {
+            timestamp: ts,
+            kind: "file".into(),
+            direction: "received".into(),
+            target: String::new(),
+            content_type: "file".into(),
+            preview: file_name,
+            detail,
+        })
+    } else {
+        None
+    }
+}
+
+fn extract_kv(line: &str, key: &str) -> String {
+    let Some(start) = line.find(key) else {
+        return String::new();
+    };
+    let rest = &line[start + key.len()..];
+    if let Some(pos) = rest
+        .find(" content=")
+        .or_else(|| rest.find(" files="))
+        .or_else(|| rest.find(" bytes="))
+    {
+        rest[..pos].to_string()
+    } else {
+        rest.trim().to_string()
+    }
+}
+
+fn split_content_field(raw: &str) -> (String, String) {
+    if raw.starts_with("text:") {
+        ("text".into(), raw[5..].to_string())
+    } else if raw == "image" {
+        ("image".into(), String::new())
+    } else {
+        ("unknown".into(), raw.to_string())
+    }
+}
+
+#[tauri::command]
+async fn read_log_lines(app: AppHandle, count: Option<usize>) -> Result<Vec<String>, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log dir: {error}"))?;
+    let log_file = log_dir.join("mykvm.log");
+    tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+        if !log_file.exists() {
+            return Ok(vec![]);
+        }
+        let content = fs::read_to_string(&log_file)
+            .map_err(|error| format!("failed to read log file: {error}"))?;
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+        let max_lines = count.unwrap_or(200);
+        let start = if lines.len() > max_lines {
+            lines.len() - max_lines
+        } else {
+            0
+        };
+        Ok(lines[start..].to_vec())
+    })
+    .await
+    .map_err(|error| format!("log lines task failed: {error}"))?
+}
+
 #[tauri::command]
 fn open_log_directory(app: AppHandle) -> Result<(), String> {
     let log_dir = app
@@ -1282,10 +1465,7 @@ fn save_layout(
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<AppStateSnapshot, String> {
     let (previous_layout, saved_layout) = {
-        let mut stored_layout = state
-            .layout
-            .lock()
-            .map_err(|_| "layout state lock poisoned".to_string())?;
+        let mut stored_layout = state.layout.lock().unwrap_or_else(|e| e.into_inner());
         let previous_layout = stored_layout.clone();
         let saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
         write_layout_to_disk(&state.config_path, &saved_layout)?;
@@ -1304,7 +1484,7 @@ fn save_layout(
         if !state
             .runtime
             .lock()
-            .map_err(|_| "runtime state lock poisoned".to_string())?
+            .unwrap_or_else(|e| e.into_inner())
             .started
         {
             state.start_discovery()?;
@@ -1410,7 +1590,7 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
     let started = state
         .runtime
         .lock()
-        .map_err(|_| "runtime state lock poisoned".to_string())?
+        .unwrap_or_else(|e| e.into_inner())
         .started;
 
     if !started {
@@ -1428,10 +1608,7 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
     let (capture, inject) = state.start_input(layout.clone());
     let clipboard = state.start_clipboard(layout.clone());
     let discovery = state.discovery_status_for_layout(&layout);
-    let mut runtime = state
-        .runtime
-        .lock()
-        .map_err(|_| "runtime state lock poisoned".to_string())?;
+    let mut runtime = state.runtime.lock().unwrap_or_else(|e| e.into_inner());
 
     runtime.transport = ready_transport_status(&discovery);
     runtime.capture = capture;
@@ -1454,10 +1631,7 @@ fn start_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
     let (capture, inject) = state.start_input(layout.clone());
     let clipboard = state.start_clipboard(layout.clone());
 
-    let mut runtime = state
-        .runtime
-        .lock()
-        .map_err(|_| "runtime state lock poisoned".to_string())?;
+    let mut runtime = state.runtime.lock().unwrap_or_else(|e| e.into_inner());
 
     *runtime = RuntimeStatus {
         started: true,
@@ -1525,6 +1699,7 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
         .collect::<Vec<_>>();
     let network_hint = diagnostic_network_hint(&known_devices);
     let firewall_hint = diagnostic_firewall_hint();
+    let input_debug = input::current_input_debug_info();
 
     let mut lines = vec![
         "MyKVM diagnostics".to_string(),
@@ -1576,6 +1751,7 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
             ));
         }
     }
+    lines.extend(input::input_debug_report_lines(&input_debug));
 
     Ok(DiagnosticInfo {
         report: lines.join("\n"),
@@ -1593,6 +1769,7 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
         config_dir: config_dir.to_string_lossy().into_owned(),
         network_hint,
         firewall_hint,
+        input_debug,
     })
 }
 
@@ -1650,10 +1827,7 @@ fn stop_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
     state.stop_clipboard();
     state.start_discovery()?;
 
-    let mut runtime = state
-        .runtime
-        .lock()
-        .map_err(|_| "runtime state lock poisoned".to_string())?;
+    let mut runtime = state.runtime.lock().unwrap_or_else(|e| e.into_inner());
     let layout = state.layout_snapshot();
     let mut stopped_runtime = default_runtime(&layout);
     stopped_runtime.discovery = state.discovery_status_for_layout(&layout);
@@ -1677,7 +1851,7 @@ fn toggle_runtime_from_app(app: &AppHandle) -> Result<RuntimeStatus, String> {
     let started = state
         .runtime
         .lock()
-        .map_err(|_| "runtime state lock poisoned".to_string())?
+        .unwrap_or_else(|e| e.into_inner())
         .started;
     let runtime = if started {
         stop_runtime_inner(state.inner())?
@@ -1731,7 +1905,7 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
     let mut current = state
         .runtime_toggle_shortcut
         .lock()
-        .map_err(|_| "runtime toggle shortcut lock poisoned".to_string())?;
+        .unwrap_or_else(|e| e.into_inner());
 
     if current.as_deref() == shortcut.as_deref() {
         return Ok(());
@@ -2165,6 +2339,12 @@ fn send_files_to_device_with_destination(
         byte_count = byte_count.saturating_add(file.total_bytes);
     }
 
+    log::info!(
+        "sync:file:sent to={} files={} bytes={}",
+        target.name,
+        file_count,
+        byte_count
+    );
     Ok(FileTransferSummary {
         target_name: target.name,
         file_count,
@@ -2173,45 +2353,53 @@ fn send_files_to_device_with_destination(
 }
 
 fn start_edge_drop_window_sync(app_handle: AppHandle) {
-    thread::spawn(move || loop {
-        let state = app_handle.state::<AppRuntime>();
-        let runtime = state.inner();
-        let layout = runtime.layout_snapshot();
-        let peers = active_peer_snapshot(&runtime.peers);
-        let specs = edge_drop_specs_for_window_visibility(
-            &layout,
-            &peers,
-            runtime.main_window_visible.load(Ordering::Relaxed),
-        );
-        let next_labels = specs
-            .iter()
-            .map(|spec| spec.label.clone())
-            .collect::<HashSet<_>>();
-        let next_targets = specs
-            .iter()
-            .map(|spec| (spec.label.clone(), spec.target_device_id.clone()))
-            .collect::<HashMap<_, _>>();
-        let stale_labels = runtime
-            .edge_drop_targets
-            .lock()
-            .map(|mut targets| {
-                let stale = targets
-                    .keys()
-                    .filter(|label| !next_labels.contains(*label))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                *targets = next_targets;
-                stale
-            })
-            .unwrap_or_default();
+    let stop = app_handle.state::<AppRuntime>().edge_drop_stop.clone();
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let state = app_handle.state::<AppRuntime>();
+            let runtime = state.inner();
+            let layout = runtime.layout_snapshot();
+            let peers = active_peer_snapshot(&runtime.peers);
+            let specs = edge_drop_specs_for_window_visibility(
+                &layout,
+                &peers,
+                runtime.main_window_visible.load(Ordering::Relaxed),
+            );
+            let next_labels = specs
+                .iter()
+                .map(|spec| spec.label.clone())
+                .collect::<HashSet<_>>();
+            let next_targets = specs
+                .iter()
+                .map(|spec| (spec.label.clone(), spec.target_device_id.clone()))
+                .collect::<HashMap<_, _>>();
+            let stale_labels = runtime
+                .edge_drop_targets
+                .lock()
+                .map(|mut targets| {
+                    let stale = targets
+                        .keys()
+                        .filter(|label| !next_labels.contains(*label))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    *targets = next_targets;
+                    stale
+                })
+                .unwrap_or_default();
 
-        let main_handle = app_handle.clone();
-        let _ = app_handle.run_on_main_thread(move || {
-            sync_edge_drop_windows_on_main(&main_handle, specs, stale_labels);
-        });
+            let main_handle = app_handle.clone();
+            let _ = app_handle.run_on_main_thread(move || {
+                sync_edge_drop_windows_on_main(&main_handle, specs, stale_labels);
+            });
 
-        thread::sleep(Duration::from_millis(1500));
+            thread::sleep(Duration::from_millis(1500));
+        }
     });
+}
+
+#[allow(dead_code)]
+fn stop_edge_drop_window_sync(state: &AppRuntime) {
+    state.edge_drop_stop.store(true, Ordering::Relaxed);
 }
 
 fn sync_edge_drop_windows_on_main(
@@ -2731,7 +2919,7 @@ async fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<Discovery
     let layout = state
         .layout
         .lock()
-        .map_err(|_| "layout state lock poisoned".to_string())?
+        .unwrap_or_else(|e| e.into_inner())
         .clone();
     let mut local_peer = local_peer_from_layout(&layout);
     if let Some(transport) = state.quic_transport_handle() {
@@ -2761,7 +2949,7 @@ fn probe_lan_peer(host: String, state: tauri::State<'_, AppRuntime>) -> Result<L
     let layout = state
         .layout
         .lock()
-        .map_err(|_| "layout state lock poisoned".to_string())?
+        .unwrap_or_else(|e| e.into_inner())
         .clone();
     let mut local_peer = local_peer_from_layout(&layout);
     if let Some(transport) = state.quic_transport_handle() {
@@ -2782,7 +2970,7 @@ fn request_lan_pairing(
     let layout = state
         .layout
         .lock()
-        .map_err(|_| "layout state lock poisoned".to_string())?
+        .unwrap_or_else(|e| e.into_inner())
         .clone();
     if layout.machine_role != "server" {
         return Err("只有服务端可以发起配对。".into());
@@ -2813,7 +3001,7 @@ fn confirm_lan_pairing(
     let layout = state
         .layout
         .lock()
-        .map_err(|_| "layout state lock poisoned".to_string())?
+        .unwrap_or_else(|e| e.into_inner())
         .clone();
     if layout.machine_role != "server" {
         return Err("只有服务端可以确认配对。".into());
@@ -2849,7 +3037,7 @@ fn dismiss_pairing_request(state: tauri::State<'_, AppRuntime>) -> Result<Runtim
         let mut challenge = state
             .pairing_challenge
             .lock()
-            .map_err(|_| "pairing challenge lock poisoned".to_string())?;
+            .unwrap_or_else(|e| e.into_inner());
         *challenge = None;
     }
 
@@ -2867,10 +3055,7 @@ fn dismiss_pairing_request(state: tauri::State<'_, AppRuntime>) -> Result<Runtim
 #[tauri::command]
 fn reset_pairing(state: tauri::State<'_, AppRuntime>) -> Result<AppStateSnapshot, String> {
     let updated_layout = {
-        let mut layout = state
-            .layout
-            .lock()
-            .map_err(|_| "layout state lock poisoned".to_string())?;
+        let mut layout = state.layout.lock().unwrap_or_else(|e| e.into_inner());
         layout.paired_controllers.clear();
         layout.clone()
     };
@@ -3442,6 +3627,8 @@ pub fn run() {
             load_app_state,
             read_runtime_status,
             read_diagnostic_info,
+            read_sync_history,
+            read_log_lines,
             open_log_directory,
             save_layout,
             start_runtime,
@@ -5011,18 +5198,51 @@ fn run_clipboard_sync(
     let mut last_failed: Option<(String, String, String, Instant)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut sequence = now_ms();
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff_until: Option<Instant> = None;
+    let mut last_change_token = clipboard::change_token();
+    let mut local_change_pending = false;
 
     while !stop.load(Ordering::Relaxed) {
+        let change_token = clipboard::change_token();
+        if change_token.is_some() && change_token != last_change_token {
+            last_change_token = change_token;
+            local_change_pending = true;
+            last_failed = None;
+            consecutive_failures = 0;
+            backoff_until = None;
+        }
+
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
             thread::sleep(Duration::from_millis(120));
             last_poll = Instant::now() - Duration::from_secs(1);
+            consecutive_failures = 0;
+            backoff_until = None;
             continue;
         };
+
+        // Exponential backoff: when consecutive sends keep failing, sleep
+        // progressively longer to avoid burning CPU on a dead peer.
+        if let Some(deadline) = backoff_until {
+            if Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
+                continue;
+            }
+            backoff_until = None;
+        }
 
         if last_poll.elapsed() < Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS) {
             thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
             continue;
         }
+
+        // Skip reading the clipboard while a remote write is in progress to
+        // avoid racing on OpenClipboard (Windows OS error 1418).
+        if CLIPBOARD_WRITE_ACTIVE.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
+            continue;
+        }
+
         last_poll = Instant::now();
 
         let Some(content) = clipboard::read_content() else {
@@ -5039,24 +5259,28 @@ fn run_clipboard_sync(
                 .map(|seen| seen.as_deref() == Some(signature.as_str()))
                 .unwrap_or(false);
             if is_known_echo {
+                last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
+                local_change_pending = false;
                 continue;
             }
             if let Ok(mut seen) = clipboard_seen_text.lock() {
                 *seen = None;
             }
+        } else if let Ok(mut seen) = clipboard_seen_text.lock() {
+            *seen = None;
         }
 
         if content.is_oversized() {
             continue;
         }
 
-        if last_sent
-            .as_ref()
-            .map(|(device_id, addr, previous)| {
-                device_id == &target.device_id && addr == &target.addr && previous == &signature
-            })
-            .unwrap_or(false)
-        {
+        if clipboard_signature_already_sent(
+            &last_sent,
+            &target.device_id,
+            &target.addr,
+            &signature,
+            local_change_pending,
+        ) {
             continue;
         }
         if last_failed
@@ -5069,23 +5293,6 @@ fn run_clipboard_sync(
             })
             .unwrap_or(false)
         {
-            continue;
-        }
-
-        let should_send = clipboard_seen_text
-            .lock()
-            .map(|mut seen| {
-                if seen.as_deref() == Some(signature.as_str()) {
-                    *seen = None;
-                    false
-                } else {
-                    true
-                }
-            })
-            .unwrap_or(true);
-
-        if !should_send {
-            last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
             continue;
         }
 
@@ -5109,9 +5316,34 @@ fn run_clipboard_sync(
             if send_result.is_ok() {
                 transport_packets.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                consecutive_failures = 0;
+                backoff_until = None;
+                let clip_preview = match &packet.formats.first().map(|f| f.kind.as_str()) {
+                    Some("plainText") => {
+                        let txt = &packet.text;
+                        if txt.len() > 60 {
+                            format!("text:{:.60}...", txt)
+                        } else {
+                            format!("text:{}", txt)
+                        }
+                    }
+                    Some("imageRgba") => "image".to_string(),
+                    _ => "unknown".to_string(),
+                };
+                log::info!(
+                    "sync:clipboard:sent to={} content={}",
+                    target.device_id,
+                    clip_preview
+                );
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, signature));
+                local_change_pending = false;
             } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff_ms = CLIPBOARD_RETRY_INTERVAL_MS
+                    .saturating_mul(1 << consecutive_failures.min(4))
+                    .min(CLIPBOARD_BACKOFF_MAX_MS);
+                backoff_until = Some(Instant::now() + Duration::from_millis(backoff_ms));
                 if let Err(error) = send_result {
                     log::warn!("clipboard send failed: {error}");
                 }
@@ -5124,6 +5356,24 @@ fn run_clipboard_sync(
             }
         }
     }
+}
+
+fn clipboard_signature_already_sent(
+    last_sent: &Option<(String, String, String)>,
+    device_id: &str,
+    addr: &str,
+    signature: &str,
+    local_change_pending: bool,
+) -> bool {
+    !local_change_pending
+        && last_sent
+            .as_ref()
+            .map(|(previous_device, previous_addr, previous_signature)| {
+                previous_device == device_id
+                    && previous_addr == addr
+                    && previous_signature == signature
+            })
+            .unwrap_or(false)
 }
 
 /// True while we are inside the post-write grace window (see
@@ -5146,18 +5396,21 @@ fn arm_clipboard_echo_guard(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) 
 }
 
 fn write_clipboard_content_with_retry(content: &ClipboardContent) -> Result<(), String> {
-    retry_clipboard_content_write(
+    CLIPBOARD_WRITE_ACTIVE.store(true, Ordering::Relaxed);
+    let result = retry_clipboard_content_write(
         content,
         CLIPBOARD_WRITE_ATTEMPTS,
-        Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
+        CLIPBOARD_WRITE_RETRY_DELAY_BASE_MS,
         clipboard::write_content,
-    )
+    );
+    CLIPBOARD_WRITE_ACTIVE.store(false, Ordering::Relaxed);
+    result
 }
 
 fn retry_clipboard_content_write<F>(
     content: &ClipboardContent,
     attempts: usize,
-    retry_delay: Duration,
+    retry_delay_base_ms: u64,
     mut write_content: F,
 ) -> Result<(), String>
 where
@@ -5170,8 +5423,12 @@ where
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
-        if attempt + 1 < attempts && !retry_delay.is_zero() {
-            thread::sleep(retry_delay);
+        if attempt + 1 < attempts && retry_delay_base_ms > 0 {
+            // Progressive delay: 50, 100, 150, 200, ... ms
+            // Total window for 10 attempts: ~2.25s — enough to outlast most
+            // transient clipboard locks from other processes.
+            let delay_ms = retry_delay_base_ms * (attempt as u64 + 1);
+            thread::sleep(Duration::from_millis(delay_ms));
         }
     }
 
@@ -5234,6 +5491,7 @@ where
     }
 
     let accepted_sequence = clipboard_packet_sequence(&packet);
+    let packet_origin_id = packet.origin_id.clone();
     let content = clipboard_content_from_packet(packet);
 
     let Some(content) = content else {
@@ -5253,6 +5511,21 @@ where
     };
 
     if written {
+        let recv_preview = match &content {
+            ClipboardContent::Text(t) => {
+                if t.len() > 60 {
+                    format!("text:{:.60}...", t)
+                } else {
+                    format!("text:{}", t)
+                }
+            }
+            ClipboardContent::Image(_) => "image".to_string(),
+        };
+        log::info!(
+            "sync:clipboard:received from={} content={}",
+            packet_origin_id,
+            recv_preview
+        );
         if let Some((origin_id, sequence)) = accepted_sequence {
             remember_clipboard_packet_sequence(clipboard_last_sequences, origin_id, sequence);
         }
@@ -5635,7 +5908,7 @@ fn send_file_transfer_packet(
         target.protocol_version,
     );
     quic_transport
-        .send_stream_expect_ack(peer, payload)
+        .send_bulk_stream_expect_ack(peer, payload)
         .map_err(|error| format!("文件传输失败: {error}"))
 }
 
@@ -5952,6 +6225,8 @@ fn start_incoming_file_transfer(
         return false;
     };
 
+    purge_stale_file_transfers(transfers);
+
     if let Err(error) = fs::create_dir_all(receive_root) {
         log::warn!(
             "file transfer receive failed: could not create {}: {error}",
@@ -5988,6 +6263,7 @@ fn start_incoming_file_transfer(
         next_chunk_index: 0,
         temp_path,
         final_path,
+        started_at: Instant::now(),
     };
 
     transfers
@@ -5997,6 +6273,23 @@ fn start_incoming_file_transfer(
             true
         })
         .unwrap_or(false)
+}
+
+fn purge_stale_file_transfers(transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>) {
+    let Ok(mut map) = transfers.lock() else {
+        return;
+    };
+    let stale_ids: Vec<String> = map
+        .iter()
+        .filter(|(_, t)| t.started_at.elapsed() > FILE_TRANSFER_STALE_TIMEOUT)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in stale_ids {
+        if let Some(transfer) = map.remove(&id) {
+            let _ = fs::remove_file(&transfer.temp_path);
+            log::info!("purged stale file transfer {} ({})", transfer.file_name, id);
+        }
+    }
 }
 
 fn append_incoming_file_transfer_chunk(
@@ -6016,7 +6309,26 @@ fn append_incoming_file_transfer_chunk(
         || packet.target_id != transfer.target_id
         || packet.file_name != transfer.file_name
         || packet.total_bytes != transfer.total_bytes
-        || packet.chunk_index != transfer.next_chunk_index
+    {
+        return false;
+    }
+
+    let duplicate_end = packet.offset.saturating_add(packet.data.len() as u64);
+    if packet.chunk_index.saturating_add(1) == transfer.next_chunk_index
+        && duplicate_end == transfer.received_bytes
+    {
+        let existing_matches = fs::File::open(&transfer.temp_path)
+            .and_then(|mut file| {
+                file.seek(SeekFrom::Start(packet.offset))?;
+                let mut existing = vec![0_u8; packet.data.len()];
+                file.read_exact(&mut existing)?;
+                Ok(existing == packet.data)
+            })
+            .unwrap_or(false);
+        return existing_matches;
+    }
+
+    if packet.chunk_index != transfer.next_chunk_index
         || packet.offset != transfer.received_bytes
         || transfer
             .received_bytes
@@ -7220,9 +7532,7 @@ fn complete_pairing_from_confirm(
     }
 
     {
-        let mut challenge = pairing_challenge
-            .lock()
-            .map_err(|_| "pairing challenge lock poisoned".to_string())?;
+        let mut challenge = pairing_challenge.lock().unwrap_or_else(|e| e.into_inner());
         let Some(existing) = challenge.as_mut() else {
             return Err("验证码已过期，请重新发起配对。".into());
         };
@@ -7247,9 +7557,7 @@ fn complete_pairing_from_confirm(
     }
 
     let snapshot = {
-        let mut layout = layout_state
-            .lock()
-            .map_err(|_| "layout state lock poisoned".to_string())?;
+        let mut layout = layout_state.lock().unwrap_or_else(|e| e.into_inner());
         if layout.machine_role != "client" {
             return Err("只有客户端可以接受服务端配对。".into());
         }
@@ -7761,6 +8069,42 @@ mod tests {
         assert!(layout.devices[1].input_ready);
         assert_eq!(layout.devices[1].host, "10.0.0.2");
         assert_eq!(layout.devices[1].transport_port, 52000);
+    }
+
+    #[test]
+    fn diagnostic_info_report_includes_input_debug_section() {
+        let summary = input::InputDebugInfo {
+            enabled: true,
+            status: "collecting".into(),
+            latest_failure: Some("input helper pipe unavailable".into()),
+            last_route: Some("helper-fallback".into()),
+            recent_event_count: 1,
+            events: vec![input::InputDebugEvent {
+                timestamp_ms: 123,
+                controller_id: "controller-a".into(),
+                event_type: "mouseMove".into(),
+                screen_id: "screen-1".into(),
+                relative_x: Some(10),
+                relative_y: Some(20),
+                absolute_x: Some(110),
+                absolute_y: Some(220),
+                desktop: "secure".into(),
+                route: "helper-fallback".into(),
+                pipe_available: Some(false),
+                result: "fallback".into(),
+                detail: "input helper pipe unavailable".into(),
+            }],
+        };
+
+        let lines = input::input_debug_report_lines(&summary);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("input debug: collecting")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("latest failure: input helper pipe unavailable")));
+        assert!(lines.iter().any(|line| line.contains("recent events: 1")));
     }
 
     #[test]
@@ -8321,11 +8665,13 @@ mod tests {
             width: 2,
             height: 1,
             rgba_base64: "AAAAAAAAAAA=".into(),
+            compressed: false,
         });
         let second = ClipboardContent::Image(ClipboardImage {
             width: 2,
             height: 1,
             rgba_base64: "AQEBAQEBAQE=".into(),
+            compressed: false,
         });
 
         assert_ne!(first.signature(), second.signature());
@@ -8340,6 +8686,7 @@ mod tests {
                 width: 800,
                 height: 600,
                 rgba_base64: "A".repeat(encoded_len),
+                compressed: false,
             }),
             "local-device".into(),
             "peer-device".into(),
@@ -8382,7 +8729,7 @@ mod tests {
         let content = ClipboardContent::Text("hello".into());
         let mut calls = 0;
 
-        let result = retry_clipboard_content_write(&content, 3, Duration::ZERO, |_| {
+        let result = retry_clipboard_content_write(&content, 3, 0, |_| {
             calls += 1;
             if calls < 3 {
                 Err("clipboard busy".into())
@@ -8393,6 +8740,30 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn clipboard_sequence_change_resends_identical_content() {
+        let last_sent = Some((
+            "peer-a".to_string(),
+            "10.0.0.2:47834".to_string(),
+            "text:hello".to_string(),
+        ));
+
+        assert!(clipboard_signature_already_sent(
+            &last_sent,
+            "peer-a",
+            "10.0.0.2:47834",
+            "text:hello",
+            false,
+        ));
+        assert!(!clipboard_signature_already_sent(
+            &last_sent,
+            "peer-a",
+            "10.0.0.2:47834",
+            "text:hello",
+            true,
+        ));
     }
 
     #[test]
@@ -8639,7 +9010,7 @@ mod tests {
             input_ready: false,
             upgrading: false,
             screens: vec![],
-            app_version: "0.1.0".into(),
+            app_version: "0.9.8".into(),
             last_seen_ms: now_ms(),
         }];
 
@@ -8763,6 +9134,63 @@ mod tests {
             &transfers,
             &root
         ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_accepts_identical_retried_chunk_once() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-retry");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet("start", "transfer-retry", "note.txt", 5, 0, 0, b""),
+            test_file_transfer_packet("chunk", "transfer-retry", "note.txt", 5, 0, 0, b"hello"),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root
+            ));
+        }
+
+        let duplicate =
+            test_file_transfer_packet("chunk", "transfer-retry", "note.txt", 5, 0, 0, b"hello");
+        let duplicate_payload = encode_wire_packet(&duplicate).expect("duplicate should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &duplicate_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+
+        let mismatched =
+            test_file_transfer_packet("chunk", "transfer-retry", "note.txt", 5, 0, 0, b"HELLO");
+        let mismatched_payload = encode_wire_packet(&mismatched).expect("mismatch should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &mismatched_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+
+        let finish =
+            test_file_transfer_packet("finish", "transfer-retry", "note.txt", 5, 1, 5, b"");
+        let finish_payload = encode_wire_packet(&finish).expect("finish should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &finish_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+        assert_eq!(fs::read(root.join("note.txt")).unwrap(), b"hello");
 
         let _ = fs::remove_dir_all(root);
     }

@@ -4,10 +4,10 @@
 
 把光标移出一台屏幕的边缘，它就落到下一台机器上；键盘随之切换，剪贴板（文本和图片）自动同步。不需要 KVM 硬件，也不用插线。
 
-[![下载](https://img.shields.io/github/v/release/XxMinor/mykvm?label=%E4%B8%8B%E8%BD%BD&style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
-[![Stars](https://img.shields.io/github/stars/XxMinor/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/stargazers)
-[![Forks](https://img.shields.io/github/forks/XxMinor/mykvm?label=Forks&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/forks)
-[![平台](https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-2786ff?style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
+[![下载](https://img.shields.io/github/v/release/aceleisureman/mykvm?label=%E4%B8%8B%E8%BD%BD&style=for-the-badge)](https://github.com/aceleisureman/mykvm/releases/latest)
+[![Stars](https://img.shields.io/github/stars/aceleisureman/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/aceleisureman/mykvm/stargazers)
+[![Forks](https://img.shields.io/github/forks/aceleisureman/mykvm?label=Forks&logo=github&style=for-the-badge)](https://github.com/aceleisureman/mykvm/forks)
+[![平台](https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-2786ff?style=for-the-badge)](https://github.com/aceleisureman/mykvm/releases/latest)
 [![许可证: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](./LICENSE)
 
 [English README](./README.md)
@@ -22,7 +22,7 @@
 
 ## 快速开始
 
-1. **两台机器都安装。** 从 [最新发布](https://github.com/XxMinor/mykvm/releases/latest) 下载各自系统的安装包。
+1. **两台机器都安装。** 从 [最新发布](https://github.com/aceleisureman/mykvm/releases/latest) 下载各自系统的安装包。
 2. **选择角色。** 在要共享键鼠的那台机器上打开 MyKVM，保持 **服务端**（默认）。在另一台机器上打开 MyKVM，到设置里切换为 **客户端**。
 3. **建立连接。** 同一局域网下两台会自动发现。否则打开 **设备**，输入对方 IP（可加 `IP:端口`），点 **添加**。只有上报了屏幕信息的设备才会加入布局。
 4. **排列屏幕。** 打开 **布局**，拖动各显示器，让相邻边缘和它们在桌面上的实际位置一致。
@@ -60,7 +60,7 @@
 
 ## 当前状态
 
-MyKVM 是一个实验性的早期版本，适合在本地可信网络中测试和迭代，但还没有面向不可信网络做生产级加固。当前版本和安装包见 [Releases 页面](https://github.com/XxMinor/mykvm/releases)。
+MyKVM 是一个实验性的早期版本，适合在本地可信网络中测试和迭代，但还没有面向不可信网络做生产级加固。当前版本和安装包见 [Releases 页面](https://github.com/aceleisureman/mykvm/releases)。
 
 - 许可证：MIT
 - 默认端口：UDP `47833`（发现）和 UDP `47834`（QUIC 传输）

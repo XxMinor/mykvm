@@ -1,4 +1,8 @@
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 
 const CLIPBOARD_MAX_TEXT_BYTES: usize = 256 * 1024;
 // Raw RGBA can be large (a 2560x1440 frame is ~14 MB); cap it so a stray huge
@@ -11,12 +15,28 @@ pub(crate) struct ClipboardImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) rgba_base64: String,
+    /// When true, `rgba_base64` contains DEFLATE-compressed RGBA bytes.
+    /// Older peers that lack this field default to false (uncompressed).
+    #[serde(default)]
+    pub(crate) compressed: bool,
 }
 
 /// One unit of clipboard content read from (or written to) the local system.
 pub(crate) enum ClipboardContent {
     Text(String),
     Image(ClipboardImage),
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn change_token() -> Option<u64> {
+    let sequence =
+        unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    (sequence != 0).then_some(sequence as u64)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn change_token() -> Option<u64> {
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +163,7 @@ mod tests {
                     width: 1,
                     height: 1,
                     rgba_base64: "AAAAAA==".into(),
+                    compressed: false,
                 }))
             },
         );
@@ -188,6 +209,12 @@ mod tests {
     }
 }
 
+fn compress_rgba(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(raw).ok()?;
+    encoder.finish().ok()
+}
+
 fn read_image() -> Option<ClipboardImage> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
@@ -200,10 +227,20 @@ fn read_image() -> Option<ClipboardImage> {
             return None;
         }
 
+        // Compress RGBA data before base64 encoding to reduce transfer size.
+        // Typical screenshots compress 5-10x with DEFLATE.
+        let (data, compressed) = match compress_rgba(image.bytes.as_ref()) {
+            Some(compressed_bytes) if compressed_bytes.len() < image.bytes.len() => {
+                (compressed_bytes, true)
+            }
+            _ => (image.bytes.to_vec(), false),
+        };
+
         Some(ClipboardImage {
             width: image.width as u32,
             height: image.height as u32,
-            rgba_base64: BASE64.encode(image.bytes.as_ref()),
+            rgba_base64: BASE64.encode(&data),
+            compressed,
         })
     });
 
@@ -223,9 +260,21 @@ fn read_image() -> Option<ClipboardImage> {
 fn write_image(image: &ClipboardImage) -> Result<(), String> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-    let bytes = BASE64
+    let decoded = BASE64
         .decode(image.rgba_base64.as_bytes())
         .map_err(|error| format!("failed to decode clipboard image: {error}"))?;
+
+    let bytes = if image.compressed {
+        let mut decoder = DeflateDecoder::new(decoded.as_slice());
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .map_err(|error| format!("failed to decompress clipboard image: {error}"))?;
+        decompressed
+    } else {
+        decoded
+    };
+
     let width = image.width as usize;
     let height = image.height as usize;
     if width == 0 || height == 0 || bytes.len() != width.saturating_mul(height).saturating_mul(4) {
@@ -336,10 +385,16 @@ fn decode_windows_dib_image(data: &[u8]) -> Option<ClipboardImage> {
         return None;
     }
 
+    let (data, compressed) = match compress_rgba(&bytes) {
+        Some(compressed_bytes) if compressed_bytes.len() < bytes.len() => (compressed_bytes, true),
+        _ => (bytes, false),
+    };
+
     Some(ClipboardImage {
         width,
         height,
-        rgba_base64: BASE64.encode(bytes),
+        rgba_base64: BASE64.encode(&data),
+        compressed,
     })
 }
 

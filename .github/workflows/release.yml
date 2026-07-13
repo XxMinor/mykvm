@@ -3,8 +3,7 @@ name: Release
 on:
   push:
     branches:
-      - main
-      - bate
+      - dev
   workflow_dispatch:
     inputs:
       channel:
@@ -66,7 +65,7 @@ jobs:
           subject="$(git log -1 --pretty=%s)"
           channel="${REQUESTED_CHANNEL:-}"
           if [[ -z "$channel" ]]; then
-            if [[ "$REF_NAME" == "bate" ]]; then
+            if [[ "$REF_NAME" == "dev" ]]; then
               channel="beta"
             else
               channel="stable"
@@ -322,8 +321,9 @@ jobs:
             data.version = version;
             if (file === 'src-tauri/tauri.conf.json' && channel === 'beta') {
               data.plugins.updater.endpoints = [
-                'https://github.com/XxMinor/mykvm/releases/download/beta/latest.json',
+                'https://github.com/aceleisureman/mykvm/releases/download/beta/latest.json',
               ];
+              data.bundle.macOS.signingIdentity = '-';
             }
             fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
           }
@@ -336,7 +336,7 @@ jobs:
           NODE
 
       - name: Validate Apple signing secrets
-        if: matrix.name == 'macos'
+        if: matrix.name == 'macos' && needs.prepare.outputs.channel != 'beta'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -380,7 +380,7 @@ jobs:
           exit "$missing"
 
       - name: Configure Apple notarization
-        if: matrix.name == 'macos'
+        if: matrix.name == 'macos' && needs.prepare.outputs.channel != 'beta'
         shell: bash
         env:
           APPLE_API_KEY_PRIVATE_KEY: ${{ secrets.APPLE_API_KEY_PRIVATE_KEY }}
@@ -424,7 +424,7 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
       - name: Set up self-signed signing keychain
-        if: matrix.name == 'macos'
+        if: matrix.name == 'macos' && needs.prepare.outputs.channel != 'beta'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -474,7 +474,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           # Notarization credentials are NOT wired in here: passing unset secrets
           # injects empty strings, which Tauri reads as "present" and tries to
           # notarize with blank creds. The "Configure Apple notarization" step
@@ -502,6 +501,7 @@ jobs:
         if: matrix.name == 'macos'
         shell: bash
         env:
+          RELEASE_CHANNEL: ${{ needs.prepare.outputs.channel }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
         run: |
@@ -528,12 +528,19 @@ jobs:
 
           # The signature itself must always be valid.
           codesign --verify --deep --strict --verbose=2 "$app_path"
-          codesign --verify --verbose=2 "$dmg_path"
+
+          # Preview DMGs wrap an ad-hoc signed app but are not themselves
+          # signed by Apple. Developer ID releases still require DMG signing.
+          if [ "$RELEASE_CHANNEL" != "beta" ]; then
+            codesign --verify --verbose=2 "$dmg_path"
+          else
+            echo "Ad-hoc signed beta: skipping DMG codesign verification."
+          fi
 
           # spctl asserts Gatekeeper acceptance, which only holds for notarized
           # builds. A free self-signed release is expected to fail it, so only
           # run it when notarization credentials were provided.
-          if [ -n "${APPLE_API_KEY_ID:-}${APPLE_ID:-}" ]; then
+          if [ "$RELEASE_CHANNEL" != "beta" ] && [ -n "${APPLE_API_KEY_ID:-}${APPLE_ID:-}" ]; then
             spctl -a -t exec -vv "$app_path"
             spctl -a -t open --context context:primary-signature -vv "$dmg_path"
           else

@@ -43,7 +43,7 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 // After returning to local, refuse to cross back into the remote for this long.
 // Lets a fast back-flick settle at the edge without bouncing into the remote.
 const RETURN_COOLDOWN_MS: u64 = 150;
-const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
+const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 16;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
 #[cfg(target_os = "macos")]
 const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
@@ -100,10 +100,14 @@ const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
 const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
+static INPUT_DEBUG_EVENTS: OnceLock<Mutex<Vec<InputDebugEvent>>> = OnceLock::new();
+static LAST_SUCCESSFUL_MOUSE_DEBUG_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE: AtomicBool = AtomicBool::new(true);
+const INPUT_DEBUG_MAX_EVENTS: usize = 32;
+const INPUT_DEBUG_MOUSE_SAMPLE_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Edge {
@@ -209,6 +213,35 @@ struct RemoteMouseState {
     buttons: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InputDebugEvent {
+    pub timestamp_ms: u64,
+    pub controller_id: String,
+    pub event_type: String,
+    pub screen_id: String,
+    pub relative_x: Option<i32>,
+    pub relative_y: Option<i32>,
+    pub absolute_x: Option<i32>,
+    pub absolute_y: Option<i32>,
+    pub desktop: String,
+    pub route: String,
+    pub pipe_available: Option<bool>,
+    pub result: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InputDebugInfo {
+    pub enabled: bool,
+    pub status: String,
+    pub latest_failure: Option<String>,
+    pub last_route: Option<String>,
+    pub recent_event_count: usize,
+    pub events: Vec<InputDebugEvent>,
+}
+
 pub fn stopped_capture_status() -> NativeStageStatus {
     NativeStageStatus {
         state: "stubbed".into(),
@@ -220,6 +253,146 @@ pub fn stopped_inject_status() -> NativeStageStatus {
     NativeStageStatus {
         state: "stubbed".into(),
         detail: "Input injection is stopped.".into(),
+    }
+}
+
+fn input_debug_events() -> &'static Mutex<Vec<InputDebugEvent>> {
+    INPUT_DEBUG_EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn now_input_debug_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn record_input_debug_event(event: InputDebugEvent) {
+    if should_record_input_debug_event(&event.event_type, &event.result, event.timestamp_ms) {
+        push_input_debug_event(event);
+    }
+}
+
+fn record_input_debug_event_lazy<F>(event_type: &str, result: &str, timestamp_ms: u64, build: F)
+where
+    F: FnOnce() -> InputDebugEvent,
+{
+    if should_record_input_debug_event(event_type, result, timestamp_ms) {
+        push_input_debug_event(build());
+    }
+}
+
+fn should_record_input_debug_event(event_type: &str, result: &str, timestamp_ms: u64) -> bool {
+    event_type != "mouseMove" || result != "injected" || sample_mouse_debug(timestamp_ms)
+}
+
+fn sample_mouse_debug(timestamp_ms: u64) -> bool {
+    LAST_SUCCESSFUL_MOUSE_DEBUG_MS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+            mouse_debug_sample_due(previous, timestamp_ms).then_some(timestamp_ms)
+        })
+        .is_ok()
+}
+
+fn mouse_debug_sample_due(previous_ms: u64, timestamp_ms: u64) -> bool {
+    previous_ms == 0 || timestamp_ms.saturating_sub(previous_ms) >= INPUT_DEBUG_MOUSE_SAMPLE_MS
+}
+
+fn push_input_debug_event(event: InputDebugEvent) {
+    let Ok(mut events) = input_debug_events().lock() else {
+        return;
+    };
+    events.push(event);
+    if events.len() > INPUT_DEBUG_MAX_EVENTS {
+        let overflow = events.len() - INPUT_DEBUG_MAX_EVENTS;
+        events.drain(0..overflow);
+    }
+}
+
+pub fn current_input_debug_info() -> InputDebugInfo {
+    let events = input_debug_events()
+        .lock()
+        .map(|events| events.clone())
+        .unwrap_or_default();
+    let latest_failure = events
+        .iter()
+        .rev()
+        .find(|event| event.result != "injected")
+        .map(|event| event.detail.clone());
+    let last_route = events.last().map(|event| event.route.clone());
+    let recent_event_count = events.len();
+    let status = if events.is_empty() {
+        "idle".to_string()
+    } else {
+        "collecting".to_string()
+    };
+
+    InputDebugInfo {
+        enabled: true,
+        status,
+        latest_failure,
+        last_route,
+        recent_event_count,
+        events,
+    }
+}
+
+pub fn input_debug_report_lines(summary: &InputDebugInfo) -> Vec<String> {
+    let mut lines = vec![format!("input debug: {}", summary.status)];
+    lines.push(format!(
+        "input debug recent events: {}",
+        summary.recent_event_count
+    ));
+    if let Some(route) = &summary.last_route {
+        lines.push(format!("input debug last route: {route}"));
+    }
+    if let Some(failure) = &summary.latest_failure {
+        lines.push(format!("input debug latest failure: {failure}"));
+    }
+
+    if summary.events.is_empty() {
+        lines.push("input debug events: none".into());
+    } else {
+        lines.push("input debug events:".into());
+        for event in &summary.events {
+            let relative = match (event.relative_x, event.relative_y) {
+                (Some(x), Some(y)) => format!("rel=({x},{y})"),
+                _ => "rel=(n/a)".into(),
+            };
+            let absolute = match (event.absolute_x, event.absolute_y) {
+                (Some(x), Some(y)) => format!("abs=({x},{y})"),
+                _ => "abs=(n/a)".into(),
+            };
+            let pipe = match event.pipe_available {
+                Some(true) => "pipe=true",
+                Some(false) => "pipe=false",
+                None => "pipe=n/a",
+            };
+            lines.push(format!(
+                "- ts={} controller={} event={} screen={} {} {} desktop={} route={} {} result={} detail={}",
+                event.timestamp_ms,
+                event.controller_id,
+                event.event_type,
+                event.screen_id,
+                relative,
+                absolute,
+                event.desktop,
+                event.route,
+                pipe,
+                event.result,
+                event.detail
+            ));
+        }
+    }
+
+    lines
+}
+
+#[cfg(test)]
+fn clear_input_debug_events_for_tests() {
+    LAST_SUCCESSFUL_MOUSE_DEBUG_MS.store(0, Ordering::Relaxed);
+    if let Ok(mut events) = input_debug_events().lock() {
+        events.clear();
     }
 }
 
@@ -1275,6 +1448,7 @@ fn send_packet(
 ) -> bool {
     let packet_context = input_packet_context(target, event, layout_state);
     let event = packet_context.event;
+    let lossy = matches!(&event, InputEvent::MouseMove { .. });
     let packet = InputPacket {
         protocol: INPUT_PROTOCOL.into(),
         target_device_id: target.device_id.clone(),
@@ -1302,7 +1476,12 @@ fn send_packet(
         }
     };
 
-    match quic_transport.send_datagram(peer, payload) {
+    let send_result = if lossy {
+        quic_transport.send_datagram_lossy(peer, payload)
+    } else {
+        quic_transport.send_datagram(peer, payload)
+    };
+    match send_result {
         Ok(()) => {
             input_events.fetch_add(1, Ordering::Relaxed);
             true
@@ -1592,7 +1771,12 @@ pub fn try_inject_packet_from_source(
         );
     }
 
-    let injected = inject_input_event(layout, native_layout, packet.event);
+    let injected = inject_input_event(
+        layout,
+        native_layout,
+        packet.event,
+        &packet.origin_device_id,
+    );
     if injected {
         input_events.fetch_add(1, Ordering::Relaxed);
     }
@@ -1707,6 +1891,31 @@ fn origin_peer_id(layout: &LayoutState) -> String {
 
 static LAST_UNAUTHORIZED_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
 
+fn record_unauthorized_debug_event(
+    controller_id: &str,
+    event_type: &str,
+    screen_id: &str,
+    relative_x: Option<i32>,
+    relative_y: Option<i32>,
+    detail: &str,
+) {
+    record_input_debug_event(InputDebugEvent {
+        timestamp_ms: now_input_debug_ms(),
+        controller_id: controller_id.to_string(),
+        event_type: event_type.to_string(),
+        screen_id: screen_id.to_string(),
+        relative_x,
+        relative_y,
+        absolute_x: None,
+        absolute_y: None,
+        desktop: "unauthorized".into(),
+        route: "rejected".into(),
+        pipe_available: None,
+        result: "dropped".into(),
+        detail: detail.to_string(),
+    });
+}
+
 /// Log (at most once every few seconds, since a single mouse move floods many
 /// packets) why a controller's input was rejected. Without this the packets
 /// were dropped silently while the device still showed "online", which makes a
@@ -1728,6 +1937,49 @@ fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
             return;
         }
         *last = Instant::now();
+    }
+
+    match &packet.event {
+        InputEvent::MouseMove { screen_id, x, y } => {
+            record_unauthorized_debug_event(
+                &packet.origin_device_id,
+                "mouseMove",
+                screen_id,
+                Some(*x),
+                Some(*y),
+                reason,
+            );
+        }
+        InputEvent::MouseButton { .. } => {
+            record_unauthorized_debug_event(
+                &packet.origin_device_id,
+                "mouseButton",
+                "",
+                None,
+                None,
+                reason,
+            );
+        }
+        InputEvent::Scroll { .. } => {
+            record_unauthorized_debug_event(
+                &packet.origin_device_id,
+                "scroll",
+                "",
+                None,
+                None,
+                reason,
+            );
+        }
+        InputEvent::Key { .. } => {
+            record_unauthorized_debug_event(
+                &packet.origin_device_id,
+                "key",
+                "",
+                None,
+                None,
+                reason,
+            );
+        }
     }
 
     log::warn!(
@@ -1754,6 +2006,8 @@ fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlP
     } else {
         "controller is not in this device's paired-controllers list"
     };
+
+    record_unauthorized_debug_event(&packet.origin_device_id, "control", "", None, None, reason);
 
     log::warn!(
         "rejected input control from controller id={} key={}: {}",
@@ -1902,13 +2156,33 @@ fn inject_input_event(
     layout: &LayoutState,
     native_layout: &LayoutState,
     event: InputEvent,
+    controller_id: &str,
 ) -> bool {
-    let Some(command) = input_event_to_command(layout, native_layout, event) else {
+    let debug_event = input_debug_event_from_input_event(&event);
+    let Some(command) = input_event_to_command(layout, native_layout, &event) else {
+        record_input_debug_event(InputDebugEvent {
+            timestamp_ms: now_input_debug_ms(),
+            controller_id: controller_id.to_string(),
+            event_type: debug_event.event_type.into(),
+            screen_id: debug_event.screen_id.to_string(),
+            relative_x: debug_event.relative_x,
+            relative_y: debug_event.relative_y,
+            absolute_x: None,
+            absolute_y: None,
+            desktop: "unknown".into(),
+            route: "dropped".into(),
+            pipe_available: None,
+            result: "dropped".into(),
+            detail: "could not map input event to native command".into(),
+        });
         return false;
     };
 
     #[cfg(target_os = "windows")]
     {
+        let desktop_is_default = windows_inject_desktop_is_default();
+        let route_to_helper = should_route_to_windows_helper(&command);
+        let (absolute_x, absolute_y) = command_coordinates(&command);
         // Inject locally on the normal desktop; hand off to the privileged SYSTEM
         // helper only for the secure desktop (lock screen / UAC) or Ctrl+Alt+Del.
         //
@@ -1923,19 +2197,116 @@ fn inject_input_event(
         // logged-in user at the foreground window's own integrity, so it clicks
         // and types normally. On the secure desktop the foreground is LogonUI
         // (System integrity), so the worker's equal-integrity injection works.
-        if should_route_to_windows_helper(&command) {
+        if route_to_helper {
             match windows_pipe_dispatcher().send(&command) {
-                Ok(()) => return true,
-                Err(error) => note_windows_helper_unavailable(&error),
+                Ok(()) => {
+                    let timestamp_ms = now_input_debug_ms();
+                    record_input_debug_event_lazy(
+                        debug_event.event_type,
+                        "injected",
+                        timestamp_ms,
+                        || InputDebugEvent {
+                            timestamp_ms,
+                            controller_id: controller_id.to_string(),
+                            event_type: debug_event.event_type.into(),
+                            screen_id: debug_event.screen_id.to_string(),
+                            relative_x: debug_event.relative_x,
+                            relative_y: debug_event.relative_y,
+                            absolute_x,
+                            absolute_y,
+                            desktop: if desktop_is_default {
+                                "default".into()
+                            } else {
+                                "secure".into()
+                            },
+                            route: "helper".into(),
+                            pipe_available: Some(true),
+                            result: "injected".into(),
+                            detail: "dispatched through input helper".into(),
+                        },
+                    );
+                    return true;
+                }
+                Err(error) => {
+                    note_windows_helper_unavailable(&error);
+                    record_input_debug_event(InputDebugEvent {
+                        timestamp_ms: now_input_debug_ms(),
+                        controller_id: controller_id.to_string(),
+                        event_type: debug_event.event_type.into(),
+                        screen_id: debug_event.screen_id.to_string(),
+                        relative_x: debug_event.relative_x,
+                        relative_y: debug_event.relative_y,
+                        absolute_x,
+                        absolute_y,
+                        desktop: if desktop_is_default {
+                            "default".into()
+                        } else {
+                            "secure".into()
+                        },
+                        route: "helper-fallback".into(),
+                        pipe_available: Some(false),
+                        result: "fallback".into(),
+                        detail: error,
+                    });
+                }
             }
         }
         inject_input_command(command);
+        let timestamp_ms = now_input_debug_ms();
+        record_input_debug_event_lazy(debug_event.event_type, "injected", timestamp_ms, || {
+            InputDebugEvent {
+                timestamp_ms,
+                controller_id: controller_id.to_string(),
+                event_type: debug_event.event_type.into(),
+                screen_id: debug_event.screen_id.to_string(),
+                relative_x: debug_event.relative_x,
+                relative_y: debug_event.relative_y,
+                absolute_x,
+                absolute_y,
+                desktop: if desktop_is_default {
+                    "default".into()
+                } else {
+                    "secure".into()
+                },
+                route: if route_to_helper {
+                    "helper-fallback".into()
+                } else {
+                    "local".into()
+                },
+                pipe_available: if route_to_helper { Some(false) } else { None },
+                result: "injected".into(),
+                detail: if route_to_helper {
+                    "fell back to local injection".into()
+                } else {
+                    "injected locally".into()
+                },
+            }
+        });
         return true;
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let (absolute_x, absolute_y) = command_coordinates(&command);
         inject_input_command(command);
+        let timestamp_ms = now_input_debug_ms();
+        record_input_debug_event_lazy(debug_event.event_type, "injected", timestamp_ms, || {
+            InputDebugEvent {
+                timestamp_ms,
+                controller_id: controller_id.to_string(),
+                event_type: debug_event.event_type.into(),
+                screen_id: debug_event.screen_id.to_string(),
+                relative_x: debug_event.relative_x,
+                relative_y: debug_event.relative_y,
+                absolute_x,
+                absolute_y,
+                desktop: "n/a".into(),
+                route: "local".into(),
+                pipe_available: None,
+                result: "injected".into(),
+                detail: "injected locally".into(),
+            }
+        });
         true
     }
 }
@@ -1988,22 +2359,22 @@ fn windows_inject_desktop_is_default() -> bool {
 fn input_event_to_command(
     layout: &LayoutState,
     native_layout: &LayoutState,
-    event: InputEvent,
+    event: &InputEvent,
 ) -> Option<InputCommand> {
     match event {
         InputEvent::MouseMove { screen_id, x, y } => {
-            if let Some(screen) = local_screen_for_event(layout, &screen_id) {
-                let native_screen = local_screen_for_event(native_layout, &screen_id)
+            if let Some(screen) = local_screen_for_event(layout, screen_id) {
+                let native_screen = local_screen_for_event(native_layout, screen_id)
                     .map(platform_native_screen)
                     .unwrap_or_else(|| platform_native_screen(screen));
                 let absolute_x = map_relative_to_native_axis(
-                    x,
+                    *x,
                     screen.width,
                     native_screen.x,
                     native_screen.width,
                 );
                 let absolute_y = map_relative_to_native_axis(
-                    y,
+                    *y,
                     screen.height,
                     native_screen.y,
                     native_screen.height,
@@ -2018,11 +2389,66 @@ fn input_event_to_command(
             None
         }
         InputEvent::MouseButton { button, down } => {
-            let (x, y) = update_remote_mouse_button(button, down);
-            Some(InputCommand::MouseButton { button, down, x, y })
+            let (x, y) = update_remote_mouse_button(*button, *down);
+            Some(InputCommand::MouseButton {
+                button: *button,
+                down: *down,
+                x,
+                y,
+            })
         }
-        InputEvent::Scroll { delta_x, delta_y } => Some(InputCommand::Scroll { delta_x, delta_y }),
-        InputEvent::Key { key_code, down } => Some(InputCommand::Key { key_code, down }),
+        InputEvent::Scroll { delta_x, delta_y } => Some(InputCommand::Scroll {
+            delta_x: *delta_x,
+            delta_y: *delta_y,
+        }),
+        InputEvent::Key { key_code, down } => Some(InputCommand::Key {
+            key_code: *key_code,
+            down: *down,
+        }),
+    }
+}
+
+struct InputDebugEventSeed<'a> {
+    event_type: &'static str,
+    screen_id: &'a str,
+    relative_x: Option<i32>,
+    relative_y: Option<i32>,
+}
+
+fn input_debug_event_from_input_event(event: &InputEvent) -> InputDebugEventSeed<'_> {
+    match event {
+        InputEvent::MouseMove { screen_id, x, y } => InputDebugEventSeed {
+            event_type: "mouseMove",
+            screen_id,
+            relative_x: Some(*x),
+            relative_y: Some(*y),
+        },
+        InputEvent::MouseButton { .. } => InputDebugEventSeed {
+            event_type: "mouseButton",
+            screen_id: "",
+            relative_x: None,
+            relative_y: None,
+        },
+        InputEvent::Scroll { .. } => InputDebugEventSeed {
+            event_type: "scroll",
+            screen_id: "",
+            relative_x: None,
+            relative_y: None,
+        },
+        InputEvent::Key { .. } => InputDebugEventSeed {
+            event_type: "key",
+            screen_id: "",
+            relative_x: None,
+            relative_y: None,
+        },
+    }
+}
+
+fn command_coordinates(command: &InputCommand) -> (Option<i32>, Option<i32>) {
+    match command {
+        InputCommand::MouseMove { x, y, .. } => (Some(*x), Some(*y)),
+        InputCommand::MouseButton { x, y, .. } => (Some(*x), Some(*y)),
+        _ => (None, None),
     }
 }
 
@@ -2946,6 +3372,9 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
 
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
     if let Some(active_target) = crossing_target(&targets, x, y, dx, dy, &context.layout_state) {
+        // Give the connection a fresh chance on each crossing attempt so that
+        // recovery after a transient disconnect is immediate.
+        context.quic_transport.reset_datagram_failures();
         let anchor = local_anchor_point(&active_target);
         hide_windows_cursor_if_needed(context);
         set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
@@ -3038,7 +3467,15 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
     let Some(active_target) = active else {
         return false;
     };
-    let delta = ((mouse_data >> 16) as i16 / 120) as i32;
+    let raw_delta = (mouse_data >> 16) as i16;
+
+    let delta = if raw_delta.abs() >= 120 {
+        (raw_delta / 120) as i32
+    } else if raw_delta != 0 {
+        raw_delta.signum() as i32
+    } else {
+        0
+    };
     let (delta_x, delta_y) = if message == WM_MOUSEHWHEEL {
         (delta, 0)
     } else if message == WM_MOUSEWHEEL {
@@ -3439,6 +3876,9 @@ fn handle_macos_mouse_move(
     if let Some(active_target) =
         mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
     {
+        // Give the connection a fresh chance on each crossing attempt so that
+        // recovery after a transient disconnect is immediate.
+        context.quic_transport.reset_datagram_failures();
         let anchor = mac_cursor_point(
             context,
             local_anchor_point(&active_target),
@@ -3685,6 +4125,15 @@ fn mac_crossing_target(
     };
     let flipped_y = min_y + max_y - y;
     if (flipped_y - y).abs() < 0.5 {
+        return None;
+    }
+
+    // Suppress the Y-flip when the cursor is at an outer edge of the local
+    // screens moving outward.  Without this guard the flip maps a
+    // bottom-edge push into a top-edge crossing (or vice-versa), producing
+    // a false transition to a remote screen on the opposite side.
+    let edge_margin = CROSSING_ACTIVATION_BAND;
+    if (y >= max_y - edge_margin && dy > 0.0) || (y <= min_y + edge_margin && dy < 0.0) {
         return None;
     }
 
@@ -5346,6 +5795,117 @@ fn inject_key(_key_code: u16, _down: bool) {}
 mod tests {
     use super::*;
 
+    #[test]
+    fn input_debug_summary_keeps_recent_events_and_latest_failure() {
+        clear_input_debug_events_for_tests();
+
+        for index in 0..(INPUT_DEBUG_MAX_EVENTS + 5) {
+            record_input_debug_event(InputDebugEvent {
+                timestamp_ms: index as u64,
+                controller_id: format!("controller-{index}"),
+                event_type: "key".into(),
+                screen_id: "screen-1".into(),
+                relative_x: Some(index as i32),
+                relative_y: Some(index as i32 + 1),
+                absolute_x: Some(index as i32 + 100),
+                absolute_y: Some(index as i32 + 200),
+                desktop: "default".into(),
+                route: "local".into(),
+                pipe_available: Some(false),
+                result: "injected".into(),
+                detail: "ok".into(),
+            });
+        }
+
+        record_input_debug_event(InputDebugEvent {
+            timestamp_ms: 999,
+            controller_id: "controller-fail".into(),
+            event_type: "mouseMove".into(),
+            screen_id: "screen-1".into(),
+            relative_x: Some(10),
+            relative_y: Some(20),
+            absolute_x: Some(110),
+            absolute_y: Some(220),
+            desktop: "secure".into(),
+            route: "helper-fallback".into(),
+            pipe_available: Some(false),
+            result: "fallback".into(),
+            detail: "input helper pipe unavailable".into(),
+        });
+
+        let summary = current_input_debug_info();
+
+        assert!(summary.enabled);
+        assert_eq!(summary.recent_event_count, INPUT_DEBUG_MAX_EVENTS);
+        assert_eq!(
+            summary.latest_failure.as_deref(),
+            Some("input helper pipe unavailable")
+        );
+        assert_eq!(summary.last_route.as_deref(), Some("helper-fallback"));
+        assert_eq!(summary.events.len(), INPUT_DEBUG_MAX_EVENTS);
+        assert_eq!(
+            summary
+                .events
+                .last()
+                .map(|event| event.controller_id.as_str()),
+            Some("controller-fail")
+        );
+        assert_eq!(
+            summary
+                .events
+                .first()
+                .map(|event| event.controller_id.as_str()),
+            Some("controller-6")
+        );
+    }
+
+    #[test]
+    fn input_debug_report_renders_route_and_coordinates() {
+        let summary = InputDebugInfo {
+            enabled: true,
+            status: "collecting".into(),
+            latest_failure: Some("input helper pipe unavailable".into()),
+            last_route: Some("helper-fallback".into()),
+            recent_event_count: 1,
+            events: vec![InputDebugEvent {
+                timestamp_ms: 123,
+                controller_id: "controller-a".into(),
+                event_type: "mouseMove".into(),
+                screen_id: "screen-1".into(),
+                relative_x: Some(10),
+                relative_y: Some(20),
+                absolute_x: Some(110),
+                absolute_y: Some(220),
+                desktop: "secure".into(),
+                route: "helper-fallback".into(),
+                pipe_available: Some(false),
+                result: "fallback".into(),
+                detail: "input helper pipe unavailable".into(),
+            }],
+        };
+
+        let lines = input_debug_report_lines(&summary);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("input debug: collecting")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("latest failure: input helper pipe unavailable")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("route=helper-fallback")));
+        assert!(lines.iter().any(|line| line.contains("rel=(10,20)")));
+        assert!(lines.iter().any(|line| line.contains("abs=(110,220)")));
+    }
+
+    #[test]
+    fn input_debug_samples_successful_mouse_moves() {
+        assert!(mouse_debug_sample_due(0, 1_000));
+        assert!(!mouse_debug_sample_due(1_000, 1_100));
+        assert!(mouse_debug_sample_due(1_000, 1_300));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn windows_vk_to_mac_flag_covers_modifiers() {
@@ -6099,7 +6659,7 @@ mod tests {
         let command = input_event_to_command(
             &layout,
             &native_layout,
-            InputEvent::MouseMove {
+            &InputEvent::MouseMove {
                 screen_id: "local-display-1".into(),
                 x: 960,
                 y: 540,

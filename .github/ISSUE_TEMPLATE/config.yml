@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: 💬 Questions & Discussion
-    url: https://github.com/XxMinor/mykvm/discussions
+    url: https://github.com/aceleisureman/mykvm/discussions
     about: Ask questions, share setups, and talk about ideas. Not sure if it's a bug? Start here.
   - name: 📖 Documentation (README)
-    url: https://github.com/XxMinor/mykvm#readme
+    url: https://github.com/aceleisureman/mykvm#readme
     about: Quick start, permissions, and limitations before filing an issue.

@@ -1,11 +1,11 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "mykvm",
-  "version": "0.1.0",
+  "version": "0.9.8",
   "identifier": "com.xzhpl.mykvm",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:5174",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "node scripts/build-tauri-assets.mjs"
   },
@@ -50,9 +50,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY4NTQyMTlDMkRCREIxQ0EKUldUS3NiMHRuQ0ZVK0pQK3pnV3ZkcnJxUjMzclVoQUh6Vk5lVlNyRzVvRFdWcVF6OWlOUmpEMFIK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNFOTk3ODREMUEwRjM2RDkKUldUWk5nOGFUWGlaUHF0YVhLa1NKL1RPaUhINzdheUhKNkdCWHRSNWZpMlBnbnA3MUY3a2NoYVEK",
       "endpoints": [
-        "https://github.com/XxMinor/mykvm/releases/latest/download/latest.json"
+        "https://github.com/aceleisureman/mykvm/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

@@ -2330,12 +2330,13 @@ dependencies = [
 
 [[package]]
 name = "mykvm"
-version = "0.1.0"
+version = "0.9.8"
 dependencies = [
  "arboard",
  "base64 0.22.1",
  "core-foundation",
  "core-graphics",
+ "flate2",
  "if-addrs",
  "image",
  "log",
@@ -2360,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "mykvm-input-helper"
-version = "0.1.0"
+version = "0.9.8"
 dependencies = [
  "mykvm",
  "windows-service",

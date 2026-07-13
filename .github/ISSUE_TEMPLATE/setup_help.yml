@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        For general "how do I…" questions, the [Discussions board](https://github.com/XxMinor/mykvm/discussions) is often faster. Use this template when setup isn't working and you want help debugging.
+        For general "how do I…" questions, the [Discussions board](https://github.com/aceleisureman/mykvm/discussions) is often faster. Use this template when setup isn't working and you want help debugging.
   - type: textarea
     id: goal
     attributes:
