@@ -1466,6 +1466,7 @@ fn start_platform_capture(
             cursor_hider_visible: AtomicBool::new(false),
             cursor_hider_reassert_ms: AtomicU64::new(0),
             local_screen_points: Mutex::new(HashMap::new()),
+            local_return_gate: Mutex::new(None),
             last_hook_event_ms: AtomicU64::new(0),
         });
 
@@ -2126,6 +2127,8 @@ fn send_packet_with_options(
     };
 
     let admission = platform_input_send_admission();
+    let fast_handoff =
+        input_event_needs_fast_handoff_copy(&packet.event).then(|| (peer.clone(), payload.clone()));
     let send_result = if let Some(class) = reliable_class {
         if admission == InputSendAdmission::Nonblocking {
             quic_transport.send_reliable_input_with_class_nonblocking(peer, payload, class)
@@ -2144,6 +2147,16 @@ fn send_packet_with_options(
 
     match send_result {
         Ok(()) => {
+            // CursorPark stays a reliable reset boundary, but also rides the
+            // latest-datagram lane so the controlled Mac hides its cursor
+            // immediately instead of waiting behind a recovering stream. The
+            // shared sequence makes either arrival authoritative and the later
+            // duplicate harmless.
+            if let Some((peer, payload)) = fast_handoff {
+                if let Err(error) = quic_transport.send_latest_datagram_nonblocking(peer, payload) {
+                    log::debug!("fast cursor handoff copy was not queued: {error}");
+                }
+            }
             input_events.fetch_add(1, Ordering::Relaxed);
             true
         }
@@ -2175,6 +2188,10 @@ fn input_event_reliable_class(event: &InputEvent) -> Option<quic_transport::Reli
         InputEvent::Scroll { .. } => Some(ReliableInputClass::Transient),
         InputEvent::MouseMove { .. } => None,
     }
+}
+
+fn input_event_needs_fast_handoff_copy(event: &InputEvent) -> bool {
+    matches!(event, InputEvent::CursorPark { .. })
 }
 
 fn input_packet_reliable_class(
@@ -4673,6 +4690,47 @@ struct WindowsPendingMouseMoves {
 }
 
 #[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy)]
+struct WindowsLocalReturnGate {
+    edge: Edge,
+    expected: (f64, f64),
+    expires_at_ms: u64,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn should_drop_windows_local_move_after_return(
+    gate: &mut Option<WindowsLocalReturnGate>,
+    snapshot: WindowsMouseMoveSnapshot,
+    now_ms: u64,
+) -> bool {
+    const RETURN_AXIS_TOLERANCE_PX: f64 = 32.0;
+
+    let Some(active) = gate.as_ref() else {
+        return false;
+    };
+    if now_ms >= active.expires_at_ms {
+        *gate = None;
+        return false;
+    }
+
+    // A low-level hook sample generated before handoff can be serviced after
+    // remote_active flips false. If that old edge point is admitted, it opens
+    // a new remote session at the previous height and warps the cursor there.
+    // Wait for the SetCursorPos reveal sample, identified by the coordinate
+    // parallel to the shared edge. Motion inward from the edge is unrestricted.
+    let axis_error = match active.edge {
+        Edge::Left | Edge::Right => (snapshot.y - active.expected.1).abs(),
+        Edge::Top | Edge::Bottom => (snapshot.x - active.expected.0).abs(),
+    };
+    if axis_error <= RETURN_AXIS_TOLERANCE_PX {
+        *gate = None;
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
 impl WindowsPendingMouseMoves {
     const CAPACITY: usize = 32;
 
@@ -4780,6 +4838,7 @@ struct WindowsCaptureContext {
     // GetTickCount64 of the last periodic cover re-assert (reassert_windows_cursor_hider).
     cursor_hider_reassert_ms: AtomicU64,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
+    local_return_gate: Mutex<Option<WindowsLocalReturnGate>>,
     // GetTickCount64 of the last time either low-level hook callback fired.
     // The pump loop compares this against system-wide input activity to detect
     // hooks Windows silently removed (slow-callback timeout, working-set trim
@@ -6143,6 +6202,7 @@ fn release_windows_remote_control_inner(context: &WindowsCaptureContext) {
         .as_ref()
         .map(|active| active.target.device_id.clone());
     let return_point = active.as_ref().map(local_return_point);
+    let return_edge = active.as_ref().map(|active| active.target.edge);
     if let Some(point) = return_point {
         retarget_windows_remote_anchor(context, point);
     }
@@ -6172,6 +6232,7 @@ fn release_windows_remote_control_inner(context: &WindowsCaptureContext) {
     }
 
     clear_windows_local_mouse_history(&context.last_point);
+    arm_windows_local_return_gate(context, return_edge.zip(return_point));
     context.remote_active.store(false, Ordering::Release);
     reset_mouse_move_timer(&context.last_mouse_move_sent);
     reveal_windows_cursor_at(context, return_point);
@@ -6278,6 +6339,7 @@ fn handle_windows_remote_mouse_delta(context: &WindowsCaptureContext, dx: f64, d
     if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
         let point = local_return_point(active_target);
         retarget_windows_remote_anchor(context, point);
+        let edge = active_target.target.edge;
         let target = active_target.target.clone();
         release_forwarded_keys_windows(context, &target);
         release_remote_buttons(
@@ -6295,12 +6357,17 @@ fn handle_windows_remote_mouse_delta(context: &WindowsCaptureContext, dx: f64, d
         );
         *active = None;
         clear_windows_local_mouse_history(&context.last_point);
+        arm_windows_local_return_gate(context, Some((edge, point)));
         context.remote_active.store(false, Ordering::Release);
         reset_mouse_move_timer(&context.last_mouse_move_sent);
         clear_clipboard_target_if_device(&context.clipboard_target, &target.device_id);
         reveal_windows_cursor_at(context, Some(point));
         clear_windows_remote_anchor(context);
-        log::info!("[input-win] returned to local from shared edge");
+        log::info!(
+            "[input-win] returned to local from shared edge point=({:.0},{:.0})",
+            point.0,
+            point.1
+        );
         return true;
     }
 
@@ -6334,6 +6401,18 @@ fn handle_windows_local_mouse_move(
     snapshot: WindowsMouseMoveSnapshot,
 ) -> bool {
     if context.remote_active.load(Ordering::Acquire) {
+        return true;
+    }
+    let should_drop = match context.local_return_gate.lock() {
+        Ok(mut gate) => {
+            should_drop_windows_local_move_after_return(&mut gate, snapshot, windows_tick_ms())
+        }
+        Err(poison) => {
+            let mut gate = poison.into_inner();
+            should_drop_windows_local_move_after_return(&mut gate, snapshot, windows_tick_ms())
+        }
+    };
+    if should_drop {
         return true;
     }
     let x = snapshot.x;
@@ -6553,6 +6632,24 @@ fn clear_windows_local_mouse_history(last_point: &Mutex<Option<(f64, f64)>>) {
     if let Ok(mut last_point) = last_point.lock() {
         *last_point = None;
     }
+}
+
+#[cfg(target_os = "windows")]
+fn arm_windows_local_return_gate(
+    context: &WindowsCaptureContext,
+    handoff: Option<(Edge, (f64, f64))>,
+) {
+    const RETURN_SAMPLE_TIMEOUT_MS: u64 = 100;
+
+    let mut gate = context
+        .local_return_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *gate = handoff.map(|(edge, expected)| WindowsLocalReturnGate {
+        edge,
+        expected,
+        expires_at_ms: windows_tick_ms().saturating_add(RETURN_SAMPLE_TIMEOUT_MS),
+    });
 }
 
 #[cfg(target_os = "windows")]
@@ -10317,6 +10414,50 @@ mod tests {
     }
 
     #[test]
+    fn windows_return_drops_old_edge_height_until_reveal_arrives() {
+        let mut gate = Some(WindowsLocalReturnGate {
+            edge: Edge::Right,
+            expected: (2555.0, 1375.0),
+            expires_at_ms: 1_100,
+        });
+        let snapshot = |x, y| WindowsMouseMoveSnapshot {
+            x,
+            y,
+            modifier_bits: 0,
+        };
+
+        assert!(
+            should_drop_windows_local_move_after_return(&mut gate, snapshot(2555.0, 786.0), 1_001),
+            "a delayed pre-handoff edge sample must not reopen the remote at its old height"
+        );
+        assert!(gate.is_some(), "the gate stays armed for the reveal sample");
+        assert!(!should_drop_windows_local_move_after_return(
+            &mut gate,
+            snapshot(2400.0, 1375.0),
+            1_002
+        ));
+        assert!(
+            gate.is_none(),
+            "the authoritative reveal sample disarms the gate"
+        );
+
+        gate = Some(WindowsLocalReturnGate {
+            edge: Edge::Right,
+            expected: (2555.0, 1375.0),
+            expires_at_ms: 1_100,
+        });
+        assert!(!should_drop_windows_local_move_after_return(
+            &mut gate,
+            snapshot(2555.0, 786.0),
+            1_100
+        ));
+        assert!(
+            gate.is_none(),
+            "a missing reveal sample cannot freeze local input"
+        );
+    }
+
+    #[test]
     fn windows_warp_guard_drops_pre_warp_backlog_but_keeps_real_motion() {
         let anchor = (960.0, 540.0);
         let mut guard = WindowsWarpGuard::default();
@@ -13092,6 +13233,28 @@ mod tests {
             input_packet_reliable_class(&normal_move, true),
             Some(quic_transport::ReliableInputClass::State)
         );
+    }
+
+    #[test]
+    fn cursor_park_uses_a_fast_copy_alongside_the_reliable_boundary() {
+        assert!(input_event_needs_fast_handoff_copy(
+            &InputEvent::CursorPark {
+                screen_id: "display-1".into(),
+                x: 100,
+                y: 200,
+                sequence: 7,
+            }
+        ));
+        assert!(!input_event_needs_fast_handoff_copy(
+            &InputEvent::MouseMove {
+                screen_id: "display-1".into(),
+                x: 100,
+                y: 200,
+                drag_button: None,
+                button_mask: Some(0),
+                sequence: 8,
+            }
+        ));
     }
 
     #[test]
