@@ -3911,11 +3911,20 @@ fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
     local_return_point(active)
 }
 
-/// When control returns to the local machine, move the controlled cursor into
-/// the far (bottom-right) corner of the remote screen instead of leaving it
-/// parked at the shared edge. True cursor hiding isn't reliably possible on the
-/// controlled side, so tucking it into a corner is the seamless-feeling
-/// approximation.
+/// When control returns to the local machine, tuck the controlled cursor out
+/// of the way. True cursor hiding isn't reliably possible on the controlled
+/// side, so tucking it is the seamless-feeling approximation.
+///
+/// Controlled macOS: park ON a clipping edge, at the end nearest this
+/// machine. The arrow's hotspot is its top-left tip and the body extends
+/// down-right, so only the RIGHT and BOTTOM screen edges clip it to a barely
+/// visible sliver (why the old far-corner park "looked like a dot"); the left
+/// and top edges show the full arrow. Corners themselves are avoided: macOS
+/// hot corners fire on pointer position alone, so the far-corner park
+/// triggered actions like "Show all applications" on every single handoff.
+///
+/// Controlled Windows (and anything else): keep the long-standing far-corner
+/// park unchanged.
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 fn send_remote_cursor_park(
     quic_transport: &quic_transport::TransportHandle,
@@ -3923,17 +3932,54 @@ fn send_remote_cursor_park(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    let (park_x, park_y) = remote_park_point(active);
     send_packet(
         quic_transport,
         &active.target,
         InputEvent::MouseMove {
             screen_id: active.current_screen_id.clone(),
-            x: (active.current_screen.width - 1).max(0),
-            y: (active.current_screen.height - 1).max(0),
+            x: park_x,
+            y: park_y,
         },
         layout_state,
         input_events,
     )
+}
+
+/// Distance a shared-edge park keeps from the screen corners, so an exit near
+/// the top/bottom of the edge cannot land the parked cursor inside a macOS
+/// hot-corner trip zone.
+const PARK_CORNER_CLEARANCE: i32 = 64;
+
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn remote_park_point(active: &ActiveTarget) -> (i32, i32) {
+    let width = active.current_screen.width;
+    let height = active.current_screen.height;
+    if !active.target.target_platform.eq_ignore_ascii_case("macos") {
+        return ((width - 1).max(0), (height - 1).max(0));
+    }
+
+    // `edge` is the LOCAL screen edge crossed to enter the remote, so this
+    // machine sits on the OPPOSITE side of the controlled screen. Pick the
+    // clipping edge (right/bottom) closest to that side.
+    let clear = |position: i32, extent: i32| {
+        position.clamp(
+            PARK_CORNER_CLEARANCE.min((extent / 2).max(0)),
+            (extent - 1 - PARK_CORNER_CLEARANCE).max((extent / 2).max(0)),
+        )
+    };
+    let x = active.x.round() as i32;
+    let y = active.y.round() as i32;
+    match active.target.edge {
+        // This machine is west of the Mac: bottom edge, west end.
+        Edge::Right => (clear(0, width), (height - 1).max(0)),
+        // East: the east edge itself clips — keep the exit height.
+        Edge::Left => ((width - 1).max(0), clear(y, height)),
+        // North: east edge, north end.
+        Edge::Bottom => ((width - 1).max(0), clear(0, height)),
+        // South: bottom edge — keep the exit x.
+        Edge::Top => (clear(x, width), (height - 1).max(0)),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5192,11 +5238,158 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     }
 }
 
+/// One pressed-button record for injected macOS click counting.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct MacClickDown {
+    button: MouseButton,
+    x: i32,
+    y: i32,
+    at: Instant,
+    count: u8,
+}
+
+/// Click counting for injected macOS mouse buttons. macOS does NOT infer
+/// double-clicks from timing for synthetic events — every injected Down/Up
+/// with `kCGMouseEventClickState` 0 is an independent single click, so remote
+/// double-clicks never registered in apps. Replicate the native rule: a press
+/// within the system double-click interval and a few px of the previous one
+/// raises the click count (capped at triple), and the release repeats the
+/// count of the press it pairs with.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacClickTracker {
+    last_down: Option<MacClickDown>,
+    pressed: [Option<MacClickDown>; 3],
+}
+
+#[cfg(target_os = "macos")]
+impl MacClickTracker {
+    const MAX_DISTANCE_PX: i32 = 8;
+
+    fn event_count(
+        &mut self,
+        button: MouseButton,
+        down: bool,
+        x: i32,
+        y: i32,
+        now: Instant,
+        double_click_interval: Duration,
+    ) -> i64 {
+        let index = match button {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            MouseButton::Middle => 2,
+        };
+
+        if down {
+            let count = self
+                .last_down
+                .filter(|last| {
+                    last.button == button
+                        && now.saturating_duration_since(last.at) <= double_click_interval
+                        && click_points_are_near(last.x, last.y, x, y, Self::MAX_DISTANCE_PX)
+                })
+                .map(|last| last.count.saturating_add(1).min(3))
+                .unwrap_or(1);
+            let click = MacClickDown {
+                button,
+                x,
+                y,
+                at: now,
+                count,
+            };
+            self.last_down = Some(click);
+            self.pressed[index] = Some(click);
+            return i64::from(count);
+        }
+
+        let Some(click) = self.pressed[index].take() else {
+            return 0;
+        };
+        if click_points_are_near(click.x, click.y, x, y, Self::MAX_DISTANCE_PX) {
+            i64::from(click.count)
+        } else {
+            // The button moved while held: that was a drag, not a click, and
+            // it must not chain into a double-click either.
+            self.last_down = None;
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn click_points_are_near(x1: i32, y1: i32, x2: i32, y2: i32, max_distance: i32) -> bool {
+    let dx = i64::from(x1) - i64::from(x2);
+    let dy = i64::from(y1) - i64::from(y2);
+    let max = i64::from(max_distance);
+    dx * dx + dy * dy <= max * max
+}
+
+/// The user's configured double-click speed ([NSEvent doubleClickInterval]),
+/// resolved once via the ObjC runtime and clamped to a sane range so a broken
+/// answer degrades to the macOS default feel instead of breaking clicks.
+#[cfg(target_os = "macos")]
+fn macos_double_click_interval() -> Duration {
+    static INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        use std::ffi::c_void;
+        use std::os::raw::c_char;
+
+        #[link(name = "objc")]
+        extern "C" {
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+
+        let seconds = unsafe {
+            let class = objc_getClass(b"NSEvent\0".as_ptr() as *const c_char);
+            if class.is_null() {
+                0.5
+            } else {
+                let selector = sel_registerName(b"doubleClickInterval\0".as_ptr() as *const c_char);
+                let get_interval: extern "C" fn(*mut c_void, *mut c_void) -> f64 =
+                    std::mem::transmute(objc_msgSend as *const ());
+                get_interval(class, selector)
+            }
+        };
+        Duration::from_secs_f64(if seconds.is_finite() && (0.1..=2.0).contains(&seconds) {
+            seconds
+        } else {
+            0.5
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_click_state(button: MouseButton, down: bool, x: i32, y: i32) -> i64 {
+    macos_click_tracker()
+        .lock()
+        .map(|mut tracker| {
+            tracker.event_count(
+                button,
+                down,
+                x,
+                y,
+                Instant::now(),
+                macos_double_click_interval(),
+            )
+        })
+        .unwrap_or(if down { 1 } else { 0 })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_click_tracker() -> &'static Mutex<MacClickTracker> {
+    static TRACKER: OnceLock<Mutex<MacClickTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(MacClickTracker::default()))
+}
+
 #[cfg(target_os = "macos")]
 fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     use core_graphics::{
         display::CGDisplay,
-        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton},
+        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
@@ -5217,6 +5410,10 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     let _ = CGDisplay::warp_mouse_cursor_position(point);
 
     if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
+        event.set_integer_value_field(
+            EventField::MOUSE_EVENT_CLICK_STATE,
+            macos_click_state(button, down, x, y),
+        );
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -5247,11 +5444,20 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
 #[cfg(target_os = "macos")]
 static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
+/// Latch so a held (auto-repeating) remote Caps Lock toggles the input source
+/// exactly once until its key-up arrives.
+#[cfg(target_os = "macos")]
+static MACOS_CAPS_LOCK_DOWN: AtomicBool = AtomicBool::new(false);
+
 /// Clears the tracked injected-modifier flags. Called when receiving stops so a
 /// dropped modifier key-up cannot leave Shift/Ctrl/Cmd stuck on for later keys.
 #[cfg(target_os = "macos")]
 pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
+    MACOS_CAPS_LOCK_DOWN.store(false, Ordering::Relaxed);
+    if let Ok(mut tracker) = macos_click_tracker().lock() {
+        *tracker = MacClickTracker::default();
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -5279,6 +5485,30 @@ fn inject_key(key_code: u16, down: bool) {
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
+    // VK_CAPITAL: replicate the macOS "Caps Lock switches input sources"
+    // behaviour for remote input. macOS honours that setting only for the
+    // physical key — an injected caps keycode toggles neither the IME nor the
+    // caps state — so post the system "Select the previous input source"
+    // hotkey (⌃Space) instead: HIToolbox then performs the switch exactly as
+    // for a physical press, including refreshing the focused app's input
+    // session (TISSelectInputSource from a background process updates the
+    // menu-bar indicator but the focused app keeps typing in the old source
+    // until refocused). Remote Caps Lock therefore never acts as a
+    // letter-case toggle on this Mac.
+    // ponytail: assumes the ⌃Space symbolic hotkey is enabled (macOS default,
+    // verified on this deployment); read com.apple.symbolichotkeys key 60 if
+    // this ever needs to adapt.
+    if key_code == 0x14 {
+        if down {
+            if !MACOS_CAPS_LOCK_DOWN.swap(true, Ordering::Relaxed) {
+                macos_post_select_previous_input_source();
+            }
+        } else {
+            MACOS_CAPS_LOCK_DOWN.store(false, Ordering::Relaxed);
+        }
+        return;
+    }
+
     // Keep the running modifier state in sync, so the modifier event itself and
     // every later key carry the right flags.
     if let Some(flag) = windows_vk_to_mac_flag(key_code) {
@@ -5301,13 +5531,77 @@ fn inject_key(key_code: u16, down: bool) {
     };
     match CGEvent::new_keyboard_event(source, mac_code, down) {
         Ok(event) => {
-            event.set_flags(CGEventFlags::from_bits_truncate(
-                MAC_INJECT_FLAGS.load(Ordering::Relaxed),
-            ));
+            let mut flags = CGEventFlags::from_bits_truncate(MAC_INJECT_FLAGS.load(Ordering::Relaxed));
+            // A physical Mac keyboard stamps the function-section flags on
+            // arrow/nav keys (arrows additionally carry the numeric-pad bit).
+            // Shortcut matching — system ones like ⌃← "move left a space" and
+            // app key equivalents like ⌘← — compares those flags, so injected
+            // arrows without them fire nothing: the historic "Ctrl+arrows do
+            // nothing on the Mac" bug.
+            flags |= mac_function_section_flags(mac_code);
+            event.set_flags(flags);
             event.post(CGEventTapLocation::HID);
         }
         Err(_) => log::warn!("inject_key: failed to build keyboard event for mac code {mac_code}"),
     }
+}
+
+/// Extra CGEventFlags a physical keyboard sets for function-section keys:
+/// arrows (123-126) carry Fn + numeric-pad; Home/End/PageUp/PageDown/forward
+/// Delete carry Fn. Everything else gets nothing extra.
+#[cfg(target_os = "macos")]
+fn mac_function_section_flags(mac_code: u16) -> core_graphics::event::CGEventFlags {
+    use core_graphics::event::CGEventFlags;
+
+    match mac_code {
+        // Left, Right, Down, Up
+        123..=126 => CGEventFlags::CGEventFlagSecondaryFn | CGEventFlags::CGEventFlagNumericPad,
+        // Home(115), PageUp(116), forward Delete(117), End(119), PageDown(121)
+        115 | 116 | 117 | 119 | 121 => CGEventFlags::CGEventFlagSecondaryFn,
+        _ => CGEventFlags::empty(),
+    }
+}
+
+/// Posts the system input-source toggle hotkey (⌃Space, symbolic hotkey 60)
+/// as a full physical-like sequence: Control down, Space down/up, Control up.
+/// Flags are set per event and deliberately plain ⌃ — a concurrently held
+/// remote modifier would form a different chord and miss the hotkey; the next
+/// injected key restores the tracked flags anyway.
+#[cfg(target_os = "macos")]
+fn macos_post_select_previous_input_source() {
+    use core_graphics::{
+        event::{CGEvent, CGEventFlags, CGEventTapLocation},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    const MAC_KEY_CONTROL: u16 = 59; // kVK_Control
+    const MAC_KEY_SPACE: u16 = 49; // kVK_Space
+
+    let control = CGEventFlags::CGEventFlagControl;
+    let no_flags = CGEventFlags::empty();
+    let sequence = [
+        (MAC_KEY_CONTROL, true, control),
+        (MAC_KEY_SPACE, true, control),
+        (MAC_KEY_SPACE, false, control),
+        (MAC_KEY_CONTROL, false, no_flags),
+    ];
+    for (mac_code, down, flags) in sequence {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            log::warn!("caps toggle: failed to create CGEventSource");
+            return;
+        };
+        match CGEvent::new_keyboard_event(source, mac_code, down) {
+            Ok(event) => {
+                event.set_flags(flags);
+                event.post(CGEventTapLocation::HID);
+            }
+            Err(_) => {
+                log::warn!("caps toggle: failed to build keyboard event for mac code {mac_code}");
+                return;
+            }
+        }
+    }
+    log::info!("[diag] caps: posted input-source toggle (ctrl+space)");
 }
 
 #[cfg(target_os = "windows")]
@@ -5689,6 +5983,139 @@ mod tests {
 
         assert!(!returned);
         assert_eq!(guarded.x, 1.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_click_tracker_emits_matching_double_click_counts() {
+        let mut tracker = MacClickTracker::default();
+        let start = Instant::now();
+        let interval = Duration::from_millis(500);
+
+        assert_eq!(
+            tracker.event_count(MouseButton::Left, true, 100, 200, start, interval),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                100,
+                200,
+                start + Duration::from_millis(40),
+                interval,
+            ),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                true,
+                102,
+                201,
+                start + Duration::from_millis(180),
+                interval,
+            ),
+            2,
+            "a nearby press inside the interval must raise the click count"
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                102,
+                201,
+                start + Duration::from_millis(220),
+                interval,
+            ),
+            2
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_click_tracker_resets_after_drag_timeout_or_button_change() {
+        let mut tracker = MacClickTracker::default();
+        let start = Instant::now();
+        let interval = Duration::from_millis(500);
+
+        assert_eq!(
+            tracker.event_count(MouseButton::Left, true, 10, 10, start, interval),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                30,
+                30,
+                start + Duration::from_millis(40),
+                interval,
+            ),
+            0,
+            "a drag release is not a click"
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Right,
+                true,
+                10,
+                10,
+                start + Duration::from_millis(100),
+                interval,
+            ),
+            1,
+            "a different button starts its own click chain"
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                true,
+                10,
+                10,
+                start + Duration::from_millis(700),
+                interval,
+            ),
+            1,
+            "a press after the interval starts over at a single click"
+        );
+    }
+
+    #[test]
+    fn remote_park_point_tucks_mac_at_shared_edge_and_keeps_windows_corner() {
+        let target = target_for_coordinate_tests(); // edge=Right, platform=windows, remote 2560x1440
+        let remote = target.remote_screen.clone();
+        let mut active = ActiveTarget {
+            target,
+            current_screen: remote.clone(),
+            current_screen_id: remote.id.clone(),
+            x: 12.0,
+            y: 700.0,
+            invert_y: false,
+        };
+
+        // Controlled Windows keeps the long-standing far-corner park.
+        assert_eq!(remote_park_point(&active), (2559, 1439));
+
+        // Controlled macOS entered through OUR right edge (this machine sits
+        // to its west): bottom clipping edge, west end, clear of the corner.
+        active.target.target_platform = "macos".into();
+        assert_eq!(
+            remote_park_point(&active),
+            (PARK_CORNER_CLEARANCE, 1439)
+        );
+
+        // Entered through OUR left edge (this machine to its east): the east
+        // edge clips the arrow itself — park there at the exit height.
+        active.target.edge = Edge::Left;
+        assert_eq!(remote_park_point(&active), (2559, 700));
+
+        // An exit right next to a corner still keeps hot-corner clearance.
+        active.y = 1439.0;
+        assert_eq!(
+            remote_park_point(&active),
+            (2559, 1439 - PARK_CORNER_CLEARANCE)
+        );
     }
 
     #[test]
