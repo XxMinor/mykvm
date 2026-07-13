@@ -4694,35 +4694,29 @@ struct WindowsPendingMouseMoves {
 struct WindowsLocalReturnGate {
     edge: Edge,
     expected: (f64, f64),
-    expires_at_ms: u64,
 }
 
 #[cfg(any(target_os = "windows", test))]
 fn should_drop_windows_local_move_after_return(
     gate: &mut Option<WindowsLocalReturnGate>,
     snapshot: WindowsMouseMoveSnapshot,
-    now_ms: u64,
 ) -> bool {
-    const RETURN_AXIS_TOLERANCE_PX: f64 = 32.0;
+    const EDGE_RELEASE_DISTANCE_PX: f64 = 1.0;
 
     let Some(active) = gate.as_ref() else {
         return false;
     };
-    if now_ms >= active.expires_at_ms {
-        *gate = None;
-        return false;
-    }
 
-    // A low-level hook sample generated before handoff can be serviced after
-    // remote_active flips false. If that old edge point is admitted, it opens
-    // a new remote session at the previous height and warps the cursor there.
-    // Wait for the SetCursorPos reveal sample, identified by the coordinate
-    // parallel to the shared edge. Motion inward from the edge is unrestricted.
-    let axis_error = match active.edge {
-        Edge::Left | Edge::Right => (snapshot.y - active.expected.1).abs(),
-        Edge::Top | Edge::Bottom => (snapshot.x - active.expected.0).abs(),
+    // SetCursorPos's correct reveal can arrive before older edge samples. Keep
+    // swallowing boundary motion until the physical pointer actually moves
+    // inward, otherwise a late sample reopens the remote at the old height.
+    let moved_inward = match active.edge {
+        Edge::Right => snapshot.x < active.expected.0 - EDGE_RELEASE_DISTANCE_PX,
+        Edge::Left => snapshot.x > active.expected.0 + EDGE_RELEASE_DISTANCE_PX,
+        Edge::Bottom => snapshot.y < active.expected.1 - EDGE_RELEASE_DISTANCE_PX,
+        Edge::Top => snapshot.y > active.expected.1 + EDGE_RELEASE_DISTANCE_PX,
     };
-    if axis_error <= RETURN_AXIS_TOLERANCE_PX {
+    if moved_inward {
         *gate = None;
         false
     } else {
@@ -5643,14 +5637,26 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     if message == WM_MOUSEMOVE {
         let modifier_bits = context.hook_modifier_bits.load(Ordering::Acquire);
         if !context.remote_active.load(Ordering::Acquire) {
-            queue_windows_local_mouse_move(
-                &context,
-                WindowsMouseMoveSnapshot {
-                    x: event.pt.x as f64,
-                    y: event.pt.y as f64,
-                    modifier_bits,
-                },
-            );
+            let snapshot = WindowsMouseMoveSnapshot {
+                x: event.pt.x as f64,
+                y: event.pt.y as f64,
+                modifier_bits,
+            };
+            let should_drop = match context.local_return_gate.try_lock() {
+                Ok(mut gate) => should_drop_windows_local_move_after_return(&mut gate, snapshot),
+                Err(TryLockError::Poisoned(poison)) => {
+                    let mut gate = poison.into_inner();
+                    should_drop_windows_local_move_after_return(&mut gate, snapshot)
+                }
+                // The return path arms the gate before publishing remote=false.
+                // If that tiny critical section is still active, dropping one
+                // move is safer than admitting an old edge sample.
+                Err(TryLockError::WouldBlock) => true,
+            };
+            if should_drop {
+                return 1;
+            }
+            queue_windows_local_mouse_move(&context, snapshot);
             return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
         }
 
@@ -6403,18 +6409,6 @@ fn handle_windows_local_mouse_move(
     if context.remote_active.load(Ordering::Acquire) {
         return true;
     }
-    let should_drop = match context.local_return_gate.lock() {
-        Ok(mut gate) => {
-            should_drop_windows_local_move_after_return(&mut gate, snapshot, windows_tick_ms())
-        }
-        Err(poison) => {
-            let mut gate = poison.into_inner();
-            should_drop_windows_local_move_after_return(&mut gate, snapshot, windows_tick_ms())
-        }
-    };
-    if should_drop {
-        return true;
-    }
     let x = snapshot.x;
     let y = snapshot.y;
 
@@ -6639,17 +6633,11 @@ fn arm_windows_local_return_gate(
     context: &WindowsCaptureContext,
     handoff: Option<(Edge, (f64, f64))>,
 ) {
-    const RETURN_SAMPLE_TIMEOUT_MS: u64 = 100;
-
     let mut gate = context
         .local_return_gate
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    *gate = handoff.map(|(edge, expected)| WindowsLocalReturnGate {
-        edge,
-        expected,
-        expires_at_ms: windows_tick_ms().saturating_add(RETURN_SAMPLE_TIMEOUT_MS),
-    });
+    *gate = handoff.map(|(edge, expected)| WindowsLocalReturnGate { edge, expected });
 }
 
 #[cfg(target_os = "windows")]
@@ -10418,7 +10406,6 @@ mod tests {
         let mut gate = Some(WindowsLocalReturnGate {
             edge: Edge::Right,
             expected: (2555.0, 1375.0),
-            expires_at_ms: 1_100,
         });
         let snapshot = |x, y| WindowsMouseMoveSnapshot {
             x,
@@ -10427,33 +10414,33 @@ mod tests {
         };
 
         assert!(
-            should_drop_windows_local_move_after_return(&mut gate, snapshot(2555.0, 786.0), 1_001),
+            should_drop_windows_local_move_after_return(&mut gate, snapshot(2555.0, 786.0)),
             "a delayed pre-handoff edge sample must not reopen the remote at its old height"
         );
         assert!(gate.is_some(), "the gate stays armed for the reveal sample");
-        assert!(!should_drop_windows_local_move_after_return(
+        assert!(should_drop_windows_local_move_after_return(
             &mut gate,
-            snapshot(2400.0, 1375.0),
-            1_002
+            snapshot(2555.0, 1375.0)
         ));
         assert!(
-            gate.is_none(),
-            "the authoritative reveal sample disarms the gate"
+            gate.is_some(),
+            "the boundary reveal must not disarm the gate before stale anchor samples finish"
         );
-
-        gate = Some(WindowsLocalReturnGate {
-            edge: Edge::Right,
-            expected: (2555.0, 1375.0),
-            expires_at_ms: 1_100,
-        });
+        assert!(should_drop_windows_local_move_after_return(
+            &mut gate,
+            snapshot(2555.0, 786.0)
+        ));
+        assert!(
+            gate.is_some(),
+            "a delayed pre-handoff edge sample must not reopen the remote after 100 ms"
+        );
         assert!(!should_drop_windows_local_move_after_return(
             &mut gate,
-            snapshot(2555.0, 786.0),
-            1_100
+            snapshot(2400.0, 1375.0)
         ));
         assert!(
             gate.is_none(),
-            "a missing reveal sample cannot freeze local input"
+            "real inward motion releases the return gate"
         );
     }
 
