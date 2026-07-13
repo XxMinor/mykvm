@@ -3873,7 +3873,33 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
 }
 
 fn hide_main_window_handle(app: &AppHandle) -> Result<(), String> {
+    if main_window_stays_alive_when_hidden(std::env::consts::OS) {
+        return hide_existing_main_window_handle(app);
+    }
+
     destroy_main_window_handle(app)
+}
+
+fn main_window_stays_alive_when_hidden(target_os: &str) -> bool {
+    target_os == "windows"
+}
+
+fn hide_existing_main_window_handle(app: &AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("main") else {
+        set_main_window_visible(app, false);
+        set_main_window_focused(app, false);
+        return Ok(());
+    };
+    let result = window
+        .hide()
+        .map_err(|error| format!("failed to hide main window: {error}"));
+
+    if result.is_ok() {
+        set_main_window_visible(app, false);
+        set_main_window_focused(app, false);
+    }
+
+    result
 }
 
 fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
@@ -9144,6 +9170,13 @@ mod tests {
             Some(tauri::RESTART_EXIT_CODE),
             false
         ));
+    }
+
+    #[test]
+    fn windows_keeps_main_webview_alive_when_hidden() {
+        assert!(main_window_stays_alive_when_hidden("windows"));
+        assert!(!main_window_stays_alive_when_hidden("macos"));
+        assert!(!main_window_stays_alive_when_hidden("linux"));
     }
 
     #[test]

@@ -979,6 +979,10 @@ function App() {
 
     let active = true;
     const samplePerformance = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+
       readPerformanceSample()
         .then((sample) => {
           if (!active) {
@@ -1009,6 +1013,10 @@ function App() {
 
     let active = true;
     const refresh = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+
       readDiagnosticInfo()
         .then((info) => {
           if (active) {
