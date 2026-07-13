@@ -101,11 +101,13 @@ const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
 static INPUT_DEBUG_EVENTS: OnceLock<Mutex<Vec<InputDebugEvent>>> = OnceLock::new();
+static LAST_SUCCESSFUL_MOUSE_DEBUG_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE: AtomicBool = AtomicBool::new(true);
 const INPUT_DEBUG_MAX_EVENTS: usize = 32;
+const INPUT_DEBUG_MOUSE_SAMPLE_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Edge {
@@ -266,6 +268,37 @@ fn now_input_debug_ms() -> u64 {
 }
 
 pub fn record_input_debug_event(event: InputDebugEvent) {
+    if should_record_input_debug_event(&event.event_type, &event.result, event.timestamp_ms) {
+        push_input_debug_event(event);
+    }
+}
+
+fn record_input_debug_event_lazy<F>(event_type: &str, result: &str, timestamp_ms: u64, build: F)
+where
+    F: FnOnce() -> InputDebugEvent,
+{
+    if should_record_input_debug_event(event_type, result, timestamp_ms) {
+        push_input_debug_event(build());
+    }
+}
+
+fn should_record_input_debug_event(event_type: &str, result: &str, timestamp_ms: u64) -> bool {
+    event_type != "mouseMove" || result != "injected" || sample_mouse_debug(timestamp_ms)
+}
+
+fn sample_mouse_debug(timestamp_ms: u64) -> bool {
+    LAST_SUCCESSFUL_MOUSE_DEBUG_MS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+            mouse_debug_sample_due(previous, timestamp_ms).then_some(timestamp_ms)
+        })
+        .is_ok()
+}
+
+fn mouse_debug_sample_due(previous_ms: u64, timestamp_ms: u64) -> bool {
+    previous_ms == 0 || timestamp_ms.saturating_sub(previous_ms) >= INPUT_DEBUG_MOUSE_SAMPLE_MS
+}
+
+fn push_input_debug_event(event: InputDebugEvent) {
     let Ok(mut events) = input_debug_events().lock() else {
         return;
     };
@@ -357,6 +390,7 @@ pub fn input_debug_report_lines(summary: &InputDebugInfo) -> Vec<String> {
 
 #[cfg(test)]
 fn clear_input_debug_events_for_tests() {
+    LAST_SUCCESSFUL_MOUSE_DEBUG_MS.store(0, Ordering::Relaxed);
     if let Ok(mut events) = input_debug_events().lock() {
         events.clear();
     }
@@ -2125,12 +2159,12 @@ fn inject_input_event(
     controller_id: &str,
 ) -> bool {
     let debug_event = input_debug_event_from_input_event(&event);
-    let Some(command) = input_event_to_command(layout, native_layout, event) else {
+    let Some(command) = input_event_to_command(layout, native_layout, &event) else {
         record_input_debug_event(InputDebugEvent {
             timestamp_ms: now_input_debug_ms(),
             controller_id: controller_id.to_string(),
-            event_type: debug_event.event_type,
-            screen_id: debug_event.screen_id,
+            event_type: debug_event.event_type.into(),
+            screen_id: debug_event.screen_id.to_string(),
             relative_x: debug_event.relative_x,
             relative_y: debug_event.relative_y,
             absolute_x: None,
@@ -2166,25 +2200,31 @@ fn inject_input_event(
         if route_to_helper {
             match windows_pipe_dispatcher().send(&command) {
                 Ok(()) => {
-                    record_input_debug_event(InputDebugEvent {
-                        timestamp_ms: now_input_debug_ms(),
-                        controller_id: controller_id.to_string(),
-                        event_type: debug_event.event_type,
-                        screen_id: debug_event.screen_id,
-                        relative_x: debug_event.relative_x,
-                        relative_y: debug_event.relative_y,
-                        absolute_x,
-                        absolute_y,
-                        desktop: if desktop_is_default {
-                            "default".into()
-                        } else {
-                            "secure".into()
+                    let timestamp_ms = now_input_debug_ms();
+                    record_input_debug_event_lazy(
+                        debug_event.event_type,
+                        "injected",
+                        timestamp_ms,
+                        || InputDebugEvent {
+                            timestamp_ms,
+                            controller_id: controller_id.to_string(),
+                            event_type: debug_event.event_type.into(),
+                            screen_id: debug_event.screen_id.to_string(),
+                            relative_x: debug_event.relative_x,
+                            relative_y: debug_event.relative_y,
+                            absolute_x,
+                            absolute_y,
+                            desktop: if desktop_is_default {
+                                "default".into()
+                            } else {
+                                "secure".into()
+                            },
+                            route: "helper".into(),
+                            pipe_available: Some(true),
+                            result: "injected".into(),
+                            detail: "dispatched through input helper".into(),
                         },
-                        route: "helper".into(),
-                        pipe_available: Some(true),
-                        result: "injected".into(),
-                        detail: "dispatched through input helper".into(),
-                    });
+                    );
                     return true;
                 }
                 Err(error) => {
@@ -2192,8 +2232,8 @@ fn inject_input_event(
                     record_input_debug_event(InputDebugEvent {
                         timestamp_ms: now_input_debug_ms(),
                         controller_id: controller_id.to_string(),
-                        event_type: debug_event.event_type.clone(),
-                        screen_id: debug_event.screen_id.clone(),
+                        event_type: debug_event.event_type.into(),
+                        screen_id: debug_event.screen_id.to_string(),
                         relative_x: debug_event.relative_x,
                         relative_y: debug_event.relative_y,
                         absolute_x,
@@ -2212,32 +2252,35 @@ fn inject_input_event(
             }
         }
         inject_input_command(command);
-        record_input_debug_event(InputDebugEvent {
-            timestamp_ms: now_input_debug_ms(),
-            controller_id: controller_id.to_string(),
-            event_type: debug_event.event_type,
-            screen_id: debug_event.screen_id,
-            relative_x: debug_event.relative_x,
-            relative_y: debug_event.relative_y,
-            absolute_x,
-            absolute_y,
-            desktop: if desktop_is_default {
-                "default".into()
-            } else {
-                "secure".into()
-            },
-            route: if route_to_helper {
-                "helper-fallback".into()
-            } else {
-                "local".into()
-            },
-            pipe_available: if route_to_helper { Some(false) } else { None },
-            result: "injected".into(),
-            detail: if route_to_helper {
-                "fell back to local injection".into()
-            } else {
-                "injected locally".into()
-            },
+        let timestamp_ms = now_input_debug_ms();
+        record_input_debug_event_lazy(debug_event.event_type, "injected", timestamp_ms, || {
+            InputDebugEvent {
+                timestamp_ms,
+                controller_id: controller_id.to_string(),
+                event_type: debug_event.event_type.into(),
+                screen_id: debug_event.screen_id.to_string(),
+                relative_x: debug_event.relative_x,
+                relative_y: debug_event.relative_y,
+                absolute_x,
+                absolute_y,
+                desktop: if desktop_is_default {
+                    "default".into()
+                } else {
+                    "secure".into()
+                },
+                route: if route_to_helper {
+                    "helper-fallback".into()
+                } else {
+                    "local".into()
+                },
+                pipe_available: if route_to_helper { Some(false) } else { None },
+                result: "injected".into(),
+                detail: if route_to_helper {
+                    "fell back to local injection".into()
+                } else {
+                    "injected locally".into()
+                },
+            }
         });
         return true;
     }
@@ -2246,20 +2289,23 @@ fn inject_input_event(
     {
         let (absolute_x, absolute_y) = command_coordinates(&command);
         inject_input_command(command);
-        record_input_debug_event(InputDebugEvent {
-            timestamp_ms: now_input_debug_ms(),
-            controller_id: controller_id.to_string(),
-            event_type: debug_event.event_type,
-            screen_id: debug_event.screen_id,
-            relative_x: debug_event.relative_x,
-            relative_y: debug_event.relative_y,
-            absolute_x,
-            absolute_y,
-            desktop: "n/a".into(),
-            route: "local".into(),
-            pipe_available: None,
-            result: "injected".into(),
-            detail: "injected locally".into(),
+        let timestamp_ms = now_input_debug_ms();
+        record_input_debug_event_lazy(debug_event.event_type, "injected", timestamp_ms, || {
+            InputDebugEvent {
+                timestamp_ms,
+                controller_id: controller_id.to_string(),
+                event_type: debug_event.event_type.into(),
+                screen_id: debug_event.screen_id.to_string(),
+                relative_x: debug_event.relative_x,
+                relative_y: debug_event.relative_y,
+                absolute_x,
+                absolute_y,
+                desktop: "n/a".into(),
+                route: "local".into(),
+                pipe_available: None,
+                result: "injected".into(),
+                detail: "injected locally".into(),
+            }
         });
         true
     }
@@ -2313,22 +2359,22 @@ fn windows_inject_desktop_is_default() -> bool {
 fn input_event_to_command(
     layout: &LayoutState,
     native_layout: &LayoutState,
-    event: InputEvent,
+    event: &InputEvent,
 ) -> Option<InputCommand> {
     match event {
         InputEvent::MouseMove { screen_id, x, y } => {
-            if let Some(screen) = local_screen_for_event(layout, &screen_id) {
-                let native_screen = local_screen_for_event(native_layout, &screen_id)
+            if let Some(screen) = local_screen_for_event(layout, screen_id) {
+                let native_screen = local_screen_for_event(native_layout, screen_id)
                     .map(platform_native_screen)
                     .unwrap_or_else(|| platform_native_screen(screen));
                 let absolute_x = map_relative_to_native_axis(
-                    x,
+                    *x,
                     screen.width,
                     native_screen.x,
                     native_screen.width,
                 );
                 let absolute_y = map_relative_to_native_axis(
-                    y,
+                    *y,
                     screen.height,
                     native_screen.y,
                     native_screen.height,
@@ -2343,44 +2389,55 @@ fn input_event_to_command(
             None
         }
         InputEvent::MouseButton { button, down } => {
-            let (x, y) = update_remote_mouse_button(button, down);
-            Some(InputCommand::MouseButton { button, down, x, y })
+            let (x, y) = update_remote_mouse_button(*button, *down);
+            Some(InputCommand::MouseButton {
+                button: *button,
+                down: *down,
+                x,
+                y,
+            })
         }
-        InputEvent::Scroll { delta_x, delta_y } => Some(InputCommand::Scroll { delta_x, delta_y }),
-        InputEvent::Key { key_code, down } => Some(InputCommand::Key { key_code, down }),
+        InputEvent::Scroll { delta_x, delta_y } => Some(InputCommand::Scroll {
+            delta_x: *delta_x,
+            delta_y: *delta_y,
+        }),
+        InputEvent::Key { key_code, down } => Some(InputCommand::Key {
+            key_code: *key_code,
+            down: *down,
+        }),
     }
 }
 
-struct InputDebugEventSeed {
-    event_type: String,
-    screen_id: String,
+struct InputDebugEventSeed<'a> {
+    event_type: &'static str,
+    screen_id: &'a str,
     relative_x: Option<i32>,
     relative_y: Option<i32>,
 }
 
-fn input_debug_event_from_input_event(event: &InputEvent) -> InputDebugEventSeed {
+fn input_debug_event_from_input_event(event: &InputEvent) -> InputDebugEventSeed<'_> {
     match event {
         InputEvent::MouseMove { screen_id, x, y } => InputDebugEventSeed {
-            event_type: "mouseMove".into(),
-            screen_id: screen_id.clone(),
+            event_type: "mouseMove",
+            screen_id,
             relative_x: Some(*x),
             relative_y: Some(*y),
         },
         InputEvent::MouseButton { .. } => InputDebugEventSeed {
-            event_type: "mouseButton".into(),
-            screen_id: String::new(),
+            event_type: "mouseButton",
+            screen_id: "",
             relative_x: None,
             relative_y: None,
         },
         InputEvent::Scroll { .. } => InputDebugEventSeed {
-            event_type: "scroll".into(),
-            screen_id: String::new(),
+            event_type: "scroll",
+            screen_id: "",
             relative_x: None,
             relative_y: None,
         },
         InputEvent::Key { .. } => InputDebugEventSeed {
-            event_type: "key".into(),
-            screen_id: String::new(),
+            event_type: "key",
+            screen_id: "",
             relative_x: None,
             relative_y: None,
         },
@@ -5746,7 +5803,7 @@ mod tests {
             record_input_debug_event(InputDebugEvent {
                 timestamp_ms: index as u64,
                 controller_id: format!("controller-{index}"),
-                event_type: "mouseMove".into(),
+                event_type: "key".into(),
                 screen_id: "screen-1".into(),
                 relative_x: Some(index as i32),
                 relative_y: Some(index as i32 + 1),
@@ -5840,6 +5897,13 @@ mod tests {
             .any(|line| line.contains("route=helper-fallback")));
         assert!(lines.iter().any(|line| line.contains("rel=(10,20)")));
         assert!(lines.iter().any(|line| line.contains("abs=(110,220)")));
+    }
+
+    #[test]
+    fn input_debug_samples_successful_mouse_moves() {
+        assert!(mouse_debug_sample_due(0, 1_000));
+        assert!(!mouse_debug_sample_due(1_000, 1_100));
+        assert!(mouse_debug_sample_due(1_000, 1_300));
     }
 
     #[cfg(target_os = "macos")]
@@ -6595,7 +6659,7 @@ mod tests {
         let command = input_event_to_command(
             &layout,
             &native_layout,
-            InputEvent::MouseMove {
+            &InputEvent::MouseMove {
                 screen_id: "local-display-1".into(),
                 x: 960,
                 y: 540,

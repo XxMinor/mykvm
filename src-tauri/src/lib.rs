@@ -5200,8 +5200,19 @@ fn run_clipboard_sync(
     let mut sequence = now_ms();
     let mut consecutive_failures: u32 = 0;
     let mut backoff_until: Option<Instant> = None;
+    let mut last_change_token = clipboard::change_token();
+    let mut local_change_pending = false;
 
     while !stop.load(Ordering::Relaxed) {
+        let change_token = clipboard::change_token();
+        if change_token.is_some() && change_token != last_change_token {
+            last_change_token = change_token;
+            local_change_pending = true;
+            last_failed = None;
+            consecutive_failures = 0;
+            backoff_until = None;
+        }
+
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
             thread::sleep(Duration::from_millis(120));
             last_poll = Instant::now() - Duration::from_secs(1);
@@ -5248,24 +5259,28 @@ fn run_clipboard_sync(
                 .map(|seen| seen.as_deref() == Some(signature.as_str()))
                 .unwrap_or(false);
             if is_known_echo {
+                last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
+                local_change_pending = false;
                 continue;
             }
             if let Ok(mut seen) = clipboard_seen_text.lock() {
                 *seen = None;
             }
+        } else if let Ok(mut seen) = clipboard_seen_text.lock() {
+            *seen = None;
         }
 
         if content.is_oversized() {
             continue;
         }
 
-        if last_sent
-            .as_ref()
-            .map(|(device_id, addr, previous)| {
-                device_id == &target.device_id && addr == &target.addr && previous == &signature
-            })
-            .unwrap_or(false)
-        {
+        if clipboard_signature_already_sent(
+            &last_sent,
+            &target.device_id,
+            &target.addr,
+            &signature,
+            local_change_pending,
+        ) {
             continue;
         }
         if last_failed
@@ -5278,23 +5293,6 @@ fn run_clipboard_sync(
             })
             .unwrap_or(false)
         {
-            continue;
-        }
-
-        let should_send = clipboard_seen_text
-            .lock()
-            .map(|mut seen| {
-                if seen.as_deref() == Some(signature.as_str()) {
-                    *seen = None;
-                    false
-                } else {
-                    true
-                }
-            })
-            .unwrap_or(true);
-
-        if !should_send {
-            last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
             continue;
         }
 
@@ -5339,6 +5337,7 @@ fn run_clipboard_sync(
                 );
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, signature));
+                local_change_pending = false;
             } else {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let backoff_ms = CLIPBOARD_RETRY_INTERVAL_MS
@@ -5357,6 +5356,24 @@ fn run_clipboard_sync(
             }
         }
     }
+}
+
+fn clipboard_signature_already_sent(
+    last_sent: &Option<(String, String, String)>,
+    device_id: &str,
+    addr: &str,
+    signature: &str,
+    local_change_pending: bool,
+) -> bool {
+    !local_change_pending
+        && last_sent
+            .as_ref()
+            .map(|(previous_device, previous_addr, previous_signature)| {
+                previous_device == device_id
+                    && previous_addr == addr
+                    && previous_signature == signature
+            })
+            .unwrap_or(false)
 }
 
 /// True while we are inside the post-write grace window (see
@@ -8723,6 +8740,30 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn clipboard_sequence_change_resends_identical_content() {
+        let last_sent = Some((
+            "peer-a".to_string(),
+            "10.0.0.2:47834".to_string(),
+            "text:hello".to_string(),
+        ));
+
+        assert!(clipboard_signature_already_sent(
+            &last_sent,
+            "peer-a",
+            "10.0.0.2:47834",
+            "text:hello",
+            false,
+        ));
+        assert!(!clipboard_signature_already_sent(
+            &last_sent,
+            "peer-a",
+            "10.0.0.2:47834",
+            "text:hello",
+            true,
+        ));
     }
 
     #[test]

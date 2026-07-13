@@ -27,6 +27,18 @@ pub(crate) enum ClipboardContent {
     Image(ClipboardImage),
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn change_token() -> Option<u64> {
+    let sequence =
+        unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    (sequence != 0).then_some(sequence as u64)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn change_token() -> Option<u64> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardContentHint {
     Image,
