@@ -31,3 +31,14 @@ case "$APP_SOURCE" in
 esac
 
 open "$APP_DEST"
+
+if command -v netstat >/dev/null 2>&1; then
+  sleep 6
+  if ! netstat -anv -p udp 2>/dev/null | grep -q 'mykvm:'; then
+    osascript -e 'tell application id "com.xzhpl.mykvm" to quit' 2>/dev/null || true
+    sleep 2
+    pkill -f '/mykvm\.app/Contents/MacOS/mykvm' 2>/dev/null || true
+    sleep 1
+    open "$APP_DEST"
+  fi
+fi

@@ -88,21 +88,112 @@ pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
 /// when the platform can identify a current image format, wait for an image
 /// read instead of falling back to stale text from a previous clipboard format.
 pub(crate) fn read_content() -> Option<ClipboardContent> {
-    match content_hint() {
-        ClipboardContentHint::Image => read_image().map(ClipboardContent::Image),
-        ClipboardContentHint::Text => read_text()
-            .ok()
-            .filter(|text| !text.is_empty())
-            .map(ClipboardContent::Text),
-        ClipboardContentHint::Unknown => {
-            if let Some(image) = read_image() {
-                return Some(ClipboardContent::Image(image));
-            }
-            read_text()
-                .ok()
-                .filter(|text| !text.is_empty())
-                .map(ClipboardContent::Text)
+    read_content_for_hint(content_hint(), read_text_content, read_image_content)
+}
+
+fn read_content_for_hint<F, G>(
+    hint: ClipboardContentHint,
+    mut read_text: F,
+    mut read_image: G,
+) -> Option<ClipboardContent>
+where
+    F: FnMut() -> Option<ClipboardContent>,
+    G: FnMut() -> Option<ClipboardContent>,
+{
+    match hint {
+        ClipboardContentHint::Image => read_image(),
+        ClipboardContentHint::Text => read_text(),
+        ClipboardContentHint::Unknown => read_unknown_content(read_text, read_image),
+    }
+}
+
+fn read_text_content() -> Option<ClipboardContent> {
+    read_text()
+        .ok()
+        .filter(|text| !text.is_empty())
+        .map(ClipboardContent::Text)
+}
+
+fn read_image_content() -> Option<ClipboardContent> {
+    read_image().map(ClipboardContent::Image)
+}
+
+#[cfg(target_os = "windows")]
+fn read_unknown_content<F, G>(read_text: F, mut read_image: G) -> Option<ClipboardContent>
+where
+    F: FnMut() -> Option<ClipboardContent>,
+    G: FnMut() -> Option<ClipboardContent>,
+{
+    read_image().or_else(read_text)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_unknown_content<F, G>(mut read_text: F, read_image: G) -> Option<ClipboardContent>
+where
+    F: FnMut() -> Option<ClipboardContent>,
+    G: FnMut() -> Option<ClipboardContent>,
+{
+    read_text().or_else(read_image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unknown_clipboard_prefers_text_before_image() {
+        let content = read_content_for_hint(
+            ClipboardContentHint::Unknown,
+            || Some(ClipboardContent::Text("中文测试 abc 123".into())),
+            || {
+                Some(ClipboardContent::Image(ClipboardImage {
+                    width: 1,
+                    height: 1,
+                    rgba_base64: "AAAAAA==".into(),
+                    compressed: false,
+                }))
+            },
+        );
+
+        match content {
+            Some(ClipboardContent::Text(text)) => assert_eq!(text, "中文测试 abc 123"),
+            _ => panic!("expected text to win when the platform cannot identify clipboard format"),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unknown_clipboard_keeps_windows_image_first_fallback() {
+        let content = read_content_for_hint(
+            ClipboardContentHint::Unknown,
+            || Some(ClipboardContent::Text("中文测试 abc 123".into())),
+            || {
+                Some(ClipboardContent::Image(ClipboardImage {
+                    width: 1,
+                    height: 1,
+                    rgba_base64: "AAAAAA==".into(),
+                }))
+            },
+        );
+
+        match content {
+            Some(ClipboardContent::Image(image)) => assert_eq!(image.width, 1),
+            _ => panic!("expected Windows fallback to keep image priority"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn utf8_command_sets_locale_for_clipboard_tools() {
+        let command = utf8_command("pbpaste");
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect();
+
+        assert_eq!(envs.get("LANG"), Some(&"en_US.UTF-8"));
+        assert_eq!(envs.get("LC_CTYPE"), Some(&"en_US.UTF-8"));
     }
 }
 
@@ -196,7 +287,7 @@ fn content_hint() -> ClipboardContentHint {
     };
     use windows_sys::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_UNICODETEXT};
 
-    let png_format = unsafe { RegisterClipboardFormatW(wide_null("PNG").as_ptr()) };
+    let png_format = unsafe { RegisterClipboardFormatW(crate::wide_null("PNG").as_ptr()) };
     let image_formats = [
         png_format,
         u32::from(CF_DIBV5),
@@ -283,9 +374,7 @@ fn decode_windows_dib_image(data: &[u8]) -> Option<ClipboardImage> {
     }
 
     let (data, compressed) = match compress_rgba(&bytes) {
-        Some(compressed_bytes) if compressed_bytes.len() < bytes.len() => {
-            (compressed_bytes, true)
-        }
+        Some(compressed_bytes) if compressed_bytes.len() < bytes.len() => (compressed_bytes, true),
         _ => (bytes, false),
     };
 
@@ -295,11 +384,6 @@ fn decode_windows_dib_image(data: &[u8]) -> Option<ClipboardImage> {
         rgba_base64: BASE64.encode(&data),
         compressed,
     })
-}
-
-#[cfg(target_os = "windows")]
-fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(target_os = "windows")]
@@ -316,7 +400,7 @@ fn read_system_text() -> Result<String, String> {
     use std::process::Command;
 
     let output = if cfg!(target_os = "macos") {
-        Command::new("pbpaste").output()
+        utf8_command("pbpaste").output()
     } else {
         Command::new("sh")
             .args([
@@ -352,7 +436,7 @@ fn write_system_text(text: &str) -> Result<(), String> {
     use std::{io::Write, process::Command, process::Stdio};
 
     let mut child = if cfg!(target_os = "macos") {
-        Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+        utf8_command("pbcopy").stdin(Stdio::piped()).spawn()
     } else {
         Command::new("sh")
             .args(["-c", "wl-copy 2>/dev/null || xclip -selection clipboard"])
@@ -375,4 +459,13 @@ fn write_system_text(text: &str) -> Result<(), String> {
     } else {
         Err(format!("clipboard command exited with status {status}"))
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn utf8_command(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_CTYPE", "en_US.UTF-8");
+    command
 }
