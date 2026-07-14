@@ -735,7 +735,6 @@ impl AppRuntime {
 
         let layout_for_input = Arc::clone(&self.layout);
         let layout_for_clipboard = Arc::clone(&self.layout);
-        let layout_for_file_transfer = Arc::clone(&self.layout);
         let layout_for_pairing = Arc::clone(&self.layout);
         let native_layout_for_input = self.native_layout();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
@@ -797,27 +796,34 @@ impl AppRuntime {
                 return true;
             }
 
-            if let Ok(layout) = layout_for_file_transfer.lock() {
-                let current_peer = local_peer_from_layout(&layout);
-                if handle_file_transfer_packet(
-                    &payload,
-                    &layout,
-                    &current_peer.id,
-                    &file_transfers,
-                    &app_handle_for_file_transfer,
-                ) {
-                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
+            // Snapshot the layout instead of holding the lock through the
+            // handlers: clipboard writes retry with sleeps, spawn pbcopy and
+            // decode up to 32MB of base64, and file transfers write chunks to
+            // disk — holding the layout lock through any of that stalls the
+            // input hot paths (which take the same lock) for tens to hundreds
+            // of ms per sync. Stream packets are rare; one clone is nothing.
+            let layout = {
+                let Ok(layout) = layout_for_clipboard.lock() else {
+                    return false;
+                };
+                layout.clone()
+            };
+            let current_peer = local_peer_from_layout(&layout);
+
+            if handle_file_transfer_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &file_transfers,
+                &app_handle_for_file_transfer,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
 
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
                 return false;
             }
-            let Ok(layout) = layout_for_clipboard.lock() else {
-                return false;
-            };
-            let current_peer = local_peer_from_layout(&layout);
             if handle_clipboard_packet(
                 &payload,
                 &layout,
