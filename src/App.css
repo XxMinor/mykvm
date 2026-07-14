@@ -12,13 +12,6 @@
   padding-top: 0;
 }
 
-.app-shell.custom-chrome-mac {
-  height: 100vh;
-  min-height: 100vh;
-  border-radius: 18px;
-  overflow: hidden auto;
-}
-
 .app-shell.theme-light {
   color: #172033;
   background: linear-gradient(180deg, #f8fbff 0, #f2f5fa 280px), #f2f5fa;
@@ -31,8 +24,6 @@
 .theme-light .layout-panel,
 .theme-light .loading-panel,
 .theme-light .connection-row,
-.theme-light .protocol-grid div,
-.theme-light .metric-grid div,
 .theme-light .network-meta div,
 .theme-light .runtime-meta div {
   border-color: #d7deea;
@@ -41,11 +32,8 @@
 
 .theme-light .brand-mark,
 .theme-light .secondary-button,
-.theme-light .screen-chip,
-.theme-light .role-status-pill,
 .theme-light .add-device-form input,
 .theme-light .settings-number-input,
-.theme-light .settings-text-input,
 .theme-light .hotkey-recorder-button,
 .theme-light .role-switcher button,
 .theme-light .segmented-control,
@@ -67,9 +55,7 @@
 .theme-light .layout-toolbar h1,
 .theme-light .surface-card h2,
 .theme-light .connection-title strong,
-.theme-light .protocol-grid strong,
 .theme-light .runtime-meta dd,
-.theme-light .metric-grid dd,
 .theme-light .network-meta dd {
   color: #172033;
 }
@@ -227,8 +213,7 @@
   color: #ffffff;
 }
 
-.theme-light .secondary-button:hover,
-.theme-light .screen-chip:hover {
+.theme-light .secondary-button:hover {
   background: #e9eef6;
 }
 
@@ -410,11 +395,7 @@
 .header-actions,
 .window-controls,
 .header-tabs,
-.status-strip,
-.layout-toolbar,
-.panel-heading,
-.device-topline,
-.mini-panel-heading {
+.layout-toolbar {
   display: flex;
   align-items: center;
 }
@@ -503,7 +484,6 @@
 .window-controls button,
 .primary-button,
 .secondary-button,
-.screen-chip,
 .screen-rect {
   border: 0;
   cursor: pointer;
@@ -551,55 +531,6 @@
   color: #ffffff;
 }
 
-.mac-window-controls {
-  position: relative;
-  z-index: 2;
-  align-self: center;
-  gap: 2px;
-  height: 36px;
-  padding: 0 7px 0 9px;
-}
-
-.mac-window-controls button {
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  display: grid;
-  place-items: center;
-  background: transparent;
-  box-shadow: none;
-  -webkit-app-region: no-drag;
-}
-
-.mac-window-controls button::before {
-  content: "";
-  width: 12px;
-  height: 12px;
-  border-radius: 999px;
-  border: 1px solid rgba(0, 0, 0, 0.22);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
-}
-
-.mac-window-controls button.close::before {
-  background: #ff5f57;
-}
-
-.mac-window-controls button.minimize::before {
-  background: #febc2e;
-}
-
-.mac-window-controls button.maximize::before {
-  background: #28c840;
-}
-
-.mac-window-controls button:hover::before {
-  filter: brightness(0.95);
-}
-
-.theme-light .mac-window-controls button::before {
-  border-color: rgba(31, 41, 55, 0.18);
-}
-
 .window-control-icon {
   width: 12px;
   height: 12px;
@@ -623,23 +554,8 @@
   justify-self: auto;
 }
 
-.role-status-pill {
-  display: inline-flex;
-  align-items: center;
-  min-height: 32px;
-  padding: 0 10px;
-  border: 1px solid rgba(63, 63, 70, 0.9);
-  border-radius: 999px;
-  background: #242429;
-  color: #d4d4d8;
-  font-size: 12px;
-  font-weight: 800;
-  white-space: nowrap;
-}
-
 .primary-button,
-.secondary-button,
-.screen-chip {
+.secondary-button {
   min-height: 34px;
   border-radius: 8px;
   padding: 0 12px;
@@ -654,27 +570,23 @@
   color: #f8fafc;
 }
 
-.secondary-button,
-.screen-chip {
+.secondary-button {
   border: 1px solid rgba(63, 63, 70, 0.92);
   background: #242429;
   color: #d4d4d8;
 }
 
 .secondary-button:hover,
-.screen-chip:hover,
 .primary-button:hover {
   transform: translateY(-1px);
 }
 
-.secondary-button:hover,
-.screen-chip:hover {
+.secondary-button:hover {
   background: #2d2d33;
 }
 
 .primary-button:disabled,
-.secondary-button:disabled,
-.screen-chip:disabled {
+.secondary-button:disabled {
   cursor: progress;
   opacity: 0.55;
 }
@@ -734,35 +646,6 @@
   font-size: 13px;
 }
 
-.status-strip {
-  min-height: 62px;
-  gap: 10px;
-  padding: 0 4px;
-}
-
-.status-strip div {
-  min-width: 116px;
-  padding: 10px 14px;
-  border: 1px solid rgba(63, 63, 70, 0.82);
-  border-radius: 10px;
-  background: #222226;
-}
-
-.status-strip span {
-  display: block;
-  color: #fafafa;
-  font-size: 20px;
-  line-height: 1;
-  font-weight: 800;
-}
-
-.status-strip label {
-  display: block;
-  margin-top: 7px;
-  color: #8f8f99;
-  font-size: 12px;
-}
-
 .workspace-shell {
   flex: 1;
   min-height: 0;
@@ -770,7 +653,6 @@
 }
 
 .layout-panel,
-.inspector-panel,
 .loading-panel {
   min-width: 0;
   border: 1px solid rgba(63, 63, 70, 0.88);
@@ -787,16 +669,12 @@
   gap: 12px;
 }
 
-.layout-toolbar,
-.panel-heading {
+.layout-toolbar {
   justify-content: space-between;
   gap: 14px;
 }
 
-.layout-toolbar h1,
-.panel-heading h2,
-.device-card h3,
-.mini-panel h3 {
+.layout-toolbar h1 {
   margin: 0;
 }
 
@@ -1020,17 +898,6 @@
 .screen-rect small {
   color: rgba(244, 244, 245, 0.76);
   font-size: 12px;
-}
-
-.inspector-panel {
-  min-height: 0;
-  overflow: hidden;
-}
-
-.tab-panel {
-  height: 100%;
-  padding: 16px;
-  overflow: auto;
 }
 
 .page-panel {
@@ -1304,34 +1171,21 @@
   line-height: 1.55;
 }
 
-.metric-grid,
-.device-meta,
 .network-meta {
   display: grid;
   gap: 10px;
 }
 
-.metric-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.metric-grid div,
-.network-meta div,
-.mini-panel,
-.device-card,
-.peer-list li {
+.network-meta div {
   border: 1px solid rgba(63, 63, 70, 0.82);
   border-radius: 10px;
   background: #242429;
 }
 
-.metric-grid div,
 .network-meta div {
   padding: 10px;
 }
 
-.metric-grid dt,
-.device-meta dt,
 .network-meta dt {
   color: #71717a;
   font-size: 11px;
@@ -1340,31 +1194,11 @@
   text-transform: uppercase;
 }
 
-.metric-grid dd,
-.device-meta dd,
 .network-meta dd {
   margin: 4px 0 0;
   color: #f4f4f5;
   font-size: 13px;
   overflow-wrap: anywhere;
-}
-
-.arrange-toolbar,
-.device-actions,
-.screen-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.arrange-toolbar {
-  margin-top: 14px;
-}
-
-.arrange-toolbar span {
-  width: 100%;
-  color: #a1a1aa;
-  font-size: 13px;
 }
 
 .add-device-form {
@@ -1379,8 +1213,7 @@
 }
 
 .add-device-form input,
-.settings-number-input,
-.settings-text-input {
+.settings-number-input {
   width: 100%;
   min-width: 0;
   border: 1px solid rgba(63, 63, 70, 0.92);
@@ -1391,15 +1224,13 @@
 }
 
 .add-device-form input,
-.settings-number-input,
-.settings-text-input {
+.settings-number-input {
   min-height: 34px;
   padding: 0 10px;
 }
 
 .add-device-form input:focus,
-.settings-number-input:focus,
-.settings-text-input:focus {
+.settings-number-input:focus {
   border-color: #2786ff;
 }
 
@@ -1531,48 +1362,6 @@
   color: #f4f4f5;
 }
 
-.runtime-summary-card {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.42fr);
-  gap: 16px;
-  align-items: start;
-}
-
-.protocol-card {
-  display: grid;
-  grid-template-columns: minmax(0, 0.44fr) minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
-}
-
-.protocol-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.protocol-grid div {
-  min-height: 72px;
-  padding: 12px;
-  border: 1px solid rgba(63, 63, 70, 0.82);
-  border-radius: 8px;
-  background: #242429;
-}
-
-.protocol-grid span {
-  display: block;
-  color: #60a5fa;
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.protocol-grid strong {
-  display: block;
-  margin-top: 8px;
-  color: #f4f4f5;
-  font-size: 14px;
-}
-
 .runtime-meta {
   margin: 0;
   display: grid;
@@ -1599,25 +1388,8 @@
   font-size: 13px;
 }
 
-.device-list,
-.stack,
-.peer-list,
-.adjacency-list {
+.stack {
   display: grid;
-  gap: 10px;
-}
-
-.device-card,
-.mini-panel {
-  padding: 12px;
-}
-
-.device-card.active {
-  border-color: rgba(39, 134, 255, 0.9);
-  background: #202a36;
-}
-
-.device-topline {
   gap: 10px;
 }
 
@@ -1640,102 +1412,8 @@
   background: #f59e0b;
 }
 
-.device-topline p,
-.adjacency-list,
-.peer-list,
-.screen-list,
-.error-banner,
-.mini-panel p {
-  margin: 0;
-}
-
-.device-topline p {
-  color: #a1a1aa;
-  font-size: 13px;
-}
-
-.role-pill {
-  display: inline-flex;
-  align-items: center;
-  margin-left: 8px;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: #303038;
-  color: #d4d4d8;
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.role-pill-local {
-  background: rgba(39, 134, 255, 0.18);
-  color: #60a5fa;
-}
-
-.role-pill-client {
-  background: rgba(20, 184, 166, 0.16);
-  color: #2dd4bf;
-}
-
-.device-meta {
-  grid-template-columns: 1fr 0.7fr;
-  margin-top: 12px;
-}
-
-.device-actions {
-  margin-top: 12px;
-}
-
 .danger-button {
   color: #fda4af;
-}
-
-.screen-list,
-.peer-list,
-.adjacency-list {
-  list-style: none;
-  padding: 0;
-}
-
-.screen-list {
-  margin-top: 12px;
-}
-
-.screen-chip {
-  font-size: 12px;
-}
-
-.screen-chip.selected {
-  background: #2786ff;
-  border-color: #2786ff;
-  color: #f8fafc;
-}
-
-.empty-screen-note {
-  color: #71717a;
-  font-size: 13px;
-}
-
-.peer-list {
-  margin-bottom: 14px;
-}
-
-.peer-list li {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px;
-  font-size: 13px;
-}
-
-.peer-list div {
-  min-width: 0;
-  display: grid;
-  gap: 3px;
-}
-
-.peer-list span {
-  color: #8f8f99;
-  overflow-wrap: anywhere;
 }
 
 .runtime-line {
@@ -1743,12 +1421,6 @@
   color: #f4f4f5;
   font-size: 22px;
   font-weight: 800;
-}
-
-.mini-panel p:last-child {
-  color: #a1a1aa;
-  font-size: 13px;
-  overflow-wrap: anywhere;
 }
 
 .network-meta {
@@ -2005,20 +1677,6 @@
   color: #a1a1aa;
   font-size: 13px;
   line-height: 1.55;
-}
-
-.adjacency-list {
-  margin-top: 14px;
-}
-
-.adjacency-list li {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px 0;
-  border-top: 1px solid rgba(63, 63, 70, 0.72);
-  color: #d4d4d8;
-  font-size: 13px;
 }
 
 .info-banner {
@@ -2447,9 +2105,6 @@
 
   .connection-stack,
   .settings-layout,
-  .runtime-summary-card,
-  .protocol-card,
-  .protocol-grid,
   .connection-add-card {
     grid-template-columns: 1fr;
   }
@@ -2460,10 +2115,6 @@
 
   .connection-actions {
     justify-content: flex-start;
-  }
-
-  .inspector-panel {
-    max-height: 42vh;
   }
 }
 
@@ -2503,22 +2154,16 @@
     margin: 0 -12px 0;
   }
 
-  .status-strip {
-    overflow-x: auto;
-  }
-
   .layout-board {
     min-height: 420px;
   }
 
   .add-device-form,
-  .metric-grid,
   .compact-meta,
   .settings-control-row,
   .role-choice-grid,
   .page-heading,
-  .runtime-meta,
-  .protocol-grid {
+  .runtime-meta {
     grid-template-columns: 1fr;
   }
 

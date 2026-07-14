@@ -51,7 +51,6 @@ import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
 import {
-  edgeSwitchHotkeyFromKeyboardEvent,
   formatEdgeSwitchHotkeyForDisplay,
   hotkeyFromKeyboardEvent,
   metaKeyLabelForPlatform,
@@ -643,7 +642,6 @@ function App() {
     navigator.platform.toLowerCase();
   const metaKeyLabel = metaKeyLabelForPlatform(localPlatform);
   const usesWindowsChrome = localPlatform.includes("win");
-  const usesCustomChrome = usesWindowsChrome;
   const inputServiceInstalled = Boolean(runtime?.inputService.installed);
   const inputServiceReady =
     inputServiceInstalled &&
@@ -674,7 +672,7 @@ function App() {
   const shellClassName = `app-shell ${chromeClassName} theme-${resolvedTheme}`;
 
   function renderWindowTitlebar() {
-    if (!usesCustomChrome) {
+    if (!usesWindowsChrome) {
       return null;
     }
 
@@ -1400,7 +1398,7 @@ function App() {
   }
 
   const captureEdgeSwitchHotkey = useEffectEvent((event: KeyboardEvent) => {
-    const hotkey = edgeSwitchHotkeyFromKeyboardEvent(event, metaKeyLabel);
+    const hotkey = hotkeyFromKeyboardEvent(event, metaKeyLabel);
     if (!hotkey) {
       return;
     }
@@ -3354,7 +3352,7 @@ function hotkeyTagLabel(part: string, platform: string) {
     case "disabled":
       return "Off";
     default:
-      return part.length === 1 ? part.toUpperCase() : part.toUpperCase();
+      return part.toUpperCase();
   }
 }
 

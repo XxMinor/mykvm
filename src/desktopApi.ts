@@ -1,5 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
-import { RELEASES_URL, REPOSITORY_URL } from './constants'
+import { APP_VERSION, RELEASES_URL, REPOSITORY_URL } from './constants'
 import { defaultLayout } from './defaultLayout'
 import type {
   AppStateSnapshot,
@@ -29,70 +29,47 @@ export interface FileTransferSummary {
   byteCount: number
 }
 
-const FALLBACK_RUNTIME: RuntimeStatus = {
+// ponytail: static stopped-state stub so `npm run dev` in a plain browser still
+// renders the layout editor; the real runtime lives in the Tauri backend.
+const STUB_DETAIL = 'Available only in the Tauri desktop runtime.'
+
+const BROWSER_RUNTIME: RuntimeStatus = {
   started: false,
-  transport: {
-    state: 'stubbed',
-    detail: 'Desktop fallback mode does not start discovery, input capture, or injection.',
-  },
-  capture: {
-    state: 'stubbed',
-    detail: 'Global input capture will be implemented in the Rust layer.',
-  },
-  inject: {
-    state: 'stubbed',
-    detail: 'System input injection will be implemented in the Rust layer.',
-  },
-  clipboard: {
-    state: 'stubbed',
-    detail: '剪贴板同步需要在 Tauri 桌面端运行。',
-  },
-  privilege: {
-    isElevated: false,
-    canElevate: false,
-    detail: 'Administrator restart is available only in the Windows desktop runtime.',
-  },
+  transport: { state: 'stubbed', detail: STUB_DETAIL },
+  capture: { state: 'stubbed', detail: STUB_DETAIL },
+  inject: { state: 'stubbed', detail: STUB_DETAIL },
+  clipboard: { state: 'stubbed', detail: STUB_DETAIL },
+  privilege: { isElevated: false, canElevate: false, detail: STUB_DETAIL },
   inputService: {
     installed: false,
     running: false,
     workerSessionId: null,
     pipeAvailable: false,
     sasAvailable: false,
-    detail: 'Windows lock screen input service is available only in the Windows desktop runtime.',
+    detail: STUB_DETAIL,
   },
   discovery: {
     state: 'idle',
-    detail: 'LAN discovery is available only in the Tauri desktop runtime.',
-    port: 47833,
+    detail: STUB_DETAIL,
+    port: defaultLayout.transportPort,
     localPeer: {
       id: 'browser-preview',
-      name: 'Desktop fallback',
+      name: 'Browser preview',
       platform: navigator.platform,
       machineRole: defaultLayout.machineRole,
       clusterId: defaultLayout.clusterId,
       pairingRequired: false,
-      host: window.location.hostname || 'localhost',
+      host: 'localhost',
       ip: '127.0.0.1',
       transportPort: defaultLayout.transportPort,
       quicPort: defaultLayout.quicPort,
       transportPublicKey: '',
       protocolVersion: 1,
-      screenCount: 1,
+      screenCount: 0,
       inputReady: false,
-      screens: [
-        {
-          id: 'browser-display-1',
-          name: 'Browser display',
-          x: defaultLayout.devices[0].screens[0].x,
-          y: defaultLayout.devices[0].screens[0].y,
-          width: defaultLayout.devices[0].screens[0].width,
-          height: defaultLayout.devices[0].screens[0].height,
-          scale: defaultLayout.devices[0].screens[0].scale,
-          isPrimary: true,
-        },
-      ],
-      appVersion: '0.1.0',
-      lastSeenMs: Date.now(),
+      screens: [],
+      appVersion: APP_VERSION,
+      lastSeenMs: 0,
     },
     peers: [],
   },
@@ -106,13 +83,11 @@ const FALLBACK_RUNTIME: RuntimeStatus = {
   },
 }
 
-let browserRuntime = FALLBACK_RUNTIME
-
 export async function loadAppState(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
     return {
       layout: defaultLayout,
-      runtime: browserRuntime,
+      runtime: BROWSER_RUNTIME,
     }
   }
 
@@ -123,7 +98,7 @@ export async function saveLayout(layout: LayoutState): Promise<AppStateSnapshot>
   if (!isTauri()) {
     return {
       layout,
-      runtime: browserRuntime,
+      runtime: BROWSER_RUNTIME,
     }
   }
 
@@ -134,7 +109,7 @@ export async function resetPairing(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
     return {
       layout: { ...defaultLayout, pairedControllers: [] },
-      runtime: browserRuntime,
+      runtime: BROWSER_RUNTIME,
     }
   }
 
@@ -159,29 +134,7 @@ export async function setAutostart(enabled: boolean): Promise<boolean> {
 
 export async function startRuntime(): Promise<RuntimeStatus> {
   if (!isTauri()) {
-    browserRuntime = {
-      started: true,
-      transport: {
-        state: 'ready',
-        detail: 'Desktop fallback does not start native discovery, input capture, or injection.',
-      },
-      capture: FALLBACK_RUNTIME.capture,
-      inject: FALLBACK_RUNTIME.inject,
-      clipboard: FALLBACK_RUNTIME.clipboard,
-      privilege: FALLBACK_RUNTIME.privilege,
-      inputService: FALLBACK_RUNTIME.inputService,
-      pairing: FALLBACK_RUNTIME.pairing,
-      discovery: {
-        ...FALLBACK_RUNTIME.discovery,
-        detail: 'Desktop fallback cannot scan the LAN. Start the Tauri desktop app to use UDP discovery.',
-        localPeer: {
-          ...FALLBACK_RUNTIME.discovery.localPeer,
-          lastSeenMs: Date.now(),
-        },
-      },
-    }
-
-    return browserRuntime
+    return BROWSER_RUNTIME
   }
 
   return invoke<RuntimeStatus>('start_runtime')
@@ -189,18 +142,7 @@ export async function startRuntime(): Promise<RuntimeStatus> {
 
 export async function readRuntimeStatus(): Promise<RuntimeStatus> {
   if (!isTauri()) {
-    browserRuntime = {
-      ...browserRuntime,
-      discovery: {
-        ...browserRuntime.discovery,
-        localPeer: {
-          ...browserRuntime.discovery.localPeer,
-          lastSeenMs: Date.now(),
-        },
-      },
-    }
-
-    return browserRuntime
+    return BROWSER_RUNTIME
   }
 
   return invoke<RuntimeStatus>('read_runtime_status')
@@ -209,21 +151,20 @@ export async function readRuntimeStatus(): Promise<RuntimeStatus> {
 export async function readDiagnosticInfo(): Promise<DiagnosticInfo> {
   if (!isTauri()) {
     return {
-      report: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
-      appVersion: '0.1.0',
+      report: STUB_DETAIL,
+      appVersion: APP_VERSION,
       platform: navigator.platform,
       role: defaultLayout.machineRole,
-      runtimeStarted: browserRuntime.started,
-      localName: browserRuntime.discovery.localPeer.name,
-      localIp: browserRuntime.discovery.localPeer.ip,
-      discoveryPort: browserRuntime.discovery.port,
-      quicPort: browserRuntime.discovery.localPeer.quicPort,
-      peerCount: browserRuntime.discovery.peers.length,
-      knownDevices: [],
+      runtimeStarted: false,
+      localName: BROWSER_RUNTIME.discovery.localPeer.name,
+      localIp: BROWSER_RUNTIME.discovery.localPeer.ip,
+      discoveryPort: BROWSER_RUNTIME.discovery.port,
+      quicPort: BROWSER_RUNTIME.discovery.localPeer.quicPort,
+      peerCount: 0,
       logDir: '',
       configDir: '',
-      networkHint: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
-      firewallHint: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
+      networkHint: STUB_DETAIL,
+      firewallHint: STUB_DETAIL,
     }
   }
 
@@ -240,8 +181,7 @@ export async function openLogDirectory(): Promise<void> {
 
 export async function stopRuntime(): Promise<RuntimeStatus> {
   if (!isTauri()) {
-    browserRuntime = FALLBACK_RUNTIME
-    return browserRuntime
+    return BROWSER_RUNTIME
   }
 
   return invoke<RuntimeStatus>('stop_runtime')
@@ -249,7 +189,7 @@ export async function stopRuntime(): Promise<RuntimeStatus> {
 
 export async function scanLanPeers(): Promise<DiscoveryStatus> {
   if (!isTauri()) {
-    return browserRuntime.discovery
+    return BROWSER_RUNTIME.discovery
   }
 
   return invoke<DiscoveryStatus>('scan_lan_peers')
@@ -284,7 +224,7 @@ export async function confirmLanPairing(host: string, code: string) {
 
 export async function dismissPairingRequest(): Promise<RuntimeStatus> {
   if (!isTauri()) {
-    return browserRuntime
+    return BROWSER_RUNTIME
   }
 
   return invoke<RuntimeStatus>('dismiss_pairing_request')
@@ -300,21 +240,13 @@ export async function writeClipboardText(text: string): Promise<void> {
 
 export async function readPerformanceSample(): Promise<PerformanceSample> {
   if (!isTauri()) {
-    const memory = (performance as Performance & {
-      memory?: {
-        usedJSHeapSize: number
-        jsHeapSizeLimit: number
-      }
-    }).memory
-    const usedMb = memory ? memory.usedJSHeapSize / 1024 / 1024 : 96 + Math.sin(Date.now() / 2000) * 12
-
     return {
       timestampMs: Date.now(),
-      appCpuPercent: Math.max(2, Math.min(100, 18 + Math.sin(Date.now() / 1500) * 10)),
-      appMemoryMb: usedMb,
-      transportPackets: Math.round(Date.now() / 1000) % 700,
-      inputEvents: Math.round(Date.now() / 80) % 1200,
-      clipboardPackets: Math.round(Date.now() / 5000) % 80,
+      appCpuPercent: 0,
+      appMemoryMb: 0,
+      transportPackets: 0,
+      inputEvents: 0,
+      clipboardPackets: 0,
     }
   }
 
@@ -331,7 +263,7 @@ export async function restartAsAdmin(): Promise<void> {
 
 export async function readInputServiceStatus(): Promise<InputServiceStatus> {
   if (!isTauri()) {
-    return browserRuntime.inputService
+    return BROWSER_RUNTIME.inputService
   }
 
   return invoke<InputServiceStatus>('read_input_service_status')
@@ -339,7 +271,7 @@ export async function readInputServiceStatus(): Promise<InputServiceStatus> {
 
 export async function installInputService(): Promise<InputServiceStatus> {
   if (!isTauri()) {
-    return browserRuntime.inputService
+    return BROWSER_RUNTIME.inputService
   }
 
   return invoke<InputServiceStatus>('install_input_service')
@@ -347,18 +279,10 @@ export async function installInputService(): Promise<InputServiceStatus> {
 
 export async function uninstallInputService(): Promise<InputServiceStatus> {
   if (!isTauri()) {
-    return browserRuntime.inputService
+    return BROWSER_RUNTIME.inputService
   }
 
   return invoke<InputServiceStatus>('uninstall_input_service')
-}
-
-export async function sendSecureAttention(deviceId: string): Promise<void> {
-  if (!isTauri()) {
-    return
-  }
-
-  await invoke('send_secure_attention', { deviceId })
 }
 
 export async function sendFilesToDevice(deviceId: string, paths: string[]): Promise<FileTransferSummary> {
