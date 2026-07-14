@@ -938,8 +938,8 @@ fn start_platform_capture(
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, PM_REMOVE, WH_KEYBOARD_LL,
-        WH_MOUSE_LL,
+        MsgWaitForMultipleObjects, PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
+        PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL,
     };
 
     let target_count = targets.len();
@@ -1018,10 +1018,18 @@ fn start_platform_capture(
                 }
             }
             drain_switch_request_windows(&context);
+            // Low-level hook callbacks are dispatched only while this thread
+            // services its message queue. Blocking on the queue (with a short
+            // timeout for the desktop/switch checks above) instead of sleeping
+            // 10ms between polls removes up to 10-16ms of added latency per
+            // input event — the sleep also quantised to ~15.6ms without a
+            // timeBeginPeriod call, batching a 1000Hz mouse into ~64Hz bursts.
+            // Slow queue servicing is also what makes Windows silently drop
+            // low-level hooks.
             unsafe {
+                let _ = MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 20, QS_ALLINPUT);
                 while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
             }
-            thread::sleep(Duration::from_millis(10));
         }
 
         unsafe {
