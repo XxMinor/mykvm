@@ -715,26 +715,12 @@ impl AppRuntime {
             if !input_receive_enabled.load(Ordering::Relaxed) {
                 return;
             }
-            let Ok(layout) = layout_for_input.lock() else {
-                return;
-            };
-            let current_peer = local_peer_from_layout(&layout);
-            if input::try_handle_control_packet_from_source(
-                &layout,
-                &payload,
-                source,
-                &current_peer.id,
-            ) {
-                transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            if input::try_inject_packet_from_source(
-                &layout,
+            if input::handle_input_datagram(
+                &layout_for_input,
                 &native_layout_for_input,
                 &payload,
                 source,
                 &input_events,
-                &current_peer.id,
                 &clipboard_target,
             ) {
                 transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
@@ -4095,6 +4081,27 @@ fn local_host_label() -> String {
 }
 
 fn local_ip_address() -> Option<String> {
+    // Callers include per-event hot paths (input target building, packet
+    // origin resolution) and the discovery loop; the UDP-socket probe is four
+    // syscalls. The LAN address changes on network reconfigs, not per event —
+    // cache it briefly.
+    const LOCAL_IP_CACHE_TTL: Duration = Duration::from_secs(5);
+    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+
+    if let Ok(mut cached) = CACHE.lock() {
+        if let Some((probed_at, address)) = cached.as_ref() {
+            if probed_at.elapsed() < LOCAL_IP_CACHE_TTL {
+                return address.clone();
+            }
+        }
+        let fresh = probe_local_ip_address();
+        *cached = Some((Instant::now(), fresh.clone()));
+        return fresh;
+    }
+    probe_local_ip_address()
+}
+
+fn probe_local_ip_address() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     let address = socket.local_addr().ok()?;

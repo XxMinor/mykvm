@@ -99,7 +99,12 @@ const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
 #[cfg(target_os = "windows")]
 const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 
-static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
+/// Last injected remote cursor position, packed x<<32|y, plus held buttons.
+/// Plain atomics: these are touched on every received mouse event and a
+/// global mutex there is contention for nothing (the fields are independent
+/// and a racing reader tolerates one event of skew).
+static REMOTE_MOUSE_POSITION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static REMOTE_MOUSE_BUTTONS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
@@ -156,6 +161,23 @@ pub struct ClipboardTarget {
     pub expires_at: Option<Instant>,
 }
 
+/// Borrowing serialization mirror of [`InputPacket`]: identical named
+/// MessagePack bytes (guarded by a test), but building one clones none of the
+/// ~1KB of credential strings — send_packet runs per mouse event.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InputPacketRef<'a> {
+    protocol: &'a str,
+    target_device_id: &'a str,
+    origin_device_id: &'a str,
+    origin_port: u16,
+    origin_transport_public_key: &'a str,
+    origin_protocol_version: u16,
+    cluster_id: &'a str,
+    pair_secret: &'a str,
+    event: &'a InputEvent,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InputPacket {
@@ -200,13 +222,6 @@ struct InputControlPacket {
 #[serde(rename_all = "camelCase")]
 enum InputControlCommand {
     SecureAttention,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct RemoteMouseState {
-    x: i32,
-    y: i32,
-    buttons: u64,
 }
 
 pub fn stopped_capture_status() -> NativeStageStatus {
@@ -705,6 +720,7 @@ fn start_input_capture(
     input_events: Arc<AtomicU64>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
+    invalidate_input_targets_cache();
     start_platform_capture(
         targets,
         layout_state,
@@ -1193,14 +1209,53 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
     targets
 }
 
+/// How long a built target list may be served from cache. Crossing geometry
+/// and pairing context only change on layout edits and peer presence flips;
+/// a quarter second of staleness is invisible at a screen edge, while
+/// rebuilding per mouse move cost a blocking layout lock, a LanPeer build
+/// (UDP-socket IP probe) and a dozen String clones inside the event tap.
+const INPUT_TARGETS_TTL: Duration = Duration::from_millis(250);
+
+static INPUT_TARGETS_CACHE: Mutex<Option<(Instant, Arc<Vec<InputTarget>>)>> = Mutex::new(None);
+
 fn current_input_targets(
     layout_state: &Arc<Mutex<LayoutState>>,
     native_layout: &LayoutState,
-) -> Vec<InputTarget> {
-    layout_state
-        .lock()
-        .map(|layout| build_input_targets(&layout, native_layout))
-        .unwrap_or_default()
+) -> Arc<Vec<InputTarget>> {
+    if let Ok(cache) = INPUT_TARGETS_CACHE.lock() {
+        if let Some((built_at, targets)) = cache.as_ref() {
+            if built_at.elapsed() < INPUT_TARGETS_TTL {
+                return Arc::clone(targets);
+            }
+        }
+    }
+
+    // Never block the event tap on a held layout lock (a save may be writing
+    // to disk under it): serve the stale cache instead and retry next event.
+    match layout_state.try_lock() {
+        Ok(layout) => {
+            let targets = Arc::new(build_input_targets(&layout, native_layout));
+            drop(layout);
+            if let Ok(mut cache) = INPUT_TARGETS_CACHE.lock() {
+                *cache = Some((Instant::now(), Arc::clone(&targets)));
+            }
+            targets
+        }
+        Err(_) => INPUT_TARGETS_CACHE
+            .lock()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|(_, targets)| Arc::clone(targets)))
+            .unwrap_or_default(),
+    }
+}
+
+/// Drops the cached target list so the next event rebuilds it — called when
+/// capture starts, so a fresh session can never act on the previous
+/// session's pairing context.
+fn invalidate_input_targets_cache() {
+    if let Ok(mut cache) = INPUT_TARGETS_CACHE.lock() {
+        *cache = None;
+    }
 }
 
 fn touching_edge(local: &Screen, remote: &Screen) -> Option<Edge> {
@@ -1281,21 +1336,20 @@ fn send_packet(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
-    let packet_context = input_packet_context(target, event, layout_state);
-    let event = packet_context.event;
-    let packet = InputPacket {
-        protocol: INPUT_PROTOCOL.into(),
-        target_device_id: target.device_id.clone(),
-        origin_device_id: packet_context.origin_device_id,
-        origin_port: quic_transport.port(),
-        origin_transport_public_key: quic_transport.public_key().to_string(),
-        origin_protocol_version: quic_transport::PROTOCOL_VERSION,
-        cluster_id: packet_context.cluster_id,
-        pair_secret: packet_context.pair_secret,
-        event,
-    };
-    let Some(peer) = packet_context.peer else {
+    let mut packet_context = input_packet_context(target, event, layout_state);
+    let Some(peer) = packet_context.peer.take() else {
         return false;
+    };
+    let packet = InputPacketRef {
+        protocol: INPUT_PROTOCOL,
+        target_device_id: &target.device_id,
+        origin_device_id: &packet_context.origin_device_id,
+        origin_port: quic_transport.port(),
+        origin_transport_public_key: quic_transport.public_key(),
+        origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+        cluster_id: &packet_context.cluster_id,
+        pair_secret: &packet_context.pair_secret,
+        event: &packet_context.event,
     };
 
     let payload = match rmp_serde::to_vec_named(&packet) {
@@ -1399,6 +1453,15 @@ fn input_packet_context(
         peer: Some(fallback_peer()),
         event,
     };
+
+    // Mouse events — essentially every packet — always use the context cached
+    // on the target at build time: it is at most INPUT_TARGETS_TTL stale and
+    // needs no layout lock, no origin re-derivation and no address formatting.
+    // Key events still consult the live layout for the modifier remap; they
+    // arrive at typing rate, not at mouse rate.
+    if !matches!(event, InputEvent::Key { .. }) {
+        return fallback_context(event);
+    }
 
     let layout = match layout_state.try_lock() {
         Ok(layout) => layout,
@@ -1538,86 +1601,131 @@ fn mark_target_offline(
     device.online = false;
 }
 
-fn target_is_online(target: &InputTarget, layout_state: &Arc<Mutex<LayoutState>>) -> bool {
-    layout_state
-        .lock()
-        .ok()
-        .and_then(|layout| {
-            layout
-                .devices
-                .iter()
-                .find(|device| device.id == target.device_id)
-                .map(|device| device.online && device.input_ready)
-        })
-        .unwrap_or(false)
-}
-
-pub fn try_inject_packet_from_source(
-    layout: &LayoutState,
+/// Handles one received input-plane datagram end to end. Structured for the
+/// per-move cost, not readability of the rare cases:
+/// - decode runs entirely OUTSIDE the layout lock, and input packets decode
+///   first (they outnumber control packets by orders of magnitude; the old
+///   control-first order fully parsed every mouse move against the wrong
+///   schema before trying the right one)
+/// - the layout lock covers only authorization + coordinate mapping;
+///   injection is syscalls and runs after the lock is released, so a slow
+///   WindowServer round-trip can no longer stretch the critical section every
+///   other hot path contends on
+pub fn handle_input_datagram(
+    layout_state: &Arc<Mutex<LayoutState>>,
     native_layout: &LayoutState,
     payload: &[u8],
     source: SocketAddr,
     input_events: &Arc<AtomicU64>,
-    local_peer_id: &str,
     clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
 ) -> bool {
-    let Some(packet) = decode_input_packet(payload) else {
-        return false;
-    };
-
-    if packet.protocol != INPUT_PROTOCOL {
-        return false;
-    }
-
-    if !packet_authorized(layout, &packet) {
-        warn_unauthorized_packet(layout, &packet);
-        return true;
-    }
-
-    if !packet_targets_local(layout, &packet.target_device_id, local_peer_id) {
-        return true;
-    }
-
-    if packet.origin_port != 0 && !packet.origin_transport_public_key.trim().is_empty() {
-        let device_id = if packet.origin_device_id.trim().is_empty() {
-            source.ip().to_string()
-        } else {
-            packet.origin_device_id.clone()
+    if let Some(packet) = decode_input_packet(payload) {
+        if packet.protocol != INPUT_PROTOCOL {
+            return false;
+        }
+        let command = {
+            let Ok(layout) = layout_state.lock() else {
+                return false;
+            };
+            if !packet_authorized(&layout, &packet) {
+                warn_unauthorized_packet(&layout, &packet);
+                return true;
+            }
+            let local_peer_id = cached_local_peer_id(&layout);
+            if !packet_targets_local(&layout, &packet.target_device_id, &local_peer_id) {
+                return true;
+            }
+            refresh_clipboard_target(clipboard_target, &layout, &packet, source);
+            input_event_to_command(&layout, native_layout, packet.event)
         };
-        // Persist the controller as our clipboard peer so a copy made on this
-        // machine syncs back to it immediately, without needing the remote
-        // cursor to re-enter. Refreshed on every input packet; cleared when
-        // input/clipboard stops.
-        set_clipboard_target(
-            clipboard_target,
-            device_id,
-            format!("{}:{}", source.ip(), packet.origin_port),
-            packet.origin_transport_public_key.clone(),
-            packet.origin_protocol_version,
-            layout.cluster_id.clone(),
-            layout.pair_secret.clone(),
-            None,
-        );
+        let Some(command) = command else {
+            return true;
+        };
+        if dispatch_input_command(command) {
+            input_events.fetch_add(1, Ordering::Relaxed);
+        }
+        return true;
     }
 
-    let injected = inject_input_event(layout, native_layout, packet.event);
-    if injected {
-        input_events.fetch_add(1, Ordering::Relaxed);
+    if let Some(packet) = decode_input_control_packet(payload) {
+        let Ok(layout) = layout_state.lock() else {
+            return false;
+        };
+        let local_peer_id = cached_local_peer_id(&layout);
+        return handle_control_packet(&layout, packet, source, &local_peer_id);
     }
 
-    true
+    false
 }
 
-pub fn try_handle_control_packet_from_source(
+/// The local peer id is derived from the hostname + LAN address and is needed
+/// for every received packet; deriving it builds a full LanPeer (screens and
+/// all). Cache the id briefly instead of rebuilding it per datagram.
+fn cached_local_peer_id(layout: &LayoutState) -> String {
+    const LOCAL_PEER_ID_TTL: Duration = Duration::from_secs(5);
+    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+
+    if let Ok(mut cached) = CACHE.lock() {
+        if let Some((resolved_at, id)) = cached.as_ref() {
+            if resolved_at.elapsed() < LOCAL_PEER_ID_TTL {
+                return id.clone();
+            }
+        }
+        let id = crate::local_peer_from_layout(layout).id;
+        *cached = Some((Instant::now(), id.clone()));
+        return id;
+    }
+    crate::local_peer_from_layout(layout).id
+}
+
+/// Persist the controller as our clipboard peer so a copy made on this
+/// machine syncs back to it immediately, without needing the remote cursor to
+/// re-enter. The target only actually changes on the first packet of a
+/// session (or a controller switch); skip the five per-packet allocations the
+/// unconditional rewrite used to pay on every mouse move.
+fn refresh_clipboard_target(
+    clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
     layout: &LayoutState,
-    payload: &[u8],
+    packet: &InputPacket,
+    source: SocketAddr,
+) {
+    if packet.origin_port == 0 || packet.origin_transport_public_key.trim().is_empty() {
+        return;
+    }
+    if !packet.origin_device_id.trim().is_empty() {
+        if let Ok(target) = clipboard_target.lock() {
+            if target.as_ref().is_some_and(|target| {
+                target.device_id == packet.origin_device_id
+                    && target.transport_public_key == packet.origin_transport_public_key
+                    && target.protocol_version == packet.origin_protocol_version
+            }) {
+                return;
+            }
+        }
+    }
+    let device_id = if packet.origin_device_id.trim().is_empty() {
+        source.ip().to_string()
+    } else {
+        packet.origin_device_id.clone()
+    };
+    set_clipboard_target(
+        clipboard_target,
+        device_id,
+        format!("{}:{}", source.ip(), packet.origin_port),
+        packet.origin_transport_public_key.clone(),
+        packet.origin_protocol_version,
+        layout.cluster_id.clone(),
+        layout.pair_secret.clone(),
+        None,
+    );
+}
+
+fn handle_control_packet(
+    layout: &LayoutState,
+    packet: InputControlPacket,
     source: SocketAddr,
     local_peer_id: &str,
 ) -> bool {
-    let Some(packet) = decode_input_control_packet(payload) else {
-        return false;
-    };
-
     if packet.protocol != INPUT_CONTROL_PROTOCOL {
         return false;
     }
@@ -1877,44 +1985,31 @@ fn scale_size(value: i32, scale: f64) -> i32 {
         .clamp(1.0, i32::MAX as f64) as i32
 }
 
-fn remote_mouse_state() -> &'static Mutex<RemoteMouseState> {
-    REMOTE_MOUSE_STATE.get_or_init(|| Mutex::new(RemoteMouseState::default()))
+fn pack_remote_position(x: i32, y: i32) -> i64 {
+    ((x as i64) << 32) | (y as u32 as i64)
+}
+
+fn unpack_remote_position(packed: i64) -> (i32, i32) {
+    ((packed >> 32) as i32, packed as u32 as i32)
 }
 
 fn update_remote_mouse_position(x: i32, y: i32) -> Option<MouseButton> {
-    let Ok(mut state) = remote_mouse_state().lock() else {
-        return None;
-    };
-    state.x = x;
-    state.y = y;
-    primary_button_from_mask(state.buttons)
+    REMOTE_MOUSE_POSITION.store(pack_remote_position(x, y), Ordering::Relaxed);
+    button_from_mask(REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed))
 }
 
 fn update_remote_mouse_button(button: MouseButton, down: bool) -> (i32, i32) {
-    let Ok(mut state) = remote_mouse_state().lock() else {
-        return (0, 0);
-    };
     if down {
-        state.buttons |= mouse_button_mask(button);
+        REMOTE_MOUSE_BUTTONS.fetch_or(mouse_button_mask(button), Ordering::Relaxed);
     } else {
-        state.buttons &= !mouse_button_mask(button);
+        REMOTE_MOUSE_BUTTONS.fetch_and(!mouse_button_mask(button), Ordering::Relaxed);
     }
-    (state.x, state.y)
+    unpack_remote_position(REMOTE_MOUSE_POSITION.load(Ordering::Relaxed))
 }
 
-fn primary_button_from_mask(mask: u64) -> Option<MouseButton> {
-    button_from_mask(mask)
-}
-
-fn inject_input_event(
-    layout: &LayoutState,
-    native_layout: &LayoutState,
-    event: InputEvent,
-) -> bool {
-    let Some(command) = input_event_to_command(layout, native_layout, event) else {
-        return false;
-    };
-
+/// Executes a mapped input command on this machine. Runs outside the layout
+/// lock — injection is syscalls and must not stretch the critical section.
+fn dispatch_input_command(command: InputCommand) -> bool {
     #[cfg(target_os = "windows")]
     {
         // Inject locally on the normal desktop; hand off to the privileged SYSTEM
@@ -2953,7 +3048,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     }
 
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
-    if let Some(active_target) = crossing_target(&targets, x, y, dx, dy, &context.layout_state) {
+    if let Some(active_target) = crossing_target(&targets, x, y, dx, dy) {
         let anchor = local_anchor_point(&active_target);
         hide_windows_cursor_if_needed(context);
         set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
@@ -3509,9 +3604,8 @@ fn crossing_target(
     y: f64,
     dx: f64,
     dy: f64,
-    layout_state: &Arc<Mutex<LayoutState>>,
 ) -> Option<ActiveTarget> {
-    crossing_target_with_transform(targets, x, y, dx, dy, false, layout_state)
+    crossing_target_with_transform(targets, x, y, dx, dy, false)
 }
 
 fn crossing_target_with_transform(
@@ -3521,15 +3615,14 @@ fn crossing_target_with_transform(
     dx: f64,
     dy: f64,
     invert_y: bool,
-    layout_state: &Arc<Mutex<LayoutState>>,
 ) -> Option<ActiveTarget> {
     targets
         .iter()
         .find_map(|target| {
-            if !target_is_online(target, layout_state) {
-                return None;
-            }
-
+            // No per-move online re-check here: build_input_targets only
+            // emits online + input-ready devices and the target cache
+            // refreshes within INPUT_TARGETS_TTL, so the check only re-took
+            // the layout lock per target per event to learn the same answer.
             crossing_layout_point(target, x, y, dx, dy).map(|point| (target, point))
         })
         .map(|(target, (mapped_x, mapped_y))| {
@@ -3683,7 +3776,7 @@ fn mac_crossing_target(
     dy: f64,
 ) -> Option<ActiveTarget> {
     if let Some(target) =
-        crossing_target_with_transform(targets, x, y, dx, dy, false, &context.layout_state)
+        crossing_target_with_transform(targets, x, y, dx, dy, false)
     {
         return Some(target);
     }
@@ -3696,7 +3789,7 @@ fn mac_crossing_target(
         return None;
     }
 
-    crossing_target_with_transform(targets, x, flipped_y, dx, -dy, true, &context.layout_state)
+    crossing_target_with_transform(targets, x, flipped_y, dx, -dy, true)
 }
 
 #[cfg(target_os = "macos")]
@@ -6281,14 +6374,7 @@ mod tests {
 
     #[test]
     fn hotkey_return_uses_recorded_point_then_local_screen_center() {
-        let active = crossing_target(
-            &[target_for_coordinate_tests()],
-            1919.0,
-            500.0,
-            40.0,
-            0.0,
-            &Arc::new(Mutex::new(layout_for_target_tests())),
-        )
+        let active = crossing_target(&[target_for_coordinate_tests()], 1919.0, 500.0, 40.0, 0.0)
         .expect("target should be active");
 
         assert_eq!(
@@ -6388,12 +6474,62 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_packet_mirror_encodes_identically_to_input_packet() {
+        let packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            target_device_id: "peer-device".into(),
+            origin_device_id: "local-device".into(),
+            origin_port: 47833,
+            origin_transport_public_key: "local-public-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            event: InputEvent::MouseMove {
+                screen_id: "display-1".into(),
+                x: 320,
+                y: 240,
+            },
+        };
+        let mirror = InputPacketRef {
+            protocol: &packet.protocol,
+            target_device_id: &packet.target_device_id,
+            origin_device_id: &packet.origin_device_id,
+            origin_port: packet.origin_port,
+            origin_transport_public_key: &packet.origin_transport_public_key,
+            origin_protocol_version: packet.origin_protocol_version,
+            cluster_id: &packet.cluster_id,
+            pair_secret: &packet.pair_secret,
+            event: &packet.event,
+        };
+
+        assert_eq!(
+            rmp_serde::to_vec_named(&packet).expect("encode owned packet"),
+            rmp_serde::to_vec_named(&mirror).expect("encode borrowed mirror"),
+            "the send-path mirror must stay byte-identical to InputPacket on the wire"
+        );
+    }
+
+    #[test]
     fn input_packet_context_uses_stable_peer_origin_id() {
         let layout = layout_for_target_tests();
         let expected_origin_id = crate::local_peer_from_layout(&layout).id;
         let layout_state = Arc::new(Mutex::new(layout));
         let target = target_for_coordinate_tests();
 
+        // Key events consult the live layout and must resolve the stable id.
+        let context = input_packet_context(
+            &target,
+            InputEvent::Key {
+                key_code: 0x41,
+                down: true,
+            },
+            &layout_state,
+        );
+        assert_ne!(expected_origin_id, "local-device");
+        assert_eq!(context.origin_device_id, expected_origin_id);
+
+        // Mouse events take the hot path: the context cached on the target at
+        // build time, which carries the same stable id without a layout lock.
         let context = input_packet_context(
             &target,
             InputEvent::MouseMove {
@@ -6403,9 +6539,7 @@ mod tests {
             },
             &layout_state,
         );
-
-        assert_ne!(expected_origin_id, "local-device");
-        assert_eq!(context.origin_device_id, expected_origin_id);
+        assert_eq!(context.origin_device_id, target.origin_device_id);
     }
 
     #[test]
@@ -6638,7 +6772,7 @@ mod tests {
     fn fast_crossing_carries_entry_delta_into_remote() {
         let target = target_for_coordinate_tests();
         let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
-        let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0, &layout_state)
+        let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0)
             .expect("fast edge movement should cross");
 
         assert!(
