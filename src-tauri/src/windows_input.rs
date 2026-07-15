@@ -1,8 +1,46 @@
 #![cfg(target_os = "windows")]
 
-use std::ptr;
+use std::{
+    ptr,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use crate::shared_input::{mouse_button_mask, InputCommand, MouseButton};
+
+/// Explains a refused button/key injection, throttled to one line per 10s.
+///
+/// Windows blocks `SendInput` from a standard-user process into an elevated or
+/// uiAccess foreground window (Task Manager — which ships `uiAccess="true"` — a
+/// UAC-elevated app, etc.) with `ERROR_ACCESS_DENIED`; the events are dropped
+/// silently, which reads to the user as "remote control just stopped" even
+/// though MyKVM is still running. Cursor MOVE keeps working because it goes
+/// through SetCursorPos, not SendInput — so only clicks and keys die, exactly
+/// the reported symptom. Surface it instead of failing mutely (this replaces a
+/// leftover per-event debug write to C:\ProgramData\MyKVM\*.txt).
+fn note_injection_refused(kind: &str, error: u32) {
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    static LAST_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let cell = LAST_WARN.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
+    if let Ok(mut last) = cell.lock() {
+        if last.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        *last = Instant::now();
+    }
+
+    if error == ERROR_ACCESS_DENIED {
+        log::warn!(
+            "injected {kind} refused by Windows (ERROR_ACCESS_DENIED): an elevated or \
+             uiAccess window (e.g. Task Manager, a UAC-elevated app) has focus. A \
+             standard-user MyKVM cannot hook or inject into higher-privilege windows — \
+             restart MyKVM as administrator (Settings) on this machine to control them."
+        );
+    } else {
+        log::warn!("injected {kind} was refused: SendInput failed with error {error}");
+    }
+}
 
 pub fn inject_command(command: &InputCommand, pressed_keys: &mut Vec<u16>, button_mask: &mut u64) {
     if matches!(command, InputCommand::ReleaseAll) {
@@ -257,14 +295,8 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
         },
     };
     unsafe {
-        let sent = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-        if sent == 0 {
-            let err = windows_sys::Win32::Foundation::GetLastError();
-            std::fs::write(
-                "C:\\ProgramData\\MyKVM\\helper-btn-err.txt",
-                format!("mouse button {flag:?} error {err}\n"),
-            )
-            .ok();
+        if SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 0 {
+            note_injection_refused("mouse button", windows_sys::Win32::Foundation::GetLastError());
         }
     }
 }
@@ -328,14 +360,8 @@ pub fn inject_key(key_code: u16, down: bool) {
         },
     };
     unsafe {
-        let sent = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-        if sent == 0 {
-            let err = windows_sys::Win32::Foundation::GetLastError();
-            std::fs::write(
-                "C:\\ProgramData\\MyKVM\\helper-key-err.txt",
-                format!("key {key_code:#04x} down={down} error {err}\n"),
-            )
-            .ok();
+        if SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 0 {
+            note_injection_refused("key", windows_sys::Win32::Foundation::GetLastError());
         }
     }
 }
