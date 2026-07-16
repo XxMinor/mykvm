@@ -99,7 +99,92 @@ const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
 #[cfg(target_os = "windows")]
 const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 
-static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
+/// How often the full pairing credentials (~0.5KB, mostly the base64 transport
+/// certificate) ride an input packet. Between refreshes, packets omit them and
+/// the receiver authorizes by its per-source cache — cutting steady-state
+/// input datagrams from ~0.8KB to ~0.15KB. Must stay below
+/// `INPUT_ORIGIN_CACHE_TTL` so the receiver's authorization never lapses
+/// mid-session.
+const INPUT_FULL_CRED_REFRESH: Duration = Duration::from_secs(2);
+/// How long the receiver treats a source address as authorized after a
+/// credentialled packet, so it can admit the credential-less packets in
+/// between. A peer that never proved the pairing secret from this address
+/// never gets an entry, so credential-less packets from it are always rejected.
+const INPUT_ORIGIN_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// True when a full-credential input packet is due for a destination whose last
+/// credentialled send was `last_sent` (or never). Pure half of
+/// `should_send_full_input_credentials`.
+fn credential_send_due(last_sent: Option<Instant>, now: Instant) -> bool {
+    last_sent
+        .map(|last| now.saturating_duration_since(last) >= INPUT_FULL_CRED_REFRESH)
+        .unwrap_or(true)
+}
+
+/// True when a source authorized at `authorized_at` is still within the cache
+/// TTL. Pure half of `input_origin_recently_authorized`.
+fn origin_authorization_fresh(authorized_at: Option<Instant>, now: Instant) -> bool {
+    authorized_at
+        .map(|at| now.saturating_duration_since(at) < INPUT_ORIGIN_CACHE_TTL)
+        .unwrap_or(false)
+}
+
+/// Per-destination timestamp of the last full-credential input packet. Keyed by
+/// the target's QUIC address so alternating between two targets still refreshes
+/// each independently.
+fn input_full_cred_tracker() -> &'static Mutex<HashMap<String, Instant>> {
+    static TRACKER: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Decides whether to attach full credentials to the packet now being built for
+/// `addr`, and records the decision so the next `INPUT_FULL_CRED_REFRESH`
+/// window of packets can omit them. On lock poisoning it errs toward including
+/// credentials (a larger but always-authorizable packet).
+fn should_send_full_input_credentials(addr: &str) -> bool {
+    let Ok(mut tracker) = input_full_cred_tracker().lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    let due = credential_send_due(tracker.get(addr).copied(), now);
+    if due {
+        tracker.retain(|_, last| {
+            now.saturating_duration_since(*last) < INPUT_ORIGIN_CACHE_TTL.saturating_mul(4)
+        });
+        tracker.insert(addr.to_string(), now);
+    }
+    due
+}
+
+/// Source addresses that sent a valid credentialled input packet within
+/// `INPUT_ORIGIN_CACHE_TTL`, so their credential-less packets can be admitted.
+fn authorized_input_origins() -> &'static Mutex<HashMap<SocketAddr, Instant>> {
+    static ORIGINS: OnceLock<Mutex<HashMap<SocketAddr, Instant>>> = OnceLock::new();
+    ORIGINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_authorized_input_origin(source: SocketAddr) {
+    if let Ok(mut origins) = authorized_input_origins().lock() {
+        let now = Instant::now();
+        origins.retain(|_, last| now.saturating_duration_since(*last) < INPUT_ORIGIN_CACHE_TTL);
+        origins.insert(source, now);
+    }
+}
+
+fn input_origin_recently_authorized(source: SocketAddr) -> bool {
+    let authorized_at = authorized_input_origins()
+        .lock()
+        .ok()
+        .and_then(|origins| origins.get(&source).copied());
+    origin_authorization_fresh(authorized_at, Instant::now())
+}
+
+/// Last injected remote cursor position, packed x<<32|y, plus held buttons.
+/// Plain atomics: these are touched on every received mouse event and a
+/// global mutex there is contention for nothing (the fields are independent
+/// and a racing reader tolerates one event of skew).
+static REMOTE_MOUSE_POSITION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static REMOTE_MOUSE_BUTTONS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
@@ -156,6 +241,34 @@ pub struct ClipboardTarget {
     pub expires_at: Option<Instant>,
 }
 
+fn str_ref_is_empty(value: &&str) -> bool {
+    value.is_empty()
+}
+
+/// Borrowing serialization mirror of [`InputPacket`]: identical named
+/// MessagePack bytes when every field is populated (guarded by a test), but
+/// building one clones none of the ~0.8KB of credential strings — send_packet
+/// runs per mouse event. The credential fields are also skipped when empty, so
+/// steady-state packets (which omit them — see send_packet) drop ~0.5KB of the
+/// static pairing block, mostly the base64 transport certificate.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InputPacketRef<'a> {
+    protocol: &'a str,
+    target_device_id: &'a str,
+    #[serde(skip_serializing_if = "str_ref_is_empty")]
+    origin_device_id: &'a str,
+    origin_port: u16,
+    #[serde(skip_serializing_if = "str_ref_is_empty")]
+    origin_transport_public_key: &'a str,
+    origin_protocol_version: u16,
+    #[serde(skip_serializing_if = "str_ref_is_empty")]
+    cluster_id: &'a str,
+    #[serde(skip_serializing_if = "str_ref_is_empty")]
+    pair_secret: &'a str,
+    event: &'a InputEvent,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InputPacket {
@@ -200,13 +313,6 @@ struct InputControlPacket {
 #[serde(rename_all = "camelCase")]
 enum InputControlCommand {
     SecureAttention,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct RemoteMouseState {
-    x: i32,
-    y: i32,
-    buttons: u64,
 }
 
 pub fn stopped_capture_status() -> NativeStageStatus {
@@ -705,6 +811,7 @@ fn start_input_capture(
     input_events: Arc<AtomicU64>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
+    invalidate_input_targets_cache();
     start_platform_capture(
         targets,
         layout_state,
@@ -938,8 +1045,8 @@ fn start_platform_capture(
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> NativeStageStatus {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, PM_REMOVE, WH_KEYBOARD_LL,
-        WH_MOUSE_LL,
+        MsgWaitForMultipleObjects, PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
+        PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL,
     };
 
     let target_count = targets.len();
@@ -1018,10 +1125,18 @@ fn start_platform_capture(
                 }
             }
             drain_switch_request_windows(&context);
+            // Low-level hook callbacks are dispatched only while this thread
+            // services its message queue. Blocking on the queue (with a short
+            // timeout for the desktop/switch checks above) instead of sleeping
+            // 10ms between polls removes up to 10-16ms of added latency per
+            // input event — the sleep also quantised to ~15.6ms without a
+            // timeBeginPeriod call, batching a 1000Hz mouse into ~64Hz bursts.
+            // Slow queue servicing is also what makes Windows silently drop
+            // low-level hooks.
             unsafe {
+                let _ = MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 20, QS_ALLINPUT);
                 while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
             }
-            thread::sleep(Duration::from_millis(10));
         }
 
         unsafe {
@@ -1185,14 +1300,53 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
     targets
 }
 
+/// How long a built target list may be served from cache. Crossing geometry
+/// and pairing context only change on layout edits and peer presence flips;
+/// a quarter second of staleness is invisible at a screen edge, while
+/// rebuilding per mouse move cost a blocking layout lock, a LanPeer build
+/// (UDP-socket IP probe) and a dozen String clones inside the event tap.
+const INPUT_TARGETS_TTL: Duration = Duration::from_millis(250);
+
+static INPUT_TARGETS_CACHE: Mutex<Option<(Instant, Arc<Vec<InputTarget>>)>> = Mutex::new(None);
+
 fn current_input_targets(
     layout_state: &Arc<Mutex<LayoutState>>,
     native_layout: &LayoutState,
-) -> Vec<InputTarget> {
-    layout_state
-        .lock()
-        .map(|layout| build_input_targets(&layout, native_layout))
-        .unwrap_or_default()
+) -> Arc<Vec<InputTarget>> {
+    if let Ok(cache) = INPUT_TARGETS_CACHE.lock() {
+        if let Some((built_at, targets)) = cache.as_ref() {
+            if built_at.elapsed() < INPUT_TARGETS_TTL {
+                return Arc::clone(targets);
+            }
+        }
+    }
+
+    // Never block the event tap on a held layout lock (a save may be writing
+    // to disk under it): serve the stale cache instead and retry next event.
+    match layout_state.try_lock() {
+        Ok(layout) => {
+            let targets = Arc::new(build_input_targets(&layout, native_layout));
+            drop(layout);
+            if let Ok(mut cache) = INPUT_TARGETS_CACHE.lock() {
+                *cache = Some((Instant::now(), Arc::clone(&targets)));
+            }
+            targets
+        }
+        Err(_) => INPUT_TARGETS_CACHE
+            .lock()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|(_, targets)| Arc::clone(targets)))
+            .unwrap_or_default(),
+    }
+}
+
+/// Drops the cached target list so the next event rebuilds it — called when
+/// capture starts, so a fresh session can never act on the previous
+/// session's pairing context.
+fn invalidate_input_targets_cache() {
+    if let Ok(mut cache) = INPUT_TARGETS_CACHE.lock() {
+        *cache = None;
+    }
 }
 
 fn touching_edge(local: &Screen, remote: &Screen) -> Option<Edge> {
@@ -1273,21 +1427,42 @@ fn send_packet(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
-    let packet_context = input_packet_context(target, event, layout_state);
-    let event = packet_context.event;
-    let packet = InputPacket {
-        protocol: INPUT_PROTOCOL.into(),
-        target_device_id: target.device_id.clone(),
-        origin_device_id: packet_context.origin_device_id,
-        origin_port: quic_transport.port(),
-        origin_transport_public_key: quic_transport.public_key().to_string(),
-        origin_protocol_version: quic_transport::PROTOCOL_VERSION,
-        cluster_id: packet_context.cluster_id,
-        pair_secret: packet_context.pair_secret,
-        event,
-    };
-    let Some(peer) = packet_context.peer else {
+    let mut packet_context = input_packet_context(target, event, layout_state);
+    let Some(peer) = packet_context.peer.take() else {
         return false;
+    };
+    // Attach the full pairing credentials only ~once per INPUT_FULL_CRED_REFRESH
+    // per destination; steady-state packets omit them (empty -> skipped on the
+    // wire) and the receiver authorizes them from its per-source cache. This is
+    // what actually shrinks the datagram; the borrowed mirror above only kept
+    // the omitted-string case allocation-free.
+    let include_credentials = should_send_full_input_credentials(&peer.addr);
+    let packet = InputPacketRef {
+        protocol: INPUT_PROTOCOL,
+        target_device_id: &target.device_id,
+        origin_device_id: if include_credentials {
+            &packet_context.origin_device_id
+        } else {
+            ""
+        },
+        origin_port: quic_transport.port(),
+        origin_transport_public_key: if include_credentials {
+            quic_transport.public_key()
+        } else {
+            ""
+        },
+        origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+        cluster_id: if include_credentials {
+            &packet_context.cluster_id
+        } else {
+            ""
+        },
+        pair_secret: if include_credentials {
+            &packet_context.pair_secret
+        } else {
+            ""
+        },
+        event: &packet_context.event,
     };
 
     let payload = match rmp_serde::to_vec_named(&packet) {
@@ -1391,6 +1566,15 @@ fn input_packet_context(
         peer: Some(fallback_peer()),
         event,
     };
+
+    // Mouse events — essentially every packet — always use the context cached
+    // on the target at build time: it is at most INPUT_TARGETS_TTL stale and
+    // needs no layout lock, no origin re-derivation and no address formatting.
+    // Key events still consult the live layout for the modifier remap; they
+    // arrive at typing rate, not at mouse rate.
+    if !matches!(event, InputEvent::Key { .. }) {
+        return fallback_context(event);
+    }
 
     let layout = match layout_state.try_lock() {
         Ok(layout) => layout,
@@ -1530,86 +1714,144 @@ fn mark_target_offline(
     device.online = false;
 }
 
-fn target_is_online(target: &InputTarget, layout_state: &Arc<Mutex<LayoutState>>) -> bool {
-    layout_state
-        .lock()
-        .ok()
-        .and_then(|layout| {
-            layout
-                .devices
-                .iter()
-                .find(|device| device.id == target.device_id)
-                .map(|device| device.online && device.input_ready)
-        })
-        .unwrap_or(false)
-}
-
-pub fn try_inject_packet_from_source(
-    layout: &LayoutState,
+/// Handles one received input-plane datagram end to end. Structured for the
+/// per-move cost, not readability of the rare cases:
+/// - decode runs entirely OUTSIDE the layout lock, and input packets decode
+///   first (they outnumber control packets by orders of magnitude; the old
+///   control-first order fully parsed every mouse move against the wrong
+///   schema before trying the right one)
+/// - the layout lock covers only authorization + coordinate mapping;
+///   injection is syscalls and runs after the lock is released, so a slow
+///   WindowServer round-trip can no longer stretch the critical section every
+///   other hot path contends on
+pub fn handle_input_datagram(
+    layout_state: &Arc<Mutex<LayoutState>>,
     native_layout: &LayoutState,
     payload: &[u8],
     source: SocketAddr,
     input_events: &Arc<AtomicU64>,
-    local_peer_id: &str,
     clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
 ) -> bool {
-    let Some(packet) = decode_input_packet(payload) else {
-        return false;
-    };
-
-    if packet.protocol != INPUT_PROTOCOL {
-        return false;
-    }
-
-    if !packet_authorized(layout, &packet) {
-        warn_unauthorized_packet(layout, &packet);
-        return true;
-    }
-
-    if !packet_targets_local(layout, &packet.target_device_id, local_peer_id) {
-        return true;
-    }
-
-    if packet.origin_port != 0 && !packet.origin_transport_public_key.trim().is_empty() {
-        let device_id = if packet.origin_device_id.trim().is_empty() {
-            source.ip().to_string()
-        } else {
-            packet.origin_device_id.clone()
+    if let Some(packet) = decode_input_packet(payload) {
+        if packet.protocol != INPUT_PROTOCOL {
+            return false;
+        }
+        // Steady-state datagrams omit the pairing block (it rides ~once per
+        // INPUT_FULL_CRED_REFRESH). A credentialled packet is authorized in
+        // full and (re)authorizes this source; a credential-less one is
+        // admitted only while that authorization is still fresh, so a peer that
+        // never proved the pairing secret from this address can never inject.
+        let carries_credentials = !packet.pair_secret.trim().is_empty();
+        let command = {
+            let Ok(layout) = layout_state.lock() else {
+                return false;
+            };
+            if carries_credentials {
+                if !packet_authorized(&layout, &packet) {
+                    warn_unauthorized_packet(&layout, &packet);
+                    return true;
+                }
+                cache_authorized_input_origin(source);
+            } else if !input_origin_recently_authorized(source) {
+                return true;
+            }
+            let local_peer_id = cached_local_peer_id(&layout);
+            if !packet_targets_local(&layout, &packet.target_device_id, &local_peer_id) {
+                return true;
+            }
+            // No-op for credential-less packets (empty key); the clipboard
+            // target was set by the last credentialled packet and persists.
+            refresh_clipboard_target(clipboard_target, &layout, &packet, source);
+            input_event_to_command(&layout, native_layout, packet.event)
         };
-        // Persist the controller as our clipboard peer so a copy made on this
-        // machine syncs back to it immediately, without needing the remote
-        // cursor to re-enter. Refreshed on every input packet; cleared when
-        // input/clipboard stops.
-        set_clipboard_target(
-            clipboard_target,
-            device_id,
-            format!("{}:{}", source.ip(), packet.origin_port),
-            packet.origin_transport_public_key.clone(),
-            packet.origin_protocol_version,
-            layout.cluster_id.clone(),
-            layout.pair_secret.clone(),
-            None,
-        );
+        let Some(command) = command else {
+            return true;
+        };
+        if dispatch_input_command(command) {
+            input_events.fetch_add(1, Ordering::Relaxed);
+        }
+        return true;
     }
 
-    let injected = inject_input_event(layout, native_layout, packet.event);
-    if injected {
-        input_events.fetch_add(1, Ordering::Relaxed);
+    if let Some(packet) = decode_input_control_packet(payload) {
+        let Ok(layout) = layout_state.lock() else {
+            return false;
+        };
+        let local_peer_id = cached_local_peer_id(&layout);
+        return handle_control_packet(&layout, packet, source, &local_peer_id);
     }
 
-    true
+    false
 }
 
-pub fn try_handle_control_packet_from_source(
+/// The local peer id is derived from the hostname + LAN address and is needed
+/// for every received packet; deriving it builds a full LanPeer (screens and
+/// all). Cache the id briefly instead of rebuilding it per datagram.
+fn cached_local_peer_id(layout: &LayoutState) -> String {
+    const LOCAL_PEER_ID_TTL: Duration = Duration::from_secs(5);
+    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+
+    if let Ok(mut cached) = CACHE.lock() {
+        if let Some((resolved_at, id)) = cached.as_ref() {
+            if resolved_at.elapsed() < LOCAL_PEER_ID_TTL {
+                return id.clone();
+            }
+        }
+        let id = crate::local_peer_from_layout(layout).id;
+        *cached = Some((Instant::now(), id.clone()));
+        return id;
+    }
+    crate::local_peer_from_layout(layout).id
+}
+
+/// Persist the controller as our clipboard peer so a copy made on this
+/// machine syncs back to it immediately, without needing the remote cursor to
+/// re-enter. The target only actually changes on the first packet of a
+/// session (or a controller switch); skip the five per-packet allocations the
+/// unconditional rewrite used to pay on every mouse move.
+fn refresh_clipboard_target(
+    clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
     layout: &LayoutState,
-    payload: &[u8],
+    packet: &InputPacket,
+    source: SocketAddr,
+) {
+    if packet.origin_port == 0 || packet.origin_transport_public_key.trim().is_empty() {
+        return;
+    }
+    if !packet.origin_device_id.trim().is_empty() {
+        if let Ok(target) = clipboard_target.lock() {
+            if target.as_ref().is_some_and(|target| {
+                target.device_id == packet.origin_device_id
+                    && target.transport_public_key == packet.origin_transport_public_key
+                    && target.protocol_version == packet.origin_protocol_version
+            }) {
+                return;
+            }
+        }
+    }
+    let device_id = if packet.origin_device_id.trim().is_empty() {
+        source.ip().to_string()
+    } else {
+        packet.origin_device_id.clone()
+    };
+    set_clipboard_target(
+        clipboard_target,
+        device_id,
+        format!("{}:{}", source.ip(), packet.origin_port),
+        packet.origin_transport_public_key.clone(),
+        packet.origin_protocol_version,
+        layout.cluster_id.clone(),
+        layout.pair_secret.clone(),
+        None,
+    );
+}
+
+fn handle_control_packet(
+    layout: &LayoutState,
+    packet: InputControlPacket,
     source: SocketAddr,
     local_peer_id: &str,
 ) -> bool {
-    let Some(packet) = decode_input_control_packet(payload) else {
-        return false;
-    };
-
     if packet.protocol != INPUT_CONTROL_PROTOCOL {
         return false;
     }
@@ -1869,44 +2111,31 @@ fn scale_size(value: i32, scale: f64) -> i32 {
         .clamp(1.0, i32::MAX as f64) as i32
 }
 
-fn remote_mouse_state() -> &'static Mutex<RemoteMouseState> {
-    REMOTE_MOUSE_STATE.get_or_init(|| Mutex::new(RemoteMouseState::default()))
+fn pack_remote_position(x: i32, y: i32) -> i64 {
+    ((x as i64) << 32) | (y as u32 as i64)
+}
+
+fn unpack_remote_position(packed: i64) -> (i32, i32) {
+    ((packed >> 32) as i32, packed as u32 as i32)
 }
 
 fn update_remote_mouse_position(x: i32, y: i32) -> Option<MouseButton> {
-    let Ok(mut state) = remote_mouse_state().lock() else {
-        return None;
-    };
-    state.x = x;
-    state.y = y;
-    primary_button_from_mask(state.buttons)
+    REMOTE_MOUSE_POSITION.store(pack_remote_position(x, y), Ordering::Relaxed);
+    button_from_mask(REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed))
 }
 
 fn update_remote_mouse_button(button: MouseButton, down: bool) -> (i32, i32) {
-    let Ok(mut state) = remote_mouse_state().lock() else {
-        return (0, 0);
-    };
     if down {
-        state.buttons |= mouse_button_mask(button);
+        REMOTE_MOUSE_BUTTONS.fetch_or(mouse_button_mask(button), Ordering::Relaxed);
     } else {
-        state.buttons &= !mouse_button_mask(button);
+        REMOTE_MOUSE_BUTTONS.fetch_and(!mouse_button_mask(button), Ordering::Relaxed);
     }
-    (state.x, state.y)
+    unpack_remote_position(REMOTE_MOUSE_POSITION.load(Ordering::Relaxed))
 }
 
-fn primary_button_from_mask(mask: u64) -> Option<MouseButton> {
-    button_from_mask(mask)
-}
-
-fn inject_input_event(
-    layout: &LayoutState,
-    native_layout: &LayoutState,
-    event: InputEvent,
-) -> bool {
-    let Some(command) = input_event_to_command(layout, native_layout, event) else {
-        return false;
-    };
-
+/// Executes a mapped input command on this machine. Runs outside the layout
+/// lock — injection is syscalls and must not stretch the critical section.
+fn dispatch_input_command(command: InputCommand) -> bool {
     #[cfg(target_os = "windows")]
     {
         // Inject locally on the normal desktop; hand off to the privileged SYSTEM
@@ -2589,7 +2818,8 @@ fn set_control_clipboard_target(
 unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
     };
 
     if code < 0 {
@@ -2609,7 +2839,12 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     let handled = match message {
         WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
-        | WM_MBUTTONUP => handle_windows_mouse_button(&context, message),
+        | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            // For the X (side) buttons the pressed button rides the high word of
+            // mouseData (XBUTTON1 = back, XBUTTON2 = forward); other buttons
+            // ignore it.
+            handle_windows_mouse_button(&context, message, event.mouseData)
+        }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => handle_windows_scroll(&context, message, event.mouseData),
         _ => false,
     };
@@ -2945,7 +3180,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     }
 
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
-    if let Some(active_target) = crossing_target(&targets, x, y, dx, dy, &context.layout_state) {
+    if let Some(active_target) = crossing_target(&targets, x, y, dx, dy) {
         let anchor = local_anchor_point(&active_target);
         hide_windows_cursor_if_needed(context);
         set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
@@ -2980,9 +3215,10 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
 }
 
 #[cfg(target_os = "windows")]
-fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) -> bool {
+fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mouse_data: u32) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1,
     };
 
     let active = context
@@ -2993,6 +3229,12 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
     let Some(active_target) = active else {
         return false;
     };
+    // WM_XBUTTON* packs which side button in the high word of mouseData.
+    let x_button = if (mouse_data >> 16) as u16 == XBUTTON1 as u16 {
+        MouseButton::Back
+    } else {
+        MouseButton::Forward
+    };
     let (button, down) = match message {
         WM_LBUTTONDOWN => (MouseButton::Left, true),
         WM_LBUTTONUP => (MouseButton::Left, false),
@@ -3000,6 +3242,8 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
         WM_RBUTTONUP => (MouseButton::Right, false),
         WM_MBUTTONDOWN => (MouseButton::Middle, true),
         WM_MBUTTONUP => (MouseButton::Middle, false),
+        WM_XBUTTONDOWN => (x_button, true),
+        WM_XBUTTONUP => (x_button, false),
         _ => return false,
     };
 
@@ -3501,9 +3745,8 @@ fn crossing_target(
     y: f64,
     dx: f64,
     dy: f64,
-    layout_state: &Arc<Mutex<LayoutState>>,
 ) -> Option<ActiveTarget> {
-    crossing_target_with_transform(targets, x, y, dx, dy, false, layout_state)
+    crossing_target_with_transform(targets, x, y, dx, dy, false)
 }
 
 fn crossing_target_with_transform(
@@ -3513,15 +3756,14 @@ fn crossing_target_with_transform(
     dx: f64,
     dy: f64,
     invert_y: bool,
-    layout_state: &Arc<Mutex<LayoutState>>,
 ) -> Option<ActiveTarget> {
     targets
         .iter()
         .find_map(|target| {
-            if !target_is_online(target, layout_state) {
-                return None;
-            }
-
+            // No per-move online re-check here: build_input_targets only
+            // emits online + input-ready devices and the target cache
+            // refreshes within INPUT_TARGETS_TTL, so the check only re-took
+            // the layout lock per target per event to learn the same answer.
             crossing_layout_point(target, x, y, dx, dy).map(|point| (target, point))
         })
         .map(|(target, (mapped_x, mapped_y))| {
@@ -3675,7 +3917,7 @@ fn mac_crossing_target(
     dy: f64,
 ) -> Option<ActiveTarget> {
     if let Some(target) =
-        crossing_target_with_transform(targets, x, y, dx, dy, false, &context.layout_state)
+        crossing_target_with_transform(targets, x, y, dx, dy, false)
     {
         return Some(target);
     }
@@ -3688,7 +3930,7 @@ fn mac_crossing_target(
         return None;
     }
 
-    crossing_target_with_transform(targets, x, flipped_y, dx, -dy, true, &context.layout_state)
+    crossing_target_with_transform(targets, x, flipped_y, dx, -dy, true)
 }
 
 #[cfg(target_os = "macos")]
@@ -3911,11 +4153,20 @@ fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
     local_return_point(active)
 }
 
-/// When control returns to the local machine, move the controlled cursor into
-/// the far (bottom-right) corner of the remote screen instead of leaving it
-/// parked at the shared edge. True cursor hiding isn't reliably possible on the
-/// controlled side, so tucking it into a corner is the seamless-feeling
-/// approximation.
+/// When control returns to the local machine, tuck the controlled cursor out
+/// of the way. True cursor hiding isn't reliably possible on the controlled
+/// side, so tucking it is the seamless-feeling approximation.
+///
+/// Controlled macOS: park ON a clipping edge, at the end nearest this
+/// machine. The arrow's hotspot is its top-left tip and the body extends
+/// down-right, so only the RIGHT and BOTTOM screen edges clip it to a barely
+/// visible sliver (why the old far-corner park "looked like a dot"); the left
+/// and top edges show the full arrow. Corners themselves are avoided: macOS
+/// hot corners fire on pointer position alone, so the far-corner park
+/// triggered actions like "Show all applications" on every single handoff.
+///
+/// Controlled Windows (and anything else): keep the long-standing far-corner
+/// park unchanged.
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 fn send_remote_cursor_park(
     quic_transport: &quic_transport::TransportHandle,
@@ -3923,17 +4174,54 @@ fn send_remote_cursor_park(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    let (park_x, park_y) = remote_park_point(active);
     send_packet(
         quic_transport,
         &active.target,
         InputEvent::MouseMove {
             screen_id: active.current_screen_id.clone(),
-            x: (active.current_screen.width - 1).max(0),
-            y: (active.current_screen.height - 1).max(0),
+            x: park_x,
+            y: park_y,
         },
         layout_state,
         input_events,
     )
+}
+
+/// Distance a shared-edge park keeps from the screen corners, so an exit near
+/// the top/bottom of the edge cannot land the parked cursor inside a macOS
+/// hot-corner trip zone.
+const PARK_CORNER_CLEARANCE: i32 = 64;
+
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn remote_park_point(active: &ActiveTarget) -> (i32, i32) {
+    let width = active.current_screen.width;
+    let height = active.current_screen.height;
+    if !active.target.target_platform.eq_ignore_ascii_case("macos") {
+        return ((width - 1).max(0), (height - 1).max(0));
+    }
+
+    // `edge` is the LOCAL screen edge crossed to enter the remote, so this
+    // machine sits on the OPPOSITE side of the controlled screen. Pick the
+    // clipping edge (right/bottom) closest to that side.
+    let clear = |position: i32, extent: i32| {
+        position.clamp(
+            PARK_CORNER_CLEARANCE.min((extent / 2).max(0)),
+            (extent - 1 - PARK_CORNER_CLEARANCE).max((extent / 2).max(0)),
+        )
+    };
+    let x = active.x.round() as i32;
+    let y = active.y.round() as i32;
+    match active.target.edge {
+        // This machine is west of the Mac: bottom edge, west end.
+        Edge::Right => (clear(0, width), (height - 1).max(0)),
+        // East: the east edge itself clips — keep the exit height.
+        Edge::Left => ((width - 1).max(0), clear(y, height)),
+        // North: east edge, north end.
+        Edge::Bottom => ((width - 1).max(0), clear(0, height)),
+        // South: bottom edge — keep the exit x.
+        Edge::Top => (clear(x, width), (height - 1).max(0)),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5178,7 +5466,12 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     let (event_type, mouse_button) = match drag_button {
         Some(MouseButton::Left) => (CGEventType::LeftMouseDragged, CGMouseButton::Left),
         Some(MouseButton::Right) => (CGEventType::RightMouseDragged, CGMouseButton::Right),
-        Some(MouseButton::Middle) => (CGEventType::OtherMouseDragged, CGMouseButton::Center),
+        // Middle and the side buttons are all "other" drags. button_from_mask
+        // never actually reports a side button as a drag, so this is only here
+        // for exhaustiveness.
+        Some(MouseButton::Middle | MouseButton::Back | MouseButton::Forward) => {
+            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+        }
         None => (CGEventType::MouseMoved, CGMouseButton::Left),
     };
 
@@ -5192,11 +5485,161 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     }
 }
 
+/// One pressed-button record for injected macOS click counting.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct MacClickDown {
+    button: MouseButton,
+    x: i32,
+    y: i32,
+    at: Instant,
+    count: u8,
+}
+
+/// Click counting for injected macOS mouse buttons. macOS does NOT infer
+/// double-clicks from timing for synthetic events — every injected Down/Up
+/// with `kCGMouseEventClickState` 0 is an independent single click, so remote
+/// double-clicks never registered in apps. Replicate the native rule: a press
+/// within the system double-click interval and a few px of the previous one
+/// raises the click count (capped at triple), and the release repeats the
+/// count of the press it pairs with.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacClickTracker {
+    last_down: Option<MacClickDown>,
+    pressed: [Option<MacClickDown>; 3],
+}
+
+#[cfg(target_os = "macos")]
+impl MacClickTracker {
+    const MAX_DISTANCE_PX: i32 = 8;
+
+    fn event_count(
+        &mut self,
+        button: MouseButton,
+        down: bool,
+        x: i32,
+        y: i32,
+        now: Instant,
+        double_click_interval: Duration,
+    ) -> i64 {
+        let index = match button {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            MouseButton::Middle => 2,
+            // Side (back/forward) buttons are navigation, not click targets:
+            // no double-click chaining and no pressed-slot tracking.
+            MouseButton::Back | MouseButton::Forward => return i64::from(down),
+        };
+
+        if down {
+            let count = self
+                .last_down
+                .filter(|last| {
+                    last.button == button
+                        && now.saturating_duration_since(last.at) <= double_click_interval
+                        && click_points_are_near(last.x, last.y, x, y, Self::MAX_DISTANCE_PX)
+                })
+                .map(|last| last.count.saturating_add(1).min(3))
+                .unwrap_or(1);
+            let click = MacClickDown {
+                button,
+                x,
+                y,
+                at: now,
+                count,
+            };
+            self.last_down = Some(click);
+            self.pressed[index] = Some(click);
+            return i64::from(count);
+        }
+
+        let Some(click) = self.pressed[index].take() else {
+            return 0;
+        };
+        if click_points_are_near(click.x, click.y, x, y, Self::MAX_DISTANCE_PX) {
+            i64::from(click.count)
+        } else {
+            // The button moved while held: that was a drag, not a click, and
+            // it must not chain into a double-click either.
+            self.last_down = None;
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn click_points_are_near(x1: i32, y1: i32, x2: i32, y2: i32, max_distance: i32) -> bool {
+    let dx = i64::from(x1) - i64::from(x2);
+    let dy = i64::from(y1) - i64::from(y2);
+    let max = i64::from(max_distance);
+    dx * dx + dy * dy <= max * max
+}
+
+/// The user's configured double-click speed ([NSEvent doubleClickInterval]),
+/// resolved once via the ObjC runtime and clamped to a sane range so a broken
+/// answer degrades to the macOS default feel instead of breaking clicks.
+#[cfg(target_os = "macos")]
+fn macos_double_click_interval() -> Duration {
+    static INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        use std::ffi::c_void;
+        use std::os::raw::c_char;
+
+        #[link(name = "objc")]
+        extern "C" {
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+
+        let seconds = unsafe {
+            let class = objc_getClass(b"NSEvent\0".as_ptr() as *const c_char);
+            if class.is_null() {
+                0.5
+            } else {
+                let selector = sel_registerName(b"doubleClickInterval\0".as_ptr() as *const c_char);
+                let get_interval: extern "C" fn(*mut c_void, *mut c_void) -> f64 =
+                    std::mem::transmute(objc_msgSend as *const ());
+                get_interval(class, selector)
+            }
+        };
+        Duration::from_secs_f64(if seconds.is_finite() && (0.1..=2.0).contains(&seconds) {
+            seconds
+        } else {
+            0.5
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_click_state(button: MouseButton, down: bool, x: i32, y: i32) -> i64 {
+    macos_click_tracker()
+        .lock()
+        .map(|mut tracker| {
+            tracker.event_count(
+                button,
+                down,
+                x,
+                y,
+                Instant::now(),
+                macos_double_click_interval(),
+            )
+        })
+        .unwrap_or(if down { 1 } else { 0 })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_click_tracker() -> &'static Mutex<MacClickTracker> {
+    static TRACKER: OnceLock<Mutex<MacClickTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(MacClickTracker::default()))
+}
+
 #[cfg(target_os = "macos")]
 fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     use core_graphics::{
         display::CGDisplay,
-        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton},
+        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
@@ -5204,19 +5647,33 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         return;
     };
-    let (event_type, mouse_button) = match (button, down) {
-        (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
-        (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-        (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
-        (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-        (MouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
-        (MouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+    // Side buttons are "other" mouse events distinguished only by their button
+    // number (macOS: 2 = middle, 3 = back, 4 = forward); new_mouse_event has no
+    // CGMouseButton for 3/4, so create an Other event and stamp the number.
+    let (event_type, mouse_button, button_number) = match (button, down) {
+        (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left, None),
+        (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left, None),
+        (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right, None),
+        (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right, None),
+        (MouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, None),
+        (MouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, None),
+        (MouseButton::Back, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, Some(3)),
+        (MouseButton::Back, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, Some(3)),
+        (MouseButton::Forward, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, Some(4)),
+        (MouseButton::Forward, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, Some(4)),
     };
     let point = CGPoint::new(x as f64, y as f64);
 
     let _ = CGDisplay::warp_mouse_cursor_position(point);
 
     if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
+        if let Some(number) = button_number {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
+        }
+        event.set_integer_value_field(
+            EventField::MOUSE_EVENT_CLICK_STATE,
+            macos_click_state(button, down, x, y),
+        );
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -5247,11 +5704,20 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
 #[cfg(target_os = "macos")]
 static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
+/// Latch so a held (auto-repeating) remote Caps Lock toggles the input source
+/// exactly once until its key-up arrives.
+#[cfg(target_os = "macos")]
+static MACOS_CAPS_LOCK_DOWN: AtomicBool = AtomicBool::new(false);
+
 /// Clears the tracked injected-modifier flags. Called when receiving stops so a
 /// dropped modifier key-up cannot leave Shift/Ctrl/Cmd stuck on for later keys.
 #[cfg(target_os = "macos")]
 pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
+    MACOS_CAPS_LOCK_DOWN.store(false, Ordering::Relaxed);
+    if let Ok(mut tracker) = macos_click_tracker().lock() {
+        *tracker = MacClickTracker::default();
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -5279,6 +5745,30 @@ fn inject_key(key_code: u16, down: bool) {
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
+    // VK_CAPITAL: replicate the macOS "Caps Lock switches input sources"
+    // behaviour for remote input. macOS honours that setting only for the
+    // physical key — an injected caps keycode toggles neither the IME nor the
+    // caps state — so post the system "Select the previous input source"
+    // hotkey (⌃Space) instead: HIToolbox then performs the switch exactly as
+    // for a physical press, including refreshing the focused app's input
+    // session (TISSelectInputSource from a background process updates the
+    // menu-bar indicator but the focused app keeps typing in the old source
+    // until refocused). Remote Caps Lock therefore never acts as a
+    // letter-case toggle on this Mac.
+    // ponytail: assumes the ⌃Space symbolic hotkey is enabled (macOS default,
+    // verified on this deployment); read com.apple.symbolichotkeys key 60 if
+    // this ever needs to adapt.
+    if key_code == 0x14 {
+        if down {
+            if !MACOS_CAPS_LOCK_DOWN.swap(true, Ordering::Relaxed) {
+                macos_post_select_previous_input_source();
+            }
+        } else {
+            MACOS_CAPS_LOCK_DOWN.store(false, Ordering::Relaxed);
+        }
+        return;
+    }
+
     // Keep the running modifier state in sync, so the modifier event itself and
     // every later key carry the right flags.
     if let Some(flag) = windows_vk_to_mac_flag(key_code) {
@@ -5301,13 +5791,77 @@ fn inject_key(key_code: u16, down: bool) {
     };
     match CGEvent::new_keyboard_event(source, mac_code, down) {
         Ok(event) => {
-            event.set_flags(CGEventFlags::from_bits_truncate(
-                MAC_INJECT_FLAGS.load(Ordering::Relaxed),
-            ));
+            let mut flags = CGEventFlags::from_bits_truncate(MAC_INJECT_FLAGS.load(Ordering::Relaxed));
+            // A physical Mac keyboard stamps the function-section flags on
+            // arrow/nav keys (arrows additionally carry the numeric-pad bit).
+            // Shortcut matching — system ones like ⌃← "move left a space" and
+            // app key equivalents like ⌘← — compares those flags, so injected
+            // arrows without them fire nothing: the historic "Ctrl+arrows do
+            // nothing on the Mac" bug.
+            flags |= mac_function_section_flags(mac_code);
+            event.set_flags(flags);
             event.post(CGEventTapLocation::HID);
         }
         Err(_) => log::warn!("inject_key: failed to build keyboard event for mac code {mac_code}"),
     }
+}
+
+/// Extra CGEventFlags a physical keyboard sets for function-section keys:
+/// arrows (123-126) carry Fn + numeric-pad; Home/End/PageUp/PageDown/forward
+/// Delete carry Fn. Everything else gets nothing extra.
+#[cfg(target_os = "macos")]
+fn mac_function_section_flags(mac_code: u16) -> core_graphics::event::CGEventFlags {
+    use core_graphics::event::CGEventFlags;
+
+    match mac_code {
+        // Left, Right, Down, Up
+        123..=126 => CGEventFlags::CGEventFlagSecondaryFn | CGEventFlags::CGEventFlagNumericPad,
+        // Home(115), PageUp(116), forward Delete(117), End(119), PageDown(121)
+        115 | 116 | 117 | 119 | 121 => CGEventFlags::CGEventFlagSecondaryFn,
+        _ => CGEventFlags::empty(),
+    }
+}
+
+/// Posts the system input-source toggle hotkey (⌃Space, symbolic hotkey 60)
+/// as a full physical-like sequence: Control down, Space down/up, Control up.
+/// Flags are set per event and deliberately plain ⌃ — a concurrently held
+/// remote modifier would form a different chord and miss the hotkey; the next
+/// injected key restores the tracked flags anyway.
+#[cfg(target_os = "macos")]
+fn macos_post_select_previous_input_source() {
+    use core_graphics::{
+        event::{CGEvent, CGEventFlags, CGEventTapLocation},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    const MAC_KEY_CONTROL: u16 = 59; // kVK_Control
+    const MAC_KEY_SPACE: u16 = 49; // kVK_Space
+
+    let control = CGEventFlags::CGEventFlagControl;
+    let no_flags = CGEventFlags::empty();
+    let sequence = [
+        (MAC_KEY_CONTROL, true, control),
+        (MAC_KEY_SPACE, true, control),
+        (MAC_KEY_SPACE, false, control),
+        (MAC_KEY_CONTROL, false, no_flags),
+    ];
+    for (mac_code, down, flags) in sequence {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            log::warn!("caps toggle: failed to create CGEventSource");
+            return;
+        };
+        match CGEvent::new_keyboard_event(source, mac_code, down) {
+            Ok(event) => {
+                event.set_flags(flags);
+                event.post(CGEventTapLocation::HID);
+            }
+            Err(_) => {
+                log::warn!("caps toggle: failed to build keyboard event for mac code {mac_code}");
+                return;
+            }
+        }
+    }
+    log::info!("[diag] caps: posted input-source toggle (ctrl+space)");
 }
 
 #[cfg(target_os = "windows")]
@@ -5691,6 +6245,139 @@ mod tests {
         assert_eq!(guarded.x, 1.0);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_click_tracker_emits_matching_double_click_counts() {
+        let mut tracker = MacClickTracker::default();
+        let start = Instant::now();
+        let interval = Duration::from_millis(500);
+
+        assert_eq!(
+            tracker.event_count(MouseButton::Left, true, 100, 200, start, interval),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                100,
+                200,
+                start + Duration::from_millis(40),
+                interval,
+            ),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                true,
+                102,
+                201,
+                start + Duration::from_millis(180),
+                interval,
+            ),
+            2,
+            "a nearby press inside the interval must raise the click count"
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                102,
+                201,
+                start + Duration::from_millis(220),
+                interval,
+            ),
+            2
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_click_tracker_resets_after_drag_timeout_or_button_change() {
+        let mut tracker = MacClickTracker::default();
+        let start = Instant::now();
+        let interval = Duration::from_millis(500);
+
+        assert_eq!(
+            tracker.event_count(MouseButton::Left, true, 10, 10, start, interval),
+            1
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                false,
+                30,
+                30,
+                start + Duration::from_millis(40),
+                interval,
+            ),
+            0,
+            "a drag release is not a click"
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Right,
+                true,
+                10,
+                10,
+                start + Duration::from_millis(100),
+                interval,
+            ),
+            1,
+            "a different button starts its own click chain"
+        );
+        assert_eq!(
+            tracker.event_count(
+                MouseButton::Left,
+                true,
+                10,
+                10,
+                start + Duration::from_millis(700),
+                interval,
+            ),
+            1,
+            "a press after the interval starts over at a single click"
+        );
+    }
+
+    #[test]
+    fn remote_park_point_tucks_mac_at_shared_edge_and_keeps_windows_corner() {
+        let target = target_for_coordinate_tests(); // edge=Right, platform=windows, remote 2560x1440
+        let remote = target.remote_screen.clone();
+        let mut active = ActiveTarget {
+            target,
+            current_screen: remote.clone(),
+            current_screen_id: remote.id.clone(),
+            x: 12.0,
+            y: 700.0,
+            invert_y: false,
+        };
+
+        // Controlled Windows keeps the long-standing far-corner park.
+        assert_eq!(remote_park_point(&active), (2559, 1439));
+
+        // Controlled macOS entered through OUR right edge (this machine sits
+        // to its west): bottom clipping edge, west end, clear of the corner.
+        active.target.target_platform = "macos".into();
+        assert_eq!(
+            remote_park_point(&active),
+            (PARK_CORNER_CLEARANCE, 1439)
+        );
+
+        // Entered through OUR left edge (this machine to its east): the east
+        // edge clips the arrow itself — park there at the exit height.
+        active.target.edge = Edge::Left;
+        assert_eq!(remote_park_point(&active), (2559, 700));
+
+        // An exit right next to a corner still keeps hot-corner clearance.
+        active.y = 1439.0;
+        assert_eq!(
+            remote_park_point(&active),
+            (2559, 1439 - PARK_CORNER_CLEARANCE)
+        );
+    }
+
     #[test]
     fn screen_switch_hotkey_matching_requires_exact_modifiers() {
         let hotkeys = crate::ScreenSwitchHotkeys {
@@ -5846,14 +6533,7 @@ mod tests {
 
     #[test]
     fn hotkey_return_uses_recorded_point_then_local_screen_center() {
-        let active = crossing_target(
-            &[target_for_coordinate_tests()],
-            1919.0,
-            500.0,
-            40.0,
-            0.0,
-            &Arc::new(Mutex::new(layout_for_target_tests())),
-        )
+        let active = crossing_target(&[target_for_coordinate_tests()], 1919.0, 500.0, 40.0, 0.0)
         .expect("target should be active");
 
         assert_eq!(
@@ -5953,12 +6633,161 @@ mod tests {
     }
 
     #[test]
+    fn side_button_events_round_trip_on_the_wire() {
+        for button in [MouseButton::Back, MouseButton::Forward] {
+            let event = InputEvent::MouseButton { button, down: true };
+            let encoded = rmp_serde::to_vec_named(&event).expect("encode side button");
+            let decoded: InputEvent = rmp_serde::from_slice(&encoded).expect("decode side button");
+            assert_eq!(decoded, InputEvent::MouseButton { button, down: true });
+        }
+        // Distinct masks so a held side button never aliases another button.
+        let masks = [
+            mouse_button_mask(MouseButton::Left),
+            mouse_button_mask(MouseButton::Right),
+            mouse_button_mask(MouseButton::Middle),
+            mouse_button_mask(MouseButton::Back),
+            mouse_button_mask(MouseButton::Forward),
+        ];
+        for (i, a) in masks.iter().enumerate() {
+            for b in &masks[i + 1..] {
+                assert_ne!(a, b, "mouse button masks must be distinct");
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_packet_mirror_encodes_identically_to_input_packet() {
+        let packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            target_device_id: "peer-device".into(),
+            origin_device_id: "local-device".into(),
+            origin_port: 47833,
+            origin_transport_public_key: "local-public-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            event: InputEvent::MouseMove {
+                screen_id: "display-1".into(),
+                x: 320,
+                y: 240,
+            },
+        };
+        let mirror = InputPacketRef {
+            protocol: &packet.protocol,
+            target_device_id: &packet.target_device_id,
+            origin_device_id: &packet.origin_device_id,
+            origin_port: packet.origin_port,
+            origin_transport_public_key: &packet.origin_transport_public_key,
+            origin_protocol_version: packet.origin_protocol_version,
+            cluster_id: &packet.cluster_id,
+            pair_secret: &packet.pair_secret,
+            event: &packet.event,
+        };
+
+        assert_eq!(
+            rmp_serde::to_vec_named(&packet).expect("encode owned packet"),
+            rmp_serde::to_vec_named(&mirror).expect("encode borrowed mirror"),
+            "the send-path mirror must stay byte-identical to InputPacket on the wire"
+        );
+    }
+
+    #[test]
+    fn credential_less_packet_omits_the_pairing_block_and_still_decodes() {
+        let event = InputEvent::MouseMove {
+            screen_id: "display-1".into(),
+            x: 320,
+            y: 240,
+        };
+        let full = InputPacketRef {
+            protocol: INPUT_PROTOCOL,
+            target_device_id: "peer-device",
+            origin_device_id: "local-device",
+            origin_port: 47833,
+            // ~roughly the size of a real base64 transport certificate
+            origin_transport_public_key: &"A".repeat(492),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test",
+            pair_secret: "secret-test",
+            event: &event,
+        };
+        let lean = InputPacketRef {
+            protocol: INPUT_PROTOCOL,
+            target_device_id: "peer-device",
+            origin_device_id: "",
+            origin_port: 47833,
+            origin_transport_public_key: "",
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "",
+            pair_secret: "",
+            event: &event,
+        };
+
+        let full_bytes = rmp_serde::to_vec_named(&full).expect("encode full");
+        let lean_bytes = rmp_serde::to_vec_named(&lean).expect("encode lean");
+        assert!(
+            lean_bytes.len() + 400 < full_bytes.len(),
+            "credential-less packet ({} bytes) should be far smaller than full ({} bytes)",
+            lean_bytes.len(),
+            full_bytes.len()
+        );
+
+        // The receiver still decodes it, with the omitted credentials defaulted
+        // to empty so it takes the cached-authorization path.
+        let decoded = decode_input_packet(&lean_bytes).expect("decode lean packet");
+        assert!(decoded.pair_secret.is_empty());
+        assert!(decoded.origin_transport_public_key.is_empty());
+        assert_eq!(decoded.target_device_id, "peer-device");
+        assert_eq!(decoded.origin_port, 47833);
+    }
+
+    #[test]
+    fn credential_refresh_and_origin_cache_windows() {
+        let t0 = Instant::now();
+        // Refresh: due when never sent, not due within the window, due after it.
+        assert!(credential_send_due(None, t0));
+        assert!(!credential_send_due(
+            Some(t0),
+            t0 + INPUT_FULL_CRED_REFRESH - Duration::from_millis(1)
+        ));
+        assert!(credential_send_due(Some(t0), t0 + INPUT_FULL_CRED_REFRESH));
+
+        // Cache: never-seen is not fresh; within TTL is fresh; past TTL is not.
+        assert!(!origin_authorization_fresh(None, t0));
+        assert!(origin_authorization_fresh(
+            Some(t0),
+            t0 + INPUT_ORIGIN_CACHE_TTL - Duration::from_millis(1)
+        ));
+        assert!(!origin_authorization_fresh(
+            Some(t0),
+            t0 + INPUT_ORIGIN_CACHE_TTL
+        ));
+
+        // The refresh interval must stay under the cache TTL, or authorization
+        // would lapse between credentialled packets.
+        assert!(INPUT_FULL_CRED_REFRESH < INPUT_ORIGIN_CACHE_TTL);
+    }
+
+    #[test]
     fn input_packet_context_uses_stable_peer_origin_id() {
         let layout = layout_for_target_tests();
         let expected_origin_id = crate::local_peer_from_layout(&layout).id;
         let layout_state = Arc::new(Mutex::new(layout));
         let target = target_for_coordinate_tests();
 
+        // Key events consult the live layout and must resolve the stable id.
+        let context = input_packet_context(
+            &target,
+            InputEvent::Key {
+                key_code: 0x41,
+                down: true,
+            },
+            &layout_state,
+        );
+        assert_ne!(expected_origin_id, "local-device");
+        assert_eq!(context.origin_device_id, expected_origin_id);
+
+        // Mouse events take the hot path: the context cached on the target at
+        // build time, which carries the same stable id without a layout lock.
         let context = input_packet_context(
             &target,
             InputEvent::MouseMove {
@@ -5968,9 +6797,7 @@ mod tests {
             },
             &layout_state,
         );
-
-        assert_ne!(expected_origin_id, "local-device");
-        assert_eq!(context.origin_device_id, expected_origin_id);
+        assert_eq!(context.origin_device_id, target.origin_device_id);
     }
 
     #[test]
@@ -6203,7 +7030,7 @@ mod tests {
     fn fast_crossing_carries_entry_delta_into_remote() {
         let target = target_for_coordinate_tests();
         let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
-        let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0, &layout_state)
+        let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0)
             .expect("fast edge movement should cross");
 
         assert!(

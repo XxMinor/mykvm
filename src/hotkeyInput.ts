@@ -24,13 +24,6 @@ const MODIFIER_KEYS = new Set([
   "windows",
 ]);
 
-export function edgeSwitchHotkeyFromKeyboardEvent(
-  event: HotkeyKeyboardEventLike,
-  metaKeyLabel: MetaKeyLabel = "meta",
-): string | null {
-  return hotkeyFromKeyboardEvent(event, metaKeyLabel);
-}
-
 /// Generic hotkey capture used by both the runtime-toggle recorder and the
 /// screen-switch direction recorders. Returns the canonical hotkey string, or
 /// `null` to ignore the event (e.g. a bare modifier press), or `"disabled"` to

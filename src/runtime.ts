@@ -71,17 +71,6 @@ export interface AppStateSnapshot {
   runtime: RuntimeStatus
 }
 
-export interface DiagnosticDevice {
-  name: string
-  host: string
-  role: string
-  online: boolean
-  inputReady: boolean
-  discoveryPort: number
-  quicPort: number
-  sameSubnet?: boolean | null
-}
-
 export interface DiagnosticInfo {
   report: string
   appVersion: string
@@ -93,7 +82,6 @@ export interface DiagnosticInfo {
   discoveryPort: number
   quicPort: number
   peerCount: number
-  knownDevices: DiagnosticDevice[]
   logDir: string
   configDir: string
   networkHint: string

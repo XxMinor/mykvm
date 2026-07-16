@@ -1,7 +1,6 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    collections::HashMap,
     env, fs,
-    hash::{Hash, Hasher},
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
@@ -19,8 +18,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, DragDropEvent, Emitter, Manager, Monitor, WebviewUrl, WebviewWindowBuilder,
-    WindowEvent, Wry,
+    AppHandle, Emitter, Manager, Monitor, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
@@ -67,13 +65,6 @@ const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const FILE_TRANSFER_DESTINATION_POINTER: &str = "pointer";
-const EDGE_DROP_WINDOWS_ENABLED: bool = false;
-const EDGE_DROP_LABEL_PREFIX: &str = "mykvm-edge-drop-";
-const EDGE_DROP_THICKNESS: i32 = 8;
-const FILE_DROP_LANDING_LABEL: &str = "mykvm-file-drop-landing";
-const FILE_DROP_LANDING_WIDTH: f64 = 96.0;
-const FILE_DROP_LANDING_HEIGHT: f64 = 72.0;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const AUTOSTART_ARG: &str = "--mykvm-autostart";
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
@@ -486,42 +477,11 @@ struct FileTransferPacket {
     cluster_id: String,
     pair_secret: String,
     file_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    destination_hint: Option<String>,
     total_bytes: u64,
     chunk_index: u64,
     offset: u64,
     #[serde(default)]
     data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum EdgeDropSide {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-impl EdgeDropSide {
-    fn as_str(self) -> &'static str {
-        match self {
-            EdgeDropSide::Left => "left",
-            EdgeDropSide::Right => "right",
-            EdgeDropSide::Top => "top",
-            EdgeDropSide::Bottom => "bottom",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct EdgeDropWindowSpec {
-    label: String,
-    target_device_id: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
 }
 
 struct AppRuntime {
@@ -532,7 +492,6 @@ struct AppRuntime {
     peers: Arc<Mutex<Vec<LanPeer>>>,
     pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
     file_transfers: Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
-    edge_drop_targets: Arc<Mutex<HashMap<String, String>>>,
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
@@ -571,7 +530,6 @@ impl AppRuntime {
             peers: Arc::new(Mutex::new(Vec::new())),
             pairing_challenge: Arc::new(Mutex::new(None)),
             file_transfers: Arc::new(Mutex::new(HashMap::new())),
-            edge_drop_targets: Arc::new(Mutex::new(HashMap::new())),
             quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
             input_stop: Mutex::new(None),
@@ -735,7 +693,6 @@ impl AppRuntime {
 
         let layout_for_input = Arc::clone(&self.layout);
         let layout_for_clipboard = Arc::clone(&self.layout);
-        let layout_for_file_transfer = Arc::clone(&self.layout);
         let layout_for_pairing = Arc::clone(&self.layout);
         let native_layout_for_input = self.native_layout();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
@@ -758,26 +715,12 @@ impl AppRuntime {
             if !input_receive_enabled.load(Ordering::Relaxed) {
                 return;
             }
-            let Ok(layout) = layout_for_input.lock() else {
-                return;
-            };
-            let current_peer = local_peer_from_layout(&layout);
-            if input::try_handle_control_packet_from_source(
-                &layout,
-                &payload,
-                source,
-                &current_peer.id,
-            ) {
-                transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            if input::try_inject_packet_from_source(
-                &layout,
+            if input::handle_input_datagram(
+                &layout_for_input,
                 &native_layout_for_input,
                 &payload,
                 source,
                 &input_events,
-                &current_peer.id,
                 &clipboard_target,
             ) {
                 transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
@@ -797,27 +740,34 @@ impl AppRuntime {
                 return true;
             }
 
-            if let Ok(layout) = layout_for_file_transfer.lock() {
-                let current_peer = local_peer_from_layout(&layout);
-                if handle_file_transfer_packet(
-                    &payload,
-                    &layout,
-                    &current_peer.id,
-                    &file_transfers,
-                    &app_handle_for_file_transfer,
-                ) {
-                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
+            // Snapshot the layout instead of holding the lock through the
+            // handlers: clipboard writes retry with sleeps, spawn pbcopy and
+            // decode up to 32MB of base64, and file transfers write chunks to
+            // disk — holding the layout lock through any of that stalls the
+            // input hot paths (which take the same lock) for tens to hundreds
+            // of ms per sync. Stream packets are rare; one clone is nothing.
+            let layout = {
+                let Ok(layout) = layout_for_clipboard.lock() else {
+                    return false;
+                };
+                layout.clone()
+            };
+            let current_peer = local_peer_from_layout(&layout);
+
+            if handle_file_transfer_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &file_transfers,
+                &app_handle_for_file_transfer,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
 
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
                 return false;
             }
-            let Ok(layout) = layout_for_clipboard.lock() else {
-                return false;
-            };
-            let current_peer = local_peer_from_layout(&layout);
             if handle_clipboard_packet(
                 &payload,
                 &layout,
@@ -2120,15 +2070,8 @@ fn send_files_to_device(
     paths: Vec<String>,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<FileTransferSummary, String> {
-    send_files_to_device_with_destination(state.inner(), &device_id, paths, None)
-}
-
-fn send_files_to_device_with_destination(
-    state: &AppRuntime,
-    device_id: &str,
-    paths: Vec<String>,
-    destination_hint: Option<&str>,
-) -> Result<FileTransferSummary, String> {
+    let state = state.inner();
+    let device_id = device_id.as_str();
     if paths.is_empty() {
         return Err("请选择要传输的文件。".into());
     }
@@ -2151,13 +2094,7 @@ fn send_files_to_device_with_destination(
     let mut byte_count = 0_u64;
 
     for file in files {
-        let packet_count = send_transfer_file(
-            &quic_transport,
-            &local_peer.id,
-            &target,
-            &file,
-            destination_hint,
-        )?;
+        let packet_count = send_transfer_file(&quic_transport, &local_peer.id, &target, &file)?;
         state
             .transport_packets
             .fetch_add(packet_count, Ordering::Relaxed);
@@ -2170,464 +2107,6 @@ fn send_files_to_device_with_destination(
         file_count,
         byte_count,
     })
-}
-
-fn start_edge_drop_window_sync(app_handle: AppHandle) {
-    thread::spawn(move || loop {
-        let state = app_handle.state::<AppRuntime>();
-        let runtime = state.inner();
-        let layout = runtime.layout_snapshot();
-        let peers = active_peer_snapshot(&runtime.peers);
-        let specs = edge_drop_specs_for_window_visibility(
-            &layout,
-            &peers,
-            runtime.main_window_visible.load(Ordering::Relaxed),
-        );
-        let next_labels = specs
-            .iter()
-            .map(|spec| spec.label.clone())
-            .collect::<HashSet<_>>();
-        let next_targets = specs
-            .iter()
-            .map(|spec| (spec.label.clone(), spec.target_device_id.clone()))
-            .collect::<HashMap<_, _>>();
-        let stale_labels = runtime
-            .edge_drop_targets
-            .lock()
-            .map(|mut targets| {
-                let stale = targets
-                    .keys()
-                    .filter(|label| !next_labels.contains(*label))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                *targets = next_targets;
-                stale
-            })
-            .unwrap_or_default();
-
-        let main_handle = app_handle.clone();
-        let _ = app_handle.run_on_main_thread(move || {
-            sync_edge_drop_windows_on_main(&main_handle, specs, stale_labels);
-        });
-
-        thread::sleep(Duration::from_millis(1500));
-    });
-}
-
-fn sync_edge_drop_windows_on_main(
-    app_handle: &AppHandle,
-    specs: Vec<EdgeDropWindowSpec>,
-    stale_labels: Vec<String>,
-) {
-    for label in stale_labels {
-        if let Some(window) = app_handle.get_webview_window(&label) {
-            let _ = window.hide();
-        }
-    }
-
-    for spec in specs {
-        if let Some(window) = app_handle.get_webview_window(&spec.label) {
-            let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
-                spec.x, spec.y,
-            )));
-            let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-                spec.width,
-                spec.height,
-            )));
-            let _ = window.set_always_on_top(true);
-            let _ = window.set_focusable(false);
-            if !window.is_visible().unwrap_or(false) {
-                let _ = window.show();
-            }
-            continue;
-        }
-
-        let build_result = WebviewWindowBuilder::new(
-            app_handle,
-            &spec.label,
-            WebviewUrl::App("edge-drop.html".into()),
-        )
-        .title("")
-        .position(spec.x, spec.y)
-        .inner_size(spec.width, spec.height)
-        .decorations(false)
-        .resizable(false)
-        .maximizable(false)
-        .minimizable(false)
-        .closable(false)
-        .shadow(false)
-        .transparent(true)
-        .always_on_top(true)
-        .visible_on_all_workspaces(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .focusable(false)
-        .build();
-
-        if let Err(error) = build_result {
-            log::warn!("edge drop window {} failed: {error}", spec.label);
-        }
-    }
-}
-
-fn handle_edge_drop_window_event(window: &tauri::Window, event: &WindowEvent) -> bool {
-    let label = window.label();
-    if !label.starts_with(EDGE_DROP_LABEL_PREFIX) {
-        return false;
-    }
-
-    match event {
-        WindowEvent::CloseRequested { api, .. } => {
-            api.prevent_close();
-            let _ = window.hide();
-        }
-        WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
-            if paths.is_empty() {
-                return true;
-            }
-            let app_handle = window.app_handle().clone();
-            let label = label.to_string();
-            let paths = paths
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            thread::spawn(move || {
-                let state = app_handle.state::<AppRuntime>();
-                let target_device_id = state
-                    .edge_drop_targets
-                    .lock()
-                    .ok()
-                    .and_then(|targets| targets.get(&label).cloned());
-                let Some(target_device_id) = target_device_id else {
-                    log::warn!("edge drop ignored: no target for {label}");
-                    return;
-                };
-
-                match send_files_to_device_with_destination(
-                    state.inner(),
-                    &target_device_id,
-                    paths,
-                    Some(FILE_TRANSFER_DESTINATION_POINTER),
-                ) {
-                    Ok(summary) => log::info!(
-                        "edge drop sent {} file(s) to {} bytes={}",
-                        summary.file_count,
-                        summary.target_name,
-                        summary.byte_count
-                    ),
-                    Err(error) => log::warn!("edge drop transfer failed: {error}"),
-                }
-            });
-        }
-        _ => {}
-    }
-
-    true
-}
-
-fn handle_file_drop_landing_window_event(window: &tauri::Window, event: &WindowEvent) -> bool {
-    if window.label() != FILE_DROP_LANDING_LABEL {
-        return false;
-    }
-
-    if let WindowEvent::CloseRequested { api, .. } = event {
-        api.prevent_close();
-        let _ = window.hide();
-    }
-
-    true
-}
-
-fn edge_drop_specs_for_layout(layout: &LayoutState, peers: &[LanPeer]) -> Vec<EdgeDropWindowSpec> {
-    if !layout.file_transfer_enabled {
-        return Vec::new();
-    }
-
-    let Some(local_device) = layout.devices.iter().find(|device| device.role == "local") else {
-        return Vec::new();
-    };
-
-    let mut specs = match layout.machine_role.as_str() {
-        "server" => server_edge_drop_specs(layout, local_device),
-        "client" => client_edge_drop_specs(layout, local_device, peers),
-        _ => Vec::new(),
-    };
-    specs.sort_by(|left, right| left.label.cmp(&right.label));
-    specs
-}
-
-fn edge_drop_specs_for_window_visibility(
-    layout: &LayoutState,
-    peers: &[LanPeer],
-    main_window_visible: bool,
-) -> Vec<EdgeDropWindowSpec> {
-    if main_window_visible {
-        edge_drop_specs_for_layout(layout, peers)
-    } else {
-        Vec::new()
-    }
-}
-
-fn server_edge_drop_specs(layout: &LayoutState, local_device: &Device) -> Vec<EdgeDropWindowSpec> {
-    let mut specs = Vec::new();
-    for device in layout.devices.iter().filter(|device| {
-        device.role != "local"
-            && device.online
-            && device.input_ready
-            && device.protocol_version == quic_transport::PROTOCOL_VERSION
-            && !device.transport_public_key.trim().is_empty()
-    }) {
-        for local_screen in &local_device.screens {
-            for remote_screen in &device.screens {
-                if edge_screens_overlap(local_screen, remote_screen) {
-                    continue;
-                }
-                let Some(side) = edge_touching_side(local_screen, remote_screen) else {
-                    continue;
-                };
-                let Some((x, y, width, height)) =
-                    edge_drop_rect_between(local_screen, remote_screen, side)
-                else {
-                    continue;
-                };
-                specs.push(EdgeDropWindowSpec {
-                    label: edge_drop_label(&device.id, local_screen, Some(remote_screen), side),
-                    target_device_id: device.id.clone(),
-                    x,
-                    y,
-                    width,
-                    height,
-                });
-            }
-        }
-    }
-    specs
-}
-
-fn client_edge_drop_specs(
-    layout: &LayoutState,
-    local_device: &Device,
-    peers: &[LanPeer],
-) -> Vec<EdgeDropWindowSpec> {
-    let Some(target_device_id) = online_paired_controller_id(layout, peers) else {
-        return Vec::new();
-    };
-
-    let mut specs = Vec::new();
-    for local_screen in &local_device.screens {
-        for side in [
-            EdgeDropSide::Left,
-            EdgeDropSide::Right,
-            EdgeDropSide::Top,
-            EdgeDropSide::Bottom,
-        ] {
-            if local_edge_has_neighbor(&local_device.screens, local_screen, side) {
-                continue;
-            }
-            let (x, y, width, height) = outer_edge_drop_rect(local_screen, side);
-            specs.push(EdgeDropWindowSpec {
-                label: edge_drop_label(&target_device_id, local_screen, None, side),
-                target_device_id: target_device_id.clone(),
-                x,
-                y,
-                width,
-                height,
-            });
-        }
-    }
-
-    specs
-}
-
-fn online_paired_controller_id(layout: &LayoutState, peers: &[LanPeer]) -> Option<String> {
-    layout
-        .paired_controllers
-        .iter()
-        .find(|controller| {
-            peers.iter().any(|peer| {
-                (peer.id == controller.id
-                    || (!controller.transport_public_key.trim().is_empty()
-                        && peer.transport_public_key == controller.transport_public_key))
-                    && peer.protocol_version == quic_transport::PROTOCOL_VERSION
-                    && !peer.transport_public_key.trim().is_empty()
-                    && peer.quic_port != 0
-            })
-        })
-        .map(|controller| controller.id.clone())
-}
-
-fn edge_drop_label(
-    target_device_id: &str,
-    local_screen: &Screen,
-    remote_screen: Option<&Screen>,
-    side: EdgeDropSide,
-) -> String {
-    let remote = remote_screen
-        .map(|screen| edge_label_component(&screen.id))
-        .unwrap_or_else(|| "outer".into());
-    format!(
-        "{}{}-{}-{}-{}",
-        EDGE_DROP_LABEL_PREFIX,
-        edge_label_component(target_device_id),
-        edge_label_component(&local_screen.id),
-        remote,
-        side.as_str()
-    )
-}
-
-fn edge_label_component(value: &str) -> String {
-    let component = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let component = component
-        .trim_matches('-')
-        .chars()
-        .take(48)
-        .collect::<String>();
-    if !component.is_empty() {
-        return component;
-    }
-
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    format!("id-{:016x}", hasher.finish())
-}
-
-fn edge_drop_rect_between(
-    local: &Screen,
-    remote: &Screen,
-    side: EdgeDropSide,
-) -> Option<(f64, f64, f64, f64)> {
-    let thickness = EDGE_DROP_THICKNESS;
-    let (x, y, width, height) = match side {
-        EdgeDropSide::Left | EdgeDropSide::Right => {
-            let y = local.y.max(remote.y);
-            let height = (local.y + local.height).min(remote.y + remote.height) - y;
-            if height <= 0 {
-                return None;
-            }
-            let x = if side == EdgeDropSide::Right {
-                local.x + local.width - thickness
-            } else {
-                local.x
-            };
-            (x, y, thickness, height)
-        }
-        EdgeDropSide::Top | EdgeDropSide::Bottom => {
-            let x = local.x.max(remote.x);
-            let width = (local.x + local.width).min(remote.x + remote.width) - x;
-            if width <= 0 {
-                return None;
-            }
-            let y = if side == EdgeDropSide::Bottom {
-                local.y + local.height - thickness
-            } else {
-                local.y
-            };
-            (x, y, width, thickness)
-        }
-    };
-
-    Some((x as f64, y as f64, width as f64, height as f64))
-}
-
-fn outer_edge_drop_rect(screen: &Screen, side: EdgeDropSide) -> (f64, f64, f64, f64) {
-    let thickness = EDGE_DROP_THICKNESS;
-    let (x, y, width, height) = match side {
-        EdgeDropSide::Left => (screen.x, screen.y, thickness, screen.height),
-        EdgeDropSide::Right => (
-            screen.x + screen.width - thickness,
-            screen.y,
-            thickness,
-            screen.height,
-        ),
-        EdgeDropSide::Top => (screen.x, screen.y, screen.width, thickness),
-        EdgeDropSide::Bottom => (
-            screen.x,
-            screen.y + screen.height - thickness,
-            screen.width,
-            thickness,
-        ),
-    };
-
-    (x as f64, y as f64, width as f64, height as f64)
-}
-
-fn local_edge_has_neighbor(screens: &[Screen], screen: &Screen, side: EdgeDropSide) -> bool {
-    screens
-        .iter()
-        .filter(|candidate| candidate.id != screen.id)
-        .any(|candidate| edge_touching_side(screen, candidate) == Some(side))
-}
-
-fn edge_touching_side(local: &Screen, remote: &Screen) -> Option<EdgeDropSide> {
-    if edge_near(local.x + local.width, remote.x)
-        && edge_ranges_overlap(
-            local.y,
-            local.y + local.height,
-            remote.y,
-            remote.y + remote.height,
-        )
-    {
-        return Some(EdgeDropSide::Right);
-    }
-
-    if edge_near(local.x, remote.x + remote.width)
-        && edge_ranges_overlap(
-            local.y,
-            local.y + local.height,
-            remote.y,
-            remote.y + remote.height,
-        )
-    {
-        return Some(EdgeDropSide::Left);
-    }
-
-    if edge_near(local.y + local.height, remote.y)
-        && edge_ranges_overlap(
-            local.x,
-            local.x + local.width,
-            remote.x,
-            remote.x + remote.width,
-        )
-    {
-        return Some(EdgeDropSide::Bottom);
-    }
-
-    if edge_near(local.y, remote.y + remote.height)
-        && edge_ranges_overlap(
-            local.x,
-            local.x + local.width,
-            remote.x,
-            remote.x + remote.width,
-        )
-    {
-        return Some(EdgeDropSide::Top);
-    }
-
-    None
-}
-
-fn edge_screens_overlap(local: &Screen, remote: &Screen) -> bool {
-    local.x < remote.x + remote.width
-        && local.x + local.width > remote.x
-        && local.y < remote.y + remote.height
-        && local.y + local.height > remote.y
-}
-
-fn edge_near(a: i32, b: i32) -> bool {
-    (a - b).abs() <= 80
-}
-
-fn edge_ranges_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> bool {
-    i32::min(a_end, b_end) - i32::max(a_start, b_start) > 80
 }
 
 #[tauri::command]
@@ -3326,12 +2805,6 @@ pub fn run() {
                 .build(),
         )
         .on_window_event(|window, event| {
-            if handle_edge_drop_window_event(window, event) {
-                return;
-            }
-            if handle_file_drop_landing_window_event(window, event) {
-                return;
-            }
             if window.label() == "main" {
                 if let WindowEvent::Focused(focused) = event {
                     set_main_window_focused(window.app_handle(), *focused);
@@ -3418,9 +2891,6 @@ pub fn run() {
             setup_macos_cursor_hider(app);
             #[cfg(target_os = "macos")]
             setup_macos_window_visibility_watcher(app);
-            if EDGE_DROP_WINDOWS_ENABLED {
-                start_edge_drop_window_sync(app.handle().clone());
-            }
             setup_tray(app)?;
             if let Err(error) = sync_runtime_toggle_shortcut(app.handle()) {
                 log::warn!("failed to register quick start/stop shortcut: {error}");
@@ -4611,6 +4081,27 @@ fn local_host_label() -> String {
 }
 
 fn local_ip_address() -> Option<String> {
+    // Callers include per-event hot paths (input target building, packet
+    // origin resolution) and the discovery loop; the UDP-socket probe is four
+    // syscalls. The LAN address changes on network reconfigs, not per event —
+    // cache it briefly.
+    const LOCAL_IP_CACHE_TTL: Duration = Duration::from_secs(5);
+    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+
+    if let Ok(mut cached) = CACHE.lock() {
+        if let Some((probed_at, address)) = cached.as_ref() {
+            if probed_at.elapsed() < LOCAL_IP_CACHE_TTL {
+                return address.clone();
+            }
+        }
+        let fresh = probe_local_ip_address();
+        *cached = Some((Instant::now(), fresh.clone()));
+        return fresh;
+    }
+    probe_local_ip_address()
+}
+
+fn probe_local_ip_address() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     let address = socket.local_addr().ok()?;
@@ -4920,6 +4411,14 @@ fn clipboard_ready_status() -> NativeStageStatus {
 struct ClipboardPacket {
     protocol: String,
     origin_id: String,
+    // The sender's QUIC transport public key. Defaulted so packets from older
+    // peers (which never sent it) still decode as an empty string. Authorization
+    // matches on this stable key first, exactly like input packets, so a copy
+    // still syncs after the origin's derived peer id drifts (e.g. its LAN IP
+    // changed since pairing) — the bug where input kept working but clipboard
+    // silently stopped in one direction.
+    #[serde(default)]
+    origin_transport_public_key: String,
     #[serde(default)]
     target_id: String,
     #[serde(default)]
@@ -4954,6 +4453,7 @@ struct ClipboardFormat {
 fn clipboard_packet_from_content(
     content: ClipboardContent,
     origin_id: String,
+    origin_transport_public_key: String,
     target_id: String,
     cluster_id: String,
     pair_secret: String,
@@ -4964,6 +4464,7 @@ fn clipboard_packet_from_content(
         ClipboardContent::Text(text) => ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id,
+            origin_transport_public_key,
             target_id,
             cluster_id,
             pair_secret,
@@ -4980,6 +4481,7 @@ fn clipboard_packet_from_content(
         ClipboardContent::Image(image) => ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id,
+            origin_transport_public_key,
             target_id,
             cluster_id,
             pair_secret,
@@ -5093,6 +4595,7 @@ fn run_clipboard_sync(
         let packet = clipboard_packet_from_content(
             content,
             local_peer_id.clone(),
+            quic_transport.public_key().to_string(),
             target.device_id.clone(),
             target.cluster_id.clone(),
             target.pair_secret.clone(),
@@ -5359,10 +4862,19 @@ fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -
     }
 
     if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
-        return layout
-            .paired_controllers
-            .iter()
-            .any(|controller| controller.id == packet.origin_id);
+        // Mirror input-packet authorization (packet_authorized_fields): match on
+        // the STABLE transport public key first, then the id, then the legacy
+        // "local-device" fallback. Matching by id alone silently rejected a
+        // controller whose derived peer id had drifted (LAN IP change) even
+        // though its key was unchanged — which is why input kept working while
+        // clipboard from that controller stopped.
+        let key = packet.origin_transport_public_key.trim();
+        return layout.paired_controllers.iter().any(|controller| {
+            (!key.is_empty() && controller.transport_public_key == key)
+                || controller.id == packet.origin_id
+        }) || (layout.paired_controllers.len() == 1
+            && packet.origin_id == "local-device"
+            && !key.is_empty());
     }
 
     true
@@ -5515,7 +5027,6 @@ fn send_transfer_file(
     origin_id: &str,
     target: &FileTransferTarget,
     file: &TransferFile,
-    destination_hint: Option<&str>,
 ) -> Result<u64, String> {
     let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
     let mut packet_count = 0_u64;
@@ -5532,7 +5043,6 @@ fn send_transfer_file(
             file.total_bytes,
             0,
             0,
-            destination_hint,
             Vec::new(),
         ),
     )?;
@@ -5563,7 +5073,6 @@ fn send_transfer_file(
                 file.total_bytes,
                 chunk_index,
                 offset,
-                destination_hint,
                 data,
             ),
         )?;
@@ -5584,7 +5093,6 @@ fn send_transfer_file(
             file.total_bytes,
             chunk_index,
             offset,
-            destination_hint,
             Vec::new(),
         ),
     )?;
@@ -5603,7 +5111,6 @@ fn file_transfer_packet(
     total_bytes: u64,
     chunk_index: u64,
     offset: u64,
-    destination_hint: Option<&str>,
     data: Vec<u8>,
 ) -> FileTransferPacket {
     FileTransferPacket {
@@ -5615,7 +5122,6 @@ fn file_transfer_packet(
         cluster_id: target.cluster_id.clone(),
         pair_secret: target.pair_secret.clone(),
         file_name: file_name.into(),
-        destination_hint: destination_hint.map(str::to_string),
         total_bytes,
         chunk_index,
         offset,
@@ -5653,23 +5159,7 @@ fn handle_file_transfer_packet(
         log::warn!("file transfer receive failed: could not resolve receive directory");
         return false;
     };
-    let pointer_receive_root = if packet.kind == "start"
-        && packet.destination_hint.as_deref() == Some(FILE_TRANSFER_DESTINATION_POINTER)
-    {
-        file_transfer_pointer_receive_root(app)
-    } else {
-        None
-    };
-
-    handle_decoded_file_transfer_packet(
-        packet,
-        layout,
-        local_peer_id,
-        transfers,
-        &receive_root,
-        pointer_receive_root.as_deref(),
-        Some(app),
-    )
+    handle_decoded_file_transfer_packet(packet, layout, local_peer_id, transfers, &receive_root)
 }
 
 fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -5683,63 +5173,6 @@ fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to resolve file transfer receive directory: {error}"))
 }
 
-fn file_transfer_pointer_receive_root(app: &AppHandle) -> Option<PathBuf> {
-    platform_pointer_receive_root(app).and_then(usable_existing_directory)
-}
-
-#[cfg(target_os = "macos")]
-fn platform_pointer_receive_root(app: &AppHandle) -> Option<PathBuf> {
-    app.path()
-        .desktop_dir()
-        .ok()
-        .or_else(macos_finder_insertion_directory)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_pointer_receive_root(app: &AppHandle) -> Option<PathBuf> {
-    app.path().desktop_dir().ok()
-}
-
-fn usable_existing_directory(path: PathBuf) -> Option<PathBuf> {
-    if path.is_absolute() && path.is_dir() {
-        Some(path)
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_finder_insertion_directory() -> Option<PathBuf> {
-    let script = r#"
-tell application "Finder"
-  try
-    set targetFolder to insertion location as alias
-    return POSIX path of targetFolder
-  on error
-    return ""
-  end try
-end tell
-"#;
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .trim_end_matches('/')
-        .to_string();
-    if path.is_empty() {
-        return None;
-    }
-
-    Some(PathBuf::from(path))
-}
-
 #[cfg(test)]
 fn handle_file_transfer_packet_with_root(
     payload: &[u8],
@@ -5748,40 +5181,10 @@ fn handle_file_transfer_packet_with_root(
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
 ) -> bool {
-    handle_file_transfer_packet_with_destination_root(
-        payload,
-        layout,
-        local_peer_id,
-        transfers,
-        receive_root,
-        None,
-        None,
-    )
-}
-
-#[cfg(test)]
-fn handle_file_transfer_packet_with_destination_root(
-    payload: &[u8],
-    layout: &LayoutState,
-    local_peer_id: &str,
-    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
-    receive_root: &Path,
-    pointer_receive_root: Option<&Path>,
-    landing_app: Option<&AppHandle>,
-) -> bool {
     let Some(packet) = decode_wire_packet::<FileTransferPacket>(payload) else {
         return false;
     };
-
-    handle_decoded_file_transfer_packet(
-        packet,
-        layout,
-        local_peer_id,
-        transfers,
-        receive_root,
-        pointer_receive_root,
-        landing_app,
-    )
+    handle_decoded_file_transfer_packet(packet, layout, local_peer_id, transfers, receive_root)
 }
 
 fn handle_decoded_file_transfer_packet(
@@ -5790,8 +5193,6 @@ fn handle_decoded_file_transfer_packet(
     local_peer_id: &str,
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
-    pointer_receive_root: Option<&Path>,
-    landing_app: Option<&AppHandle>,
 ) -> bool {
     if packet.protocol != FILE_TRANSFER_PROTOCOL {
         return false;
@@ -5809,130 +5210,12 @@ fn handle_decoded_file_transfer_packet(
         return true;
     }
 
-    let destination_root =
-        file_transfer_destination_root(&packet, receive_root, pointer_receive_root);
     match packet.kind.as_str() {
-        "start" => {
-            let show_landing =
-                packet.destination_hint.as_deref() == Some(FILE_TRANSFER_DESTINATION_POINTER);
-            let file_name = packet.file_name.clone();
-            let accepted = start_incoming_file_transfer(packet, transfers, destination_root);
-            if accepted && show_landing {
-                if let Some(app) = landing_app {
-                    show_file_drop_landing_window(app, &file_name);
-                }
-            }
-            accepted
-        }
+        "start" => start_incoming_file_transfer(packet, transfers, receive_root),
         "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
         "finish" => finish_incoming_file_transfer(packet, transfers),
         _ => false,
     }
-}
-
-fn file_transfer_destination_root<'a>(
-    packet: &FileTransferPacket,
-    receive_root: &'a Path,
-    pointer_receive_root: Option<&'a Path>,
-) -> &'a Path {
-    if packet.destination_hint.as_deref() == Some(FILE_TRANSFER_DESTINATION_POINTER) {
-        return pointer_receive_root.unwrap_or(receive_root);
-    }
-
-    receive_root
-}
-
-fn show_file_drop_landing_window(app: &AppHandle, _file_name: &str) {
-    let Some((x, y)) = current_pointer_position() else {
-        return;
-    };
-    let x = x - FILE_DROP_LANDING_WIDTH / 2.0;
-    let y = y - FILE_DROP_LANDING_HEIGHT / 2.0;
-
-    if let Some(window) = app.get_webview_window(FILE_DROP_LANDING_LABEL) {
-        let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_focusable(false);
-        let _ = window.show();
-        schedule_file_drop_landing_hide(app.clone());
-        return;
-    }
-
-    let build_result = WebviewWindowBuilder::new(
-        app,
-        FILE_DROP_LANDING_LABEL,
-        WebviewUrl::App("file-drop-landing.html".into()),
-    )
-    .title("")
-    .position(x, y)
-    .inner_size(FILE_DROP_LANDING_WIDTH, FILE_DROP_LANDING_HEIGHT)
-    .decorations(false)
-    .resizable(false)
-    .maximizable(false)
-    .minimizable(false)
-    .closable(false)
-    .shadow(false)
-    .transparent(true)
-    .always_on_top(true)
-    .visible_on_all_workspaces(true)
-    .skip_taskbar(true)
-    .focused(false)
-    .focusable(false)
-    .build();
-
-    if let Err(error) = build_result {
-        log::warn!("file drop landing window failed: {error}");
-        return;
-    }
-
-    schedule_file_drop_landing_hide(app.clone());
-}
-
-fn schedule_file_drop_landing_hide(app: AppHandle) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(2200));
-        let main_handle = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            if let Some(window) = main_handle.get_webview_window(FILE_DROP_LANDING_LABEL) {
-                let _ = window.hide();
-            }
-        });
-    });
-}
-
-fn current_pointer_position() -> Option<(f64, f64)> {
-    platform_current_pointer_position()
-}
-
-#[cfg(target_os = "macos")]
-fn platform_current_pointer_position() -> Option<(f64, f64)> {
-    use core_graphics::{
-        event::CGEvent,
-        event_source::{CGEventSource, CGEventSourceStateID},
-    };
-
-    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
-    let event = CGEvent::new(source).ok()?;
-    let point = event.location();
-    Some((point.x, point.y))
-}
-
-#[cfg(target_os = "windows")]
-fn platform_current_pointer_position() -> Option<(f64, f64)> {
-    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
-
-    let mut point = POINT { x: 0, y: 0 };
-    let ok = unsafe { GetCursorPos(&mut point) };
-    if ok == 0 {
-        return None;
-    }
-
-    Some((point.x as f64, point.y as f64))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn platform_current_pointer_position() -> Option<(f64, f64)> {
-    None
 }
 
 fn start_incoming_file_transfer(
@@ -7804,105 +7087,6 @@ mod tests {
     }
 
     #[test]
-    fn edge_drop_specs_follow_server_screen_adjacency() {
-        let mut layout = test_layout();
-        layout.devices[1].screens[0].x = 1920;
-
-        let specs = edge_drop_specs_for_layout(&layout, &[]);
-
-        assert_eq!(specs.len(), 1);
-        let spec = &specs[0];
-        assert_eq!(spec.target_device_id, "peer-client-10-0-0-2");
-        assert_eq!(spec.x, 1912.0);
-        assert_eq!(spec.y, 0.0);
-        assert_eq!(spec.width, EDGE_DROP_THICKNESS as f64);
-        assert_eq!(spec.height, 1080.0);
-    }
-
-    #[test]
-    fn edge_drop_specs_respect_file_transfer_setting() {
-        let mut layout = test_layout();
-        layout.devices[1].screens[0].x = 1920;
-        layout.file_transfer_enabled = false;
-
-        let specs = edge_drop_specs_for_layout(&layout, &[]);
-
-        assert!(specs.is_empty());
-    }
-
-    #[test]
-    fn edge_drop_specs_pause_when_main_window_is_hidden() {
-        let mut layout = test_layout();
-        layout.devices[1].screens[0].x = 1920;
-
-        assert_eq!(
-            edge_drop_specs_for_window_visibility(&layout, &[], true).len(),
-            1
-        );
-        assert!(edge_drop_specs_for_window_visibility(&layout, &[], false).is_empty());
-    }
-
-    #[test]
-    fn edge_drop_specs_skip_internal_client_monitor_edges() {
-        let mut layout = test_layout();
-        layout.machine_role = "client".into();
-        layout.input_mode = "receive".into();
-        layout.devices.truncate(1);
-        let mut second_screen = test_screen("local-device");
-        second_screen.id = "local-device-display-2".into();
-        second_screen.x = 1920;
-        layout.devices[0].screens.push(second_screen);
-        layout.paired_controllers = vec![PairedController {
-            id: "peer-server-10-0-0-1".into(),
-            name: "Server".into(),
-            host: "server".into(),
-            ip: "10.0.0.1".into(),
-            transport_public_key: "server-public-key".into(),
-            protocol_version: quic_transport::PROTOCOL_VERSION,
-            cluster_id: layout.cluster_id.clone(),
-            paired_at_ms: now_ms(),
-        }];
-        let mut peer = test_peer();
-        peer.id = "peer-server-10-0-0-1".into();
-        peer.name = "Server".into();
-        peer.machine_role = "server".into();
-        peer.transport_public_key = "server-public-key".into();
-
-        let specs = edge_drop_specs_for_layout(&layout, &[peer]);
-
-        assert_eq!(specs.len(), 6);
-        assert!(specs.iter().all(|spec| {
-            spec.target_device_id == "peer-server-10-0-0-1" && spec.width > 0.0 && spec.height > 0.0
-        }));
-        assert!(!specs.iter().any(|spec| {
-            spec.x == (1920 - EDGE_DROP_THICKNESS) as f64
-                && spec.y == 0.0
-                && spec.width == EDGE_DROP_THICKNESS as f64
-                && spec.height == 1080.0
-        }));
-        assert!(specs.iter().any(|spec| {
-            spec.x == (3840 - EDGE_DROP_THICKNESS) as f64
-                && spec.y == 0.0
-                && spec.width == EDGE_DROP_THICKNESS as f64
-                && spec.height == 1080.0
-        }));
-    }
-
-    #[test]
-    fn edge_drop_label_handles_non_ascii_ids() {
-        let mut local = test_screen("local-device");
-        local.id = "显示器".into();
-        let mut remote = test_screen("remote-device");
-        remote.id = "远程".into();
-
-        let label = edge_drop_label("设备", &local, Some(&remote), EdgeDropSide::Right);
-
-        assert!(label.starts_with(EDGE_DROP_LABEL_PREFIX));
-        assert!(label.contains("id-"));
-        assert!(label.ends_with("-right"));
-    }
-
-    #[test]
     fn peer_presence_does_not_add_unapproved_peer_screens() {
         let mut layout = test_layout();
         layout.devices.truncate(1);
@@ -8296,6 +7480,7 @@ mod tests {
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id: "attacker".into(),
+            origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
             cluster_id: layout.cluster_id.clone(),
             pair_secret: layout.pair_secret.clone(),
@@ -8313,6 +7498,54 @@ mod tests {
         assert!(!clipboard_packet_authorized(&layout, &packet));
         packet.origin_id = "server-10-0-0-1".into();
         assert!(clipboard_packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn clipboard_packet_authorized_by_transport_key_after_id_drift() {
+        // Regression for the macOS->Windows one-way clipboard bug: input kept
+        // working (it matches the stable transport key) but clipboard was
+        // rejected because it matched the origin id alone, which drifts when the
+        // controller's LAN IP changes. Clipboard must accept the same key.
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "server-10-0-0-1".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+        let mut packet = ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            // id no longer matches the recorded controller (IP moved),
+            origin_id: "server-10-0-0-77".into(),
+            origin_transport_public_key: "server-key".into(),
+            target_id: "local-device".into(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            signature: "text:hi".into(),
+            formats: vec![ClipboardFormat {
+                kind: "plainText".into(),
+                text: "hi".into(),
+                image: None,
+            }],
+            text: "hi".into(),
+            image: None,
+            sequence: 1,
+        };
+
+        assert!(
+            clipboard_packet_authorized(&layout, &packet),
+            "a drifted id with the paired transport key must still be authorized"
+        );
+        packet.origin_transport_public_key = "attacker-key".into();
+        assert!(
+            !clipboard_packet_authorized(&layout, &packet),
+            "neither the id nor the key matches — must be rejected"
+        );
     }
 
     #[test]
@@ -8342,6 +7575,7 @@ mod tests {
                 rgba_base64: "A".repeat(encoded_len),
             }),
             "local-device".into(),
+            String::new(),
             "peer-device".into(),
             "cluster-test".into(),
             "secret-test".into(),
@@ -8362,6 +7596,7 @@ mod tests {
         let packet = clipboard_packet_from_content(
             ClipboardContent::Text("hello".into()),
             "local-device".into(),
+            String::new(),
             "peer-device".into(),
             "cluster-test".into(),
             "secret-test".into(),
@@ -8401,6 +7636,7 @@ mod tests {
         let packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id: "peer-client-10-0-0-2".into(),
+            origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
             cluster_id: layout.cluster_id.clone(),
             pair_secret: layout.pair_secret.clone(),
@@ -8449,6 +7685,7 @@ mod tests {
         let packet = clipboard_packet_from_content(
             ClipboardContent::Text("中文测试 abc 123".into()),
             "peer-client-10-0-0-2".into(),
+            String::new(),
             "local-device".into(),
             layout.cluster_id.clone(),
             layout.pair_secret.clone(),
@@ -8489,6 +7726,7 @@ mod tests {
         let packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id: "peer-client-10-0-0-2".into(),
+            origin_transport_public_key: String::new(),
             target_id: String::new(),
             cluster_id: layout.cluster_id.clone(),
             pair_secret: layout.pair_secret.clone(),
@@ -8534,6 +7772,7 @@ mod tests {
         let first = clipboard_packet_from_content(
             ClipboardContent::Text("new".into()),
             "peer-client-10-0-0-2".into(),
+            String::new(),
             "local-device".into(),
             layout.cluster_id.clone(),
             layout.pair_secret.clone(),
@@ -8542,6 +7781,7 @@ mod tests {
         let stale = clipboard_packet_from_content(
             ClipboardContent::Text("old".into()),
             "peer-client-10-0-0-2".into(),
+            String::new(),
             "local-device".into(),
             layout.cluster_id.clone(),
             layout.pair_secret.clone(),
@@ -8575,6 +7815,7 @@ mod tests {
         let packet = clipboard_packet_from_content(
             ClipboardContent::Text("hello".into()),
             "peer-client-10-0-0-2".into(),
+            String::new(),
             "local-device".into(),
             layout.cluster_id.clone(),
             layout.pair_secret.clone(),
@@ -8680,66 +7921,6 @@ mod tests {
     }
 
     #[test]
-    fn file_transfer_pointer_hint_writes_to_drop_destination() {
-        let layout = test_layout();
-        let default_root = temp_test_dir("file-transfer-default-root");
-        let drop_root = temp_test_dir("file-transfer-pointer-root");
-        let transfers = Arc::new(Mutex::new(HashMap::new()));
-
-        for packet in [
-            test_file_transfer_packet_with_destination_hint(
-                "start",
-                "transfer-pointer",
-                "desktop.txt",
-                7,
-                0,
-                0,
-                b"",
-                Some(FILE_TRANSFER_DESTINATION_POINTER),
-            ),
-            test_file_transfer_packet_with_destination_hint(
-                "chunk",
-                "transfer-pointer",
-                "desktop.txt",
-                7,
-                0,
-                0,
-                b"desktop",
-                Some(FILE_TRANSFER_DESTINATION_POINTER),
-            ),
-            test_file_transfer_packet_with_destination_hint(
-                "finish",
-                "transfer-pointer",
-                "desktop.txt",
-                7,
-                1,
-                7,
-                b"",
-                Some(FILE_TRANSFER_DESTINATION_POINTER),
-            ),
-        ] {
-            let payload = encode_wire_packet(&packet).expect("file packet should encode");
-            assert!(handle_file_transfer_packet_with_destination_root(
-                &payload,
-                &layout,
-                "local-device",
-                &transfers,
-                &default_root,
-                Some(&drop_root),
-                None,
-            ));
-        }
-
-        assert!(!default_root.join("desktop.txt").exists());
-        assert_eq!(
-            fs::read_to_string(drop_root.join("desktop.txt")).expect("received file"),
-            "desktop"
-        );
-        let _ = fs::remove_dir_all(default_root);
-        let _ = fs::remove_dir_all(drop_root);
-    }
-
-    #[test]
     fn file_transfer_rejects_out_of_order_chunks() {
         let layout = test_layout();
         let root = temp_test_dir("file-transfer-order");
@@ -8792,29 +7973,6 @@ mod tests {
         offset: u64,
         data: &[u8],
     ) -> FileTransferPacket {
-        test_file_transfer_packet_with_destination_hint(
-            kind,
-            transfer_id,
-            file_name,
-            total_bytes,
-            chunk_index,
-            offset,
-            data,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn test_file_transfer_packet_with_destination_hint(
-        kind: &str,
-        transfer_id: &str,
-        file_name: &str,
-        total_bytes: u64,
-        chunk_index: u64,
-        offset: u64,
-        data: &[u8],
-        destination_hint: Option<&str>,
-    ) -> FileTransferPacket {
         FileTransferPacket {
             protocol: FILE_TRANSFER_PROTOCOL.into(),
             kind: kind.into(),
@@ -8824,7 +7982,6 @@ mod tests {
             cluster_id: "cluster-test".into(),
             pair_secret: "secret-test".into(),
             file_name: file_name.into(),
-            destination_hint: destination_hint.map(str::to_string),
             total_bytes,
             chunk_index,
             offset,
