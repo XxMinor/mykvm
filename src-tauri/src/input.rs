@@ -99,6 +99,86 @@ const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
 #[cfg(target_os = "windows")]
 const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 
+/// How often the full pairing credentials (~0.5KB, mostly the base64 transport
+/// certificate) ride an input packet. Between refreshes, packets omit them and
+/// the receiver authorizes by its per-source cache — cutting steady-state
+/// input datagrams from ~0.8KB to ~0.15KB. Must stay below
+/// `INPUT_ORIGIN_CACHE_TTL` so the receiver's authorization never lapses
+/// mid-session.
+const INPUT_FULL_CRED_REFRESH: Duration = Duration::from_secs(2);
+/// How long the receiver treats a source address as authorized after a
+/// credentialled packet, so it can admit the credential-less packets in
+/// between. A peer that never proved the pairing secret from this address
+/// never gets an entry, so credential-less packets from it are always rejected.
+const INPUT_ORIGIN_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// True when a full-credential input packet is due for a destination whose last
+/// credentialled send was `last_sent` (or never). Pure half of
+/// `should_send_full_input_credentials`.
+fn credential_send_due(last_sent: Option<Instant>, now: Instant) -> bool {
+    last_sent
+        .map(|last| now.saturating_duration_since(last) >= INPUT_FULL_CRED_REFRESH)
+        .unwrap_or(true)
+}
+
+/// True when a source authorized at `authorized_at` is still within the cache
+/// TTL. Pure half of `input_origin_recently_authorized`.
+fn origin_authorization_fresh(authorized_at: Option<Instant>, now: Instant) -> bool {
+    authorized_at
+        .map(|at| now.saturating_duration_since(at) < INPUT_ORIGIN_CACHE_TTL)
+        .unwrap_or(false)
+}
+
+/// Per-destination timestamp of the last full-credential input packet. Keyed by
+/// the target's QUIC address so alternating between two targets still refreshes
+/// each independently.
+fn input_full_cred_tracker() -> &'static Mutex<HashMap<String, Instant>> {
+    static TRACKER: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Decides whether to attach full credentials to the packet now being built for
+/// `addr`, and records the decision so the next `INPUT_FULL_CRED_REFRESH`
+/// window of packets can omit them. On lock poisoning it errs toward including
+/// credentials (a larger but always-authorizable packet).
+fn should_send_full_input_credentials(addr: &str) -> bool {
+    let Ok(mut tracker) = input_full_cred_tracker().lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    let due = credential_send_due(tracker.get(addr).copied(), now);
+    if due {
+        tracker.retain(|_, last| {
+            now.saturating_duration_since(*last) < INPUT_ORIGIN_CACHE_TTL.saturating_mul(4)
+        });
+        tracker.insert(addr.to_string(), now);
+    }
+    due
+}
+
+/// Source addresses that sent a valid credentialled input packet within
+/// `INPUT_ORIGIN_CACHE_TTL`, so their credential-less packets can be admitted.
+fn authorized_input_origins() -> &'static Mutex<HashMap<SocketAddr, Instant>> {
+    static ORIGINS: OnceLock<Mutex<HashMap<SocketAddr, Instant>>> = OnceLock::new();
+    ORIGINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_authorized_input_origin(source: SocketAddr) {
+    if let Ok(mut origins) = authorized_input_origins().lock() {
+        let now = Instant::now();
+        origins.retain(|_, last| now.saturating_duration_since(*last) < INPUT_ORIGIN_CACHE_TTL);
+        origins.insert(source, now);
+    }
+}
+
+fn input_origin_recently_authorized(source: SocketAddr) -> bool {
+    let authorized_at = authorized_input_origins()
+        .lock()
+        .ok()
+        .and_then(|origins| origins.get(&source).copied());
+    origin_authorization_fresh(authorized_at, Instant::now())
+}
+
 /// Last injected remote cursor position, packed x<<32|y, plus held buttons.
 /// Plain atomics: these are touched on every received mouse event and a
 /// global mutex there is contention for nothing (the fields are independent
@@ -161,19 +241,30 @@ pub struct ClipboardTarget {
     pub expires_at: Option<Instant>,
 }
 
+fn str_ref_is_empty(value: &&str) -> bool {
+    value.is_empty()
+}
+
 /// Borrowing serialization mirror of [`InputPacket`]: identical named
-/// MessagePack bytes (guarded by a test), but building one clones none of the
-/// ~1KB of credential strings — send_packet runs per mouse event.
+/// MessagePack bytes when every field is populated (guarded by a test), but
+/// building one clones none of the ~0.8KB of credential strings — send_packet
+/// runs per mouse event. The credential fields are also skipped when empty, so
+/// steady-state packets (which omit them — see send_packet) drop ~0.5KB of the
+/// static pairing block, mostly the base64 transport certificate.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InputPacketRef<'a> {
     protocol: &'a str,
     target_device_id: &'a str,
+    #[serde(skip_serializing_if = "str_ref_is_empty")]
     origin_device_id: &'a str,
     origin_port: u16,
+    #[serde(skip_serializing_if = "str_ref_is_empty")]
     origin_transport_public_key: &'a str,
     origin_protocol_version: u16,
+    #[serde(skip_serializing_if = "str_ref_is_empty")]
     cluster_id: &'a str,
+    #[serde(skip_serializing_if = "str_ref_is_empty")]
     pair_secret: &'a str,
     event: &'a InputEvent,
 }
@@ -1340,15 +1431,37 @@ fn send_packet(
     let Some(peer) = packet_context.peer.take() else {
         return false;
     };
+    // Attach the full pairing credentials only ~once per INPUT_FULL_CRED_REFRESH
+    // per destination; steady-state packets omit them (empty -> skipped on the
+    // wire) and the receiver authorizes them from its per-source cache. This is
+    // what actually shrinks the datagram; the borrowed mirror above only kept
+    // the omitted-string case allocation-free.
+    let include_credentials = should_send_full_input_credentials(&peer.addr);
     let packet = InputPacketRef {
         protocol: INPUT_PROTOCOL,
         target_device_id: &target.device_id,
-        origin_device_id: &packet_context.origin_device_id,
+        origin_device_id: if include_credentials {
+            &packet_context.origin_device_id
+        } else {
+            ""
+        },
         origin_port: quic_transport.port(),
-        origin_transport_public_key: quic_transport.public_key(),
+        origin_transport_public_key: if include_credentials {
+            quic_transport.public_key()
+        } else {
+            ""
+        },
         origin_protocol_version: quic_transport::PROTOCOL_VERSION,
-        cluster_id: &packet_context.cluster_id,
-        pair_secret: &packet_context.pair_secret,
+        cluster_id: if include_credentials {
+            &packet_context.cluster_id
+        } else {
+            ""
+        },
+        pair_secret: if include_credentials {
+            &packet_context.pair_secret
+        } else {
+            ""
+        },
         event: &packet_context.event,
     };
 
@@ -1623,18 +1736,31 @@ pub fn handle_input_datagram(
         if packet.protocol != INPUT_PROTOCOL {
             return false;
         }
+        // Steady-state datagrams omit the pairing block (it rides ~once per
+        // INPUT_FULL_CRED_REFRESH). A credentialled packet is authorized in
+        // full and (re)authorizes this source; a credential-less one is
+        // admitted only while that authorization is still fresh, so a peer that
+        // never proved the pairing secret from this address can never inject.
+        let carries_credentials = !packet.pair_secret.trim().is_empty();
         let command = {
             let Ok(layout) = layout_state.lock() else {
                 return false;
             };
-            if !packet_authorized(&layout, &packet) {
-                warn_unauthorized_packet(&layout, &packet);
+            if carries_credentials {
+                if !packet_authorized(&layout, &packet) {
+                    warn_unauthorized_packet(&layout, &packet);
+                    return true;
+                }
+                cache_authorized_input_origin(source);
+            } else if !input_origin_recently_authorized(source) {
                 return true;
             }
             let local_peer_id = cached_local_peer_id(&layout);
             if !packet_targets_local(&layout, &packet.target_device_id, &local_peer_id) {
                 return true;
             }
+            // No-op for credential-less packets (empty key); the clipboard
+            // target was set by the last credentialled packet and persists.
             refresh_clipboard_target(clipboard_target, &layout, &packet, source);
             input_event_to_command(&layout, native_layout, packet.event)
         };
@@ -6507,6 +6633,82 @@ mod tests {
             rmp_serde::to_vec_named(&mirror).expect("encode borrowed mirror"),
             "the send-path mirror must stay byte-identical to InputPacket on the wire"
         );
+    }
+
+    #[test]
+    fn credential_less_packet_omits_the_pairing_block_and_still_decodes() {
+        let event = InputEvent::MouseMove {
+            screen_id: "display-1".into(),
+            x: 320,
+            y: 240,
+        };
+        let full = InputPacketRef {
+            protocol: INPUT_PROTOCOL,
+            target_device_id: "peer-device",
+            origin_device_id: "local-device",
+            origin_port: 47833,
+            // ~roughly the size of a real base64 transport certificate
+            origin_transport_public_key: &"A".repeat(492),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test",
+            pair_secret: "secret-test",
+            event: &event,
+        };
+        let lean = InputPacketRef {
+            protocol: INPUT_PROTOCOL,
+            target_device_id: "peer-device",
+            origin_device_id: "",
+            origin_port: 47833,
+            origin_transport_public_key: "",
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "",
+            pair_secret: "",
+            event: &event,
+        };
+
+        let full_bytes = rmp_serde::to_vec_named(&full).expect("encode full");
+        let lean_bytes = rmp_serde::to_vec_named(&lean).expect("encode lean");
+        assert!(
+            lean_bytes.len() + 400 < full_bytes.len(),
+            "credential-less packet ({} bytes) should be far smaller than full ({} bytes)",
+            lean_bytes.len(),
+            full_bytes.len()
+        );
+
+        // The receiver still decodes it, with the omitted credentials defaulted
+        // to empty so it takes the cached-authorization path.
+        let decoded = decode_input_packet(&lean_bytes).expect("decode lean packet");
+        assert!(decoded.pair_secret.is_empty());
+        assert!(decoded.origin_transport_public_key.is_empty());
+        assert_eq!(decoded.target_device_id, "peer-device");
+        assert_eq!(decoded.origin_port, 47833);
+    }
+
+    #[test]
+    fn credential_refresh_and_origin_cache_windows() {
+        let t0 = Instant::now();
+        // Refresh: due when never sent, not due within the window, due after it.
+        assert!(credential_send_due(None, t0));
+        assert!(!credential_send_due(
+            Some(t0),
+            t0 + INPUT_FULL_CRED_REFRESH - Duration::from_millis(1)
+        ));
+        assert!(credential_send_due(Some(t0), t0 + INPUT_FULL_CRED_REFRESH));
+
+        // Cache: never-seen is not fresh; within TTL is fresh; past TTL is not.
+        assert!(!origin_authorization_fresh(None, t0));
+        assert!(origin_authorization_fresh(
+            Some(t0),
+            t0 + INPUT_ORIGIN_CACHE_TTL - Duration::from_millis(1)
+        ));
+        assert!(!origin_authorization_fresh(
+            Some(t0),
+            t0 + INPUT_ORIGIN_CACHE_TTL
+        ));
+
+        // The refresh interval must stay under the cache TTL, or authorization
+        // would lapse between credentialled packets.
+        assert!(INPUT_FULL_CRED_REFRESH < INPUT_ORIGIN_CACHE_TTL);
     }
 
     #[test]
