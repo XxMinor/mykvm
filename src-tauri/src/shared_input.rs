@@ -4,6 +4,8 @@ use std::path::PathBuf;
 pub const LEFT_BUTTON_MASK: u64 = 1;
 pub const RIGHT_BUTTON_MASK: u64 = 1 << 1;
 pub const MIDDLE_BUTTON_MASK: u64 = 1 << 2;
+pub const BACK_BUTTON_MASK: u64 = 1 << 3;
+pub const FORWARD_BUTTON_MASK: u64 = 1 << 4;
 pub const INPUT_PIPE_PREFIX: &str = r"\\.\pipe\mykvm-input-s";
 pub const INPUT_SERVICE_NAME: &str = "MyKVMInputService";
 pub const INPUT_SERVICE_DISPLAY_NAME: &str = "MyKVM Lock Screen Input Service";
@@ -23,6 +25,9 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+    // The side navigation buttons (Windows XBUTTON1/XBUTTON2, "back"/"forward").
+    Back,
+    Forward,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,6 +73,8 @@ pub fn mouse_button_mask(button: MouseButton) -> u64 {
         MouseButton::Left => LEFT_BUTTON_MASK,
         MouseButton::Right => RIGHT_BUTTON_MASK,
         MouseButton::Middle => MIDDLE_BUTTON_MASK,
+        MouseButton::Back => BACK_BUTTON_MASK,
+        MouseButton::Forward => FORWARD_BUTTON_MASK,
     }
 }
 

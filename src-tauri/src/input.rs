@@ -2818,7 +2818,8 @@ fn set_control_clipboard_target(
 unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
     };
 
     if code < 0 {
@@ -2838,7 +2839,12 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     let handled = match message {
         WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
-        | WM_MBUTTONUP => handle_windows_mouse_button(&context, message),
+        | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            // For the X (side) buttons the pressed button rides the high word of
+            // mouseData (XBUTTON1 = back, XBUTTON2 = forward); other buttons
+            // ignore it.
+            handle_windows_mouse_button(&context, message, event.mouseData)
+        }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => handle_windows_scroll(&context, message, event.mouseData),
         _ => false,
     };
@@ -3209,9 +3215,10 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
 }
 
 #[cfg(target_os = "windows")]
-fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) -> bool {
+fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mouse_data: u32) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1,
     };
 
     let active = context
@@ -3222,6 +3229,12 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
     let Some(active_target) = active else {
         return false;
     };
+    // WM_XBUTTON* packs which side button in the high word of mouseData.
+    let x_button = if (mouse_data >> 16) as u16 == XBUTTON1 as u16 {
+        MouseButton::Back
+    } else {
+        MouseButton::Forward
+    };
     let (button, down) = match message {
         WM_LBUTTONDOWN => (MouseButton::Left, true),
         WM_LBUTTONUP => (MouseButton::Left, false),
@@ -3229,6 +3242,8 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
         WM_RBUTTONUP => (MouseButton::Right, false),
         WM_MBUTTONDOWN => (MouseButton::Middle, true),
         WM_MBUTTONUP => (MouseButton::Middle, false),
+        WM_XBUTTONDOWN => (x_button, true),
+        WM_XBUTTONUP => (x_button, false),
         _ => return false,
     };
 
@@ -5451,7 +5466,12 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     let (event_type, mouse_button) = match drag_button {
         Some(MouseButton::Left) => (CGEventType::LeftMouseDragged, CGMouseButton::Left),
         Some(MouseButton::Right) => (CGEventType::RightMouseDragged, CGMouseButton::Right),
-        Some(MouseButton::Middle) => (CGEventType::OtherMouseDragged, CGMouseButton::Center),
+        // Middle and the side buttons are all "other" drags. button_from_mask
+        // never actually reports a side button as a drag, so this is only here
+        // for exhaustiveness.
+        Some(MouseButton::Middle | MouseButton::Back | MouseButton::Forward) => {
+            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+        }
         None => (CGEventType::MouseMoved, CGMouseButton::Left),
     };
 
@@ -5507,6 +5527,9 @@ impl MacClickTracker {
             MouseButton::Left => 0,
             MouseButton::Right => 1,
             MouseButton::Middle => 2,
+            // Side (back/forward) buttons are navigation, not click targets:
+            // no double-click chaining and no pressed-slot tracking.
+            MouseButton::Back | MouseButton::Forward => return i64::from(down),
         };
 
         if down {
@@ -5624,19 +5647,29 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         return;
     };
-    let (event_type, mouse_button) = match (button, down) {
-        (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
-        (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-        (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
-        (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-        (MouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
-        (MouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+    // Side buttons are "other" mouse events distinguished only by their button
+    // number (macOS: 2 = middle, 3 = back, 4 = forward); new_mouse_event has no
+    // CGMouseButton for 3/4, so create an Other event and stamp the number.
+    let (event_type, mouse_button, button_number) = match (button, down) {
+        (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left, None),
+        (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left, None),
+        (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right, None),
+        (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right, None),
+        (MouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, None),
+        (MouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, None),
+        (MouseButton::Back, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, Some(3)),
+        (MouseButton::Back, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, Some(3)),
+        (MouseButton::Forward, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, Some(4)),
+        (MouseButton::Forward, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, Some(4)),
     };
     let point = CGPoint::new(x as f64, y as f64);
 
     let _ = CGDisplay::warp_mouse_cursor_position(point);
 
     if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
+        if let Some(number) = button_number {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
+        }
         event.set_integer_value_field(
             EventField::MOUSE_EVENT_CLICK_STATE,
             macos_click_state(button, down, x, y),
@@ -6596,6 +6629,29 @@ mod tests {
                 assert_eq!(y, 240);
             }
             _ => panic!("decoded the wrong input event"),
+        }
+    }
+
+    #[test]
+    fn side_button_events_round_trip_on_the_wire() {
+        for button in [MouseButton::Back, MouseButton::Forward] {
+            let event = InputEvent::MouseButton { button, down: true };
+            let encoded = rmp_serde::to_vec_named(&event).expect("encode side button");
+            let decoded: InputEvent = rmp_serde::from_slice(&encoded).expect("decode side button");
+            assert_eq!(decoded, InputEvent::MouseButton { button, down: true });
+        }
+        // Distinct masks so a held side button never aliases another button.
+        let masks = [
+            mouse_button_mask(MouseButton::Left),
+            mouse_button_mask(MouseButton::Right),
+            mouse_button_mask(MouseButton::Middle),
+            mouse_button_mask(MouseButton::Back),
+            mouse_button_mask(MouseButton::Forward),
+        ];
+        for (i, a) in masks.iter().enumerate() {
+            for b in &masks[i + 1..] {
+                assert_ne!(a, b, "mouse button masks must be distinct");
+            }
         }
     }
 

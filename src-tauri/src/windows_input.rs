@@ -257,10 +257,13 @@ pub fn inject_mouse_move(x: i32, y: i32, _drag_button: Option<MouseButton>) {
 }
 
 pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-        MOUSEINPUT,
+    use windows_sys::Win32::UI::{
+        Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+            MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+        },
+        WindowsAndMessaging::{XBUTTON1, XBUTTON2},
     };
 
     if x != 0 || y != 0 {
@@ -272,13 +275,20 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     // spawned injection thread on some desktops, which produced the "cursor
     // moves but cannot click" symptom. SendInput reports failures via its
     // return value and is the recommended injection API.
-    let flag = match (button, down) {
-        (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
-        (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
-        (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
-        (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
-        (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
-        (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
+    //
+    // The side buttons ride MOUSEEVENTF_X* with the button in mouseData
+    // (XBUTTON1 = back, XBUTTON2 = forward).
+    let (flag, mouse_data) = match (button, down) {
+        (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+        (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
+        (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+        (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
+        (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+        (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+        (MouseButton::Back, true) => (MOUSEEVENTF_XDOWN, XBUTTON1 as i32),
+        (MouseButton::Back, false) => (MOUSEEVENTF_XUP, XBUTTON1 as i32),
+        (MouseButton::Forward, true) => (MOUSEEVENTF_XDOWN, XBUTTON2 as i32),
+        (MouseButton::Forward, false) => (MOUSEEVENTF_XUP, XBUTTON2 as i32),
     };
 
     let input = INPUT {
@@ -287,7 +297,7 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
             mi: MOUSEINPUT {
                 dx: 0,
                 dy: 0,
-                mouseData: 0,
+                mouseData: mouse_data as u32,
                 dwFlags: flag,
                 time: 0,
                 dwExtraInfo: 0,
