@@ -4411,6 +4411,14 @@ fn clipboard_ready_status() -> NativeStageStatus {
 struct ClipboardPacket {
     protocol: String,
     origin_id: String,
+    // The sender's QUIC transport public key. Defaulted so packets from older
+    // peers (which never sent it) still decode as an empty string. Authorization
+    // matches on this stable key first, exactly like input packets, so a copy
+    // still syncs after the origin's derived peer id drifts (e.g. its LAN IP
+    // changed since pairing) — the bug where input kept working but clipboard
+    // silently stopped in one direction.
+    #[serde(default)]
+    origin_transport_public_key: String,
     #[serde(default)]
     target_id: String,
     #[serde(default)]
@@ -4445,6 +4453,7 @@ struct ClipboardFormat {
 fn clipboard_packet_from_content(
     content: ClipboardContent,
     origin_id: String,
+    origin_transport_public_key: String,
     target_id: String,
     cluster_id: String,
     pair_secret: String,
@@ -4455,6 +4464,7 @@ fn clipboard_packet_from_content(
         ClipboardContent::Text(text) => ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id,
+            origin_transport_public_key,
             target_id,
             cluster_id,
             pair_secret,
@@ -4471,6 +4481,7 @@ fn clipboard_packet_from_content(
         ClipboardContent::Image(image) => ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id,
+            origin_transport_public_key,
             target_id,
             cluster_id,
             pair_secret,
@@ -4584,6 +4595,7 @@ fn run_clipboard_sync(
         let packet = clipboard_packet_from_content(
             content,
             local_peer_id.clone(),
+            quic_transport.public_key().to_string(),
             target.device_id.clone(),
             target.cluster_id.clone(),
             target.pair_secret.clone(),
@@ -4850,10 +4862,19 @@ fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -
     }
 
     if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
-        return layout
-            .paired_controllers
-            .iter()
-            .any(|controller| controller.id == packet.origin_id);
+        // Mirror input-packet authorization (packet_authorized_fields): match on
+        // the STABLE transport public key first, then the id, then the legacy
+        // "local-device" fallback. Matching by id alone silently rejected a
+        // controller whose derived peer id had drifted (LAN IP change) even
+        // though its key was unchanged — which is why input kept working while
+        // clipboard from that controller stopped.
+        let key = packet.origin_transport_public_key.trim();
+        return layout.paired_controllers.iter().any(|controller| {
+            (!key.is_empty() && controller.transport_public_key == key)
+                || controller.id == packet.origin_id
+        }) || (layout.paired_controllers.len() == 1
+            && packet.origin_id == "local-device"
+            && !key.is_empty());
     }
 
     true
@@ -7459,6 +7480,7 @@ mod tests {
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id: "attacker".into(),
+            origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
             cluster_id: layout.cluster_id.clone(),
             pair_secret: layout.pair_secret.clone(),
@@ -7476,6 +7498,54 @@ mod tests {
         assert!(!clipboard_packet_authorized(&layout, &packet));
         packet.origin_id = "server-10-0-0-1".into();
         assert!(clipboard_packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn clipboard_packet_authorized_by_transport_key_after_id_drift() {
+        // Regression for the macOS->Windows one-way clipboard bug: input kept
+        // working (it matches the stable transport key) but clipboard was
+        // rejected because it matched the origin id alone, which drifts when the
+        // controller's LAN IP changes. Clipboard must accept the same key.
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "server-10-0-0-1".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+        let mut packet = ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            // id no longer matches the recorded controller (IP moved),
+            origin_id: "server-10-0-0-77".into(),
+            origin_transport_public_key: "server-key".into(),
+            target_id: "local-device".into(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            signature: "text:hi".into(),
+            formats: vec![ClipboardFormat {
+                kind: "plainText".into(),
+                text: "hi".into(),
+                image: None,
+            }],
+            text: "hi".into(),
+            image: None,
+            sequence: 1,
+        };
+
+        assert!(
+            clipboard_packet_authorized(&layout, &packet),
+            "a drifted id with the paired transport key must still be authorized"
+        );
+        packet.origin_transport_public_key = "attacker-key".into();
+        assert!(
+            !clipboard_packet_authorized(&layout, &packet),
+            "neither the id nor the key matches — must be rejected"
+        );
     }
 
     #[test]
@@ -7505,6 +7575,7 @@ mod tests {
                 rgba_base64: "A".repeat(encoded_len),
             }),
             "local-device".into(),
+            String::new(),
             "peer-device".into(),
             "cluster-test".into(),
             "secret-test".into(),
@@ -7525,6 +7596,7 @@ mod tests {
         let packet = clipboard_packet_from_content(
             ClipboardContent::Text("hello".into()),
             "local-device".into(),
+            String::new(),
             "peer-device".into(),
             "cluster-test".into(),
             "secret-test".into(),
@@ -7564,6 +7636,7 @@ mod tests {
         let packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id: "peer-client-10-0-0-2".into(),
+            origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
             cluster_id: layout.cluster_id.clone(),
             pair_secret: layout.pair_secret.clone(),
@@ -7612,6 +7685,7 @@ mod tests {
         let packet = clipboard_packet_from_content(
             ClipboardContent::Text("中文测试 abc 123".into()),
             "peer-client-10-0-0-2".into(),
+            String::new(),
             "local-device".into(),
             layout.cluster_id.clone(),
             layout.pair_secret.clone(),
@@ -7652,6 +7726,7 @@ mod tests {
         let packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
             origin_id: "peer-client-10-0-0-2".into(),
+            origin_transport_public_key: String::new(),
             target_id: String::new(),
             cluster_id: layout.cluster_id.clone(),
             pair_secret: layout.pair_secret.clone(),
@@ -7697,6 +7772,7 @@ mod tests {
         let first = clipboard_packet_from_content(
             ClipboardContent::Text("new".into()),
             "peer-client-10-0-0-2".into(),
+            String::new(),
             "local-device".into(),
             layout.cluster_id.clone(),
             layout.pair_secret.clone(),
@@ -7705,6 +7781,7 @@ mod tests {
         let stale = clipboard_packet_from_content(
             ClipboardContent::Text("old".into()),
             "peer-client-10-0-0-2".into(),
+            String::new(),
             "local-device".into(),
             layout.cluster_id.clone(),
             layout.pair_secret.clone(),
@@ -7738,6 +7815,7 @@ mod tests {
         let packet = clipboard_packet_from_content(
             ClipboardContent::Text("hello".into()),
             "peer-client-10-0-0-2".into(),
+            String::new(),
             "local-device".into(),
             layout.cluster_id.clone(),
             layout.pair_secret.clone(),
