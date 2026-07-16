@@ -201,6 +201,22 @@ jobs:
           git tag -a "${{ steps.version.outputs.tag }}" -m "MyKVM ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
+      - name: Create draft release
+        if: steps.version.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          CHANNEL: ${{ steps.version.outputs.channel }}
+          RELEASE_NOTES: ${{ steps.version.outputs.release_notes }}
+        run: |
+          set -euo pipefail
+          args=("$TAG" --draft --title "MyKVM $TAG" --notes "$RELEASE_NOTES" --target "$GITHUB_SHA")
+          if [[ "$CHANNEL" == "beta" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}" --repo "$GITHUB_REPOSITORY"
+
   build:
     name: Build ${{ matrix.name }}
     needs: prepare
