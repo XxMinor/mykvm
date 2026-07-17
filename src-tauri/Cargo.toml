@@ -6,7 +6,8 @@ authors = ["XxMinor"]
 license = "MIT"
 repository = "https://github.com/XxMinor/mykvm"
 edition = "2021"
-rust-version = "1.77.2"
+# std::fs::File::try_lock (the macOS single-instance lock) stabilized in 1.89.
+rust-version = "1.89"
 default-run = "mykvm"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

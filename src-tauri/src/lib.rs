@@ -88,6 +88,15 @@ static WINDOWS_FIREWALL_ENSURED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static SINGLE_INSTANCE_MUTEX: OnceLock<Mutex<Option<SingleInstanceGuard>>> = OnceLock::new();
 
+// Matches the `identifier` in tauri.conf.json.
+#[cfg(target_os = "macos")]
+const MACOS_BUNDLE_ID: &str = "com.xzhpl.mykvm";
+
+// Holds the flock'd lock file for the process lifetime; the kernel releases
+// the lock when the process exits, however it exits.
+#[cfg(target_os = "macos")]
+static MACOS_INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
+
 #[cfg(target_os = "windows")]
 struct SingleInstanceGuard {
     mutex: windows_sys::Win32::Foundation::HANDLE,
@@ -2481,7 +2490,44 @@ pub fn acquire_single_instance() -> bool {
     true
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub fn acquire_single_instance() -> bool {
+    // Launch Services only dedupes Finder/Dock launches of the same bundle:
+    // `open -n`, a second .app copy (e.g. one still on a mounted DMG), or a
+    // bare binary all start another process, and two instances then fight
+    // over the discovery/QUIC ports and the config dir.
+    let Some(home) = std::env::var_os("HOME") else {
+        return true;
+    };
+    let lock_dir = std::path::Path::new(&home)
+        .join("Library/Application Support")
+        .join(MACOS_BUNDLE_ID);
+    if std::fs::create_dir_all(&lock_dir).is_err() {
+        return true;
+    }
+    // Truncating a file another process holds a flock on is harmless: the
+    // lock lives on the open file description, not the contents.
+    let Ok(file) = std::fs::File::create(lock_dir.join("instance.lock")) else {
+        // Never brick startup over lock-file plumbing.
+        return true;
+    };
+
+    // An updater relaunch briefly overlaps the old and new processes, so retry
+    // before concluding that a live instance owns the lock.
+    for _ in 0..20 {
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = MACOS_INSTANCE_LOCK.set(file);
+                return true;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(100)),
+            Err(std::fs::TryLockError::Error(_)) => return true,
+        }
+    }
+    false
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn acquire_single_instance() -> bool {
     true
 }
@@ -2513,7 +2559,18 @@ pub fn activate_existing_instance() -> bool {
         return signal_named_instance_event(ACTIVATE_INSTANCE_EVENT_NAME);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Launch Services delivers this to the running instance as a Reopen
+        // event, which the app already answers by showing the main window.
+        return std::process::Command::new("open")
+            .args(["-b", MACOS_BUNDLE_ID])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         false
     }
