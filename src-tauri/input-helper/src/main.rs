@@ -36,7 +36,7 @@ mod windows_helper {
         define_windows_service,
         service::{
             ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-            ServiceType, SessionChangeReason,
+            ServiceType,
         },
         service_control_handler::{self, ServiceControlHandlerResult},
         service_dispatcher,
@@ -103,8 +103,8 @@ mod windows_helper {
                     let _ = handler_tx.send(ServiceEvent::Stop);
                     ServiceControlHandlerResult::NoError
                 }
-                ServiceControl::SessionChange(change) => {
-                    let _ = handler_tx.send(ServiceEvent::SessionChange(change.reason));
+                ServiceControl::SessionChange(_) => {
+                    let _ = handler_tx.send(ServiceEvent::SessionChange);
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -128,13 +128,8 @@ mod windows_helper {
         loop {
             match event_rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(ServiceEvent::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Ok(ServiceEvent::SessionChange(reason)) => {
-                    if should_restart_worker(reason) {
-                        let _ = worker.restart();
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if worker.has_exited() {
+                Ok(ServiceEvent::SessionChange) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if worker.needs_restart() {
                         let _ = worker.restart();
                     }
                 }
@@ -157,19 +152,7 @@ mod windows_helper {
 
     enum ServiceEvent {
         Stop,
-        SessionChange(SessionChangeReason),
-    }
-
-    fn should_restart_worker(reason: SessionChangeReason) -> bool {
-        matches!(
-            reason,
-            SessionChangeReason::ConsoleConnect
-                | SessionChangeReason::RemoteConnect
-                | SessionChangeReason::SessionLogon
-                | SessionChangeReason::SessionLogoff
-                | SessionChangeReason::SessionCreate
-                | SessionChangeReason::SessionTerminate
-        )
+        SessionChange,
     }
 
     #[derive(Default)]
@@ -179,6 +162,19 @@ mod windows_helper {
     }
 
     impl WorkerProcess {
+        /// True when the worker died, or the physical console moved to a
+        /// different session while the worker stayed behind. An RDP attach or
+        /// detach swaps the console to a LogonUI session (and back on unlock)
+        /// without a session-change reason that names the console (issue #21),
+        /// so the 2s service tick polls for drift instead of trusting reasons.
+        fn needs_restart(&mut self) -> bool {
+            if self.has_exited() {
+                return true;
+            }
+            let console_session = unsafe { WTSGetActiveConsoleSessionId() };
+            console_session != INVALID_SESSION_ID && console_session != self.session_id
+        }
+
         fn restart(&mut self) -> Result<(), String> {
             self.stop();
             let session_id = unsafe { WTSGetActiveConsoleSessionId() };

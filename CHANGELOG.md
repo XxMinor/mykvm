@@ -10,6 +10,8 @@ release will reuse them).
 
 ### Fixed
 
+- Windows: keyboard and mouse from the controller now keep working while a Remote Desktop session owns the machine and after it disconnects, so you can unlock the physical screen remotely instead of walking over to it (#21). The lock-screen input service now follows the physical console session when Remote Desktop swaps it, and the app reaches the service across that swap.
+
 - Keyboard, mouse, and clipboard could fail to connect between machines — the QUIC handshake rejected the peer with `invalid peer certificate: BadSignature`. The transport now pins the device's advertised certificate directly instead of running brittle chain validation over a self-signed certificate, which fixes cross-platform (macOS ↔ Windows) handshakes.
 
 ## v0.4.0

@@ -2358,14 +2358,32 @@ impl WindowsInputDispatcher {
 #[cfg(target_os = "windows")]
 fn open_current_session_input_pipe() -> Result<std::fs::File, String> {
     use std::fs::OpenOptions;
+    use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 
-    let session_id = current_windows_session_id()?;
+    // The helper's worker follows the physical console session. While an RDP
+    // client owns the machine — and until someone unlocks the physical screen
+    // after it disconnects (issue #21) — the console is a LogonUI session with
+    // a different id than the session this app runs in, so try the console
+    // session's pipe first and fall back to our own session's pipe.
+    let own_session = current_windows_session_id()?;
+    let console_session = unsafe { WTSGetActiveConsoleSessionId() };
+    let mut candidates = Vec::new();
+    if console_session != u32::MAX {
+        candidates.push(console_session);
+    }
+    if !candidates.contains(&own_session) {
+        candidates.push(own_session);
+    }
 
-    let pipe_name = crate::shared_input::input_pipe_name(session_id);
-    OpenOptions::new()
-        .write(true)
-        .open(&pipe_name)
-        .map_err(|error| format!("open input helper pipe {pipe_name}: {error}"))
+    let mut errors = Vec::new();
+    for session_id in candidates {
+        let pipe_name = crate::shared_input::input_pipe_name(session_id);
+        match OpenOptions::new().write(true).open(&pipe_name) {
+            Ok(pipe) => return Ok(pipe),
+            Err(error) => errors.push(format!("open input helper pipe {pipe_name}: {error}")),
+        }
+    }
+    Err(errors.join("; "))
 }
 
 #[cfg(target_os = "windows")]
