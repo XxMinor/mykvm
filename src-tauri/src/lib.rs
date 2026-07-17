@@ -28,6 +28,8 @@ mod performance;
 mod quic_transport;
 pub mod shared_input;
 #[cfg(target_os = "windows")]
+pub mod windows_drag;
+#[cfg(target_os = "windows")]
 pub mod windows_input;
 
 use clipboard::{ClipboardContent, ClipboardImage};
@@ -63,6 +65,7 @@ const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
 const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
+const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
@@ -72,6 +75,10 @@ const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
 const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
 const HELPER_PATH_ARG: &str = "--helper-path";
 const RUNTIME_STATE_EVENT: &str = "runtime-state-changed";
+const FILE_TRANSFER_PROGRESS_EVENT: &str = "file-transfer-progress";
+// Progress is emitted at most this often per file while sending (plus always on
+// completion) so a multi-GB transfer doesn't flood the webview with events.
+const FILE_TRANSFER_PROGRESS_INTERVAL_MS: u64 = 100;
 
 #[cfg(target_os = "windows")]
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\MyKVM_SingleInstance";
@@ -475,6 +482,56 @@ struct FileTransferSummary {
     byte_count: u64,
 }
 
+// One progress update for the sending-side toast. `file_index` is 1-based.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTransferProgress {
+    transfer_id: String,
+    file_name: String,
+    target_name: String,
+    sent_bytes: u64,
+    total_bytes: u64,
+    file_index: usize,
+    file_count: usize,
+    done: bool,
+    error: Option<String>,
+}
+
+// Carries what a per-file send needs to emit progress. Optional throughout the
+// send path so tests and any UI-less caller simply pass `None`.
+struct FileTransferProgressReporter<'a> {
+    app: &'a AppHandle,
+    target_name: &'a str,
+    file_index: usize,
+    file_count: usize,
+}
+
+impl FileTransferProgressReporter<'_> {
+    fn emit(
+        &self,
+        transfer_id: &str,
+        file: &TransferFile,
+        sent_bytes: u64,
+        done: bool,
+        error: Option<String>,
+    ) {
+        let _ = self.app.emit(
+            FILE_TRANSFER_PROGRESS_EVENT,
+            FileTransferProgress {
+                transfer_id: transfer_id.into(),
+                file_name: file.name.clone(),
+                target_name: self.target_name.into(),
+                sent_bytes,
+                total_bytes: file.total_bytes,
+                file_index: self.file_index,
+                file_count: self.file_count,
+                done,
+                error,
+            },
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FileTransferPacket {
@@ -491,6 +548,11 @@ struct FileTransferPacket {
     offset: u64,
     #[serde(default)]
     data: Vec<u8>,
+    // Edge drag-drop: land the file on the receiver's Desktop instead of the
+    // transfers folder. Named-field msgpack, so old peers just ignore it (and
+    // an old sender leaves it false here).
+    #[serde(default)]
+    drop_to_desktop: bool,
 }
 
 struct AppRuntime {
@@ -762,6 +824,11 @@ impl AppRuntime {
                 layout.clone()
             };
             let current_peer = local_peer_from_layout(&layout);
+
+            if handle_drag_control_packet(&payload, &layout, &current_peer.id) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
 
             if handle_file_transfer_packet(
                 &payload,
@@ -2079,8 +2146,15 @@ fn send_files_to_device(
     paths: Vec<String>,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<FileTransferSummary, String> {
-    let state = state.inner();
-    let device_id = device_id.as_str();
+    send_files_to_device_inner(state.inner(), &device_id, &paths, false)
+}
+
+fn send_files_to_device_inner(
+    state: &AppRuntime,
+    device_id: &str,
+    paths: &[String],
+    drop_to_desktop: bool,
+) -> Result<FileTransferSummary, String> {
     if paths.is_empty() {
         return Err("请选择要传输的文件。".into());
     }
@@ -2098,12 +2172,27 @@ fn send_files_to_device(
 
     let peers = active_peer_snapshot(&state.peers);
     let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
-    let files = collect_transfer_files(&paths)?;
+    let files = collect_transfer_files(paths)?;
+    let total_files = files.len();
     let mut file_count = 0_usize;
     let mut byte_count = 0_u64;
 
-    for file in files {
-        let packet_count = send_transfer_file(&quic_transport, &local_peer.id, &target, &file)?;
+    for (index, file) in files.iter().enumerate() {
+        let reporter = FileTransferProgressReporter {
+            app: &state.app_handle,
+            target_name: &target.name,
+            file_index: index + 1,
+            file_count: total_files,
+        };
+        let packet_count = send_transfer_file(
+            &quic_transport,
+            &local_peer.id,
+            &target,
+            file,
+            &new_transfer_id("file"),
+            drop_to_desktop,
+            Some(&reporter),
+        )?;
         state
             .transport_packets
             .fetch_add(packet_count, Ordering::Relaxed);
@@ -2958,6 +3047,61 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
             setup_single_instance_events(app.handle().clone());
+
+            // Edge drag-drop (ShareMouse-style): the capture tap hands us drag
+            // events as a local file drag crosses onto a controlled machine. A
+            // Windows target gets a native OLE drag (icon + drop into any folder
+            // or app); other targets transfer the files to land at the drop.
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                input::set_edge_drag_sender(Box::new(move |event| {
+                    let handle = handle.clone();
+                    thread::spawn(move || {
+                        let state = handle.state::<AppRuntime>();
+                        let state = state.inner();
+                        let to_paths = |files: Vec<std::path::PathBuf>| -> Vec<String> {
+                            files
+                                .iter()
+                                .map(|path| path.to_string_lossy().into_owned())
+                                .collect()
+                        };
+                        match event {
+                            input::EdgeDragEvent::StartOle { device_id, files } => {
+                                if let Err(error) =
+                                    send_ole_drag_start(state, &device_id, &to_paths(files))
+                                {
+                                    log::warn!("native drag start failed: {error}");
+                                }
+                            }
+                            input::EdgeDragEvent::DropOle { device_id } => {
+                                if let Err(error) = send_ole_drag_signal(state, &device_id, "drop") {
+                                    log::warn!("native drag drop failed: {error}");
+                                }
+                            }
+                            input::EdgeDragEvent::CancelOle { device_id } => {
+                                let _ = send_ole_drag_signal(state, &device_id, "cancel");
+                            }
+                            input::EdgeDragEvent::Transfer { device_id, files } => {
+                                match send_files_to_device_inner(
+                                    state,
+                                    &device_id,
+                                    &to_paths(files),
+                                    true,
+                                ) {
+                                    Ok(summary) => log::info!(
+                                        "edge drag-drop delivered {} file(s) ({}) to {}",
+                                        summary.file_count,
+                                        format_bytes(summary.byte_count),
+                                        summary.target_name
+                                    ),
+                                    Err(error) => log::warn!("edge drag-drop failed: {error}"),
+                                }
+                            }
+                        }
+                    });
+                }));
+            }
             if silent_launch {
                 hide_main_window_handle(app.handle())?;
             } else {
@@ -5079,13 +5223,54 @@ fn transfer_file_name(path: &Path) -> Result<String, String> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_transfer_file(
     quic_transport: &quic_transport::TransportHandle,
     origin_id: &str,
     target: &FileTransferTarget,
     file: &TransferFile,
+    transfer_id: &str,
+    drop_to_desktop: bool,
+    reporter: Option<&FileTransferProgressReporter>,
 ) -> Result<u64, String> {
-    let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
+    if let Some(reporter) = reporter {
+        reporter.emit(transfer_id, file, 0, false, None);
+    }
+
+    let outcome = send_transfer_file_bytes(
+        quic_transport,
+        origin_id,
+        target,
+        file,
+        drop_to_desktop,
+        transfer_id,
+        reporter,
+    );
+
+    if let Some(reporter) = reporter {
+        match &outcome {
+            Ok(_) => reporter.emit(transfer_id, file, file.total_bytes, true, None),
+            Err(error) => reporter.emit(transfer_id, file, 0, true, Some(error.clone())),
+        }
+    }
+
+    outcome
+}
+
+fn new_transfer_id(prefix: &str) -> String {
+    format!("{prefix}-{}-{}", now_ms(), random_hex(8))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_transfer_file_bytes(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: &str,
+    target: &FileTransferTarget,
+    file: &TransferFile,
+    drop_to_desktop: bool,
+    transfer_id: &str,
+    reporter: Option<&FileTransferProgressReporter>,
+) -> Result<u64, String> {
     let mut packet_count = 0_u64;
 
     send_file_transfer_packet(
@@ -5093,7 +5278,7 @@ fn send_transfer_file(
         target,
         file_transfer_packet(
             "start",
-            &transfer_id,
+            transfer_id,
             origin_id,
             target,
             &file.name,
@@ -5101,6 +5286,7 @@ fn send_transfer_file(
             0,
             0,
             Vec::new(),
+            drop_to_desktop,
         ),
     )?;
     packet_count += 1;
@@ -5110,6 +5296,7 @@ fn send_transfer_file(
     let mut buffer = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
     let mut offset = 0_u64;
     let mut chunk_index = 0_u64;
+    let mut last_progress = Instant::now();
     loop {
         let read = file_handle
             .read(&mut buffer)
@@ -5123,7 +5310,7 @@ fn send_transfer_file(
             target,
             file_transfer_packet(
                 "chunk",
-                &transfer_id,
+                transfer_id,
                 origin_id,
                 target,
                 &file.name,
@@ -5131,11 +5318,18 @@ fn send_transfer_file(
                 chunk_index,
                 offset,
                 data,
+                drop_to_desktop,
             ),
         )?;
         packet_count += 1;
         offset = offset.saturating_add(read as u64);
         chunk_index = chunk_index.saturating_add(1);
+        if let Some(reporter) = reporter {
+            if last_progress.elapsed() >= Duration::from_millis(FILE_TRANSFER_PROGRESS_INTERVAL_MS) {
+                reporter.emit(transfer_id, file, offset, false, None);
+                last_progress = Instant::now();
+            }
+        }
     }
 
     send_file_transfer_packet(
@@ -5143,7 +5337,7 @@ fn send_transfer_file(
         target,
         file_transfer_packet(
             "finish",
-            &transfer_id,
+            transfer_id,
             origin_id,
             target,
             &file.name,
@@ -5151,6 +5345,7 @@ fn send_transfer_file(
             chunk_index,
             offset,
             Vec::new(),
+            drop_to_desktop,
         ),
     )?;
     packet_count += 1;
@@ -5169,6 +5364,7 @@ fn file_transfer_packet(
     chunk_index: u64,
     offset: u64,
     data: Vec<u8>,
+    drop_to_desktop: bool,
 ) -> FileTransferPacket {
     FileTransferPacket {
         protocol: FILE_TRANSFER_PROTOCOL.into(),
@@ -5183,6 +5379,7 @@ fn file_transfer_packet(
         chunk_index,
         offset,
         data,
+        drop_to_desktop,
     }
 }
 
@@ -5202,6 +5399,213 @@ fn send_file_transfer_packet(
         .map_err(|error| format!("文件传输失败: {error}"))
 }
 
+// Control channel for ShareMouse-style native drag-drop onto a Windows client.
+// The file bytes still travel as ordinary FileTransferPackets (matched to the
+// drag by transfer_id); these messages open/close the client's OLE session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DragControlPacket {
+    protocol: String,
+    kind: String, // "start" | "drop" | "cancel"
+    origin_id: String,
+    target_id: String,
+    cluster_id: String,
+    pair_secret: String,
+    #[serde(default)]
+    files: Vec<DragControlFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DragControlFile {
+    transfer_id: String,
+    name: String,
+    size: u64,
+}
+
+/// Windows target: open the OLE drag session and stream the files (used by the
+/// edge drag-drop path). Returns the number of files started. Only the macOS
+/// capture path originates edge drags, so this is a controller-side helper.
+#[cfg(target_os = "macos")]
+fn send_ole_drag_start(
+    state: &AppRuntime,
+    device_id: &str,
+    paths: &[String],
+) -> Result<usize, String> {
+    state.start_discovery()?;
+    let layout = state.layout_snapshot();
+    if !layout.file_transfer_enabled {
+        return Err("文件传输未开启。".into());
+    }
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready; start the runtime first.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
+    let files = collect_transfer_files(paths)?;
+
+    // Pre-assign a transfer id per file so the client can match the streamed
+    // bytes to the drag session it is about to open.
+    let with_ids: Vec<(String, TransferFile)> = files
+        .into_iter()
+        .map(|file| (new_transfer_id("drag"), file))
+        .collect();
+
+    let manifest = with_ids
+        .iter()
+        .map(|(id, file)| DragControlFile {
+            transfer_id: id.clone(),
+            name: file.name.clone(),
+            size: file.total_bytes,
+        })
+        .collect();
+    let start = DragControlPacket {
+        protocol: DRAG_CONTROL_PROTOCOL.into(),
+        kind: "start".into(),
+        origin_id: local_peer.id.clone(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        files: manifest,
+    };
+    let payload = encode_wire_packet(&start)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    quic_transport
+        .send_stream_expect_ack(peer, payload)
+        .map_err(|error| format!("拖放控制失败: {error}"))?;
+
+    let total = with_ids.len();
+    for (index, (transfer_id, file)) in with_ids.iter().enumerate() {
+        let reporter = FileTransferProgressReporter {
+            app: &state.app_handle,
+            target_name: &target.name,
+            file_index: index + 1,
+            file_count: total,
+        };
+        let packet_count = send_transfer_file(
+            &quic_transport,
+            &local_peer.id,
+            &target,
+            file,
+            transfer_id,
+            false,
+            Some(&reporter),
+        )?;
+        state
+            .transport_packets
+            .fetch_add(packet_count, Ordering::Relaxed);
+    }
+    Ok(total)
+}
+
+/// Windows target: signal drop or cancel for an in-flight OLE drag session.
+#[cfg(target_os = "macos")]
+fn send_ole_drag_signal(state: &AppRuntime, device_id: &str, kind: &str) -> Result<(), String> {
+    let layout = state.layout_snapshot();
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
+    let packet = DragControlPacket {
+        protocol: DRAG_CONTROL_PROTOCOL.into(),
+        kind: kind.into(),
+        origin_id: local_peer.id.clone(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        files: Vec::new(),
+    };
+    let payload = encode_wire_packet(&packet)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    quic_transport
+        .send_stream_expect_ack(peer, payload)
+        .map_err(|error| format!("拖放控制失败: {error}"))
+}
+
+/// Client side: apply an incoming drag-control message. Returns true if the
+/// payload was a drag-control packet addressed to us (whether or not this
+/// platform can act on it).
+fn handle_drag_control_packet(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+) -> bool {
+    let Some(packet) = decode_wire_packet::<DragControlPacket>(payload) else {
+        return false;
+    };
+    if packet.protocol != DRAG_CONTROL_PROTOCOL {
+        return false;
+    }
+    if !layout.file_transfer_enabled {
+        return true;
+    }
+    // Reuse the file-transfer trust checks: same cluster, same pair secret, and
+    // (on a client) an origin we are paired to.
+    if layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || packet.pair_secret != layout.pair_secret
+    {
+        return true;
+    }
+    if layout.machine_role == "client"
+        && !layout.paired_controllers.is_empty()
+        && !layout
+            .paired_controllers
+            .iter()
+            .any(|controller| controller.id == packet.origin_id)
+    {
+        return true;
+    }
+    if packet.target_id != local_peer_id || packet.origin_id == local_peer_id {
+        return true;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        match packet.kind.as_str() {
+            "start" => {
+                let files = packet
+                    .files
+                    .into_iter()
+                    .map(|file| windows_drag::DragFileMeta {
+                        transfer_id: file.transfer_id,
+                        name: file.name,
+                        size: file.size,
+                    })
+                    .collect();
+                if windows_drag::start_drag_session(files) {
+                    log::info!("native drag session started from {}", packet.origin_id);
+                }
+            }
+            "drop" => windows_drag::signal_drop(),
+            "cancel" => windows_drag::cancel_session(),
+            _ => {}
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Only a Windows client runs OLE drag sessions; elsewhere the controller
+        // uses the transfer fallback, so nothing to do here.
+        let _ = packet;
+    }
+    true
+}
+
 fn handle_file_transfer_packet(
     payload: &[u8],
     layout: &LayoutState,
@@ -5216,7 +5620,20 @@ fn handle_file_transfer_packet(
         log::warn!("file transfer receive failed: could not resolve receive directory");
         return false;
     };
-    handle_decoded_file_transfer_packet(packet, layout, local_peer_id, transfers, &receive_root)
+    // Edge drag-drop lands on the Desktop; fall back to the transfers folder
+    // when the Desktop can't be resolved.
+    let desktop_root = packet
+        .drop_to_desktop
+        .then(|| app.path().desktop_dir().ok())
+        .flatten();
+    handle_decoded_file_transfer_packet(
+        packet,
+        layout,
+        local_peer_id,
+        transfers,
+        &receive_root,
+        desktop_root.as_deref(),
+    )
 }
 
 fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -5241,7 +5658,7 @@ fn handle_file_transfer_packet_with_root(
     let Some(packet) = decode_wire_packet::<FileTransferPacket>(payload) else {
         return false;
     };
-    handle_decoded_file_transfer_packet(packet, layout, local_peer_id, transfers, receive_root)
+    handle_decoded_file_transfer_packet(packet, layout, local_peer_id, transfers, receive_root, None)
 }
 
 fn handle_decoded_file_transfer_packet(
@@ -5250,6 +5667,7 @@ fn handle_decoded_file_transfer_packet(
     local_peer_id: &str,
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
+    desktop_root: Option<&Path>,
 ) -> bool {
     if packet.protocol != FILE_TRANSFER_PROTOCOL {
         return false;
@@ -5267,8 +5685,20 @@ fn handle_decoded_file_transfer_packet(
         return true;
     }
 
+    // A file that belongs to an active native drag session feeds that session's
+    // in-memory stream (read by the OLE drop target) instead of landing on disk.
+    #[cfg(target_os = "windows")]
+    if windows_drag::session_wants(&packet.transfer_id) {
+        return match packet.kind.as_str() {
+            "start" => true,
+            "chunk" => windows_drag::feed_chunk(&packet.transfer_id, &packet.data),
+            "finish" => windows_drag::finish_file(&packet.transfer_id),
+            _ => false,
+        };
+    }
+
     match packet.kind.as_str() {
-        "start" => start_incoming_file_transfer(packet, transfers, receive_root),
+        "start" => start_incoming_file_transfer(packet, transfers, receive_root, desktop_root),
         "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
         "finish" => finish_incoming_file_transfer(packet, transfers),
         _ => false,
@@ -5279,6 +5709,7 @@ fn start_incoming_file_transfer(
     packet: FileTransferPacket,
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
+    desktop_root: Option<&Path>,
 ) -> bool {
     if packet.transfer_id.trim().is_empty()
         || packet.origin_id.trim().is_empty()
@@ -5300,7 +5731,10 @@ fn start_incoming_file_transfer(
         return false;
     }
 
-    let final_path = unique_transfer_destination(receive_root, &file_name);
+    // Edge drag-drops finalize on the Desktop; the .part staging file stays in
+    // the transfers folder either way so it never flashes on the Desktop.
+    let final_root = desktop_root.unwrap_or(receive_root);
+    let final_path = unique_transfer_destination(final_root, &file_name);
     let temp_path = receive_root.join(format!(
         ".mykvm-{}-{}.part",
         sanitize_transfer_id(&packet.transfer_id),
@@ -5414,7 +5848,14 @@ fn finish_incoming_file_transfer(
         )
     };
 
-    match fs::rename(&temp_path, &final_path) {
+    // The staging dir and the final dir can sit on different volumes (e.g. a
+    // redirected Desktop), where rename fails — fall back to copy + delete.
+    let finalize = fs::rename(&temp_path, &final_path).or_else(|_| {
+        fs::copy(&temp_path, &final_path).map(|_| {
+            let _ = fs::remove_file(&temp_path);
+        })
+    });
+    match finalize {
         Ok(()) => {
             if let Ok(mut transfers) = transfers.lock() {
                 transfers.remove(&packet.transfer_id);
@@ -7978,6 +8419,42 @@ mod tests {
     }
 
     #[test]
+    fn edge_drop_transfer_finalizes_on_desktop_root_with_part_file_staged_elsewhere() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-staging");
+        let desktop = temp_test_dir("file-transfer-desktop");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet("start", "transfer-3", "note.txt", 5, 0, 0, b""),
+            test_file_transfer_packet("chunk", "transfer-3", "note.txt", 5, 0, 0, b"hello"),
+            test_file_transfer_packet("finish", "transfer-3", "note.txt", 5, 1, 5, b""),
+        ] {
+            let mut packet = packet;
+            packet.drop_to_desktop = true;
+            assert!(handle_decoded_file_transfer_packet(
+                packet,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+                Some(&desktop)
+            ));
+        }
+
+        assert_eq!(
+            fs::read_to_string(desktop.join("note.txt")).expect("file lands on the desktop root"),
+            "hello"
+        );
+        assert!(
+            !root.join("note.txt").exists(),
+            "final file must not appear in the staging root"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(desktop);
+    }
+
+    #[test]
     fn file_transfer_rejects_out_of_order_chunks() {
         let layout = test_layout();
         let root = temp_test_dir("file-transfer-order");
@@ -8043,6 +8520,7 @@ mod tests {
             chunk_index,
             offset,
             data: data.to_vec(),
+            drop_to_desktop: false,
         }
     }
 

@@ -8,6 +8,10 @@ release will reuse them).
 
 ## [Unreleased]
 
+### Added
+
+- Drag-and-drop files across machines (ShareMouse-style): start dragging files on the controlling Mac, slide the cursor onto a controlled machine's screen, and release. Dragging onto a **Windows** client shows the native drag cursor and drops the files wherever you release — into the open Explorer folder, onto the desktop, or into an app that accepts files (chat, mail, an editor). Dragging onto any other machine transfers the files to land on its Desktop. Works with multiple files and streams large files as they copy; a progress toast shows each transfer. The drag must begin on the Mac that owns the keyboard and mouse. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
+
 ### Fixed
 
 - macOS: opening MyKVM while it is already running (a second .app copy, `open -n`, or launching from a mounted DMG) now brings the running window to the front instead of starting a second process that fights the first over the network ports.

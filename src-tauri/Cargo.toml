@@ -55,4 +55,12 @@ core-graphics = { version = "0.25", features = ["highsierra"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.8.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_Services", "Win32_System_StationsAndDesktops", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# COM interfaces (IDataObject/IDropSource/IStream) for native OLE drag-drop on
+# the controlled Windows client. windows-sys models COM only as c_void pointers,
+# so the higher-level `windows` crate (already in the tree transitively) is used
+# for the drag-drop object model and #[implement].
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemServices"] }
+# The #[implement] macro expands to `windows_core::` paths, so the crate must be
+# a direct dependency (matches the version `windows` 0.61 already pulls in).
+windows-core = "0.61"
 image = { version = "0.25", default-features = false, features = ["bmp"] }

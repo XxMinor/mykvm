@@ -163,6 +163,19 @@ type NativeFileDragPayload =
   | { type: "cancel" }
   | { type: string; paths?: string[]; position?: FileDropPosition };
 
+// Mirrors the Rust FileTransferProgress payload (camelCase serde).
+interface FileTransferProgressEntry {
+  transferId: string;
+  fileName: string;
+  targetName: string;
+  sentBytes: number;
+  totalBytes: number;
+  fileIndex: number;
+  fileCount: number;
+  done: boolean;
+  error: string | null;
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -183,6 +196,9 @@ function App() {
   const [fileTransferMessage, setFileTransferMessage] = useState<string | null>(
     null,
   );
+  const [fileTransfers, setFileTransfers] = useState<
+    Record<string, FileTransferProgressEntry>
+  >({});
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
   const [isInputServicePending, setIsInputServicePending] = useState(false);
@@ -283,6 +299,69 @@ function App() {
     return () => {
       window.removeEventListener("dragover", allowNativeFileDrop);
       window.removeEventListener("drop", allowNativeFileDrop);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    const removalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<FileTransferProgressEntry>(
+          "file-transfer-progress",
+          ({ payload }) => {
+            if (!active) {
+              return;
+            }
+            setFileTransfers((current) => ({
+              ...current,
+              [payload.transferId]: payload,
+            }));
+            // A finished (or failed) toast lingers briefly, then disappears.
+            if (payload.done) {
+              const existing = removalTimers.get(payload.transferId);
+              if (existing) {
+                clearTimeout(existing);
+              }
+              removalTimers.set(
+                payload.transferId,
+                setTimeout(() => {
+                  setFileTransfers((current) => {
+                    const next = { ...current };
+                    delete next[payload.transferId];
+                    return next;
+                  });
+                  removalTimers.delete(payload.transferId);
+                }, 3000),
+              );
+            }
+          },
+        ),
+      )
+      .then((stop) => {
+        if (active) {
+          unlisten = stop;
+          return;
+        }
+        stop();
+      })
+      .catch(() => {
+        // Progress toasts are a nicety; a missing listener just hides them.
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+      for (const timer of removalTimers.values()) {
+        clearTimeout(timer);
+      }
+      removalTimers.clear();
     };
   }, []);
 
@@ -1888,6 +1967,73 @@ function App() {
     );
   }
 
+  function renderFileTransferToasts() {
+    const transfers = Object.values(fileTransfers);
+    if (transfers.length === 0) {
+      return null;
+    }
+    // Newest first, so a fresh transfer appears on top of the stack.
+    transfers.sort((a, b) => b.transferId.localeCompare(a.transferId));
+
+    return (
+      <div className="file-transfer-toasts" aria-live="polite">
+        {transfers.map((transfer) => {
+          const percent =
+            transfer.totalBytes > 0
+              ? Math.min(
+                  100,
+                  Math.round((transfer.sentBytes / transfer.totalBytes) * 100),
+                )
+              : transfer.done && !transfer.error
+                ? 100
+                : 0;
+          const failed = Boolean(transfer.error);
+          const status = failed
+            ? ui.devices.fileTransferFailed
+            : transfer.done
+              ? ui.devices.fileTransferSent
+              : ui.devices.fileTransferSending;
+          const counter =
+            transfer.fileCount > 1
+              ? ` (${transfer.fileIndex}/${transfer.fileCount})`
+              : "";
+          return (
+            <div
+              key={transfer.transferId}
+              className={`file-transfer-toast${failed ? " failed" : ""}${
+                transfer.done && !failed ? " done" : ""
+              }`}
+              role="status"
+            >
+              <div className="file-transfer-toast-head">
+                <span className="file-transfer-toast-name" title={transfer.fileName}>
+                  {transfer.fileName}
+                </span>
+                <span className="file-transfer-toast-status">
+                  {status}
+                  {counter}
+                </span>
+              </div>
+              <div className="file-transfer-toast-track">
+                <div
+                  className="file-transfer-toast-fill"
+                  style={{ width: `${failed ? 100 : percent}%` }}
+                />
+              </div>
+              <div className="file-transfer-toast-meta">
+                {failed
+                  ? transfer.error
+                  : `${formatFileTransferBytes(transfer.sentBytes)} / ${formatFileTransferBytes(
+                      transfer.totalBytes,
+                    )} · ${transfer.targetName}`}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   function renderInputServicePrompt(action: InputServiceAction) {
     const title =
       action === "uninstall"
@@ -2143,6 +2289,7 @@ function App() {
 
       {errorMessage ? renderErrorDialog(errorMessage) : null}
       {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
+      {renderFileTransferToasts()}
       {inputServiceAction ? renderInputServicePrompt(inputServiceAction) : null}
 
       {machineRole === "server" && currentTab === "layout" ? (

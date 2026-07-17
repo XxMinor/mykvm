@@ -2171,3 +2171,95 @@
     display: grid;
   }
 }
+
+/* Sending-side file-transfer progress toasts (bottom-right stack). */
+.file-transfer-toasts {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 70;
+  display: grid;
+  gap: 10px;
+  width: min(340px, calc(100vw - 36px));
+  pointer-events: none;
+}
+
+.file-transfer-toast {
+  pointer-events: auto;
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid rgba(45, 212, 191, 0.28);
+  border-radius: 12px;
+  background: rgba(15, 23, 32, 0.92);
+  box-shadow: 0 10px 30px rgba(2, 6, 12, 0.45);
+  color: #e2e8f0;
+  font-size: 12px;
+}
+
+.file-transfer-toast.done {
+  border-color: rgba(45, 212, 191, 0.5);
+}
+
+.file-transfer-toast.failed {
+  border-color: rgba(248, 113, 113, 0.5);
+}
+
+.file-transfer-toast-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.file-transfer-toast-name {
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-transfer-toast-status {
+  flex: none;
+  font-size: 11px;
+  color: #99f6e4;
+}
+
+.file-transfer-toast.failed .file-transfer-toast-status {
+  color: #fca5a5;
+}
+
+.file-transfer-toast-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.22);
+  overflow: hidden;
+}
+
+.file-transfer-toast-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2dd4bf, #22d3ee);
+  transition: width 0.15s ease;
+}
+
+.file-transfer-toast.failed .file-transfer-toast-fill {
+  background: #f87171;
+}
+
+.file-transfer-toast-meta {
+  color: #94a3b8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.theme-light .file-transfer-toast {
+  background: rgba(255, 255, 255, 0.97);
+  color: #0f172a;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.18);
+}
+
+.theme-light .file-transfer-toast-meta {
+  color: #475569;
+}

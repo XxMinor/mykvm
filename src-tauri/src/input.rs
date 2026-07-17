@@ -881,6 +881,10 @@ fn start_platform_capture(
             local_screen_points: Mutex::new(HashMap::new()),
             local_y_bounds,
             display_snapshots,
+            drag_count_at_left_down: std::sync::atomic::AtomicI64::new(
+                macos_drag_pasteboard::change_count(),
+            ),
+            pending_edge_drop: Mutex::new(None),
         });
         let callback_context = Arc::clone(&context);
         let event_types = vec![
@@ -1012,6 +1016,7 @@ fn start_platform_capture(
         }
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
+        clear_pending_edge_drop(&context);
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
@@ -2437,6 +2442,12 @@ struct MacCaptureContext {
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
+    // Edge drag-drop (ShareMouse-style): the drag pasteboard's changeCount as
+    // of the last LOCAL left-button press. A left-drag that crosses the edge
+    // with a HIGHER count means a drag session started during this hold, so
+    // its files are captured here and sent when the button releases remotely.
+    drag_count_at_left_down: std::sync::atomic::AtomicI64,
+    pending_edge_drop: Mutex<Option<PendingEdgeDrop>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2703,6 +2714,8 @@ fn release_remote_buttons(
 /// never leave a stuck Ctrl/Cmd/Shift or pressed button on the controlled side.
 #[cfg(target_os = "macos")]
 fn release_held_remote_inputs_macos(context: &MacCaptureContext, target: &InputTarget) {
+    // Control is leaving the remote without a drop: forget any armed edge drag.
+    clear_pending_edge_drop(context);
     let held = context
         .pressed_modifiers
         .lock()
@@ -3432,6 +3445,14 @@ fn handle_macos_event(
         return CallbackResult::Keep;
     }
 
+    // Events this process posted for LOCAL consumption (e.g. the Escape that
+    // cancels a Finder drag once it crosses to the remote) — pass them through
+    // untouched instead of re-capturing and forwarding them.
+    if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == MACOS_SELF_EVENT_MARKER
+    {
+        return CallbackResult::Keep;
+    }
+
     let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f64;
     let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64;
 
@@ -3442,7 +3463,13 @@ fn handle_macos_event(
             | CGEventType::RightMouseDragged
             | CGEventType::OtherMouseDragged
     ) {
-        return handle_macos_mouse_move(context, event, dx, dy);
+        return handle_macos_mouse_move(
+            context,
+            event,
+            dx,
+            dy,
+            matches!(event_type, CGEventType::LeftMouseDragged),
+        );
     }
 
     let Ok(active) = context.active.lock() else {
@@ -3450,6 +3477,11 @@ fn handle_macos_event(
     };
     let Some(active_target) = active.as_ref().cloned() else {
         drop(active);
+        if matches!(event_type, CGEventType::LeftMouseDown) {
+            context
+                .drag_count_at_left_down
+                .store(macos_drag_pasteboard::change_count(), Ordering::Relaxed);
+        }
         return handle_macos_modifier_event(context, event_type, event);
     };
     drop(active);
@@ -3460,6 +3492,8 @@ fn handle_macos_event(
             send_macos_mouse_button(context, &active_target, MouseButton::Left, true)
         }
         CGEventType::LeftMouseUp => {
+            // Releasing the drag over the controlled machine: this is the drop.
+            fire_pending_edge_drop(context);
             send_macos_mouse_button(context, &active_target, MouseButton::Left, false)
         }
         CGEventType::RightMouseDown => {
@@ -3568,6 +3602,7 @@ fn handle_macos_mouse_move(
     event: &core_graphics::event::CGEvent,
     dx: f64,
     dy: f64,
+    left_drag: bool,
 ) -> core_graphics::event::CallbackResult {
     use core_graphics::{event::CallbackResult, geometry::CGPoint};
 
@@ -3663,6 +3698,7 @@ fn handle_macos_mouse_move(
                     reset_mouse_move_timer(&context.last_mouse_move_sent);
                     reset_cursor_repin_timer(context);
                     reset_remote_button_mask(&context.remote_button_mask);
+                    clear_pending_edge_drop(context);
                     if let Ok(mut modifiers) = context.pressed_modifiers.lock() {
                         modifiers.clear();
                     }
@@ -3750,10 +3786,347 @@ fn handle_macos_mouse_move(
             *anchor_state = Some(anchor);
         }
         context.just_crossed.store(true, Ordering::Relaxed);
+        if left_drag {
+            // The crossing happened mid-left-drag: if a drag session started
+            // during this button hold and it carries files, arm an edge drop.
+            capture_edge_drag_files(context, &active_target);
+        }
         return CallbackResult::Drop;
     }
 
     CallbackResult::Keep
+}
+
+/// What the capture tap hands lib.rs as a local file drag interacts with a
+/// controlled machine. A Windows target gets a real OLE drag session (native
+/// icon, drop into any folder/app), driven by Start → Drop/Cancel; every other
+/// target falls back to transferring the files at release (they land at the
+/// drop point). Installed once by lib.rs at startup.
+#[cfg(target_os = "macos")]
+pub enum EdgeDragEvent {
+    /// Windows target: open the OLE drag session and stream the file bytes now.
+    StartOle {
+        device_id: String,
+        files: Vec<std::path::PathBuf>,
+    },
+    /// Windows target: the drag was released over the client — do the drop.
+    DropOle { device_id: String },
+    /// Windows target: the drag left without dropping — cancel the session.
+    CancelOle { device_id: String },
+    /// Non-Windows target: transfer the files so they land at the drop.
+    Transfer {
+        device_id: String,
+        files: Vec<std::path::PathBuf>,
+    },
+}
+
+#[cfg(target_os = "macos")]
+pub type EdgeDragSender = Box<dyn Fn(EdgeDragEvent) + Send + Sync>;
+
+#[cfg(target_os = "macos")]
+static EDGE_DRAG_SENDER: OnceLock<EdgeDragSender> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+pub fn set_edge_drag_sender(sender: EdgeDragSender) {
+    let _ = EDGE_DRAG_SENDER.set(sender);
+}
+
+#[cfg(target_os = "macos")]
+fn emit_edge_drag(event: EdgeDragEvent) {
+    if let Some(sender) = EDGE_DRAG_SENDER.get() {
+        sender(event);
+    } else {
+        log::warn!("edge drag-drop dropped: no sender installed");
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PendingEdgeDrop {
+    device_id: String,
+    files: Vec<std::path::PathBuf>,
+    ole: bool,
+}
+
+/// kCGEventSourceUserData magic stamped on events this process posts for
+/// LOCAL consumption, so the capture tap passes them through instead of
+/// forwarding them to the remote.
+#[cfg(target_os = "macos")]
+const MACOS_SELF_EVENT_MARKER: i64 = 0x4D59_4B56; // "MYKV"
+
+/// Cancels the in-flight local drag session (Escape is the native drag
+/// cancel), so Finder's drag doesn't stay stuck mid-air while the pointer
+/// lives on the remote screen.
+#[cfg(target_os = "macos")]
+fn post_marked_escape_key() {
+    use core_graphics::event::{CGEvent, CGEventTapLocation, EventField};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    const ESCAPE_KEYCODE: u16 = 53;
+    for down in [true, false] {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            return;
+        };
+        if let Ok(event) = CGEvent::new_keyboard_event(source, ESCAPE_KEYCODE, down) {
+            event.set_integer_value_field(
+                EventField::EVENT_SOURCE_USER_DATA,
+                MACOS_SELF_EVENT_MARKER,
+            );
+            event.post(CGEventTapLocation::HID);
+        }
+    }
+}
+
+/// Called when a left-drag crosses onto a controlled machine: if a drag
+/// session started during this button hold and it carries files, remember
+/// them (armed until the release) and cancel the local drag session.
+#[cfg(target_os = "macos")]
+fn capture_edge_drag_files(context: &MacCaptureContext, active_target: &ActiveTarget) {
+    let transfer_enabled = context
+        .layout_state
+        .lock()
+        .map(|layout| layout.file_transfer_enabled)
+        .unwrap_or(false);
+    if !transfer_enabled {
+        return;
+    }
+
+    // The drag pasteboard keeps the items of the PREVIOUS drag after it ends,
+    // so "non-empty" alone would false-positive on a plain button hold (window
+    // drag, text selection). Only a changeCount bump since this left-button
+    // press proves a fresh drag session.
+    let at_press = context.drag_count_at_left_down.load(Ordering::Relaxed);
+    let current = macos_drag_pasteboard::change_count();
+    if current == at_press {
+        return;
+    }
+    // Arm at most once per button hold: after the Escape below kills the local
+    // drag session, a re-cross during the same hold would still see the stale
+    // pasteboard items, so advance the snapshot to swallow them.
+    context
+        .drag_count_at_left_down
+        .store(current, Ordering::Relaxed);
+
+    let files = macos_drag_pasteboard::file_paths();
+    if files.is_empty() {
+        return; // dragging something that isn't files (text, an image, …)
+    }
+
+    let device_id = active_target.target.device_id.clone();
+    // A Windows client can run a native OLE drag; anything else falls back to
+    // the transfer-at-release path.
+    let ole = active_target
+        .target
+        .target_platform
+        .eq_ignore_ascii_case("windows");
+    log::info!(
+        "edge drag-drop armed: {} file(s) to {} ({})",
+        files.len(),
+        device_id,
+        if ole { "native drag" } else { "transfer" }
+    );
+    if ole {
+        // Start the drag session on the client and begin streaming now, so the
+        // native drag image tracks and the bytes are ready by the drop.
+        emit_edge_drag(EdgeDragEvent::StartOle {
+            device_id: device_id.clone(),
+            files: files.clone(),
+        });
+    }
+    if let Ok(mut pending) = context.pending_edge_drop.lock() {
+        *pending = Some(PendingEdgeDrop {
+            device_id,
+            files,
+            ole,
+        });
+    }
+    post_marked_escape_key();
+}
+
+#[cfg(target_os = "macos")]
+fn fire_pending_edge_drop(context: &MacCaptureContext) {
+    let pending = context
+        .pending_edge_drop
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take());
+    let Some(pending) = pending else {
+        return;
+    };
+    if pending.ole {
+        emit_edge_drag(EdgeDragEvent::DropOle {
+            device_id: pending.device_id,
+        });
+    } else {
+        emit_edge_drag(EdgeDragEvent::Transfer {
+            device_id: pending.device_id,
+            files: pending.files,
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_pending_edge_drop(context: &MacCaptureContext) {
+    let pending = context
+        .pending_edge_drop
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take());
+    // Control left the remote without a drop: cancel an in-flight OLE session.
+    if let Some(pending) = pending {
+        if pending.ole {
+            emit_edge_drag(EdgeDragEvent::CancelOle {
+                device_id: pending.device_id,
+            });
+        }
+    }
+}
+
+/// Raw-objc access to the macOS drag pasteboard ("Apple CFPasteboard drag",
+/// the value of NSPasteboardNameDrag). Every entry point pushes an
+/// autorelease pool — AppKit calls without one from a non-main thread leak
+/// autoreleased objects and eventually crash (see the clipboard SIGSEGV
+/// history). Only ever called from the capture tap thread.
+#[cfg(target_os = "macos")]
+mod macos_drag_pasteboard {
+    use std::ffi::{c_void, CStr, CString};
+    use std::os::raw::c_char;
+    use std::path::PathBuf;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
+    }
+
+    struct PoolGuard(*mut c_void);
+
+    impl Drop for PoolGuard {
+        fn drop(&mut self) {
+            unsafe { objc_autoreleasePoolPop(self.0) }
+        }
+    }
+
+    unsafe fn sel(name: &[u8]) -> *mut c_void {
+        sel_registerName(name.as_ptr() as *const c_char)
+    }
+
+    unsafe fn msg_obj(receiver: *mut c_void, selector: *mut c_void) -> *mut c_void {
+        let send: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        send(receiver, selector)
+    }
+
+    unsafe fn msg_obj1(
+        receiver: *mut c_void,
+        selector: *mut c_void,
+        argument: *mut c_void,
+    ) -> *mut c_void {
+        let send: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        send(receiver, selector, argument)
+    }
+
+    unsafe fn msg_i64(receiver: *mut c_void, selector: *mut c_void) -> i64 {
+        let send: extern "C" fn(*mut c_void, *mut c_void) -> i64 =
+            std::mem::transmute(objc_msgSend as *const ());
+        send(receiver, selector)
+    }
+
+    unsafe fn msg_obj_at(receiver: *mut c_void, selector: *mut c_void, index: u64) -> *mut c_void {
+        let send: extern "C" fn(*mut c_void, *mut c_void, u64) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        send(receiver, selector, index)
+    }
+
+    unsafe fn ns_string(value: &str) -> *mut c_void {
+        let Ok(value) = CString::new(value) else {
+            return std::ptr::null_mut();
+        };
+        let class = objc_getClass(b"NSString\0".as_ptr() as *const c_char);
+        if class.is_null() {
+            return std::ptr::null_mut();
+        }
+        let send: extern "C" fn(*mut c_void, *mut c_void, *const c_char) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        send(class, sel(b"stringWithUTF8String:\0"), value.as_ptr())
+    }
+
+    unsafe fn drag_pasteboard() -> *mut c_void {
+        let class = objc_getClass(b"NSPasteboard\0".as_ptr() as *const c_char);
+        if class.is_null() {
+            return std::ptr::null_mut();
+        }
+        let name = ns_string("Apple CFPasteboard drag");
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        msg_obj1(class, sel(b"pasteboardWithName:\0"), name)
+    }
+
+    pub fn change_count() -> i64 {
+        unsafe {
+            let _pool = PoolGuard(objc_autoreleasePoolPush());
+            let pasteboard = drag_pasteboard();
+            if pasteboard.is_null() {
+                return 0;
+            }
+            msg_i64(pasteboard, sel(b"changeCount\0"))
+        }
+    }
+
+    /// The file paths currently on the drag pasteboard (one per dragged file).
+    pub fn file_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        unsafe {
+            let _pool = PoolGuard(objc_autoreleasePoolPush());
+            let pasteboard = drag_pasteboard();
+            if pasteboard.is_null() {
+                return paths;
+            }
+            let items = msg_obj(pasteboard, sel(b"pasteboardItems\0"));
+            if items.is_null() {
+                return paths;
+            }
+            let count = msg_i64(items, sel(b"count\0")).max(0) as u64;
+            let file_url_type = ns_string("public.file-url");
+            let url_class = objc_getClass(b"NSURL\0".as_ptr() as *const c_char);
+            if file_url_type.is_null() || url_class.is_null() {
+                return paths;
+            }
+            for index in 0..count {
+                let item = msg_obj_at(items, sel(b"objectAtIndex:\0"), index);
+                if item.is_null() {
+                    continue;
+                }
+                let url_string = msg_obj1(item, sel(b"stringForType:\0"), file_url_type);
+                if url_string.is_null() {
+                    continue;
+                }
+                // NSURL does the percent-decoding (file:///a%20b -> /a b).
+                let url = msg_obj1(url_class, sel(b"URLWithString:\0"), url_string);
+                if url.is_null() {
+                    continue;
+                }
+                let path_string = msg_obj(url, sel(b"path\0"));
+                if path_string.is_null() {
+                    continue;
+                }
+                let utf8 = msg_obj(path_string, sel(b"UTF8String\0")) as *const c_char;
+                if utf8.is_null() {
+                    continue;
+                }
+                if let Ok(path) = CStr::from_ptr(utf8).to_str() {
+                    if !path.is_empty() {
+                        paths.push(PathBuf::from(path));
+                    }
+                }
+            }
+        }
+        paths
+    }
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
