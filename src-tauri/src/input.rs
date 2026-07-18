@@ -6118,17 +6118,29 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
 #[cfg(target_os = "macos")]
 static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
-/// Latch so a held (auto-repeating) remote Caps Lock toggles the input source
-/// exactly once until its key-up arrives.
+/// Debounce window for remote Caps Lock → input-source switches. A single
+/// press must switch exactly once, and holding caps (auto-repeat) must not
+/// switch repeatedly — but we must NOT gate on the caps key-up, because a
+/// dropped up packet used to latch caps "down" forever and swallow every later
+/// press (the "have to press it several times" symptom). Time-debouncing the
+/// key-DOWN instead needs no up at all.
 #[cfg(target_os = "macos")]
-static MACOS_CAPS_LOCK_DOWN: AtomicBool = AtomicBool::new(false);
+const MACOS_CAPS_DEBOUNCE_MS: u64 = 300;
+
+#[cfg(target_os = "macos")]
+fn macos_caps_last_switch() -> &'static Mutex<Option<Instant>> {
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(None))
+}
 
 /// Clears the tracked injected-modifier flags. Called when receiving stops so a
 /// dropped modifier key-up cannot leave Shift/Ctrl/Cmd stuck on for later keys.
 #[cfg(target_os = "macos")]
 pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
-    MACOS_CAPS_LOCK_DOWN.store(false, Ordering::Relaxed);
+    if let Ok(mut last) = macos_caps_last_switch().lock() {
+        *last = None;
+    }
     if let Ok(mut tracker) = macos_click_tracker().lock() {
         *tracker = MacClickTracker::default();
     }
@@ -6173,12 +6185,26 @@ fn inject_key(key_code: u16, down: bool) {
     // verified on this deployment); read com.apple.symbolichotkeys key 60 if
     // this ever needs to adapt.
     if key_code == 0x14 {
+        // Switch on the key-DOWN, debounced by time (see MACOS_CAPS_DEBOUNCE_MS)
+        // so a lost key-up can't wedge it and auto-repeat can't spam switches.
         if down {
-            if !MACOS_CAPS_LOCK_DOWN.swap(true, Ordering::Relaxed) {
+            let switch = {
+                match macos_caps_last_switch().lock() {
+                    Ok(mut last) => {
+                        let due = last
+                            .map(|when| when.elapsed() >= Duration::from_millis(MACOS_CAPS_DEBOUNCE_MS))
+                            .unwrap_or(true);
+                        if due {
+                            *last = Some(Instant::now());
+                        }
+                        due
+                    }
+                    Err(_) => true,
+                }
+            };
+            if switch {
                 macos_post_select_previous_input_source();
             }
-        } else {
-            MACOS_CAPS_LOCK_DOWN.store(false, Ordering::Relaxed);
         }
         return;
     }
@@ -6236,11 +6262,16 @@ fn mac_function_section_flags(mac_code: u16) -> core_graphics::event::CGEventFla
     }
 }
 
-/// Posts the system input-source toggle hotkey (⌃Space, symbolic hotkey 60)
-/// as a full physical-like sequence: Control down, Space down/up, Control up.
-/// Flags are set per event and deliberately plain ⌃ — a concurrently held
-/// remote modifier would form a different chord and miss the hotkey; the next
-/// injected key restores the tracked flags anyway.
+/// Posts the system input-source toggle hotkey (⌃Space, symbolic hotkey 60) as
+/// a full physical-like sequence: Control down, Space down/up, Control up.
+///
+/// Runs on its own thread with a small gap between events and ONE shared event
+/// source, so HIToolbox reliably recognizes it as a real chord. The previous
+/// version built a fresh source per event and fired them back-to-back with no
+/// gap; HIToolbox would then intermittently flip only the menu-bar indicator
+/// without refreshing the focused app's input session (the "icon changed but
+/// still typing English" symptom). The thread also keeps the ~40ms of paced
+/// posting off the injection hot path.
 #[cfg(target_os = "macos")]
 fn macos_post_select_previous_input_source() {
     use core_graphics::{
@@ -6251,31 +6282,36 @@ fn macos_post_select_previous_input_source() {
     const MAC_KEY_CONTROL: u16 = 59; // kVK_Control
     const MAC_KEY_SPACE: u16 = 49; // kVK_Space
 
-    let control = CGEventFlags::CGEventFlagControl;
-    let no_flags = CGEventFlags::empty();
-    let sequence = [
-        (MAC_KEY_CONTROL, true, control),
-        (MAC_KEY_SPACE, true, control),
-        (MAC_KEY_SPACE, false, control),
-        (MAC_KEY_CONTROL, false, no_flags),
-    ];
-    for (mac_code, down, flags) in sequence {
+    thread::spawn(|| {
+        let control = CGEventFlags::CGEventFlagControl;
+        let no_flags = CGEventFlags::empty();
+        let sequence = [
+            (MAC_KEY_CONTROL, true, control),
+            (MAC_KEY_SPACE, true, control),
+            (MAC_KEY_SPACE, false, control),
+            (MAC_KEY_CONTROL, false, no_flags),
+        ];
         let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
             log::warn!("caps toggle: failed to create CGEventSource");
             return;
         };
-        match CGEvent::new_keyboard_event(source, mac_code, down) {
-            Ok(event) => {
-                event.set_flags(flags);
-                event.post(CGEventTapLocation::HID);
+        for (index, (mac_code, down, flags)) in sequence.into_iter().enumerate() {
+            if index > 0 {
+                thread::sleep(Duration::from_millis(12));
             }
-            Err(_) => {
-                log::warn!("caps toggle: failed to build keyboard event for mac code {mac_code}");
-                return;
+            match CGEvent::new_keyboard_event(source.clone(), mac_code, down) {
+                Ok(event) => {
+                    event.set_flags(flags);
+                    event.post(CGEventTapLocation::HID);
+                }
+                Err(_) => {
+                    log::warn!("caps toggle: failed to build keyboard event for mac code {mac_code}");
+                    return;
+                }
             }
         }
-    }
-    log::info!("[diag] caps: posted input-source toggle (ctrl+space)");
+        log::info!("[diag] caps: posted input-source toggle (ctrl+space)");
+    });
 }
 
 #[cfg(target_os = "windows")]
