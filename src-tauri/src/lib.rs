@@ -5819,13 +5819,21 @@ mod drag_place {
 
     /// A Windows→Mac drag started delivering files.
     pub fn begin() {
-        if let Ok(mut state) = state().lock() {
-            if !state.active {
+        let first = {
+            let Ok(mut state) = state().lock() else {
+                return;
+            };
+            let first = !state.active;
+            if first {
                 state.staged.clear();
                 state.target = None;
                 state.target_at = None;
             }
             state.active = true;
+            first
+        };
+        if first {
+            crate::input::drag_overlay_show();
         }
     }
 
@@ -5862,6 +5870,7 @@ mod drag_place {
             state.active = false;
             std::mem::take(&mut state.staged)
         };
+        crate::input::drag_overlay_hide();
         log::info!("drag drop released over {}", target.display());
         for path in staged {
             place(&path, &target);

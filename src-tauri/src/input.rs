@@ -6174,6 +6174,236 @@ end tell"#,
     path.is_dir().then_some(path)
 }
 
+/// Show the drag icon overlay following the cursor (ShareMouse-style) while a
+/// Windows→Mac drag is in flight over this Mac.
+#[cfg(target_os = "macos")]
+pub fn drag_overlay_show() {
+    macos_drag_overlay::show();
+}
+
+#[cfg(target_os = "macos")]
+pub fn drag_overlay_hide() {
+    macos_drag_overlay::hide();
+}
+
+/// A borderless, click-through, top-most window showing a document icon that
+/// follows the cursor. All AppKit calls are marshaled to the main thread; a
+/// poll thread tracks the cursor while shown. Kept tiny and self-contained so
+/// it never interferes with the drop (ignoresMouseEvents).
+#[cfg(target_os = "macos")]
+mod macos_drag_overlay {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NsPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NsRect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+
+    const SIZE: f64 = 56.0;
+    // NSMainMenuWindowLevel-ish; above normal windows.
+    const WINDOW_LEVEL: i64 = 25;
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    // The NSWindow pointer (as usize), created lazily on the main thread.
+    static WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    #[link(name = "System")]
+    extern "C" {
+        fn dispatch_async_f(
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+    extern "C" {
+        static _dispatch_main_q: c_void;
+    }
+
+    unsafe fn cls(name: &[u8]) -> *mut c_void {
+        objc_getClass(name.as_ptr() as *const c_char)
+    }
+    unsafe fn sel(name: &[u8]) -> *mut c_void {
+        sel_registerName(name.as_ptr() as *const c_char)
+    }
+    unsafe fn send(obj: *mut c_void, s: *mut c_void) -> *mut c_void {
+        let f: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, s)
+    }
+    unsafe fn send1(obj: *mut c_void, s: *mut c_void, a: *mut c_void) -> *mut c_void {
+        let f: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, s, a)
+    }
+
+    fn main_queue() -> *mut c_void {
+        unsafe { &_dispatch_main_q as *const c_void as *mut c_void }
+    }
+
+    fn on_main(work: extern "C" fn(*mut c_void), ctx: *mut c_void) {
+        unsafe { dispatch_async_f(main_queue(), ctx, work) }
+    }
+
+    pub fn show() {
+        if ACTIVE.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        on_main(create_and_show, std::ptr::null_mut());
+        std::thread::spawn(follow_cursor);
+    }
+
+    pub fn hide() {
+        if !ACTIVE.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        on_main(order_out, std::ptr::null_mut());
+    }
+
+    extern "C" fn create_and_show(_ctx: *mut c_void) {
+        unsafe {
+            if WINDOW.load(Ordering::Relaxed) == 0 {
+                let window = build_window();
+                WINDOW.store(window as usize, Ordering::Relaxed);
+            }
+            let window = WINDOW.load(Ordering::Relaxed) as *mut c_void;
+            if !window.is_null() {
+                // orderFrontRegardless
+                send(window, sel(b"orderFrontRegardless\0"));
+            }
+        }
+    }
+
+    extern "C" fn order_out(_ctx: *mut c_void) {
+        let window = WINDOW.load(Ordering::Relaxed) as *mut c_void;
+        if !window.is_null() {
+            unsafe {
+                send1(window, sel(b"orderOut:\0"), std::ptr::null_mut());
+            }
+        }
+    }
+
+    unsafe fn build_window() -> *mut c_void {
+        let rect = NsRect {
+            x: 0.0,
+            y: 0.0,
+            w: SIZE,
+            h: SIZE,
+        };
+        let alloc = send(cls(b"NSWindow\0"), sel(b"alloc\0"));
+        // initWithContentRect:styleMask:backing:defer: (borderless=0, buffered=2)
+        let init: extern "C" fn(*mut c_void, *mut c_void, NsRect, u64, u64, bool) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let window = init(
+            alloc,
+            sel(b"initWithContentRect:styleMask:backing:defer:\0"),
+            rect,
+            0,
+            2,
+            false,
+        );
+        if window.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        // Transparent, shadowless, click-through, top-most, all-spaces.
+        let clear = send(cls(b"NSColor\0"), sel(b"clearColor\0"));
+        send1(window, sel(b"setBackgroundColor:\0"), clear);
+        set_bool(window, b"setOpaque:\0", false);
+        set_bool(window, b"setHasShadow:\0", false);
+        set_bool(window, b"setIgnoresMouseEvents:\0", true);
+        let set_level: extern "C" fn(*mut c_void, *mut c_void, i64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        set_level(window, sel(b"setLevel:\0"), WINDOW_LEVEL);
+        // canJoinAllSpaces(1) | stationary(16)
+        let set_behavior: extern "C" fn(*mut c_void, *mut c_void, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        set_behavior(window, sel(b"setCollectionBehavior:\0"), 1 | 16);
+
+        // Background = the generic multiple-documents icon, as a pattern color.
+        let name = ns_string("NSMultipleDocuments");
+        let image = send1(cls(b"NSImage\0"), sel(b"imageNamed:\0"), name);
+        if !image.is_null() {
+            let pattern = send1(cls(b"NSColor\0"), sel(b"colorWithPatternImage:\0"), image);
+            if !pattern.is_null() {
+                send1(window, sel(b"setBackgroundColor:\0"), pattern);
+            }
+        }
+        window
+    }
+
+    unsafe fn set_bool(obj: *mut c_void, selector: &[u8], value: bool) {
+        let f: extern "C" fn(*mut c_void, *mut c_void, bool) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel(selector), value);
+    }
+
+    unsafe fn ns_string(value: &str) -> *mut c_void {
+        let bytes = std::ffi::CString::new(value).unwrap_or_default();
+        let f: extern "C" fn(*mut c_void, *mut c_void, *const c_char) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(
+            cls(b"NSString\0"),
+            sel(b"stringWithUTF8String:\0"),
+            bytes.as_ptr(),
+        )
+    }
+
+    // Cursor position (top-left global) → boxed and moved on the main thread.
+    fn follow_cursor() {
+        let screen_height = core_graphics::display::CGDisplay::main().bounds().size.height;
+        while ACTIVE.load(Ordering::Relaxed) {
+            if let Ok(source) = core_graphics::event_source::CGEventSource::new(
+                core_graphics::event_source::CGEventSourceStateID::CombinedSessionState,
+            ) {
+                if let Ok(event) = core_graphics::event::CGEvent::new(source) {
+                    let p = event.location();
+                    // NSWindow origin is bottom-left; offset the icon down-right
+                    // of the cursor.
+                    let origin = Box::new(NsPoint {
+                        x: p.x + 8.0,
+                        y: screen_height - p.y - SIZE + 8.0,
+                    });
+                    on_main(move_window, Box::into_raw(origin) as *mut c_void);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    }
+
+    extern "C" fn move_window(ctx: *mut c_void) {
+        let origin = unsafe { Box::from_raw(ctx as *mut NsPoint) };
+        let window = WINDOW.load(Ordering::Relaxed) as *mut c_void;
+        if window.is_null() {
+            return;
+        }
+        unsafe {
+            let f: extern "C" fn(*mut c_void, *mut c_void, NsPoint) =
+                std::mem::transmute(objc_msgSend as *const ());
+            f(window, sel(b"setFrameOrigin:\0"), *origin);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     use core_graphics::{
