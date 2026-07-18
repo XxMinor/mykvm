@@ -10,7 +10,7 @@ release will reuse them).
 
 ### Added
 
-- Drag-and-drop files across machines (ShareMouse-style, experimental): drag files on the machine that owns the keyboard and mouse onto a controlled machine. The controlling-Mac → Windows-client direction is in; the controlling-Windows → Mac direction is still being reworked (the previous approach didn't survive the cursor handoff). Requires file transfer to be enabled in Settings, and both sides on this version or newer.
+- Drag-and-drop files across machines (ShareMouse-style, experimental): drag files on the machine that owns the keyboard and mouse onto a controlled machine. Controlling Windows → Mac: drag files toward the screen edge that borders the Mac — the files transfer, the cursor slides onto the Mac, and the files land on the Mac's Desktop. Controlling Mac → Windows client is also in. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
 
 ### Fixed
 

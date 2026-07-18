@@ -1078,6 +1078,7 @@ fn start_platform_capture(
             cursor_hide_calls: Mutex::new(0),
             just_crossed: AtomicBool::new(false),
             local_screen_points: Mutex::new(HashMap::new()),
+            pending_drag_cross: Mutex::new(None),
         });
 
         if let Ok(mut current) = WINDOWS_CAPTURE_CONTEXT.lock() {
@@ -2611,6 +2612,10 @@ struct WindowsCaptureContext {
     // does not shove the cursor inward on Windows, where we pin by warping.
     just_crossed: AtomicBool,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
+    // Edge drag-drop: while a left-button file drag sits on the edge catcher
+    // (before crossing), the target it would cross into is parked here; the
+    // catcher's DragEnter hand-off then activates it so the cursor slides over.
+    pending_drag_cross: Mutex<Option<ActiveTarget>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -3108,6 +3113,48 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         Err(_) => return false,
     };
 
+    // Edge drag-drop hand-off: the edge catcher read a file drag and asked us
+    // to cross so the cursor slides onto the controlled machine. Activate the
+    // target we parked when we armed the catcher.
+    if active.is_none() {
+        if let Some(device_id) = crate::windows_drop_catcher::take_handoff() {
+            let pending = context
+                .pending_drag_cross
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            if let Some(active_target) = pending {
+                let anchor = local_anchor_point(&active_target);
+                hide_windows_cursor_if_needed(context);
+                set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+                let _ = send_remote_mouse_move(
+                    &context.quic_transport,
+                    &active_target,
+                    &context.layout_state,
+                    &context.input_events,
+                );
+                mark_mouse_move_sent(&context.last_mouse_move_sent);
+                reset_remote_button_mask(&context.remote_button_mask);
+                context.remote_active.store(true, Ordering::Relaxed);
+                set_control_clipboard_target(
+                    &context.clipboard_target,
+                    &active_target,
+                    &context.layout_state,
+                );
+                log::info!(
+                    "edge drag-drop: crossing to {} after edge read",
+                    active_target.target.device_id
+                );
+                *active = Some(active_target);
+                if let Ok(mut anchor_state) = context.anchor.lock() {
+                    *anchor_state = Some(anchor);
+                }
+                context.just_crossed.store(true, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+
     if let Some(active_target) = active.as_mut() {
         let anchor = context
             .anchor
@@ -3217,6 +3264,26 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
     if let Some(active_target) = crossing_target(&targets, x, y, dx, dy) {
         let anchor = local_anchor_point(&active_target);
+
+        // A left-button file drag reaching the edge: do NOT cross yet. Crossing
+        // would make the hook swallow the mouse events the source app's
+        // DoDragDrop needs, so it would never hand us its files. Instead park
+        // the target and arm the invisible edge catcher right where the cursor
+        // sits; its DragEnter reads the files, transfers them, ends the local
+        // drag, and hands back a cross (consumed at the top of this function),
+        // so the cursor then slides onto the remote.
+        if windows_left_button_down() {
+            if let Ok(mut pending) = context.pending_drag_cross.lock() {
+                *pending = Some(active_target.clone());
+            }
+            crate::windows_drop_catcher::arm(
+                &active_target.target.device_id,
+                anchor.0.round() as i32,
+                anchor.1.round() as i32,
+            );
+            return true;
+        }
+
         hide_windows_cursor_if_needed(context);
         set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
         if !send_remote_mouse_move(
@@ -3238,16 +3305,6 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             &active_target,
             &context.layout_state,
         );
-        // If this crossing is a file drag (left button held), park the edge
-        // drop catcher at the pinned cursor so the source app's OLE drag loop
-        // drops onto it and we can forward the files to the controlled machine.
-        if windows_left_button_down() {
-            crate::windows_drop_catcher::arm(
-                &active_target.target.device_id,
-                anchor.0.round() as i32,
-                anchor.1.round() as i32,
-            );
-        }
         *active = Some(active_target);
         if let Ok(mut anchor_state) = context.anchor.lock() {
             *anchor_state = Some(anchor);
@@ -3274,6 +3331,17 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mo
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
         WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1,
     };
+
+    // The button was released: retract the edge drop catcher if a drag armed it
+    // but never handed off (e.g. it wasn't a file drag, or it was released off
+    // the edge). Runs even when we are not remote-active (the armed-not-crossed
+    // state), which is why it sits before the active check.
+    if message == WM_LBUTTONUP {
+        crate::windows_drop_catcher::disarm();
+        if let Ok(mut pending) = context.pending_drag_cross.lock() {
+            *pending = None;
+        }
+    }
 
     let active = context
         .active
