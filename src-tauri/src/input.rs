@@ -6175,10 +6175,11 @@ end tell"#,
 }
 
 /// Show the drag icon overlay following the cursor (ShareMouse-style) while a
-/// Windows→Mac drag is in flight over this Mac.
+/// Windows→Mac drag is in flight over this Mac. `extension` is the dragged
+/// file's extension, so the overlay shows that file type's system icon.
 #[cfg(target_os = "macos")]
-pub fn drag_overlay_show() {
-    macos_drag_overlay::show();
+pub fn drag_overlay_show(extension: Option<String>) {
+    macos_drag_overlay::show(extension);
 }
 
 #[cfg(target_os = "macos")]
@@ -6195,7 +6196,7 @@ mod macos_drag_overlay {
     use std::ffi::c_void;
     use std::os::raw::c_char;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     #[repr(C)]
@@ -6218,8 +6219,14 @@ mod macos_drag_overlay {
     const WINDOW_LEVEL: i64 = 25;
 
     static ACTIVE: AtomicBool = AtomicBool::new(false);
-    // The NSWindow pointer (as usize), created lazily on the main thread.
+    // The NSWindow / NSImageView pointers (as usize), created lazily on main.
     static WINDOW: AtomicUsize = AtomicUsize::new(0);
+    static IMAGE_VIEW: AtomicUsize = AtomicUsize::new(0);
+
+    fn icon_ext() -> &'static Mutex<Option<String>> {
+        static EXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+        EXT.get_or_init(|| Mutex::new(None))
+    }
 
     #[link(name = "objc")]
     extern "C" {
@@ -6264,7 +6271,10 @@ mod macos_drag_overlay {
         unsafe { dispatch_async_f(main_queue(), ctx, work) }
     }
 
-    pub fn show() {
+    pub fn show(extension: Option<String>) {
+        if let Ok(mut ext) = icon_ext().lock() {
+            *ext = extension.filter(|e| !e.is_empty());
+        }
         if ACTIVE.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -6285,11 +6295,33 @@ mod macos_drag_overlay {
                 let window = build_window();
                 WINDOW.store(window as usize, Ordering::Relaxed);
             }
+            set_icon_for_current_ext();
             let window = WINDOW.load(Ordering::Relaxed) as *mut c_void;
             if !window.is_null() {
-                // orderFrontRegardless
                 send(window, sel(b"orderFrontRegardless\0"));
             }
+        }
+    }
+
+    // Set the image view's icon to the current file type's system icon.
+    unsafe fn set_icon_for_current_ext() {
+        let image_view = IMAGE_VIEW.load(Ordering::Relaxed) as *mut c_void;
+        if image_view.is_null() {
+            return;
+        }
+        let ext = icon_ext().lock().ok().and_then(|ext| ext.clone());
+        let icon = match ext {
+            Some(ext) => {
+                let workspace = send(cls(b"NSWorkspace\0"), sel(b"sharedWorkspace\0"));
+                send1(workspace, sel(b"iconForFileType:\0"), ns_string(&ext))
+            }
+            None => {
+                let name = ns_string("NSMultipleDocuments");
+                send1(cls(b"NSImage\0"), sel(b"imageNamed:\0"), name)
+            }
+        };
+        if !icon.is_null() {
+            send1(image_view, sel(b"setImage:\0"), icon);
         }
     }
 
@@ -6339,14 +6371,19 @@ mod macos_drag_overlay {
             std::mem::transmute(objc_msgSend as *const ());
         set_behavior(window, sel(b"setCollectionBehavior:\0"), 1 | 16);
 
-        // Background = the generic multiple-documents icon, as a pattern color.
-        let name = ns_string("NSMultipleDocuments");
-        let image = send1(cls(b"NSImage\0"), sel(b"imageNamed:\0"), name);
-        if !image.is_null() {
-            let pattern = send1(cls(b"NSColor\0"), sel(b"colorWithPatternImage:\0"), image);
-            if !pattern.is_null() {
-                send1(window, sel(b"setBackgroundColor:\0"), pattern);
-            }
+        // An image view fills the window; its icon (set per drag by file type)
+        // scales proportionally so it isn't tiled or cropped.
+        let iv_alloc = send(cls(b"NSImageView\0"), sel(b"alloc\0"));
+        let iv_init: extern "C" fn(*mut c_void, *mut c_void, NsRect) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let image_view = iv_init(iv_alloc, sel(b"initWithFrame:\0"), rect);
+        if !image_view.is_null() {
+            // NSImageScaleProportionallyUpOrDown = 3
+            let set_scaling: extern "C" fn(*mut c_void, *mut c_void, u64) =
+                std::mem::transmute(objc_msgSend as *const ());
+            set_scaling(image_view, sel(b"setImageScaling:\0"), 3);
+            send1(window, sel(b"setContentView:\0"), image_view);
+            IMAGE_VIEW.store(image_view as usize, Ordering::Relaxed);
         }
         window
     }

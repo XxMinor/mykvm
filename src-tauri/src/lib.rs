@@ -5817,8 +5817,9 @@ mod drag_place {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// A Windows→Mac drag started delivering files.
-    pub fn begin() {
+    /// A Windows→Mac drag started delivering files. `file_name` seeds the drag
+    /// overlay icon with that file type.
+    pub fn begin(file_name: &str) {
         let first = {
             let Ok(mut state) = state().lock() else {
                 return;
@@ -5833,7 +5834,11 @@ mod drag_place {
             first
         };
         if first {
-            crate::input::drag_overlay_show();
+            let extension = Path::new(file_name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_string());
+            crate::input::drag_overlay_show(extension);
         }
     }
 
@@ -6073,7 +6078,7 @@ fn start_incoming_file_transfer(
     // A ShareMouse-style drag: hold the file for release-time placement.
     #[cfg(target_os = "macos")]
     if packet.drag_drop {
-        drag_place::begin();
+        drag_place::begin(&packet.file_name);
     }
 
     let transfer = IncomingFileTransfer {
