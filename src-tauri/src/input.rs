@@ -1150,6 +1150,7 @@ fn start_platform_capture(
         }
         show_windows_cursor_if_needed(&context);
         context.remote_active.store(false, Ordering::Relaxed);
+        crate::windows_drop_catcher::disarm();
         clear_clipboard_target(&context.clipboard_target);
         clear_windows_capture_context();
     });
@@ -3145,6 +3146,8 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             );
             *active = None;
             context.remote_active.store(false, Ordering::Relaxed);
+            // Control is back on this machine: retract the edge drop catcher.
+            crate::windows_drop_catcher::disarm();
             // Keep the clipboard peer so copies still sync after returning.
             release_forwarded_keys_windows(context, &target);
             release_remote_buttons(
@@ -3179,6 +3182,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             ) {
                 *active = None;
                 context.remote_active.store(false, Ordering::Relaxed);
+                crate::windows_drop_catcher::disarm();
                 clear_clipboard_target(&context.clipboard_target);
                 reset_mouse_move_timer(&context.last_mouse_move_sent);
                 reset_remote_button_mask(&context.remote_button_mask);
@@ -3234,6 +3238,16 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             &active_target,
             &context.layout_state,
         );
+        // If this crossing is a file drag (left button held), park the edge
+        // drop catcher at the pinned cursor so the source app's OLE drag loop
+        // drops onto it and we can forward the files to the controlled machine.
+        if windows_left_button_down() {
+            crate::windows_drop_catcher::arm(
+                &active_target.target.device_id,
+                anchor.0.round() as i32,
+                anchor.1.round() as i32,
+            );
+        }
         *active = Some(active_target);
         if let Ok(mut anchor_state) = context.anchor.lock() {
             *anchor_state = Some(anchor);
@@ -3243,6 +3257,15 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     }
 
     false
+}
+
+/// Is the physical left mouse button currently held? Used to tell a file drag
+/// crossing the edge apart from a plain cursor crossing.
+#[cfg(target_os = "windows")]
+fn windows_left_button_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_LBUTTON: i32 = 0x01;
+    (unsafe { GetAsyncKeyState(VK_LBUTTON) } as u16 & 0x8000) != 0
 }
 
 #[cfg(target_os = "windows")]

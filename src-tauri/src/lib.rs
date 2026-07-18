@@ -30,6 +30,8 @@ pub mod shared_input;
 #[cfg(target_os = "windows")]
 pub mod windows_drag;
 #[cfg(target_os = "windows")]
+pub mod windows_drop_catcher;
+#[cfg(target_os = "windows")]
 pub mod windows_input;
 
 use clipboard::{ClipboardContent, ClipboardImage};
@@ -2931,6 +2933,36 @@ fn setup_macos_window_visibility_watcher(app: &tauri::App) {
     });
 }
 
+// Poll for display reconfiguration (lid open/close, monitor plug/unplug) and
+// refresh the announced screen list. macOS enumerates displays via NSScreen,
+// which must run on the main thread, so the change is applied there.
+#[cfg(target_os = "macos")]
+fn setup_macos_display_watcher(app: &tauri::App) {
+    let app_handle = app.handle().clone();
+    thread::spawn(move || {
+        let mut last = macos_display_fingerprint();
+        loop {
+            thread::sleep(Duration::from_millis(1500));
+            let now = macos_display_fingerprint();
+            if now == last {
+                continue;
+            }
+            last = now;
+            let handle = app_handle.clone();
+            let _ = app_handle.run_on_main_thread(move || {
+                refresh_local_screens(&handle);
+            });
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn macos_display_fingerprint() -> Vec<u32> {
+    let mut ids = core_graphics::display::CGDisplay::active_displays().unwrap_or_default();
+    ids.sort_unstable();
+    ids
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3037,6 +3069,8 @@ pub fn run() {
             setup_macos_cursor_hider(app);
             #[cfg(target_os = "macos")]
             setup_macos_window_visibility_watcher(app);
+            #[cfg(target_os = "macos")]
+            setup_macos_display_watcher(app);
             setup_tray(app)?;
             if let Err(error) = sync_runtime_toggle_shortcut(app.handle()) {
                 log::warn!("failed to register quick start/stop shortcut: {error}");
@@ -3098,6 +3132,34 @@ pub fn run() {
                                     Err(error) => log::warn!("edge drag-drop failed: {error}"),
                                 }
                             }
+                        }
+                    });
+                }));
+            }
+
+            // The other direction: this Windows machine is the controller and
+            // the user drags files onto a controlled machine. The edge catcher
+            // grabs the OLE drop and we transfer the files to land on the
+            // controlled machine's Desktop.
+            #[cfg(target_os = "windows")]
+            {
+                let handle = app.handle().clone();
+                windows_drop_catcher::init(Box::new(move |device_id, files| {
+                    let handle = handle.clone();
+                    thread::spawn(move || {
+                        let paths: Vec<String> = files
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect();
+                        let state = handle.state::<AppRuntime>();
+                        match send_files_to_device_inner(state.inner(), &device_id, &paths, true) {
+                            Ok(summary) => log::info!(
+                                "edge drop delivered {} file(s) ({}) to {}",
+                                summary.file_count,
+                                format_bytes(summary.byte_count),
+                                summary.target_name
+                            ),
+                            Err(error) => log::warn!("edge drop transfer failed: {error}"),
                         }
                     });
                 }));
@@ -4103,6 +4165,89 @@ fn detect_local_screens(app: &AppHandle, device_id: &str) -> Vec<Screen> {
             }
         })
         .collect()
+}
+
+/// Re-detect this machine's displays and update the local device's screens in
+/// the runtime layout, carrying over the user's saved on-canvas positions.
+/// Called when the display configuration changes (e.g. a MacBook lid closes)
+/// so the announce loop advertises the current screens instead of the stale
+/// list captured at startup.
+#[cfg(target_os = "macos")]
+fn refresh_local_screens(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return;
+    };
+    let state = state.inner();
+
+    let local_id = {
+        let Ok(layout) = state.layout.lock() else {
+            return;
+        };
+        match layout.devices.iter().find(|device| device.role == "local") {
+            Some(local) => local.id.clone(),
+            None => return,
+        }
+    };
+
+    let detected = detect_local_screens(app, &local_id);
+
+    let updated = {
+        let Ok(mut layout) = state.layout.lock() else {
+            return;
+        };
+        let Some(local) = layout.devices.iter_mut().find(|device| device.role == "local") else {
+            return;
+        };
+        let merged: Vec<Screen> = detected
+            .into_iter()
+            .map(|screen| {
+                local
+                    .screens
+                    .iter()
+                    .find(|saved| saved.id == screen.id)
+                    .map(|saved| Screen {
+                        x: saved.x,
+                        y: saved.y,
+                        ..screen.clone()
+                    })
+                    .unwrap_or(screen)
+            })
+            .collect();
+        if screens_fingerprint(&local.screens) == screens_fingerprint(&merged) {
+            None
+        } else {
+            local.screens = merged.clone();
+            if !merged.iter().any(|s| s.id == layout.selected_screen_id) {
+                if let Some(pick) = merged.iter().find(|s| s.is_primary).or_else(|| merged.first()) {
+                    layout.selected_screen_id = pick.id.clone();
+                }
+            }
+            Some(layout.clone())
+        }
+    };
+
+    if let Some(snapshot) = updated {
+        let count = snapshot
+            .devices
+            .iter()
+            .find(|d| d.role == "local")
+            .map(|d| d.screens.len())
+            .unwrap_or(0);
+        log::info!("local displays changed: now advertising {count} screen(s)");
+        let _ = write_layout_to_disk(&state.config_path, &snapshot);
+    }
+}
+
+// Identity of a screen set for change detection (ignores on-canvas position,
+// which the user arranges and we carry over).
+#[cfg(target_os = "macos")]
+fn screens_fingerprint(screens: &[Screen]) -> Vec<(String, i32, i32, bool)> {
+    let mut fingerprint: Vec<(String, i32, i32, bool)> = screens
+        .iter()
+        .map(|s| (s.id.clone(), s.width, s.height, s.is_primary))
+        .collect();
+    fingerprint.sort();
+    fingerprint
 }
 
 fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutState) -> LayoutState {

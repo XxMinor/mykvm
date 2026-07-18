@@ -10,9 +10,11 @@ release will reuse them).
 
 ### Added
 
-- Drag-and-drop files across machines (ShareMouse-style): start dragging files on the controlling Mac, slide the cursor onto a controlled machine's screen, and release. Dragging onto a **Windows** client shows the native drag cursor and drops the files wherever you release — into the open Explorer folder, onto the desktop, or into an app that accepts files (chat, mail, an editor). Dragging onto any other machine transfers the files to land on its Desktop. Works with multiple files and streams large files as they copy; a progress toast shows each transfer. The drag must begin on the Mac that owns the keyboard and mouse. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
+- Drag-and-drop files across machines (ShareMouse-style): start dragging files on the machine that owns the keyboard and mouse, slide the cursor onto a controlled machine's screen, and release. Works in both directions — a controlling Mac dragging onto a Windows client, or a controlling Windows machine dragging onto a Mac client. Dragging onto a Windows client shows the native drag cursor and drops the files wherever you release (Explorer folder, desktop, or an app that accepts files); dragging onto any other machine lands the files on its Desktop. Multiple files and large files are supported, with a progress toast per transfer. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
 
 ### Fixed
+
+- macOS: closing the MacBook lid (or unplugging a monitor) now removes that display from the layout instead of leaving a phantom screen. The Mac re-checks its displays when the configuration changes and re-announces, instead of advertising the list it captured at startup.
 
 - macOS: opening MyKVM while it is already running (a second .app copy, `open -n`, or launching from a mounted DMG) now brings the running window to the front instead of starting a second process that fights the first over the network ports.
 - Windows: keyboard and mouse from the controller now keep working while a Remote Desktop session owns the machine and after it disconnects, so you can unlock the physical screen remotely instead of walking over to it (#21). The lock-screen input service now follows the physical console session when Remote Desktop swaps it, and the app reaches the service across that swap.
