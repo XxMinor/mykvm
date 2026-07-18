@@ -6139,91 +6139,38 @@ fn macos_click_tracker() -> &'static Mutex<MacClickTracker> {
 
 /// The folder under the Mac cursor for a ShareMouse-style drop: the Finder
 /// window at `(x, y)` (top-left global points), or `None` for the Desktop / any
-/// non-Finder target. Used only at drag release, so the AX round-trip is fine.
+/// non-Finder target. Uses Finder scripting — modern Finder leaves the AX
+/// AXDocument attribute empty, but `URL of (target of Finder window i)` is
+/// reliable. Index iteration matters: `repeat with w in Finder windows` can't
+/// resolve `target of w`.
 #[cfg(target_os = "macos")]
 fn macos_folder_under_cursor(x: f64, y: f64) -> Option<std::path::PathBuf> {
-    use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
-    use core_foundation::string::{CFString, CFStringRef};
-    use std::ffi::c_void;
-
-    type AXUIElementRef = *const c_void;
-
-    #[link(name = "ApplicationServices", kind = "framework")]
-    extern "C" {
-        fn AXUIElementCreateSystemWide() -> AXUIElementRef;
-        fn AXUIElementCopyElementAtPosition(
-            application: AXUIElementRef,
-            x: f32,
-            y: f32,
-            element: *mut AXUIElementRef,
-        ) -> i32;
-        fn AXUIElementCopyAttributeValue(
-            element: AXUIElementRef,
-            attribute: CFStringRef,
-            value: *mut CFTypeRef,
-        ) -> i32;
+    let script = format!(
+        r#"tell application "Finder"
+  set px to {px}
+  set py to {py}
+  repeat with i from 1 to (count of Finder windows)
+    set b to bounds of Finder window i
+    if px ≥ (item 1 of b) and px ≤ (item 3 of b) and py ≥ (item 2 of b) and py ≤ (item 4 of b) then
+      return POSIX path of ((target of Finder window i) as text)
+    end if
+  end repeat
+  return ""
+end tell"#,
+        px = x as i64,
+        py = y as i64,
+    );
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        log::info!("[diag] drag drop: no Finder folder under ({x},{y}); using Desktop");
+        return None;
     }
-
-    unsafe fn copy_attr(element: AXUIElementRef, attr: &str) -> Option<CFTypeRef> {
-        let key = CFString::new(attr);
-        let mut value: CFTypeRef = std::ptr::null();
-        let err = AXUIElementCopyAttributeValue(element, key.as_concrete_TypeRef(), &mut value);
-        (err == 0 && !value.is_null()).then_some(value)
-    }
-
-    unsafe {
-        let system = AXUIElementCreateSystemWide();
-        if system.is_null() {
-            return None;
-        }
-        let mut element: AXUIElementRef = std::ptr::null();
-        let err = AXUIElementCopyElementAtPosition(system, x as f32, y as f32, &mut element);
-        CFRelease(system as CFTypeRef);
-        if err != 0 || element.is_null() {
-            return None;
-        }
-
-        // The element's window (else the element itself), then its document — a
-        // "file:///…" URL for Finder folder windows and document apps.
-        let window = copy_attr(element, "AXWindow");
-        let doc_source = window.unwrap_or(element as CFTypeRef) as AXUIElementRef;
-        let result = copy_attr(doc_source, "AXDocument").and_then(|doc| {
-            let url = CFString::wrap_under_create_rule(doc as CFStringRef).to_string();
-            macos_finder_folder_from_url(&url)
-        });
-        if let Some(window) = window {
-            CFRelease(window);
-        }
-        CFRelease(element as CFTypeRef);
-        result
-    }
-}
-
-/// `file:///Users/me/My%20Folder/` → `/Users/me/My Folder` if it is a directory.
-#[cfg(target_os = "macos")]
-fn macos_finder_folder_from_url(url: &str) -> Option<std::path::PathBuf> {
-    let encoded = url.strip_prefix("file://")?;
-    let bytes = encoded.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let hex = |b: u8| match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    };
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    let path = std::path::PathBuf::from(String::from_utf8_lossy(&out).into_owned());
+    let path = std::path::PathBuf::from(path);
     path.is_dir().then_some(path)
 }
 
@@ -6237,10 +6184,14 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     };
 
     // ShareMouse-style drag release: a staged Windows→Mac drag drops into the
-    // folder under the cursor here (else Desktop).
+    // folder under the cursor here (else Desktop). The Finder query spawns
+    // osascript, so run it off the injection thread — the button-up below still
+    // posts immediately, and drag_place holds the files until placement.
     if !down && matches!(button, MouseButton::Left) && crate::drag_place::is_active() {
-        let folder = macos_folder_under_cursor(x as f64, y as f64);
-        crate::drag_place::release(folder);
+        thread::spawn(move || {
+            let folder = macos_folder_under_cursor(x as f64, y as f64);
+            crate::drag_place::release(folder);
+        });
     }
 
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
