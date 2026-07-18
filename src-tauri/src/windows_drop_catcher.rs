@@ -54,7 +54,8 @@ const WM_ARM: u32 = WM_APP + 1;
 const WM_DISARM: u32 = WM_APP + 2;
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
+    MOUSEEVENTF_LEFTUP, MOUSEINPUT,
 };
 
 /// Called with `(device_id, files)` when a drag's files are read at the edge.
@@ -269,8 +270,9 @@ impl IDropTarget_Impl for EdgeDropTarget_Impl {
         if let Some(sink) = SINK.get() {
             sink(device_id.clone(), files);
         }
-        // End the source app's local drag so it doesn't drop a copy here.
-        inject_escape();
+        // End the source app's local drag (and clear the held button) before
+        // the hand-off, so Windows doesn't come back stuck in a drag state.
+        inject_end_drag();
         // Tell the capture hook to cross so the cursor slides onto the remote.
         if let Ok(mut slot) = handoff_slot().lock() {
             *slot = Some(device_id);
@@ -365,12 +367,18 @@ fn read_hdrop_files(data_object: &IDataObject) -> Vec<PathBuf> {
     paths
 }
 
-/// End the source app's in-progress OLE drag (Escape is the OLE drag cancel).
-fn inject_escape() {
+/// End the source app's in-progress OLE drag: Escape cancels the drag, and a
+/// left-button up clears Windows' held-button state. Without the button-up the
+/// physical press stays "down" from Windows' view (its real release is later
+/// swallowed and forwarded to the Mac), so the cursor comes back to Windows
+/// still in a dragging state. Injected before the hand-off, while we are not yet
+/// remote-active, so the events reach Windows instead of the Mac.
+fn inject_end_drag() {
     const VK_ESCAPE: u16 = 0x1B;
     let mut inputs = [
         key_input(VK_ESCAPE, false),
         key_input(VK_ESCAPE, true),
+        left_up_input(),
     ];
     unsafe {
         SendInput(
@@ -389,6 +397,22 @@ fn key_input(vk: u16, up: bool) -> INPUT {
                 wVk: vk,
                 wScan: 0,
                 dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+fn left_up_input() -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_LEFTUP,
                 time: 0,
                 dwExtraInfo: 0,
             },

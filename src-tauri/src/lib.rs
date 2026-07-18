@@ -474,6 +474,10 @@ struct IncomingFileTransfer {
     next_chunk_index: u64,
     temp_path: PathBuf,
     final_path: PathBuf,
+    // ShareMouse-style drag: on finish, hand the completed file to the drag
+    // placer (which drops it into the folder under the cursor on release)
+    // instead of leaving it at final_path.
+    staged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +559,11 @@ struct FileTransferPacket {
     // an old sender leaves it false here).
     #[serde(default)]
     drop_to_desktop: bool,
+    // ShareMouse-style drag: the receiver stages the file and, when the drag is
+    // released over it, drops it into the folder under the cursor (else Desktop)
+    // instead of placing it immediately.
+    #[serde(default)]
+    drag_drop: bool,
 }
 
 struct AppRuntime {
@@ -2148,14 +2157,14 @@ fn send_files_to_device(
     paths: Vec<String>,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<FileTransferSummary, String> {
-    send_files_to_device_inner(state.inner(), &device_id, &paths, false)
+    send_files_to_device_inner(state.inner(), &device_id, &paths, DropMode::TransfersFolder)
 }
 
 fn send_files_to_device_inner(
     state: &AppRuntime,
     device_id: &str,
     paths: &[String],
-    drop_to_desktop: bool,
+    drop_mode: DropMode,
 ) -> Result<FileTransferSummary, String> {
     if paths.is_empty() {
         return Err("请选择要传输的文件。".into());
@@ -2192,7 +2201,7 @@ fn send_files_to_device_inner(
             &target,
             file,
             &new_transfer_id("file"),
-            drop_to_desktop,
+            drop_mode,
             Some(&reporter),
         )?;
         state
@@ -3121,7 +3130,7 @@ pub fn run() {
                                     state,
                                     &device_id,
                                     &to_paths(files),
-                                    true,
+                                    DropMode::Desktop,
                                 ) {
                                     Ok(summary) => log::info!(
                                         "edge drag-drop delivered {} file(s) ({}) to {}",
@@ -3152,7 +3161,12 @@ pub fn run() {
                             .map(|path| path.to_string_lossy().into_owned())
                             .collect();
                         let state = handle.state::<AppRuntime>();
-                        match send_files_to_device_inner(state.inner(), &device_id, &paths, true) {
+                        match send_files_to_device_inner(
+                            state.inner(),
+                            &device_id,
+                            &paths,
+                            DropMode::DragDrop,
+                        ) {
                             Ok(summary) => log::info!(
                                 "edge drop delivered {} file(s) ({}) to {}",
                                 summary.file_count,
@@ -5375,7 +5389,7 @@ fn send_transfer_file(
     target: &FileTransferTarget,
     file: &TransferFile,
     transfer_id: &str,
-    drop_to_desktop: bool,
+    drop_mode: DropMode,
     reporter: Option<&FileTransferProgressReporter>,
 ) -> Result<u64, String> {
     if let Some(reporter) = reporter {
@@ -5387,7 +5401,7 @@ fn send_transfer_file(
         origin_id,
         target,
         file,
-        drop_to_desktop,
+        drop_mode,
         transfer_id,
         reporter,
     );
@@ -5412,7 +5426,7 @@ fn send_transfer_file_bytes(
     origin_id: &str,
     target: &FileTransferTarget,
     file: &TransferFile,
-    drop_to_desktop: bool,
+    drop_mode: DropMode,
     transfer_id: &str,
     reporter: Option<&FileTransferProgressReporter>,
 ) -> Result<u64, String> {
@@ -5431,7 +5445,7 @@ fn send_transfer_file_bytes(
             0,
             0,
             Vec::new(),
-            drop_to_desktop,
+            drop_mode,
         ),
     )?;
     packet_count += 1;
@@ -5463,7 +5477,7 @@ fn send_transfer_file_bytes(
                 chunk_index,
                 offset,
                 data,
-                drop_to_desktop,
+                drop_mode,
             ),
         )?;
         packet_count += 1;
@@ -5490,12 +5504,24 @@ fn send_transfer_file_bytes(
             chunk_index,
             offset,
             Vec::new(),
-            drop_to_desktop,
+            drop_mode,
         ),
     )?;
     packet_count += 1;
 
     Ok(packet_count)
+}
+
+// Where a transfer should land on the receiver.
+#[derive(Clone, Copy, PartialEq)]
+enum DropMode {
+    /// The MyKVM Transfers folder (the manual "send files" button).
+    TransfersFolder,
+    /// Straight onto the Desktop (edge drag-drop onto a non-Windows machine).
+    Desktop,
+    /// ShareMouse-style: stage, then drop into the folder under the cursor when
+    /// the drag is released (else Desktop).
+    DragDrop,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5509,7 +5535,7 @@ fn file_transfer_packet(
     chunk_index: u64,
     offset: u64,
     data: Vec<u8>,
-    drop_to_desktop: bool,
+    drop_mode: DropMode,
 ) -> FileTransferPacket {
     FileTransferPacket {
         protocol: FILE_TRANSFER_PROTOCOL.into(),
@@ -5524,7 +5550,8 @@ fn file_transfer_packet(
         chunk_index,
         offset,
         data,
-        drop_to_desktop,
+        drop_to_desktop: drop_mode == DropMode::Desktop,
+        drag_drop: drop_mode == DropMode::DragDrop,
     }
 }
 
@@ -5640,7 +5667,7 @@ fn send_ole_drag_start(
             &target,
             file,
             transfer_id,
-            false,
+            DropMode::TransfersFolder,
             Some(&reporter),
         )?;
         state
@@ -5751,6 +5778,132 @@ fn handle_drag_control_packet(
     true
 }
 
+/// ShareMouse-style drag placement (macOS receiver). Files transferred during a
+/// Windows→Mac drag are staged here; when the drag is released the input layer
+/// reports the folder under the cursor and the staged files move into it.
+#[cfg(target_os = "macos")]
+mod drag_place {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    struct State {
+        active: bool,
+        staged: Vec<PathBuf>,
+        target: Option<PathBuf>,
+        target_at: Option<Instant>,
+    }
+
+    fn state() -> &'static Mutex<State> {
+        static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+        STATE.get_or_init(|| {
+            Mutex::new(State {
+                active: false,
+                staged: Vec::new(),
+                target: None,
+                target_at: None,
+            })
+        })
+    }
+
+    fn fresh(at: Option<Instant>) -> bool {
+        at.map(|t| t.elapsed() < Duration::from_secs(3)).unwrap_or(false)
+    }
+
+    fn desktop_dir() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(|home| Path::new(&home).join("Desktop"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// A Windows→Mac drag started delivering files.
+    pub fn begin() {
+        if let Ok(mut state) = state().lock() {
+            if !state.active {
+                state.staged.clear();
+                state.target = None;
+                state.target_at = None;
+            }
+            state.active = true;
+        }
+    }
+
+    /// A file finished transferring into the staging dir.
+    pub fn stage(path: PathBuf) {
+        let ready_target = {
+            let Ok(mut state) = state().lock() else {
+                return;
+            };
+            match state.target.clone() {
+                // Released already: drop it straight in.
+                Some(target) if fresh(state.target_at) => Some(target),
+                _ => {
+                    state.staged.push(path.clone());
+                    None
+                }
+            }
+        };
+        if let Some(target) = ready_target {
+            place(&path, &target);
+        }
+    }
+
+    /// The drag was released over the Mac; `folder` is the folder under the
+    /// cursor (None = Desktop). Places everything staged so far.
+    pub fn release(folder: Option<PathBuf>) {
+        let target = folder.unwrap_or_else(desktop_dir);
+        let staged = {
+            let Ok(mut state) = state().lock() else {
+                return;
+            };
+            state.target = Some(target.clone());
+            state.target_at = Some(Instant::now());
+            state.active = false;
+            std::mem::take(&mut state.staged)
+        };
+        log::info!("drag drop released over {}", target.display());
+        for path in staged {
+            place(&path, &target);
+        }
+    }
+
+    /// Whether a drag is in flight (so the release hook bothers to resolve the
+    /// folder under the cursor). Cheap — checked on every injected button-up.
+    pub fn is_active() -> bool {
+        state()
+            .lock()
+            .map(|state| state.active || fresh(state.target_at))
+            .unwrap_or(false)
+    }
+
+    fn place(staged: &Path, folder: &Path) {
+        let Some(name) = staged.file_name() else {
+            return;
+        };
+        let _ = fs::create_dir_all(folder);
+        let mut dest = folder.join(name);
+        let mut index = 1;
+        while dest.exists() {
+            let stem = staged.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+            dest = folder.join(match staged.extension().and_then(|e| e.to_str()) {
+                Some(ext) => format!("{stem} ({index}).{ext}"),
+                None => format!("{stem} ({index})"),
+            });
+            index += 1;
+        }
+        let moved = fs::rename(staged, &dest).or_else(|_| {
+            fs::copy(staged, &dest).map(|_| {
+                let _ = fs::remove_file(staged);
+            })
+        });
+        match moved {
+            Ok(()) => log::info!("drag drop placed {} -> {}", name.to_string_lossy(), dest.display()),
+            Err(error) => log::warn!("drag drop placement failed: {error}"),
+        }
+    }
+}
+
 fn handle_file_transfer_packet(
     payload: &[u8],
     layout: &LayoutState,
@@ -5765,19 +5918,25 @@ fn handle_file_transfer_packet(
         log::warn!("file transfer receive failed: could not resolve receive directory");
         return false;
     };
-    // Edge drag-drop lands on the Desktop; fall back to the transfers folder
-    // when the Desktop can't be resolved.
-    let desktop_root = packet
-        .drop_to_desktop
-        .then(|| app.path().desktop_dir().ok())
-        .flatten();
+    // Where the file finalizes:
+    //  - drag_drop → a hidden staging dir; the real placement (into the folder
+    //    under the cursor, or Desktop) happens when the drag is released.
+    //  - drop_to_desktop → straight onto the Desktop.
+    //  - otherwise → the transfers folder (None here).
+    let drop_root = if packet.drag_drop {
+        Some(receive_root.join(".mykvm-drag-staging"))
+    } else if packet.drop_to_desktop {
+        app.path().desktop_dir().ok()
+    } else {
+        None
+    };
     handle_decoded_file_transfer_packet(
         packet,
         layout,
         local_peer_id,
         transfers,
         &receive_root,
-        desktop_root.as_deref(),
+        drop_root.as_deref(),
     )
 }
 
@@ -5812,7 +5971,7 @@ fn handle_decoded_file_transfer_packet(
     local_peer_id: &str,
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
-    desktop_root: Option<&Path>,
+    drop_root: Option<&Path>,
 ) -> bool {
     if packet.protocol != FILE_TRANSFER_PROTOCOL {
         return false;
@@ -5843,7 +6002,7 @@ fn handle_decoded_file_transfer_packet(
     }
 
     match packet.kind.as_str() {
-        "start" => start_incoming_file_transfer(packet, transfers, receive_root, desktop_root),
+        "start" => start_incoming_file_transfer(packet, transfers, receive_root, drop_root),
         "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
         "finish" => finish_incoming_file_transfer(packet, transfers),
         _ => false,
@@ -5854,7 +6013,7 @@ fn start_incoming_file_transfer(
     packet: FileTransferPacket,
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
-    desktop_root: Option<&Path>,
+    drop_root: Option<&Path>,
 ) -> bool {
     if packet.transfer_id.trim().is_empty()
         || packet.origin_id.trim().is_empty()
@@ -5876,9 +6035,13 @@ fn start_incoming_file_transfer(
         return false;
     }
 
-    // Edge drag-drops finalize on the Desktop; the .part staging file stays in
-    // the transfers folder either way so it never flashes on the Desktop.
-    let final_root = desktop_root.unwrap_or(receive_root);
+    // The finalize root overrides the transfers folder (Desktop, or the hidden
+    // drag-staging dir). The .part staging file always stays in the transfers
+    // folder so it never flashes at the final location.
+    let final_root = drop_root.unwrap_or(receive_root);
+    if drop_root.is_some() {
+        let _ = fs::create_dir_all(final_root);
+    }
     let final_path = unique_transfer_destination(final_root, &file_name);
     let temp_path = receive_root.join(format!(
         ".mykvm-{}-{}.part",
@@ -5898,6 +6061,12 @@ fn start_incoming_file_transfer(
         return false;
     }
 
+    // A ShareMouse-style drag: hold the file for release-time placement.
+    #[cfg(target_os = "macos")]
+    if packet.drag_drop {
+        drag_place::begin();
+    }
+
     let transfer = IncomingFileTransfer {
         origin_id: packet.origin_id.clone(),
         target_id: packet.target_id.clone(),
@@ -5907,6 +6076,7 @@ fn start_incoming_file_transfer(
         next_chunk_index: 0,
         temp_path,
         final_path,
+        staged: packet.drag_drop,
     };
 
     transfers
@@ -5968,7 +6138,7 @@ fn finish_incoming_file_transfer(
     if !packet.data.is_empty() {
         return false;
     }
-    let (temp_path, final_path, file_name, total_bytes) = {
+    let (temp_path, final_path, file_name, total_bytes, staged) = {
         let Ok(transfers) = transfers.lock() else {
             return false;
         };
@@ -5990,6 +6160,7 @@ fn finish_incoming_file_transfer(
             transfer.final_path.clone(),
             transfer.file_name.clone(),
             transfer.total_bytes,
+            transfer.staged,
         )
     };
 
@@ -6005,6 +6176,15 @@ fn finish_incoming_file_transfer(
             if let Ok(mut transfers) = transfers.lock() {
                 transfers.remove(&packet.transfer_id);
             }
+            // ShareMouse-style drag: the file is complete in the staging dir;
+            // hand it to the placer, which drops it into the folder under the
+            // cursor when the drag is released (or right away if already).
+            #[cfg(target_os = "macos")]
+            if staged {
+                drag_place::stage(final_path.clone());
+                return true;
+            }
+            let _ = staged;
             log::info!(
                 "received file transfer {} bytes={} path={}",
                 file_name,
@@ -8666,6 +8846,7 @@ mod tests {
             offset,
             data: data.to_vec(),
             drop_to_desktop: false,
+            drag_drop: false,
         }
     }
 
