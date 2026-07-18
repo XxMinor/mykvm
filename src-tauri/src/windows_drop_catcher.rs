@@ -27,7 +27,8 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{implement, Ref, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINTL, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINTL, WPARAM};
+use windows::Win32::Graphics::Gdi::CreateSolidBrush;
 use windows::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{
@@ -37,11 +38,20 @@ use windows::Win32::System::Ole::{
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, LWA_ALPHA,
-    MSG, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW, RegisterClassW,
+    SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_APP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+
+// The drop-target box is ~invisible-brief but must be a real, non-transparent,
+// on-screen window or OLE drag hit-testing (WindowFromPoint) skips it.
+const CATCH_W: i32 = 36;
+const CATCH_H: i32 = 220;
+// Arm/disarm are posted to the window's own (STA) thread; doing SetWindowPos /
+// ShowWindow there — not cross-thread from the capture hook — is what actually
+// moves and shows the window in time for the drag to land on it.
+const WM_ARM: u32 = WM_APP + 1;
+const WM_DISARM: u32 = WM_APP + 2;
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
@@ -87,8 +97,9 @@ pub fn init(sink: DropSink) {
     std::thread::spawn(run_catcher_thread);
 }
 
-/// Park the invisible catcher over the edge at `(x, y)` (physical pixels, where
-/// the un-warped dragging cursor sits) so the source app's drag moves onto it.
+/// Park the catcher over the edge at `(x, y)` (physical pixels, where the
+/// un-warped dragging cursor sits) so the source app's drag moves onto it.
+/// The move+show is posted to the window's own thread (see WM_ARM).
 pub fn arm(device_id: &str, x: i32, y: i32) {
     let Some(catcher) = catcher() else {
         log::warn!("edge catcher: arm before init");
@@ -98,11 +109,12 @@ pub fn arm(device_id: &str, x: i32, y: i32) {
         *slot = Some(device_id.to_string());
     }
     let hwnd = HWND(catcher.hwnd as *mut _);
-    // A tall band hugging the edge, so a drag sliding toward the edge reliably
-    // lands on it regardless of the exact vertical position.
+    // Pack the (possibly negative on multi-monitor) coordinates through the
+    // message params; the window thread unpacks and positions itself.
+    let wparam = WPARAM((x as i32) as u32 as usize);
+    let lparam = LPARAM((y as i32) as isize);
     unsafe {
-        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x - 20, y - 160, 40, 320, SWP_NOACTIVATE);
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = PostMessageW(Some(hwnd), WM_ARM, wparam, lparam);
     }
     log::info!("edge catcher: armed at ({x},{y}) for {device_id}");
 }
@@ -117,7 +129,7 @@ pub fn disarm() {
     }
     let hwnd = HWND(catcher.hwnd as *mut _);
     unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
+        let _ = PostMessageW(Some(hwnd), WM_DISARM, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -132,23 +144,29 @@ fn run_catcher_thread() {
             Err(_) => return,
         };
         let class_name = windows::core::w!("MyKvmEdgeDropCatcher");
+        // A solid background so the window has real, hit-testable pixels — a
+        // transparent/layered window is skipped by OLE drag hit-testing. It is
+        // only on-screen for the instant a drag rests on the edge before the
+        // cursor crosses, so a faint tint is fine.
+        let brush = CreateSolidBrush(COLORREF(0x00F0_A030));
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance.into(),
             lpszClassName: class_name,
+            hbrBackground: brush,
             ..Default::default()
         };
         RegisterClassW(&wc);
 
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             class_name,
             PCWSTR::null(),
             WS_POPUP,
-            0,
-            0,
-            40,
-            320,
+            -10_000,
+            -10_000,
+            CATCH_W,
+            CATCH_H,
             None,
             None,
             Some(instance.into()),
@@ -158,7 +176,6 @@ fn run_catcher_thread() {
             log::warn!("edge catcher: CreateWindowExW failed");
             return;
         };
-        let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 1, LWA_ALPHA);
 
         let target: IDropTarget = EdgeDropTarget.into();
         if RegisterDragDrop(hwnd, &target).is_err() {
@@ -181,7 +198,34 @@ fn run_catcher_thread() {
 }
 
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    // Position/show on THIS (the window's) thread; cross-thread SetWindowPos
+    // from the capture hook did not reliably move it under the dragging cursor.
+    match msg {
+        WM_ARM => {
+            let x = (wparam.0 as u32) as i32;
+            let y = lparam.0 as i32;
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    x - CATCH_W / 2,
+                    y - CATCH_H / 2,
+                    CATCH_W,
+                    CATCH_H,
+                    SWP_NOACTIVATE,
+                );
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+            LRESULT(0)
+        }
+        WM_DISARM => {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
 }
 
 #[implement(IDropTarget)]

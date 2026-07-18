@@ -1079,6 +1079,7 @@ fn start_platform_capture(
             just_crossed: AtomicBool::new(false),
             local_screen_points: Mutex::new(HashMap::new()),
             pending_drag_cross: Mutex::new(None),
+            drag_arm_since: Mutex::new(None),
         });
 
         if let Ok(mut current) = WINDOWS_CAPTURE_CONTEXT.lock() {
@@ -2616,6 +2617,10 @@ struct WindowsCaptureContext {
     // (before crossing), the target it would cross into is parked here; the
     // catcher's DragEnter hand-off then activates it so the cursor slides over.
     pending_drag_cross: Mutex<Option<ActiveTarget>>,
+    // When the current file drag first armed the edge catcher. If the catcher
+    // hasn't caught within a short window, we cross normally so a drag can never
+    // leave the cursor stuck at the edge. Reset on button-up.
+    drag_arm_since: Mutex<Option<Instant>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -3273,15 +3278,27 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         // drag, and hands back a cross (consumed at the top of this function),
         // so the cursor then slides onto the remote.
         if windows_left_button_down() {
-            if let Ok(mut pending) = context.pending_drag_cross.lock() {
-                *pending = Some(active_target.clone());
+            let give_up = match context.drag_arm_since.lock() {
+                Ok(mut since) => {
+                    since.get_or_insert_with(Instant::now).elapsed() > Duration::from_millis(500)
+                }
+                Err(_) => true,
+            };
+            if !give_up {
+                if let Ok(mut pending) = context.pending_drag_cross.lock() {
+                    *pending = Some(active_target.clone());
+                }
+                crate::windows_drop_catcher::arm(
+                    &active_target.target.device_id,
+                    anchor.0.round() as i32,
+                    anchor.1.round() as i32,
+                );
+                return true;
             }
-            crate::windows_drop_catcher::arm(
-                &active_target.target.device_id,
-                anchor.0.round() as i32,
-                anchor.1.round() as i32,
-            );
-            return true;
+            // The catcher never caught this drag; cross normally so the cursor
+            // is never left stuck at the edge.
+            log::info!("edge drag-drop: catcher missed; crossing normally");
+            crate::windows_drop_catcher::disarm();
         }
 
         hide_windows_cursor_if_needed(context);
@@ -3340,6 +3357,9 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mo
         crate::windows_drop_catcher::disarm();
         if let Ok(mut pending) = context.pending_drag_cross.lock() {
             *pending = None;
+        }
+        if let Ok(mut since) = context.drag_arm_since.lock() {
+            *since = None;
         }
     }
 
