@@ -6530,6 +6530,10 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
 #[cfg(target_os = "macos")]
 static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
+/// Whether remote Caps Lock is currently held down, so auto-repeat key-downs
+/// (which arrive with no key-up between them) don't each trigger a switch.
+static MACOS_CAPS_DOWN: AtomicBool = AtomicBool::new(false);
+
 /// Debounce window for remote Caps Lock → input-source switches. A single
 /// press must switch exactly once, and holding caps (auto-repeat) must not
 /// switch repeatedly — but we must NOT gate on the caps key-up, because a
@@ -6538,6 +6542,9 @@ static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// key-DOWN instead needs no up at all.
 #[cfg(target_os = "macos")]
 const MACOS_CAPS_DEBOUNCE_MS: u64 = 300;
+/// While Caps is held, only switch again once this long has passed with no
+/// key-up — recovers from a dropped key-up without acting on auto-repeat.
+const MACOS_CAPS_STALE_MS: u64 = 1500;
 
 #[cfg(target_os = "macos")]
 fn macos_caps_last_switch() -> &'static Mutex<Option<Instant>> {
@@ -6550,6 +6557,7 @@ fn macos_caps_last_switch() -> &'static Mutex<Option<Instant>> {
 #[cfg(target_os = "macos")]
 pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
+    MACOS_CAPS_DOWN.store(false, Ordering::Relaxed);
     if let Ok(mut last) = macos_caps_last_switch().lock() {
         *last = None;
     }
@@ -6593,26 +6601,35 @@ fn inject_key(key_code: u16, down: bool) {
     // Carbon TIS instead; see macos_toggle_input_source. Remote Caps Lock
     // therefore never acts as a letter-case toggle on this Mac.
     if key_code == 0x14 {
-        // Switch on the key-DOWN, debounced by time (see MACOS_CAPS_DEBOUNCE_MS)
-        // so a lost key-up can't wedge it and auto-repeat can't spam switches.
+        // Toggle on the key-DOWN edge only. Holding Caps Lock makes Windows
+        // auto-repeat the key-down (with no key-up between repeats), and each
+        // repeat used to switch again — so a slightly-long press flipped the
+        // source twice and the on-screen HUD ended up showing the opposite of
+        // the real source. Ignore repeats while Caps is held; a stale
+        // last-toggle still lets a fresh press through if a key-up was dropped.
         if down {
-            let switch = {
-                match macos_caps_last_switch().lock() {
-                    Ok(mut last) => {
-                        let due = last
-                            .map(|when| when.elapsed() >= Duration::from_millis(MACOS_CAPS_DEBOUNCE_MS))
-                            .unwrap_or(true);
-                        if due {
-                            *last = Some(Instant::now());
-                        }
-                        due
+            let was_down = MACOS_CAPS_DOWN.swap(true, Ordering::Relaxed);
+            let switch = match macos_caps_last_switch().lock() {
+                Ok(mut last) => {
+                    let gap = last.map(|when| when.elapsed()).unwrap_or(Duration::MAX);
+                    let threshold = if was_down {
+                        Duration::from_millis(MACOS_CAPS_STALE_MS)
+                    } else {
+                        Duration::from_millis(MACOS_CAPS_DEBOUNCE_MS)
+                    };
+                    let due = gap >= threshold;
+                    if due {
+                        *last = Some(Instant::now());
                     }
-                    Err(_) => true,
+                    due
                 }
+                Err(_) => true,
             };
             if switch {
                 macos_toggle_input_source();
             }
+        } else {
+            MACOS_CAPS_DOWN.store(false, Ordering::Relaxed);
         }
         return;
     }
