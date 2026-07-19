@@ -4462,10 +4462,17 @@ fn local_ip_address() -> Option<String> {
 }
 
 fn probe_local_ip_address() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let address = socket.local_addr().ok()?;
-    Some(address.ip().to_string())
+    // Prefer the interface that routes to the internet, but reject a loopback /
+    // otherwise-unusable result: right after wake the network stack can hand
+    // back 127.0.0.1, and announcing that address makes peers unable to connect
+    // (the "worked yesterday, dead this morning" symptom). Fall back to any real
+    // LAN interface address so we never advertise loopback.
+    if let Some(ip) = default_route_ipv4_address() {
+        if usable_discovery_ipv4(ip) {
+            return Some(ip.to_string());
+        }
+    }
+    local_ipv4_addresses().first().map(|ip| ip.to_string())
 }
 
 fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
