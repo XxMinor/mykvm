@@ -6586,16 +6586,12 @@ fn inject_key(key_code: u16, down: bool) {
     // VK_CAPITAL: replicate the macOS "Caps Lock switches input sources"
     // behaviour for remote input. macOS honours that setting only for the
     // physical key — an injected caps keycode toggles neither the IME nor the
-    // caps state — so post the system "Select the previous input source"
-    // hotkey (⌃Space) instead: HIToolbox then performs the switch exactly as
-    // for a physical press, including refreshing the focused app's input
-    // session (TISSelectInputSource from a background process updates the
-    // menu-bar indicator but the focused app keeps typing in the old source
-    // until refocused). Remote Caps Lock therefore never acts as a
-    // letter-case toggle on this Mac.
-    // ponytail: assumes the ⌃Space symbolic hotkey is enabled (macOS default,
-    // verified on this deployment); read com.apple.symbolichotkeys key 60 if
-    // this ever needs to adapt.
+    // caps state. Posting the ⌃Space symbolic hotkey does not work either: a
+    // Chinese IME (e.g. WeType) binds ⌃Space itself and swallows it, so the
+    // source never changes (verified on this deployment — the injected chord
+    // left the current source untouched). Switch the source directly via
+    // Carbon TIS instead; see macos_toggle_input_source. Remote Caps Lock
+    // therefore never acts as a letter-case toggle on this Mac.
     if key_code == 0x14 {
         // Switch on the key-DOWN, debounced by time (see MACOS_CAPS_DEBOUNCE_MS)
         // so a lost key-up can't wedge it and auto-repeat can't spam switches.
@@ -6615,7 +6611,7 @@ fn inject_key(key_code: u16, down: bool) {
                 }
             };
             if switch {
-                macos_post_select_previous_input_source();
+                macos_toggle_input_source();
             }
         }
         return;
@@ -6674,56 +6670,168 @@ fn mac_function_section_flags(mac_code: u16) -> core_graphics::event::CGEventFla
     }
 }
 
-/// Posts the system input-source toggle hotkey (⌃Space, symbolic hotkey 60) as
-/// a full physical-like sequence: Control down, Space down/up, Control up.
+/// Switches the macOS keyboard input source for remote Caps Lock by calling
+/// Carbon's TISSelectInputSource directly (injected caps does nothing and the
+/// ⌃Space hotkey gets eaten by IMEs — see the note at the caps branch).
 ///
-/// Runs on its own thread with a small gap between events and ONE shared event
-/// source, so HIToolbox reliably recognizes it as a real chord. The previous
-/// version built a fresh source per event and fired them back-to-back with no
-/// gap; HIToolbox would then intermittently flip only the menu-bar indicator
-/// without refreshing the focused app's input session (the "icon changed but
-/// still typing English" symptom). The thread also keeps the ~40ms of paced
-/// posting off the injection hot path.
+/// Toggles English (a `com.apple.keylayout.*` layout such as ABC) and the
+/// last-used IME, mirroring a physical Caps-Lock toggle, rather than cycling
+/// through every enabled source. Runs on the main thread (Apple's expectation,
+/// and it lets the focused app's input session adopt the new source) via
+/// dispatch_async_f.
 #[cfg(target_os = "macos")]
-fn macos_post_select_previous_input_source() {
-    use core_graphics::{
-        event::{CGEvent, CGEventFlags, CGEventTapLocation},
-        event_source::{CGEventSource, CGEventSourceStateID},
+fn macos_toggle_input_source() {
+    macos_input_source::toggle();
+}
+
+#[cfg(target_os = "macos")]
+mod macos_input_source {
+    use core_foundation::{
+        base::TCFType,
+        dictionary::CFDictionary,
+        string::{CFString, CFStringRef},
     };
+    use std::os::raw::c_void;
+    use std::sync::{Mutex, OnceLock};
 
-    const MAC_KEY_CONTROL: u16 = 59; // kVK_Control
-    const MAC_KEY_SPACE: u16 = 49; // kVK_Space
+    type TISInputSourceRef = *mut c_void;
+    type CFArrayRef = *const c_void;
 
-    thread::spawn(|| {
-        let control = CGEventFlags::CGEventFlagControl;
-        let no_flags = CGEventFlags::empty();
-        let sequence = [
-            (MAC_KEY_CONTROL, true, control),
-            (MAC_KEY_SPACE, true, control),
-            (MAC_KEY_SPACE, false, control),
-            (MAC_KEY_CONTROL, false, no_flags),
-        ];
-        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
-            log::warn!("caps toggle: failed to create CGEventSource");
-            return;
-        };
-        for (index, (mac_code, down, flags)) in sequence.into_iter().enumerate() {
-            if index > 0 {
-                thread::sleep(Duration::from_millis(12));
-            }
-            match CGEvent::new_keyboard_event(source.clone(), mac_code, down) {
-                Ok(event) => {
-                    event.set_flags(flags);
-                    event.post(CGEventTapLocation::HID);
-                }
-                Err(_) => {
-                    log::warn!("caps toggle: failed to build keyboard event for mac code {mac_code}");
-                    return;
-                }
-            }
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
+        fn TISCreateInputSourceList(
+            properties: core_foundation::dictionary::CFDictionaryRef,
+            include_all_installed: u8,
+        ) -> CFArrayRef;
+        fn TISGetInputSourceProperty(source: TISInputSourceRef, key: CFStringRef) -> *const c_void;
+        fn TISSelectInputSource(source: TISInputSourceRef) -> i32;
+        static kTISPropertyInputSourceID: CFStringRef;
+        static kTISPropertyInputSourceCategory: CFStringRef;
+        static kTISPropertyInputSourceIsSelectCapable: CFStringRef;
+        static kTISCategoryKeyboardInputSource: CFStringRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: CFArrayRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CFArrayRef, idx: isize) -> *const c_void;
+        fn CFBooleanGetValue(boolean: *const c_void) -> u8;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    #[link(name = "System")]
+    extern "C" {
+        fn dispatch_async_f(
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+        static _dispatch_main_q: c_void;
+    }
+
+    /// The IME to return to when Caps Lock is pressed while an English layout is
+    /// active, so the toggle goes back to the IME you actually use instead of
+    /// the first one in the list.
+    fn last_ime() -> &'static Mutex<Option<String>> {
+        static LAST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+        LAST.get_or_init(|| Mutex::new(None))
+    }
+
+    // Latin keyboard layouts are com.apple.keylayout.*; IMEs are inputmethod.*.
+    fn is_latin(id: &str) -> bool {
+        id.starts_with("com.apple.keylayout.")
+    }
+
+    pub fn toggle() {
+        let main_q = unsafe { &_dispatch_main_q as *const c_void as *mut c_void };
+        unsafe { dispatch_async_f(main_q, std::ptr::null_mut(), run) };
+    }
+
+    unsafe fn prop_string(src: TISInputSourceRef, key: CFStringRef) -> Option<String> {
+        let p = TISGetInputSourceProperty(src, key) as CFStringRef;
+        if p.is_null() {
+            return None;
         }
-        log::info!("[diag] caps: posted input-source toggle (ctrl+space)");
-    });
+        Some(CFString::wrap_under_get_rule(p).to_string())
+    }
+
+    unsafe fn prop_bool(src: TISInputSourceRef, key: CFStringRef) -> bool {
+        let p = TISGetInputSourceProperty(src, key);
+        !p.is_null() && CFBooleanGetValue(p) != 0
+    }
+
+    extern "C" fn run(_ctx: *mut c_void) {
+        unsafe {
+            let current = TISCopyCurrentKeyboardInputSource();
+            if current.is_null() {
+                return;
+            }
+            let current_id = prop_string(current, kTISPropertyInputSourceID);
+            CFRelease(current as *const c_void);
+            let Some(current_id) = current_id else {
+                return;
+            };
+
+            // Enumerate keyboard input sources. The refs below are borrowed from
+            // `list`, so keep it alive until after TISSelectInputSource.
+            let key = CFString::wrap_under_get_rule(kTISPropertyInputSourceCategory);
+            let val = CFString::wrap_under_get_rule(kTISCategoryKeyboardInputSource);
+            let filter = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), val.as_CFType())]);
+            let list = TISCreateInputSourceList(filter.as_concrete_TypeRef(), 0);
+            if list.is_null() {
+                return;
+            }
+
+            // (ref, id, is_latin) for every user-selectable source.
+            let mut sources: Vec<(TISInputSourceRef, String, bool)> = Vec::new();
+            for i in 0..CFArrayGetCount(list) {
+                let src = CFArrayGetValueAtIndex(list, i) as TISInputSourceRef;
+                if src.is_null() || !prop_bool(src, kTISPropertyInputSourceIsSelectCapable) {
+                    continue;
+                }
+                if let Some(id) = prop_string(src, kTISPropertyInputSourceID) {
+                    let latin = is_latin(&id);
+                    sources.push((src, id, latin));
+                }
+            }
+            if sources.is_empty() {
+                CFRelease(list);
+                return;
+            }
+
+            let primary = if is_latin(&current_id) {
+                // English -> the remembered IME, else the first IME.
+                let remembered = last_ime().lock().ok().and_then(|g| g.clone());
+                remembered
+                    .and_then(|w| sources.iter().find(|s| s.1 == w))
+                    .or_else(|| sources.iter().find(|s| !s.2))
+                    .map(|s| (s.0, s.1.clone()))
+            } else {
+                // IME -> English; remember this IME for the way back.
+                if let Ok(mut g) = last_ime().lock() {
+                    *g = Some(current_id.clone());
+                }
+                sources.iter().find(|s| s.2).map(|s| (s.0, s.1.clone()))
+            };
+            // Fallback: cycle to the next select-capable source.
+            let target = primary.or_else(|| {
+                let idx = sources.iter().position(|s| s.1 == current_id);
+                let next = idx.map_or(0, |i| (i + 1) % sources.len());
+                Some((sources[next].0, sources[next].1.clone()))
+            });
+
+            if let Some((src, id)) = target {
+                if id == current_id {
+                    log::info!("[diag] caps: input source already {current_id}, no switch");
+                } else {
+                    let err = TISSelectInputSource(src);
+                    log::info!("[diag] caps: input source {current_id} -> {id} (err {err})");
+                }
+            }
+            CFRelease(list);
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]

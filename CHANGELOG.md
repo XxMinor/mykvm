@@ -14,7 +14,7 @@ release will reuse them).
 
 ### Fixed
 
-- macOS: remote Caps Lock now switches the input source reliably. It no longer wedges when a key-up packet is dropped (which is what forced you to press it several times), and the injected ⌃Space is now paced so the focused app actually adopts the new source instead of only flipping the menu-bar indicator.
+- macOS: remote Caps Lock now switches the input source reliably. It switches the source directly (via Carbon TIS) instead of injecting the ⌃Space hotkey, which a Chinese IME such as WeType would swallow so nothing changed. Caps now toggles between English and the input method you last used, and no longer wedges when a key-up packet is dropped (which is what forced you to press it several times).
 - macOS: closing the MacBook lid (or unplugging a monitor) now removes that display from the layout instead of leaving a phantom screen. The Mac re-checks its displays when the configuration changes and re-announces, instead of advertising the list it captured at startup.
 
 - macOS: opening MyKVM while it is already running (a second .app copy, `open -n`, or launching from a mounted DMG) now brings the running window to the front instead of starting a second process that fights the first over the network ports.
