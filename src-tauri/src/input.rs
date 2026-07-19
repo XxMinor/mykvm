@@ -3206,6 +3206,26 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             if crate::windows_drop_catcher::hold_consumed() && windows_left_button_down() {
                 crate::windows_drop_catcher::inject_left_up();
             }
+            // Crossed back while the left button was held: ask the controlled
+            // machine to hand any file drag it has to us as a native OLE drag,
+            // and clear LEFT so release_remote_buttons below won't send a
+            // left-up that would drop the drag on the far side before the
+            // handoff reads it (the receiver releases the button itself).
+            if context.remote_button_mask.load(Ordering::Relaxed) & LEFT_BUTTON_MASK != 0 {
+                crate::send_drag_pull_to_mac(
+                    &context.quic_transport,
+                    target.origin_device_id.clone(),
+                    target.device_id.clone(),
+                    target.target_addr.clone(),
+                    target.transport_public_key.clone(),
+                    target.protocol_version,
+                    target.cluster_id.clone(),
+                    target.pair_secret.clone(),
+                );
+                context
+                    .remote_button_mask
+                    .fetch_and(!LEFT_BUTTON_MASK, Ordering::Relaxed);
+            }
             // Keep the clipboard peer so copies still sync after returning.
             release_forwarded_keys_windows(context, &target);
             release_remote_buttons(
@@ -4099,6 +4119,48 @@ fn clear_pending_edge_drop(context: &MacCaptureContext) {
             });
         }
     }
+}
+
+/// Drag pasteboard changeCount at the last receiver-injected left press. A
+/// handoff only ships files if this bumped since (a real Finder drag started),
+/// not on a plain hold that would otherwise send the previous drag's stale
+/// pasteboard items.
+#[cfg(target_os = "macos")]
+static MACOS_RECEIVER_DRAG_COUNT_AT_DOWN: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+/// The controller crossed back to its own screen while the left button was held
+/// and asked (via a drag-control "pull") for any file drag we have. If a fresh
+/// Finder drag of files is in progress, hand them to the controller as a native
+/// OLE drag and cancel the local drag so it doesn't drop here. Always releases
+/// the held left button, because the controller cleared LEFT on its side and
+/// will not send a button-up (that up would otherwise drop the drag locally,
+/// racing this handoff).
+#[cfg(target_os = "macos")]
+pub fn receiver_handoff_drag(controller_device_id: String) {
+    let (x, y) = unpack_remote_position(REMOTE_MOUSE_POSITION.load(Ordering::Relaxed));
+    let at_down = MACOS_RECEIVER_DRAG_COUNT_AT_DOWN.load(Ordering::Relaxed);
+    let current = macos_drag_pasteboard::change_count();
+    if current != at_down {
+        // Swallow these items so a re-cross during the same hold can't resend.
+        MACOS_RECEIVER_DRAG_COUNT_AT_DOWN.store(current, Ordering::Relaxed);
+        let files = macos_drag_pasteboard::file_paths();
+        if !files.is_empty() {
+            log::info!(
+                "receiver drag handoff: {} file(s) -> {controller_device_id}",
+                files.len()
+            );
+            emit_edge_drag(EdgeDragEvent::StartOle {
+                device_id: controller_device_id,
+                files,
+            });
+            // Escape cancels the Finder drag so the button-up below releases the
+            // button without dropping the files on this machine.
+            post_marked_escape_key();
+        }
+    }
+    // Release the held left button (Escape above already cancelled any drag).
+    inject_mouse_button(MouseButton::Left, false, x, y);
 }
 
 /// Raw-objc access to the macOS drag pasteboard ("Apple CFPasteboard drag",
@@ -6458,6 +6520,14 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
+
+    // Snapshot the drag pasteboard's changeCount when a left press begins, so a
+    // later "pull" from the controller can tell a fresh Finder drag (count
+    // bumped) from a plain hold that would ship the previous drag's stale items.
+    if down && matches!(button, MouseButton::Left) {
+        MACOS_RECEIVER_DRAG_COUNT_AT_DOWN
+            .store(macos_drag_pasteboard::change_count(), Ordering::Relaxed);
+    }
 
     // ShareMouse-style drag release: a staged Windows→Mac drag drops into the
     // folder under the cursor here (else Desktop). The Finder query spawns

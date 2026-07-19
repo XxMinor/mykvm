@@ -5715,6 +5715,51 @@ fn send_ole_drag_signal(state: &AppRuntime, device_id: &str, kind: &str) -> Resu
         .map_err(|error| format!("拖放控制失败: {error}"))
 }
 
+/// Windows controller: ask the controlled macOS machine to hand its in-flight
+/// file drag back to us as a native OLE drag. Sent when the cursor crosses back
+/// to Windows mid-drag. Fire-and-forget on a thread so the input hot path never
+/// blocks on the round-trip.
+#[cfg(target_os = "windows")]
+pub(crate) fn send_drag_pull_to_mac(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: String,
+    target_device_id: String,
+    target_addr: String,
+    target_pubkey: String,
+    target_version: u16,
+    cluster_id: String,
+    pair_secret: String,
+) {
+    if target_pubkey.trim().is_empty()
+        || target_addr.trim().is_empty()
+        || cluster_id.trim().is_empty()
+        || pair_secret.trim().is_empty()
+    {
+        return;
+    }
+    let quic_transport = quic_transport.clone();
+    thread::spawn(move || {
+        let label = target_device_id.clone();
+        let packet = DragControlPacket {
+            protocol: DRAG_CONTROL_PROTOCOL.into(),
+            kind: "pull".into(),
+            origin_id,
+            target_id: target_device_id,
+            cluster_id,
+            pair_secret,
+            files: Vec::new(),
+        };
+        let Ok(payload) = encode_wire_packet(&packet) else {
+            return;
+        };
+        let peer = quic_transport.peer(target_addr, target_pubkey, target_version);
+        match quic_transport.send_stream_expect_ack(peer, payload) {
+            Ok(_) => log::info!("drag pull sent to {label}"),
+            Err(error) => log::warn!("drag pull send failed: {error}"),
+        }
+    });
+}
+
 /// Client side: apply an incoming drag-control message. Returns true if the
 /// payload was a drag-control packet addressed to us (whether or not this
 /// platform can act on it).
@@ -5776,10 +5821,18 @@ fn handle_drag_control_packet(
             _ => {}
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        // Only a Windows client runs OLE drag sessions; elsewhere the controller
-        // uses the transfer fallback, so nothing to do here.
+        // A Windows controller crossed back to itself mid-drag and asked us to
+        // hand our local file drag over as a native OLE drag on its side.
+        if packet.kind == "pull" {
+            crate::input::receiver_handoff_drag(packet.origin_id.clone());
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // Only Windows runs OLE drag sessions and only macOS hands one off;
+        // elsewhere the controller uses the transfer fallback.
         let _ = packet;
     }
     true

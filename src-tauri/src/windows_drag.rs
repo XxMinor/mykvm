@@ -51,7 +51,8 @@ use windows::Win32::UI::Shell::{
 };
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEINPUT, VK_LBUTTON,
 };
 
 /// Files whose transfer feeds a drag session. `transfer_id` matches the id the
@@ -79,6 +80,11 @@ struct DragSession {
     // Drop/cancel decided here and read by the IDropSource.
     released: Mutex<bool>,
     cancelled: Mutex<bool>,
+    // The drag rides a real physical button (this machine is the controller and
+    // the file came from the far side): QueryContinueDrag honors the physical
+    // Escape/button and no synthetic button bracket is injected. False = the
+    // original injected/remote drag driven by signal_drop/cancel_session.
+    physical: bool,
 }
 
 impl DragSession {
@@ -257,17 +263,31 @@ pub fn start_drag_session(files: Vec<DragFileMeta>) -> bool {
         by_transfer_id.insert(meta.transfer_id, Arc::clone(&buffer));
         order.push(buffer);
     }
+    // If the physical left button is down, this machine is the controller and
+    // the drag rides that real button — DoDragDrop tracks it to the physical
+    // drop. Otherwise the drag is remote/injected and needs a synthetic button
+    // bracket to start it and to end it (via signal_drop / cancel_session).
+    let physical = unsafe { (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000) != 0 };
+
     let session = Arc::new(DragSession {
         order,
         by_transfer_id,
         released: Mutex::new(false),
         cancelled: Mutex::new(false),
+        physical,
     });
     *slot = Some(Arc::clone(&session));
     drop(slot);
 
-    // Hold a synthetic left button so DoDragDrop treats this as a live drag.
-    inject_left_button(true);
+    // Injected drags need a synthetic left button so DoDragDrop treats them as
+    // a live drag; a physical drag already has the user's real button.
+    if !physical {
+        inject_left_button(true);
+    }
+    log::info!(
+        "native drag session started ({} button)",
+        if physical { "physical" } else { "synthetic" }
+    );
 
     std::thread::spawn(move || {
         run_drag_thread(session);
@@ -307,8 +327,12 @@ fn run_drag_thread(session: Arc<DragSession>) {
         let mut effect = DROPEFFECT::default();
         let _ = DoDragDrop(&data_object, &drop_source, DROPEFFECT_COPY, &mut effect);
 
-        // Whatever the outcome, release the synthetic button and clear state.
-        inject_left_button(false);
+        // Release the synthetic button (injected drags only — a physical drag's
+        // button belongs to the user and is already up, which is why DoDragDrop
+        // returned). Then clear state.
+        if !session.physical {
+            inject_left_button(false);
+        }
         for buffer in &session.order {
             buffer.abort();
         }
@@ -736,9 +760,20 @@ struct DragDropSource {
 impl IDropSource_Impl for DragDropSource_Impl {
     fn QueryContinueDrag(
         &self,
-        _fescapepressed: windows::core::BOOL,
-        _grfkeystate: MODIFIERKEYS_FLAGS,
+        fescapepressed: windows::core::BOOL,
+        grfkeystate: MODIFIERKEYS_FLAGS,
     ) -> windows::core::HRESULT {
+        // Physical drag (controller side): no signal_drop/cancel arrives for it,
+        // so end it from the real inputs — Escape cancels, releasing the left
+        // button (MK_LBUTTON = 0x0001 clears) drops.
+        if self.session.physical {
+            if fescapepressed.as_bool() {
+                return DRAGDROP_S_CANCEL;
+            }
+            if (grfkeystate.0 & 0x0001) == 0 {
+                return DRAGDROP_S_DROP;
+            }
+        }
         if self.session.is_cancelled() {
             return DRAGDROP_S_CANCEL;
         }
