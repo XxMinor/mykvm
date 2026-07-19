@@ -4212,21 +4212,11 @@ fn refresh_local_screens(app: &AppHandle) {
         let Some(local) = layout.devices.iter_mut().find(|device| device.role == "local") else {
             return;
         };
-        let merged: Vec<Screen> = detected
-            .into_iter()
-            .map(|screen| {
-                local
-                    .screens
-                    .iter()
-                    .find(|saved| saved.id == screen.id)
-                    .map(|saved| Screen {
-                        x: saved.x,
-                        y: saved.y,
-                        ..screen.clone()
-                    })
-                    .unwrap_or(screen)
-            })
-            .collect();
+        let Ok(mut memory) = screen_layout_memory().lock() else {
+            return;
+        };
+        let merged = restore_local_screen_layout(detected, &local.screens, &mut memory);
+        drop(memory);
         if screens_fingerprint(&local.screens) == screens_fingerprint(&merged) {
             None
         } else {
@@ -4241,15 +4231,76 @@ fn refresh_local_screens(app: &AppHandle) {
     };
 
     if let Some(snapshot) = updated {
-        let count = snapshot
-            .devices
-            .iter()
-            .find(|d| d.role == "local")
-            .map(|d| d.screens.len())
-            .unwrap_or(0);
-        log::info!("local displays changed: now advertising {count} screen(s)");
+        if let Some(local) = snapshot.devices.iter().find(|d| d.role == "local") {
+            let desc: Vec<String> = local
+                .screens
+                .iter()
+                .map(|s| format!("{}[{}x{}]@({},{})", s.id, s.width, s.height, s.x, s.y))
+                .collect();
+            log::info!(
+                "local displays changed: now advertising {} screen(s): {}",
+                local.screens.len(),
+                desc.join(", ")
+            );
+        }
         let _ = write_layout_to_disk(&state.config_path, &snapshot);
     }
+}
+
+// Remembers each display's id + on-canvas position keyed by resolution, so a
+// display that disconnects and comes back (a MacBook lid closing then opening)
+// is restored to the same id and place. Screen ids are built from the volatile
+// enumeration index, so they cannot be trusted across a display-set change;
+// resolution is stable per display. Survives for the life of the process, which
+// covers a lid close→open cycle.
+#[cfg(target_os = "macos")]
+fn screen_layout_memory() -> &'static Mutex<std::collections::HashMap<(i32, i32), (String, i32, i32)>>
+{
+    static MEM: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<(i32, i32), (String, i32, i32)>>,
+    > = std::sync::OnceLock::new();
+    MEM.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Restores each detected display's remembered id + on-canvas position, keyed by
+/// resolution, so a display that disconnected and came back (a MacBook lid) lands
+/// where the user put it instead of at a default spot, and keeps a stable id even
+/// if the enumeration order (which detected ids are built from) shuffled.
+/// `memory` first absorbs the currently-known screens, then supplies matches;
+/// identical-resolution displays keep distinct ids.
+#[cfg(target_os = "macos")]
+fn restore_local_screen_layout(
+    detected: Vec<Screen>,
+    current: &[Screen],
+    memory: &mut std::collections::HashMap<(i32, i32), (String, i32, i32)>,
+) -> Vec<Screen> {
+    for screen in current.iter() {
+        memory.insert(
+            (screen.width, screen.height),
+            (screen.id.clone(), screen.x, screen.y),
+        );
+    }
+    let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<Screen> = Vec::with_capacity(detected.len());
+    for mut screen in detected {
+        if let Some((id, x, y)) = memory.get(&(screen.width, screen.height)) {
+            if !used_ids.contains(id) {
+                screen.id = id.clone();
+                screen.x = *x;
+                screen.y = *y;
+            }
+        }
+        while used_ids.contains(&screen.id) {
+            screen.id = format!("{}-b", screen.id);
+        }
+        used_ids.insert(screen.id.clone());
+        memory.insert(
+            (screen.width, screen.height),
+            (screen.id.clone(), screen.x, screen.y),
+        );
+        merged.push(screen);
+    }
+    merged
 }
 
 // Identity of a screen set for change detection (ignores on-canvas position,
@@ -7756,6 +7807,63 @@ mod tests {
             scale: 1.0,
             is_primary: true,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_local_screen_layout_survives_lid_close_and_reopen() {
+        use std::collections::HashMap;
+        let mk = |id: &str, w: i32, h: i32, x: i32, y: i32| Screen {
+            id: id.into(),
+            device_id: "local-device".into(),
+            name: format!("Monitor {w}x{h}"),
+            x,
+            y,
+            width: w,
+            height: h,
+            scale: 1.0,
+            is_primary: w == 2560,
+        };
+        let mut memory: HashMap<(i32, i32), (String, i32, i32)> = HashMap::new();
+
+        // External on top, built-in arranged below (the user's real layout).
+        let arranged = vec![
+            mk("local-display-1", 2560, 1440, 0, 0),
+            mk("local-display-2", 1512, 982, 518, 1440),
+        ];
+
+        // Lid closes: only the external is detected — built-in drops out.
+        let closed = restore_local_screen_layout(
+            vec![mk("local-display-1", 2560, 1440, 0, 0)],
+            &arranged,
+            &mut memory,
+        );
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].id, "local-display-1");
+
+        // Lid re-opens with the enumeration SHUFFLED (built-in now index 0, so
+        // its index-based id collides with the external's). Each physical display
+        // must still be restored to its own id and its user-arranged position.
+        let reopened = restore_local_screen_layout(
+            vec![
+                mk("local-display-1", 1512, 982, 99, 99), // built-in, default (wrong) pos
+                mk("local-display-2", 2560, 1440, 99, 99), // external, default (wrong) pos
+            ],
+            &closed,
+            &mut memory,
+        );
+        let built_in = reopened
+            .iter()
+            .find(|s| (s.width, s.height) == (1512, 982))
+            .unwrap();
+        let external = reopened
+            .iter()
+            .find(|s| (s.width, s.height) == (2560, 1440))
+            .unwrap();
+        assert_eq!(built_in.id, "local-display-2");
+        assert_eq!((built_in.x, built_in.y), (518, 1440), "built-in restored below");
+        assert_eq!(external.id, "local-display-1");
+        assert_eq!((external.x, external.y), (0, 0), "external restored to origin");
     }
 
     fn test_layout() -> LayoutState {
