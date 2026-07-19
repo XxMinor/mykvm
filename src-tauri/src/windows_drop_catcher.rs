@@ -66,6 +66,30 @@ static CATCHER: OnceLock<Catcher> = OnceLock::new();
 // Set by DragEnter once the files are read; the capture hook consumes it to
 // cross to the remote so the cursor slides onto the controlled screen.
 static HANDOFF: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+// True once a drag has been captured for the current left-button hold, so
+// shuttling the cursor back and forth across the edge can't read + transfer the
+// same drag again (each round used to make another copy). Reset on button-up.
+static HOLD_CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while the current button hold has already handed off one drag; the
+/// capture hook then skips re-arming so no duplicate transfer happens.
+pub fn hold_consumed() -> bool {
+    HOLD_CONSUMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Clear the per-hold guard — called when the left button is released.
+pub fn reset_hold() {
+    HOLD_CONSUMED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Inject a left-button up to clear Windows' held-drag state (used when the
+/// cursor crosses back to this machine mid-drag so it isn't stuck dragging).
+pub fn inject_left_up() {
+    let mut input = [left_up_input()];
+    unsafe {
+        SendInput(1, input.as_mut_ptr(), std::mem::size_of::<INPUT>() as i32);
+    }
+}
 
 fn handoff_slot() -> &'static Mutex<Option<String>> {
     HANDOFF.get_or_init(|| Mutex::new(None))
@@ -243,14 +267,21 @@ impl IDropTarget_Impl for EdgeDropTarget_Impl {
         // The drag reached the edge. Read its files NOW (the user is still
         // holding the button), transfer them, end the local drag, and hand off
         // to the capture hook so the cursor crosses to the remote.
+        if !pdweffect.is_null() {
+            unsafe { *pdweffect = DROPEFFECT_NONE };
+        }
+        // One capture per button hold: shuttling back and forth across the edge
+        // must not read + transfer the drag again (that made a copy each time).
+        if HOLD_CONSUMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            disarm();
+            return Ok(());
+        }
         let files = pdataobj
             .as_ref()
             .map(read_hdrop_files)
             .unwrap_or_default();
-        if !pdweffect.is_null() {
-            unsafe { *pdweffect = DROPEFFECT_NONE };
-        }
         if files.is_empty() {
+            HOLD_CONSUMED.store(false, std::sync::atomic::Ordering::Relaxed);
             log::info!("edge catcher: DragEnter with no files (not a file drag)");
             return Ok(());
         }

@@ -3200,6 +3200,12 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             context.remote_active.store(false, Ordering::Relaxed);
             // Control is back on this machine: retract the edge drop catcher.
             crate::windows_drop_catcher::disarm();
+            // If the cursor crossed back mid-drag (button still held after a
+            // drag hand-off), clear Windows' held-drag state so it isn't left
+            // stuck showing a drag cursor.
+            if crate::windows_drop_catcher::hold_consumed() && windows_left_button_down() {
+                crate::windows_drop_catcher::inject_left_up();
+            }
             // Keep the clipboard peer so copies still sync after returning.
             release_forwarded_keys_windows(context, &target);
             release_remote_buttons(
@@ -3277,7 +3283,9 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         // sits; its DragEnter reads the files, transfers them, ends the local
         // drag, and hands back a cross (consumed at the top of this function),
         // so the cursor then slides onto the remote.
-        if windows_left_button_down() {
+        // Only try to catch a drag once per button hold; after the first
+        // capture, shuttling across the edge just crosses normally (no re-copy).
+        if windows_left_button_down() && !crate::windows_drop_catcher::hold_consumed() {
             let give_up = match context.drag_arm_since.lock() {
                 Ok(mut since) => {
                     since.get_or_insert_with(Instant::now).elapsed() > Duration::from_millis(500)
@@ -3355,6 +3363,7 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mo
     // state), which is why it sits before the active check.
     if message == WM_LBUTTONUP {
         crate::windows_drop_catcher::disarm();
+        crate::windows_drop_catcher::reset_hold();
         if let Ok(mut pending) = context.pending_drag_cross.lock() {
             *pending = None;
         }
