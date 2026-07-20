@@ -6763,9 +6763,9 @@ fn mac_function_section_flags(mac_code: u16) -> core_graphics::event::CGEventFla
 ///
 /// Toggles English (a `com.apple.keylayout.*` layout such as ABC) and the
 /// last-used IME, mirroring a physical Caps-Lock toggle, rather than cycling
-/// through every enabled source. Runs on the main thread (Apple's expectation,
-/// and it lets the focused app's input session adopt the new source) via
-/// dispatch_async_f.
+/// through every enabled source. Runs synchronously on the caller's injection
+/// thread so the switch lands before any key injected after Caps — an async
+/// switch let a fast follow-up key race ahead and type in the old source.
 #[cfg(target_os = "macos")]
 fn macos_toggle_input_source() {
     macos_input_source::toggle();
@@ -6807,16 +6807,6 @@ mod macos_input_source {
         fn CFRelease(cf: *const c_void);
     }
 
-    #[link(name = "System")]
-    extern "C" {
-        fn dispatch_async_f(
-            queue: *mut c_void,
-            context: *mut c_void,
-            work: extern "C" fn(*mut c_void),
-        );
-        static _dispatch_main_q: c_void;
-    }
-
     /// The IME to return to when Caps Lock is pressed while an English layout is
     /// active, so the toggle goes back to the IME you actually use instead of
     /// the first one in the list.
@@ -6831,8 +6821,12 @@ mod macos_input_source {
     }
 
     pub fn toggle() {
-        let main_q = unsafe { &_dispatch_main_q as *const c_void as *mut c_void };
-        unsafe { dispatch_async_f(main_q, std::ptr::null_mut(), run) };
+        // Switch synchronously on the caller's (injection) thread so the source
+        // is in effect BEFORE any key injected after the Caps press. An async
+        // switch let a fast follow-up key race ahead and type in the old source
+        // (the "popup switched but still English" report). TIS works off the main
+        // thread — the switch and its change-notification fire regardless.
+        run(std::ptr::null_mut());
     }
 
     unsafe fn prop_string(src: TISInputSourceRef, key: CFStringRef) -> Option<String> {
@@ -6913,7 +6907,20 @@ mod macos_input_source {
                     log::info!("[diag] caps: input source already {current_id}, no switch");
                 } else {
                     let err = TISSelectInputSource(src);
-                    log::info!("[diag] caps: input source {current_id} -> {id} (err {err})");
+                    // Read back so the log shows whether the switch took at the
+                    // system level (the focused app adopting it is separate).
+                    let now = TISCopyCurrentKeyboardInputSource();
+                    let now_id = if now.is_null() {
+                        None
+                    } else {
+                        let s = prop_string(now, kTISPropertyInputSourceID);
+                        CFRelease(now as *const c_void);
+                        s
+                    };
+                    log::info!(
+                        "[diag] caps: input source {current_id} -> {id} (err {err}, now {})",
+                        now_id.as_deref().unwrap_or("?")
+                    );
                 }
             }
             CFRelease(list);
