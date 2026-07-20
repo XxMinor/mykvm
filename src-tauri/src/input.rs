@@ -6763,9 +6763,9 @@ fn mac_function_section_flags(mac_code: u16) -> core_graphics::event::CGEventFla
 ///
 /// Toggles English (a `com.apple.keylayout.*` layout such as ABC) and the
 /// last-used IME, mirroring a physical Caps-Lock toggle, rather than cycling
-/// through every enabled source. Runs synchronously on the caller's injection
-/// thread so the switch lands before any key injected after Caps — an async
-/// switch let a fast follow-up key race ahead and type in the old source.
+/// through every enabled source. Runs on the main queue (HIToolbox's TIS APIs
+/// assert that) but SYNCHRONOUSLY, so the switch lands before any key injected
+/// after Caps — an async switch let a fast follow-up key type in the old source.
 #[cfg(target_os = "macos")]
 fn macos_toggle_input_source() {
     macos_input_source::toggle();
@@ -6807,6 +6807,17 @@ mod macos_input_source {
         fn CFRelease(cf: *const c_void);
     }
 
+    #[link(name = "System")]
+    extern "C" {
+        fn dispatch_sync_f(
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+        static _dispatch_main_q: c_void;
+        fn pthread_main_np() -> i32;
+    }
+
     /// The IME to return to when Caps Lock is pressed while an English layout is
     /// active, so the toggle goes back to the IME you actually use instead of
     /// the first one in the list.
@@ -6821,12 +6832,18 @@ mod macos_input_source {
     }
 
     pub fn toggle() {
-        // Switch synchronously on the caller's (injection) thread so the source
-        // is in effect BEFORE any key injected after the Caps press. An async
-        // switch let a fast follow-up key race ahead and type in the old source
-        // (the "popup switched but still English" report). TIS works off the main
-        // thread — the switch and its change-notification fire regardless.
-        run(std::ptr::null_mut());
+        // HIToolbox's TIS APIs assert they run on the main queue
+        // (islGetInputSourceListWithAdditions → dispatch_assert_queue) and crash
+        // on the injection thread. Run on the main queue but SYNCHRONOUSLY, so the
+        // switch still lands before the next injected key (fixing the race that
+        // left a fast key in the old source). If we are already on the main
+        // thread, run inline — dispatch_sync onto our own queue would deadlock.
+        if unsafe { pthread_main_np() } != 0 {
+            run(std::ptr::null_mut());
+            return;
+        }
+        let main_q = unsafe { &_dispatch_main_q as *const c_void as *mut c_void };
+        unsafe { dispatch_sync_f(main_q, std::ptr::null_mut(), run) };
     }
 
     unsafe fn prop_string(src: TISInputSourceRef, key: CFStringRef) -> Option<String> {
