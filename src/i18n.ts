@@ -121,6 +121,18 @@ export const TEXT = {
       fileTransfer: "文件传输 (bate)",
       fileTransferCopy:
         "将文件或文件夹拖到相邻屏幕即可跨设备传输，落在哪个设备上就送到哪台。",
+      lockFollow: "锁屏跟随",
+      lockFollowCopy:
+        "仅控制端生效：本机锁屏或解锁时，自动同步锁上或解锁已配对在线的 Windows 被控端。",
+      unlockPassword: "远程解锁密码",
+      unlockPasswordCopy:
+        "仅被控端生效：保存本机 Windows 登录密码（DPAPI 加密，仅本机用户可解密）。控制端解锁跟随时，本机自动输入该密码完成解锁；需先安装锁屏控制服务。",
+      unlockPasswordPlaceholder: "输入 Windows 登录密码",
+      unlockPasswordSave: "保存密码",
+      unlockPasswordSet: "已设置",
+      unlockPasswordSaving: "正在保存",
+      unlockPasswordSaved: "密码已保存",
+      unlockPasswordFailed: "密码保存失败。",
       modifierTitle: "跨平台改键",
       modifierCopy:
         "本机作为控制端时，发往不同系统对端的修饰键映射（仅 Win↔Mac 跨平台时生效）。默认 Ctrl↔Command 对调，让复制、粘贴、全选等快捷键沿用各自系统习惯。",
@@ -350,6 +362,18 @@ export const TEXT = {
       fileTransfer: "File Transfer (bate)",
       fileTransferCopy:
         "Drag files or folders onto an adjacent screen to transfer them across devices — wherever they land is where they go.",
+      lockFollow: "Lock follow",
+      lockFollowCopy:
+        "Controller side only: when this machine locks or unlocks, paired online Windows peers are locked or unlocked to match.",
+      unlockPassword: "Remote unlock password",
+      unlockPasswordCopy:
+        "Controlled side only: stores this machine\u0027s Windows login password (DPAPI-encrypted, decryptable only by this Windows user). When the controller follows its unlock, the password is typed automatically; the lock-screen input service is required.",
+      unlockPasswordPlaceholder: "Windows login password",
+      unlockPasswordSave: "Save password",
+      unlockPasswordSet: "Set",
+      unlockPasswordSaving: "Saving",
+      unlockPasswordSaved: "Password saved",
+      unlockPasswordFailed: "Failed to save the password.",
       modifierTitle: "Cross-platform Keys",
       modifierCopy:
         "When this machine controls a peer on a different OS, remap modifier keys (only applies across Win↔Mac). The default swaps Ctrl↔Command so copy, paste, and select-all keep each platform's shortcut habits.",

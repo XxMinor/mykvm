@@ -376,6 +376,31 @@ pub fn inject_key(key_code: u16, down: bool) {
     }
 }
 
+pub const VK_SHIFT: u16 = 0x10;
+pub const VK_RETURN: u16 = 0x0D;
+
+/// Maps a (BMP) character to the virtual-key that types it on the active
+/// keyboard layout, plus whether Shift must be held. Returns `None` when the
+/// layout cannot type the character (e.g. an emoji in the password).
+pub fn char_keystroke(ch: char) -> Option<(u16, bool)> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VkKeyScanW;
+
+    let code = ch as u32;
+    if code > 0xFFFF {
+        return None;
+    }
+    let scan = unsafe { VkKeyScanW(code as u16) } as i16;
+    if scan == -1 {
+        return None;
+    }
+    let vk = (scan & 0xFF) as u16;
+    if vk == 0xFF {
+        return None;
+    }
+    let shift = ((scan >> 8) & 0x01) != 0;
+    Some((vk, shift))
+}
+
 fn is_extended_key_vk(vk: u16) -> bool {
     matches!(
         vk,

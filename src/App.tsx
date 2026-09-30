@@ -37,6 +37,7 @@ import {
   saveLayout,
   sendFilesToDevice,
   setAutostart,
+  setUnlockPassword,
   scanLanPeers,
   startRuntime,
   startWindowDrag,
@@ -188,6 +189,10 @@ function App() {
   const [isInputServicePending, setIsInputServicePending] = useState(false);
   const [inputServiceAction, setInputServiceAction] =
     useState<InputServiceAction | null>(null);
+  const [unlockPasswordDraft, setUnlockPasswordDraft] = useState("");
+  const [unlockPasswordStatus, setUnlockPasswordStatus] = useState<
+    "idle" | "saving" | "saved" | "failed"
+  >("idle");
   const [boardZoom, setBoardZoom] = useState(1);
   const [manualDeviceName, setManualDeviceName] = useState("");
   const [manualDeviceHost, setManualDeviceHost] = useState("");
@@ -1339,6 +1344,25 @@ function App() {
       ...layoutState,
       clipboardSync,
     }));
+  }
+
+  function setLockFollowEnabled(lockFollowEnabled: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      lockFollowEnabled,
+    }));
+  }
+
+  async function saveUnlockPassword() {
+    setUnlockPasswordStatus("saving");
+    try {
+      await setUnlockPassword(unlockPasswordDraft);
+      setUnlockPasswordDraft("");
+      setUnlockPasswordStatus("saved");
+      void loadAppState();
+    } catch {
+      setUnlockPasswordStatus("failed");
+    }
   }
 
   function setFileTransferEnabled(fileTransferEnabled: boolean) {
@@ -2649,6 +2673,73 @@ function App() {
                     >
                       {ui.common.disabled}
                     </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.lockFollow}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.lockFollowCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.lockFollowEnabled ? "active" : ""}
+                      onClick={() => setLockFollowEnabled(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.lockFollowEnabled ? "active" : ""}
+                      onClick={() => setLockFollowEnabled(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.unlockPassword}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.unlockPasswordCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div>
+                    <input
+                      type="password"
+                      value={unlockPasswordDraft}
+                      placeholder={ui.settings.unlockPasswordPlaceholder}
+                      onChange={(event) => {
+                        setUnlockPasswordDraft(event.target.value);
+                        setUnlockPasswordStatus("idle");
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={unlockPasswordStatus === "saving"}
+                      onClick={() => void saveUnlockPassword()}
+                    >
+                      {unlockPasswordStatus === "saving"
+                        ? ui.settings.unlockPasswordSaving
+                        : ui.settings.unlockPasswordSave}
+                    </button>
+                    {layout.unlockPasswordBlob ? (
+                      <span>{ui.settings.unlockPasswordSet}</span>
+                    ) : null}
+                    {unlockPasswordStatus === "saved" ? (
+                      <span>{ui.settings.unlockPasswordSaved}</span>
+                    ) : null}
+                    {unlockPasswordStatus === "failed" ? (
+                      <span>{ui.settings.unlockPasswordFailed}</span>
+                    ) : null}
                   </div>
                 </div>
                 <div className="settings-control-row">

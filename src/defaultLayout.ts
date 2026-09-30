@@ -33,6 +33,8 @@ export const defaultLayout: LayoutState = {
   modifierMap: { control: 'meta', alt: 'same', meta: 'control' },
   edgeSwitchHotkey: 'alt+shift+k',
   screenSwitchHotkeys: { left: 'alt+left', right: 'alt+right', up: 'alt+up', down: 'alt+down' },
+  lockFollowEnabled: false,
+  unlockPasswordBlob: '',
   devices: [
     {
       id: 'local-device',

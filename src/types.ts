@@ -85,4 +85,6 @@ export interface LayoutState {
   modifierMap: ModifierMap
   edgeSwitchHotkey: string
   screenSwitchHotkeys: ScreenSwitchHotkeys
+  lockFollowEnabled: boolean
+  unlockPasswordBlob: string
 }

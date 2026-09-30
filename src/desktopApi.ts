@@ -94,6 +94,14 @@ export async function loadAppState(): Promise<AppStateSnapshot> {
   return invoke<AppStateSnapshot>('load_app_state')
 }
 
+export async function setUnlockPassword(password: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('set_unlock_password', { password })
+}
+
 export async function saveLayout(layout: LayoutState): Promise<AppStateSnapshot> {
   if (!isTauri()) {
     return {

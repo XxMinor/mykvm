@@ -237,6 +237,14 @@ struct LayoutState {
     edge_switch_hotkey: String,
     #[serde(default)]
     screen_switch_hotkeys: ScreenSwitchHotkeys,
+    /// Controller side: when true, this machine's lock/unlock transitions are
+    /// mirrored onto its paired Windows targets (lock follow).
+    #[serde(default)]
+    lock_follow_enabled: bool,
+    /// Controlled side: DPAPI-protected local login password used to unlock
+    /// this workstation when a paired controller follows its own unlock.
+    #[serde(default)]
+    unlock_password_blob: String,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -1275,6 +1283,10 @@ fn merge_runtime_owned_layout_fields(
     // clear them and force the client to be paired again.
     incoming.cluster_id = current.cluster_id.clone();
     incoming.pair_secret = current.pair_secret.clone();
+    // The unlock password is set through its own backend command (DPAPI on the
+    // stored blob); a stale whole-layout snapshot from the frontend must never
+    // clobber or clear it.
+    incoming.unlock_password_blob = current.unlock_password_blob.clone();
 
     if current.machine_role == "client"
         && incoming.machine_role == "client"
@@ -2335,6 +2347,205 @@ fn dismiss_pairing_request(state: tauri::State<'_, AppRuntime>) -> Result<Runtim
     Ok(state.runtime_status())
 }
 
+/// Windows-only lock-follow monitor. Polls this machine's input desktop and
+/// mirrors lock/unlock transitions onto every paired online Windows target.
+/// While the workstation is locked (or a UAC prompt owns the secure desktop)
+/// `OpenInputDesktop` fails for this process, which is exactly the state we
+/// want to follow.
+#[cfg(target_os = "windows")]
+fn start_lock_follow_monitor(app: tauri::AppHandle) {
+    if let Err(error) = thread::Builder::new()
+        .name("mykvm-lock-follow".into())
+        .spawn(move || lock_follow_loop(app))
+    {
+        eprintln!("failed to spawn lock-follow monitor: {error}");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_lock_follow_monitor(_app: tauri::AppHandle) {}
+
+#[cfg(target_os = "windows")]
+fn lock_follow_loop(app: tauri::AppHandle) {
+    use crate::input::windows_input_desktop_is_default;
+
+    let mut last_locked: Option<bool> = None;
+    loop {
+        thread::sleep(Duration::from_secs(2));
+        let state = app.state::<AppRuntime>();
+        let layout = state.layout_snapshot();
+        // Lock follow is a controller-side feature: the machine whose lock
+        // state is mirrored is the one driving remote input ("server").
+        if !layout.lock_follow_enabled || layout.machine_role != "server" {
+            last_locked = None;
+            continue;
+        }
+        let locked = !windows_input_desktop_is_default();
+        if Some(locked) == last_locked {
+            continue;
+        }
+        last_locked = Some(locked);
+        let Some(transport) = state.quic_transport_handle() else {
+            continue;
+        };
+        let action = if locked { "lock" } else { "unlock" };
+        for device in layout.devices.iter() {
+            if device.role == "local"
+                || device.platform != "windows"
+                || !device.online
+                || !device.input_ready
+            {
+                continue;
+            }
+            if let Err(error) =
+                input::send_workstation_follow_control(&layout, &transport, &device.id, locked)
+            {
+                log::warn!("lock-follow {action} to {} failed: {error}", device.id);
+            } else {
+                log::info!("lock-follow: sent {action} to {}", device.id);
+            }
+        }
+    }
+}
+
+/// Protects the unlock password with DPAPI so the layout file on disk never
+/// contains the plaintext; the blob only decrypts for the same Windows user.
+#[cfg(target_os = "windows")]
+fn protect_unlock_password(password: &str) -> Result<String, String> {
+    use base64::Engine;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    if password.is_empty() {
+        return Ok(String::new());
+    }
+    let mut input: Vec<u8> = password.as_bytes().to_vec();
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let mut blob_in = CRYPT_INTEGER_BLOB {
+        cbData: input.len() as u32,
+        pbData: input.as_mut_ptr(),
+    };
+    let ok = unsafe {
+        CryptProtectData(
+            &mut blob_in,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "failed to protect unlock password: {}",
+            unsafe { windows_sys::Win32::Foundation::GetLastError() }
+        ));
+    }
+    let protected = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(protected);
+    unsafe { windows_sys::Win32::Foundation::LocalFree(output.pbData as _) };
+    Ok(encoded)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn protect_unlock_password(_password: &str) -> Result<String, String> {
+    Err("unlock follow is only supported on Windows.".into())
+}
+
+/// Decrypts a DPAPI-protected unlock password produced by
+/// [`protect_unlock_password`]. Only ever used on the receiving (controlled)
+/// side to type the password into the local logon UI.
+#[cfg(target_os = "windows")]
+pub(crate) fn unprotect_unlock_password(blob: &str) -> Result<String, String> {
+    use base64::Engine;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let protected = base64::engine::general_purpose::STANDARD
+        .decode(blob.trim())
+        .map_err(|error| format!("decode unlock password blob: {error}"))?;
+    if protected.is_empty() {
+        return Ok(String::new());
+    }
+    let mut blob_in = CRYPT_INTEGER_BLOB {
+        cbData: protected.len() as u32,
+        pbData: protected.as_ptr() as *mut _,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptUnprotectData(
+            &mut blob_in,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "failed to unprotect unlock password: {}",
+            unsafe { windows_sys::Win32::Foundation::GetLastError() }
+        ));
+    }
+    let plain = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    let password = String::from_utf8_lossy(plain).into_owned();
+    unsafe { windows_sys::Win32::Foundation::LocalFree(output.pbData as _) };
+    Ok(password)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn unprotect_unlock_password(_blob: &str) -> Result<String, String> {
+    Err("unlock follow is only supported on Windows.".into())
+}
+
+/// Controller side: enable/disable mirroring this machine's lock/unlock onto
+/// the paired Windows targets.
+#[tauri::command]
+fn set_lock_follow_enabled(
+    enabled: bool,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    let updated_layout = {
+        let mut layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        layout.lock_follow_enabled = enabled;
+        layout.clone()
+    };
+    write_layout_to_disk(&state.config_path, &updated_layout)
+}
+
+/// Controlled side: store (DPAPI-protected) or clear the local login password
+/// used to unlock this workstation when the controller follows its unlock.
+#[tauri::command]
+fn set_unlock_password(
+    password: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    let blob = protect_unlock_password(&password)?;
+    let updated_layout = {
+        let mut layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        layout.unlock_password_blob = blob;
+        layout.clone()
+    };
+    write_layout_to_disk(&state.config_path, &updated_layout)
+}
+
 /// Drop this machine's stored pairing trust so it can be paired afresh.
 ///
 /// A client only accepts a new pairing handshake while `pairing_required`
@@ -2852,6 +3063,7 @@ pub fn run() {
                 detected_layout,
             );
             app.manage(runtime);
+            start_lock_follow_monitor(app.handle().clone());
 
             // Eagerly start discovery + input BEFORE the WebView2/frontend is
             // ready. The old flow waited for the frontend to call
@@ -2910,6 +3122,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             load_app_state,
+            set_lock_follow_enabled,
+            set_unlock_password,
             read_runtime_status,
             read_diagnostic_info,
             open_log_directory,
@@ -3808,6 +4022,8 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        lock_follow_enabled: false,
+        unlock_password_blob: String::new(),
         devices: vec![Device {
             id: device_id,
             name: local_device_name(),
@@ -3851,6 +4067,8 @@ fn detect_fallback_layout() -> LayoutState {
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        lock_follow_enabled: false,
+        unlock_password_blob: String::new(),
     }
 }
 
@@ -3964,6 +4182,8 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         modifier_map: normalize_modifier_map(&saved_layout.modifier_map),
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
         screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
+        lock_follow_enabled: saved_layout.lock_follow_enabled,
+        unlock_password_blob: saved_layout.unlock_password_blob.clone(),
     }
 }
 
@@ -6920,6 +7140,8 @@ mod tests {
             modifier_map: default_modifier_map(),
             edge_switch_hotkey: default_edge_switch_hotkey(),
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        lock_follow_enabled: false,
+        unlock_password_blob: String::new(),
         }
     }
 

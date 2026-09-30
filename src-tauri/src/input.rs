@@ -313,6 +313,8 @@ struct InputControlPacket {
 #[serde(rename_all = "camelCase")]
 enum InputControlCommand {
     SecureAttention,
+    LockWorkstation,
+    UnlockWorkstation,
 }
 
 pub fn stopped_capture_status() -> NativeStageStatus {
@@ -1494,6 +1496,44 @@ pub fn send_secure_attention_control(
     quic_transport: &quic_transport::TransportHandle,
     device_id: &str,
 ) -> Result<(), String> {
+    send_workstation_control(
+        layout,
+        quic_transport,
+        device_id,
+        InputControlCommand::SecureAttention,
+        "Ctrl+Alt+Del control is only available for Windows targets.",
+    )
+}
+
+/// Sends the lock-follow control to a paired Windows target: ask it to lock
+/// its workstation, or to unlock itself with its locally stored password.
+pub fn send_workstation_follow_control(
+    layout: &LayoutState,
+    quic_transport: &quic_transport::TransportHandle,
+    device_id: &str,
+    lock: bool,
+) -> Result<(), String> {
+    let (command, unsupported) = if lock {
+        (
+            InputControlCommand::LockWorkstation,
+            "Lock follow control is only available for Windows targets.",
+        )
+    } else {
+        (
+            InputControlCommand::UnlockWorkstation,
+            "Unlock follow control is only available for Windows targets.",
+        )
+    };
+    send_workstation_control(layout, quic_transport, device_id, command, unsupported)
+}
+
+fn send_workstation_control(
+    layout: &LayoutState,
+    quic_transport: &quic_transport::TransportHandle,
+    device_id: &str,
+    command: InputControlCommand,
+    unsupported_error: &str,
+) -> Result<(), String> {
     let Some(target) = layout
         .devices
         .iter()
@@ -1502,7 +1542,7 @@ pub fn send_secure_attention_control(
         return Err("target device is not in the layout".into());
     };
     if target.platform != "windows" {
-        return Err("Ctrl+Alt+Del control is only available for Windows targets.".into());
+        return Err(unsupported_error.into());
     }
     if !target.online || !target.input_ready {
         return Err("target device is not online and input-ready".into());
@@ -1523,7 +1563,7 @@ pub fn send_secure_attention_control(
         origin_protocol_version: quic_transport::PROTOCOL_VERSION,
         cluster_id: layout.cluster_id.clone(),
         pair_secret: layout.pair_secret.clone(),
-        command: InputControlCommand::SecureAttention,
+        command,
     };
     let payload = rmp_serde::to_vec_named(&packet)
         .map_err(|error| format!("encode input control packet: {error}"))?;
@@ -1882,9 +1922,120 @@ fn handle_control_packet(
                 source
             );
         }
+        InputControlCommand::LockWorkstation => {
+            #[cfg(target_os = "windows")]
+            {
+                // LockWorkStation works from the normal user session — no
+                // elevation or helper required. The peer is already authorized
+                // (paired controllers only) before reaching this arm.
+                use windows_sys::Win32::System::Shutdown::LockWorkStation;
+                if unsafe { LockWorkStation() } == 0 {
+                    log::warn!(
+                        "LockWorkStation control from {} failed with error {}",
+                        source,
+                        unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                    );
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            log::warn!(
+                "LockWorkstation control from {} ignored on non-Windows target",
+                source
+            );
+        }
+        InputControlCommand::UnlockWorkstation => {
+            #[cfg(target_os = "windows")]
+            if let Err(error) = unlock_workstation_with_stored_password(layout) {
+                log::warn!(
+                    "UnlockWorkstation control from {} failed: {}",
+                    source,
+                    error
+                );
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            log::warn!(
+                "UnlockWorkstation control from {} ignored on non-Windows target",
+                source
+            );
+        }
     }
 
     true
+}
+
+/// Types the locally stored unlock password into the Windows logon UI and
+/// presses Enter, so a paired controller can follow its own unlock. The
+/// keystrokes go through the regular dispatch path: on the secure desktop that
+/// routes to the privileged input service (the same path remote typing uses
+/// while the machine is locked), so no extra privileges are needed here.
+#[cfg(target_os = "windows")]
+fn unlock_workstation_with_stored_password(layout: &LayoutState) -> Result<(), String> {
+    let blob = layout.unlock_password_blob.trim();
+    if blob.is_empty() {
+        return Err("no unlock password is configured on this device".into());
+    }
+    let password = crate::unprotect_unlock_password(blob)?;
+    if windows_input_desktop_is_default() {
+        return Err("workstation is not locked; skipped unlock keystrokes".into());
+    }
+    if !windows_input_pipe_available() {
+        return Err(
+            "input service is unavailable; install it to unlock from the lock screen".into(),
+        );
+    }
+
+    // A first Enter brings up the password entry field on the Windows lock
+    // screen, then we type the password and confirm it.
+    let type_char = |ch: char| -> Result<(), String> {
+        let (vk, shift) = crate::windows_input::char_keystroke(ch)
+            .ok_or_else(|| format!("password contains character {ch:?} that cannot be typed"))?;
+        if shift {
+            send_through_input_pipe(&InputCommand::Key {
+                key_code: crate::windows_input::VK_SHIFT,
+                down: true,
+            })?;
+        }
+        send_through_input_pipe(&InputCommand::Key { key_code: vk, down: true })?;
+        send_through_input_pipe(&InputCommand::Key { key_code: vk, down: false })?;
+        if shift {
+            send_through_input_pipe(&InputCommand::Key {
+                key_code: crate::windows_input::VK_SHIFT,
+                down: false,
+            })?;
+        }
+        Ok(())
+    };
+
+    let enter = || -> Result<(), String> {
+        send_through_input_pipe(&InputCommand::Key {
+            key_code: crate::windows_input::VK_RETURN,
+            down: true,
+        })?;
+        send_through_input_pipe(&InputCommand::Key {
+            key_code: crate::windows_input::VK_RETURN,
+            down: false,
+        })
+    };
+
+    enter()?;
+    thread::sleep(Duration::from_millis(400));
+    for ch in password.chars() {
+        type_char(ch)?;
+        thread::sleep(Duration::from_millis(12));
+    }
+    thread::sleep(Duration::from_millis(120));
+    enter()?;
+    Ok(())
+}
+
+/// Sends one key command straight through the privileged input service pipe,
+/// bypassing the local-injection fallback: on the lock screen the local path
+/// cannot deliver keystrokes, and silently falling back would type nothing.
+#[cfg(target_os = "windows")]
+fn send_through_input_pipe(command: &InputCommand) -> Result<(), String> {
+    windows_pipe_dispatcher().send(command)
 }
 
 fn packet_authorized(layout: &LayoutState, packet: &InputPacket) -> bool {
@@ -3033,7 +3184,7 @@ fn refresh_windows_input_desktop_cache() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_input_desktop_is_default() -> bool {
+pub fn windows_input_desktop_is_default() -> bool {
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS, UOI_NAME,
     };
