@@ -192,6 +192,12 @@ struct Device {
     #[serde(default = "default_device_source")]
     source: String,
     screens: Vec<Screen>,
+    /// Pointer and scroll speed this controller applies when driving the
+    /// device (a per-device multiplier; 1 = as the local mouse moves).
+    #[serde(default = "default_input_speed")]
+    pointer_speed: f64,
+    #[serde(default = "default_input_speed")]
+    scroll_speed: f64,
 }
 
 /// Per-direction hotkeys for jumping between adjacent screens without moving
@@ -5160,6 +5166,8 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         devices: vec![Device {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             id: device_id,
             name: local_device_name(),
             platform: current_platform().into(),
@@ -5754,6 +5762,10 @@ fn usable_discovery_ipv4(address: Ipv4Addr) -> bool {
         // 198.18.0.0/15 (RFC 2544 benchmarking) is the TUN range of Clash,
         // Mihomo and Surge — never a LAN a peer could reach.
         && !(a == 198 && b & 0xfe == 18)
+}
+
+fn default_input_speed() -> f64 {
+    1.0
 }
 
 fn default_device_source() -> String {
@@ -9624,6 +9636,8 @@ mod tests {
             lock_sync: false,
             devices: vec![
                 Device {
+                    pointer_speed: 1.0,
+                    scroll_speed: 1.0,
                     id: "local-device".into(),
                     name: "Local".into(),
                     platform: "macos".into(),
@@ -9642,6 +9656,8 @@ mod tests {
                     screens: vec![test_screen("local-device")],
                 },
                 Device {
+                    pointer_speed: 1.0,
+                    scroll_speed: 1.0,
                     id: "peer-client-10-0-0-2".into(),
                     name: "Client".into(),
                     platform: "windows".into(),

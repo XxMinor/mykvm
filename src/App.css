@@ -32,6 +32,7 @@
 
 .theme-light .brand-mark,
 .theme-light .secondary-button,
+.theme-light .speed-select select,
 .theme-light .add-device-form input,
 .theme-light .settings-number-input,
 .theme-light .hotkey-recorder-button,
@@ -589,6 +590,22 @@
 .secondary-button:disabled {
   cursor: progress;
   opacity: 0.55;
+}
+
+.speed-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.speed-select select {
+  min-height: 32px;
+  border: 1px solid rgba(63, 63, 70, 0.92);
+  border-radius: 8px;
+  padding: 0 6px;
+  background: #242429;
+  color: #d4d4d8;
 }
 
 .runtime-toggle-button {

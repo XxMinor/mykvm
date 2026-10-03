@@ -221,6 +221,10 @@ struct InputTarget {
     /// The modifier remap for this target, captured with the target so key
     /// events never need the layout lock. `None` when no remap applies.
     modifier_map: Option<crate::ModifierMap>,
+    /// Per-device pointer and scroll multipliers (Device::pointer_speed /
+    /// scroll_speed), captured like `modifier_map`.
+    pointer_speed: f64,
+    scroll_speed: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1565,6 +1569,8 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
                         remote_screen: remote_screen.clone(),
                         edge,
                         modifier_map: target_modifier_map(layout, &device.platform),
+                        pointer_speed: sane_input_speed(device.pointer_speed),
+                        scroll_speed: sane_input_speed(device.scroll_speed),
                     });
                 }
             }
@@ -3683,8 +3689,8 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             return true;
         }
 
-        active_target.x += dx;
-        active_target.y += dy;
+        active_target.x += dx * active_target.target.pointer_speed;
+        active_target.y += dy * active_target.target.pointer_speed;
 
         if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
             // Logged so an unexpected return can be told apart from the others
@@ -3985,6 +3991,32 @@ fn return_to_local_after_send_failure_windows(context: &WindowsCaptureContext, w
 /// nothing. Carry the remainder per axis until it adds up to a whole notch,
 /// the unit the wire carries. (PR #22 rounded each event up instead, which
 /// makes a touchpad scroll many times too fast.)
+/// A speed from the saved layout, kept to a usable range (a hand-edited 0 or
+/// NaN must not freeze the remote cursor).
+fn sane_input_speed(speed: f64) -> f64 {
+    if speed.is_finite() {
+        speed.clamp(0.25, 4.0)
+    } else {
+        1.0
+    }
+}
+
+/// Scale a scroll by the target's speed, carrying the fraction per axis in
+/// thousandths so a slow speed still scrolls (0.5x: one step every other
+/// notch) instead of rounding every step to nothing.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn scaled_scroll(horizontal: bool, delta: i32, speed: f64) -> i32 {
+    use std::sync::atomic::AtomicI64;
+    static REMAINDER_MILLI: [AtomicI64; 2] = [AtomicI64::new(0), AtomicI64::new(0)];
+    if delta == 0 || (speed - 1.0).abs() < 1e-9 {
+        return delta;
+    }
+    let remainder = &REMAINDER_MILLI[usize::from(horizontal)];
+    let total = (f64::from(delta) * speed * 1000.0).round() as i64 + remainder.load(Ordering::Relaxed);
+    remainder.store(total % 1000, Ordering::Relaxed);
+    (total / 1000) as i32
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn wheel_notches(horizontal: bool, raw: i16) -> Option<i32> {
     use std::sync::atomic::AtomicI32;
@@ -4012,13 +4044,18 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
         // Part of a notch: swallowed while remote, sent once it adds up.
         return true;
     };
+    let speed = active_target.target.scroll_speed;
     let (delta_x, delta_y) = if message == WM_MOUSEHWHEEL {
-        (delta, 0)
+        (scaled_scroll(true, delta, speed), 0)
     } else if message == WM_MOUSEWHEEL {
-        (0, delta)
+        (0, scaled_scroll(false, delta, speed))
     } else {
         return false;
     };
+    if delta_x == 0 && delta_y == 0 {
+        // A slow speed carried this step into the next one.
+        return true;
+    }
 
     let sent = send_remote_mouse_move(
         &context.quic_transport,
@@ -4225,10 +4262,20 @@ fn handle_macos_event(
             send_macos_mouse_button(context, &active_target, MouseButton::Middle, false)
         }
         CGEventType::ScrollWheel => {
-            let delta_y =
-                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as i32;
-            let delta_x =
-                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32;
+            let speed = active_target.target.scroll_speed;
+            let delta_y = scaled_scroll(
+                false,
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as i32,
+                speed,
+            );
+            let delta_x = scaled_scroll(
+                true,
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32,
+                speed,
+            );
+            if delta_x == 0 && delta_y == 0 {
+                return CallbackResult::Drop;
+            }
             if !send_remote_mouse_move(
                 &context.quic_transport,
                 &active_target,
@@ -4358,8 +4405,8 @@ fn handle_macos_mouse_move(
             {
                 return CallbackResult::Drop;
             }
-            active_target.x += dx;
-            active_target.y += dy;
+            active_target.x += dx * active_target.target.pointer_speed;
+            active_target.y += dy * active_target.target.pointer_speed;
 
             if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
                 let point = local_return_point(active_target);
@@ -7853,6 +7900,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scroll_speed_carries_the_fraction() {
+        // 1x is untouched; 2x doubles.
+        assert_eq!(scaled_scroll(false, 3, 1.0), 3);
+        assert_eq!(scaled_scroll(false, 1, 2.0), 2);
+        // 0.5x: every other notch goes through, none is lost.
+        let slow: i32 = (0..4).map(|_| scaled_scroll(true, 1, 0.5)).sum();
+        assert_eq!(slow, 2);
+        // A broken saved speed falls back to a usable one.
+        assert_eq!(sane_input_speed(f64::NAN), 1.0);
+        assert_eq!(sane_input_speed(0.0), 0.25);
+    }
+
+    #[test]
     fn media_keys_map_both_ways() {
         // volume up/down, mute, play, next, previous
         for (mac, vk) in [(0, 0xAF), (1, 0xAE), (7, 0xAD), (16, 0xB3), (17, 0xB0), (18, 0xB1)] {
@@ -8141,6 +8201,8 @@ mod tests {
 
     fn target_for_coordinate_tests() -> InputTarget {
         InputTarget {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -8177,6 +8239,8 @@ mod tests {
             lock_sync: false,
             devices: vec![
                 Device {
+                    pointer_speed: 1.0,
+                    scroll_speed: 1.0,
                     id: "local-device".into(),
                     name: "Local".into(),
                     platform: "macos".into(),
@@ -8195,6 +8259,8 @@ mod tests {
                     screens: vec![screen("local-device", "local-display-1", 0, 0, 1920, 1080)],
                 },
                 Device {
+                    pointer_speed: 1.0,
+                    scroll_speed: 1.0,
                     id: "peer-device".into(),
                     name: "Client".into(),
                     platform: "windows".into(),
@@ -8247,6 +8313,8 @@ mod tests {
         // Remote device with two stacked screens: a primary and a secondary
         // directly below it (the screenshot's #10086 / #41039 arrangement).
         let device = Device {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             id: "peer-device".into(),
             name: "Client".into(),
             platform: "windows".into(),
@@ -8274,6 +8342,8 @@ mod tests {
 
         let entry = screen("peer-device", "peer-device-scr-1", 1920, 0, 1920, 1080);
         let target = InputTarget {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -8329,6 +8399,8 @@ mod tests {
             1080,
         );
         let target = InputTarget {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -8377,6 +8449,8 @@ mod tests {
             1080,
         );
         let target = InputTarget {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -8749,6 +8823,8 @@ mod tests {
             (Edge::Top, 500.0, 820.0, 16.0, 300.0, 516.0, 1079.0),
         ] {
             let target = InputTarget {
+                pointer_speed: 1.0,
+                scroll_speed: 1.0,
                 device_id: "peer-device".into(),
                 origin_device_id: "peer-local-192-168-66-92".into(),
                 cluster_id: "cluster-test".into(),
@@ -9463,6 +9539,8 @@ mod tests {
     #[test]
     fn crossing_uses_native_edge_before_mapping_to_layout() {
         let target = InputTarget {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -9500,6 +9578,8 @@ mod tests {
     #[test]
     fn crossing_rejects_fast_jump_from_middle() {
         let target = InputTarget {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),

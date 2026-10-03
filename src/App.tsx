@@ -182,6 +182,8 @@ interface FileTransferProgressEntry {
 }
 
 const INPUT_SERVICE_OFFER_DISMISSED_KEY = "mykvm.inputServiceOfferDismissed";
+const POINTER_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+const SCROLL_SPEEDS = [0.5, 1, 1.5, 2, 3];
 
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
@@ -1908,6 +1910,19 @@ function App() {
     }
   }
 
+  function setDeviceSpeed(
+    deviceId: string,
+    field: "pointerSpeed" | "scrollSpeed",
+    value: number,
+  ) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      devices: layoutState.devices.map((device) =>
+        device.id === deviceId ? { ...device, [field]: value } : device,
+      ),
+    }));
+  }
+
   function handleRemoveDevice(deviceId: string) {
     updateLayout((layoutState) => {
       const nextDevices = layoutState.devices.filter(
@@ -2302,8 +2317,37 @@ function App() {
       return null;
     }
 
+    // The controller applies these when it drives the device.
+    const speedSelect = (
+      field: "pointerSpeed" | "scrollSpeed",
+      label: string,
+      speeds: number[],
+    ) => (
+      <label className="speed-select" title={label}>
+        <span>{label}</span>
+        <select
+          value={device[field] ?? 1}
+          onChange={(event) =>
+            setDeviceSpeed(device.id, field, Number(event.target.value))
+          }
+        >
+          {speeds.map((speed) => (
+            <option key={speed} value={speed}>
+              {speed}×
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+
     return (
       <>
+        {machineRole === "server" ? (
+          <>
+            {speedSelect("pointerSpeed", ui.devices.pointerSpeed, POINTER_SPEEDS)}
+            {speedSelect("scrollSpeed", ui.devices.scrollSpeed, SCROLL_SPEEDS)}
+          </>
+        ) : null}
         <button
           type="button"
           className="secondary-button compact-button"

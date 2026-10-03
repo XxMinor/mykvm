@@ -59,6 +59,9 @@ export interface Device {
   online: boolean
   inputReady: boolean
   upgrading?: boolean
+  /** Multipliers this controller applies when driving the device. */
+  pointerSpeed?: number
+  scrollSpeed?: number
   role: 'local' | 'server' | 'client'
   source?: 'detected' | 'manual'
   screens: Screen[]
