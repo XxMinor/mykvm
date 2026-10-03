@@ -6574,34 +6574,11 @@ fn file_transfer_target_for_device(
         return Err("当前设备尚未完成配对，无法传输文件。".into());
     }
 
-    if let Some(device) = layout
-        .devices
-        .iter()
-        .find(|device| device.id == device_id && device.role != "local")
-    {
-        if !device.online || !device.input_ready {
-            return Err(format!("{} 当前不在线，无法传输文件。", device.name));
-        }
-        if device.protocol_version != quic_transport::PROTOCOL_VERSION
-            || device.transport_public_key.trim().is_empty()
-        {
-            return Err(format!("{} 版本过旧，请先升级 MyKVM。", device.name));
-        }
-        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
-        let host = file_transfer_host(&device.host)
-            .ok_or_else(|| format!("{} 缺少可用地址。", device.name))?;
-
-        return Ok(FileTransferTarget {
-            device_id: device.id.clone(),
-            name: device.name.clone(),
-            addr: format!("{host}:{quic_port}"),
-            transport_public_key: device.transport_public_key.clone(),
-            protocol_version: device.protocol_version,
-            cluster_id: layout.cluster_id.clone(),
-            pair_secret: layout.pair_secret.clone(),
-        });
-    }
-
+    // A client's only target is its controller: look there first. A device
+    // entry with the same id can be left over from when this machine was the
+    // server; it says "not input-ready" (a controller does not take input),
+    // and answering from it failed every transfer — the drag hand-off and the
+    // log — with "offline".
     if layout.machine_role == "client" {
         if let Some(controller) = layout
             .paired_controllers
@@ -6644,6 +6621,34 @@ fn file_transfer_target_for_device(
                 pair_secret: layout.pair_secret.clone(),
             });
         }
+    }
+
+    if let Some(device) = layout
+        .devices
+        .iter()
+        .find(|device| device.id == device_id && device.role != "local")
+    {
+        if !device.online || !device.input_ready {
+            return Err(format!("{} 当前不在线，无法传输文件。", device.name));
+        }
+        if device.protocol_version != quic_transport::PROTOCOL_VERSION
+            || device.transport_public_key.trim().is_empty()
+        {
+            return Err(format!("{} 版本过旧，请先升级 MyKVM。", device.name));
+        }
+        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
+        let host = file_transfer_host(&device.host)
+            .ok_or_else(|| format!("{} 缺少可用地址。", device.name))?;
+
+        return Ok(FileTransferTarget {
+            device_id: device.id.clone(),
+            name: device.name.clone(),
+            addr: format!("{host}:{quic_port}"),
+            transport_public_key: device.transport_public_key.clone(),
+            protocol_version: device.protocol_version,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+        });
     }
 
     Err("没有找到可传输的目标设备。".into())
@@ -10763,6 +10768,19 @@ mod tests {
 
         assert_eq!(target.addr, "10.0.0.1:52001");
         assert_eq!(target.transport_public_key, "server-public-key");
+
+        // The two machines swapped roles: this client still lists the
+        // controller as a device from its server days, online but not
+        // input-ready. The transfer must still go to the controller.
+        let mut stale = layout.devices[1].clone();
+        stale.id = "peer-server-10-0-0-1".into();
+        stale.role = "client".into();
+        stale.online = true;
+        stale.input_ready = false;
+        layout.devices.push(stale);
+        let target =
+            file_transfer_target_for_device(&layout, &peers, "peer-server-10-0-0-1").unwrap();
+        assert_eq!(target.addr, "10.0.0.1:52001");
     }
 
     #[test]
