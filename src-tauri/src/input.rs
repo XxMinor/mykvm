@@ -3504,6 +3504,20 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
     }
 }
 
+/// One probe of the input desktop. A secure desktop (UAC prompt, lock screen)
+/// stays up for seconds; a single probe that could not open the input desktop
+/// is noise, and acting on it silently pulled control back from the remote
+/// machine mid-use. Only three misses in a row count; Default resets them.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn input_desktop_still_default(misses: &std::sync::atomic::AtomicU32, is_default: bool) -> bool {
+    const MISSES_TO_SWITCH: u32 = 3;
+    if is_default {
+        misses.store(0, Ordering::Relaxed);
+        return true;
+    }
+    misses.fetch_add(1, Ordering::Relaxed).saturating_add(1) < MISSES_TO_SWITCH
+}
+
 #[cfg(target_os = "windows")]
 fn cached_windows_input_desktop_is_default() -> bool {
     WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE.load(Ordering::Relaxed)
@@ -3511,13 +3525,30 @@ fn cached_windows_input_desktop_is_default() -> bool {
 
 #[cfg(target_os = "windows")]
 fn refresh_windows_input_desktop_cache() -> bool {
-    let value = windows_input_desktop_is_default();
-    WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE.store(value, Ordering::Relaxed);
+    use std::sync::atomic::AtomicU32;
+    // Consecutive probes that did not find the Default desktop.
+    static MISSES: AtomicU32 = AtomicU32::new(0);
+
+    let probe = windows_input_desktop_name();
+    let is_default = matches!(&probe, Ok(name) if name.eq_ignore_ascii_case("default"));
+    let value = input_desktop_still_default(&MISSES, is_default);
+    if WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE.swap(value, Ordering::Relaxed) != value {
+        match probe {
+            _ if value => log::info!("input desktop is Default again"),
+            Ok(name) => log::warn!("input desktop is {name:?}; input stays on this machine"),
+            Err(code) => log::warn!(
+                "cannot open the input desktop (error {code}); treating it as a secure desktop"
+            ),
+        }
+    }
     value
 }
 
+/// Name of the current input desktop ("Default", "Winlogon", ...), or the
+/// Win32 error when it cannot be opened (a secure desktop usually cannot).
 #[cfg(target_os = "windows")]
-fn windows_input_desktop_is_default() -> bool {
+fn windows_input_desktop_name() -> Result<String, u32> {
+    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS, UOI_NAME,
     };
@@ -3525,7 +3556,7 @@ fn windows_input_desktop_is_default() -> bool {
     unsafe {
         let desktop = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
         if desktop.is_null() {
-            return false;
+            return Err(GetLastError());
         }
 
         let mut needed = 0_u32;
@@ -3537,19 +3568,18 @@ fn windows_input_desktop_is_default() -> bool {
             (buffer.len() * std::mem::size_of::<u16>()) as u32,
             &mut needed,
         ) != 0;
+        let error = GetLastError();
         let _ = CloseDesktop(desktop);
 
         if !ok || needed == 0 {
-            return false;
+            return Err(error);
         }
 
         let mut units = ((needed as usize) / std::mem::size_of::<u16>()).min(buffer.len());
         if units > 0 && buffer[units - 1] == 0 {
             units -= 1;
         }
-        let name = String::from_utf16_lossy(&buffer[..units]);
-
-        name.eq_ignore_ascii_case("default")
+        Ok(String::from_utf16_lossy(&buffer[..units]))
     }
 }
 
@@ -3628,6 +3658,18 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         active_target.y += dy;
 
         if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
+            // Logged so an unexpected return can be told apart from the others
+            // (a stale remote screen size after its displays changed shows here).
+            log::info!(
+                "returning to local: left remote screen {} ({}x{}) at ({:.0}, {:.0}) moving ({:.0}, {:.0})",
+                active_target.current_screen_id,
+                active_target.current_screen.width,
+                active_target.current_screen.height,
+                active_target.x,
+                active_target.y,
+                dx,
+                dy
+            );
             let point = local_return_point(active_target);
             let target = active_target.target.clone();
             // Control is returning to the local machine: park the controlled
@@ -7637,6 +7679,21 @@ fn inject_key(_key_code: u16, _down: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_desktop_switch_needs_three_misses_in_a_row() {
+        let misses = std::sync::atomic::AtomicU32::new(0);
+        // One or two failed probes are noise: stay on the Default desktop.
+        assert!(input_desktop_still_default(&misses, false));
+        assert!(input_desktop_still_default(&misses, false));
+        // A Default probe resets the run.
+        assert!(input_desktop_still_default(&misses, true));
+        assert!(input_desktop_still_default(&misses, false));
+        assert!(input_desktop_still_default(&misses, false));
+        // The third miss in a row is a secure desktop.
+        assert!(!input_desktop_still_default(&misses, false));
+        assert!(!input_desktop_still_default(&misses, false));
+    }
 
     #[test]
     fn one_failed_send_keeps_remote_control_a_second_of_them_hands_it_back() {
