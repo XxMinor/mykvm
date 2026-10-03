@@ -1341,6 +1341,18 @@ impl AppRuntime {
         }
     }
 
+    /// This process is about to end (quit, or an update about to install).
+    /// Release remote control, then close QUIC so the peer gets a
+    /// CONNECTION_CLOSE and reconnects at once — on a Windows client to the
+    /// input service, which takes over the same ports and identity when this
+    /// process is gone — instead of sending into a dead connection until its
+    /// 10 s idle timeout.
+    fn hand_off_network(&self) {
+        self.stop_input();
+        self.stop_clipboard();
+        self.stop_discovery();
+    }
+
     fn stop_input(&self) {
         #[cfg(target_os = "macos")]
         input::set_macos_app_nap_suppressed(false);
@@ -2496,6 +2508,13 @@ fn read_performance_sample(state: tauri::State<'_, AppRuntime>) -> PerformanceSa
     )
 }
 
+/// The update is downloaded and installs next. On Windows the updater ends
+/// this process itself, without the exit hooks, so hand the network over now.
+#[tauri::command]
+fn prepare_update_install(state: tauri::State<'_, AppRuntime>) {
+    state.hand_off_network();
+}
+
 #[tauri::command]
 fn set_app_upgrading(state: tauri::State<'_, AppRuntime>, enabled: bool) {
     state.upgrading.store(enabled, Ordering::Relaxed);
@@ -3521,6 +3540,7 @@ pub fn run() {
             write_clipboard_text,
             read_performance_sample,
             set_app_upgrading,
+            prepare_update_install,
             scan_lan_peers,
             probe_lan_peer,
             request_lan_pairing,
@@ -3552,6 +3572,11 @@ pub fn run() {
                 if !should_allow_app_exit(app, code) {
                     api.prevent_exit();
                     let _ = hide_main_window_handle(app);
+                }
+            }
+            tauri::RunEvent::Exit => {
+                if let Some(state) = app.try_state::<AppRuntime>() {
+                    state.hand_off_network();
                 }
             }
             #[cfg(target_os = "macos")]

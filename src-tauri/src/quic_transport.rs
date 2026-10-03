@@ -580,6 +580,11 @@ fn tuned_transport_config() -> quinn::TransportConfig {
     // reconnect. 10 s tolerates brief LAN/Wi-Fi hiccups while auto-recovering
     // across the typical upgrade downtime without any manual toggle.
     transport.keep_alive_interval(Some(Duration::from_secs(3)));
+    // A LAN round trip is a few ms; quinn's 333 ms default made the first
+    // handshake retransmit wait about a second. When a peer process hands its
+    // ports over (an update, the input service taking over), the reconnect's
+    // first Initial can hit the port before it is bound again, so retry fast.
+    transport.initial_rtt(Duration::from_millis(50));
     if let Ok(timeout) = quinn::IdleTimeout::try_from(Duration::from_secs(10)) {
         transport.max_idle_timeout(Some(timeout));
     }

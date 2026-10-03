@@ -427,10 +427,20 @@ export async function installAppUpdate(): Promise<void> {
   }
 
   await setAppUpgrading(true).catch(() => {})
+  let handedOff = false
   try {
-    await update.downloadAndInstall()
+    await update.download()
+    // On Windows install() ends this process without the exit hooks: close
+    // the network first so the controller reconnects at once (to the input
+    // service while the installer runs) instead of timing out.
+    await invoke('prepare_update_install').catch(() => {})
+    handedOff = true
+    await update.install()
   } catch (error) {
     await setAppUpgrading(false).catch(() => {})
+    if (handedOff) {
+      await startRuntime().catch(() => {})
+    }
     throw error
   }
   await relaunch()
