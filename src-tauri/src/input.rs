@@ -3695,13 +3695,21 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         let dragging = remote_button_is_down(&context.remote_button_mask);
         let due = should_send_mouse_move(&context.last_mouse_move_sent, dragging);
         context.move_pending.store(!due, Ordering::Relaxed);
-        if due {
-            if !send_remote_mouse_move(
+        if due
+            && !send_remote_mouse_move(
                 &context.quic_transport,
                 active_target,
                 &context.layout_state,
                 &context.input_events,
-            ) {
+            )
+        {
+            // A move that fails while the connection is rebuilt is dropped
+            // and the latest position re-sent by the flush; one failure used
+            // to drop remote control at once, silently, at 125 moves a second.
+            if !input_send_failure_persistent(&INPUT_SEND_FAILING_SINCE_MS, crate::now_ms()) {
+                context.move_pending.store(true, Ordering::Relaxed);
+            } else {
+                log::warn!("remote mouse moves kept failing; returning control to the local machine");
                 *active = None;
                 context.remote_active.store(false, Ordering::Relaxed);
                 crate::windows_drop_catcher::disarm();
@@ -4341,13 +4349,22 @@ fn handle_macos_mouse_move(
             let dragging = remote_button_is_down(&context.remote_button_mask);
             let due = should_send_mouse_move(&context.last_mouse_move_sent, dragging);
             context.move_pending.store(!due, Ordering::Relaxed);
-            if due {
-                if !send_remote_mouse_move(
+            if due
+                && !send_remote_mouse_move(
                     &context.quic_transport,
                     active_target,
                     &context.layout_state,
                     &context.input_events,
-                ) {
+                )
+            {
+                // As on Windows: a move failing while the connection is rebuilt
+                // is re-sent by the flush instead of dropping remote control.
+                if !input_send_failure_persistent(&INPUT_SEND_FAILING_SINCE_MS, crate::now_ms()) {
+                    context.move_pending.store(true, Ordering::Relaxed);
+                } else {
+                    log::warn!(
+                        "remote mouse moves kept failing; returning control to the local machine"
+                    );
                     *active = None;
                     context.remote_active.store(false, Ordering::Relaxed);
                     context.just_crossed.store(false, Ordering::Relaxed);
