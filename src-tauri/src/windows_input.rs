@@ -413,6 +413,8 @@ fn is_extended_key_vk(vk: u16) -> bool {
             | 0x90
             | 0xA3
             | 0xA5
+            // browser, volume and media keys (E0-prefixed on a keyboard)
+            | 0xA6..=0xB7
     )
 }
 

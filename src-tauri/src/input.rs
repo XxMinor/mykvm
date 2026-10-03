@@ -2925,6 +2925,10 @@ unsafe extern "C" fn macos_raw_gesture_event_callback(
     }
 
     if context.remote_active.load(Ordering::Relaxed) {
+        // Media keys (volume, play, next...) go to the controlled machine.
+        if event_type == MACOS_NSEVENT_TYPE_SYSTEM_DEFINED {
+            forward_macos_media_key(context, event);
+        }
         repin_macos_cursor_while_remote(context);
         log::debug!(
             "remote-active macOS gesture/system event {} was dropped",
@@ -2934,6 +2938,31 @@ unsafe extern "C" fn macos_raw_gesture_event_callback(
     }
 
     event
+}
+
+#[cfg(target_os = "macos")]
+fn forward_macos_media_key(context: &MacCaptureContext, event: core_graphics::sys::CGEventRef) {
+    let Some((key, down)) = macos_appkit::media_key_from_system_event(event) else {
+        return;
+    };
+    let Some(key_code) = mac_media_key_to_windows_vk(key) else {
+        return;
+    };
+    let Some(target) = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|active| active.target.clone()))
+    else {
+        return;
+    };
+    send_packet(
+        &context.quic_transport,
+        &target,
+        InputEvent::Key { key_code, down },
+        &context.layout_state,
+        &context.input_events,
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -5039,6 +5068,97 @@ pub(crate) mod macos_appkit {
             CStr::from_ptr(utf8).to_str() == Ok("com.apple.dock")
         }
     }
+
+    /// A media key (volume, play, next, ...) arrives as a system-defined event
+    /// (NSEvent subtype 8) whose data1 packs the NX_KEYTYPE and the key state:
+    /// `(key << 16) | (state << 8)`, state 0xA = down, 0xB = up. Returns
+    /// `(key, down)`, or None for other system-defined events.
+    pub(crate) fn media_key_from_system_event(
+        event: core_graphics::sys::CGEventRef,
+    ) -> Option<(u32, bool)> {
+        const AUX_CONTROL_BUTTONS: i16 = 8;
+        let _pool = autorelease_pool();
+        unsafe {
+            let class = objc_getClass(b"NSEvent\0".as_ptr() as *const c_char);
+            if class.is_null() {
+                return None;
+            }
+            let ns_event = msg_obj1(class, sel(b"eventWithCGEvent:\0"), event as *mut c_void);
+            if ns_event.is_null() {
+                return None;
+            }
+            let subtype: extern "C" fn(*mut c_void, *mut c_void) -> i16 =
+                std::mem::transmute(objc_msgSend as *const ());
+            if subtype(ns_event, sel(b"subtype\0")) != AUX_CONTROL_BUTTONS {
+                return None;
+            }
+            let data1 = msg_i64(ns_event, sel(b"data1\0"));
+            let key = ((data1 >> 16) & 0xFFFF) as u32;
+            match (data1 >> 8) & 0xFF {
+                0xA => Some((key, true)),
+                0xB => Some((key, false)),
+                _ => None,
+            }
+        }
+    }
+
+    /// Post a media key the way the keyboard does: a system-defined event,
+    /// which is what macOS acts on for volume and playback (a key code alone
+    /// does nothing). Marked as ours like every other event this app posts.
+    pub(crate) fn post_media_key(key: u32, down: bool, marker: i64) {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSetIntegerValueField(event: *mut c_void, field: u32, value: i64);
+            fn CGEventPost(tap: u32, event: *mut c_void);
+        }
+        const SYSTEM_DEFINED: u64 = 14;
+        const AUX_CONTROL_BUTTONS: i16 = 8;
+        const EVENT_SOURCE_USER_DATA: u32 = 42;
+        const HID_EVENT_TAP: u32 = 0;
+        let state: i64 = if down { 0xA } else { 0xB };
+        let _pool = autorelease_pool();
+        unsafe {
+            let class = objc_getClass(b"NSEvent\0".as_ptr() as *const c_char);
+            if class.is_null() {
+                return;
+            }
+            let make: extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                u64,
+                core_graphics::geometry::CGPoint,
+                u64,
+                f64,
+                i64,
+                *mut c_void,
+                i16,
+                i64,
+                i64,
+            ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+            let ns_event = make(
+                class,
+                sel(b"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:\0"),
+                SYSTEM_DEFINED,
+                core_graphics::geometry::CGPoint::new(0.0, 0.0),
+                (state << 8) as u64,
+                0.0,
+                0,
+                std::ptr::null_mut(),
+                AUX_CONTROL_BUTTONS,
+                (i64::from(key) << 16) | (state << 8),
+                -1,
+            );
+            if ns_event.is_null() {
+                return;
+            }
+            let cg_event = msg_obj(ns_event, sel(b"CGEvent\0"));
+            if cg_event.is_null() {
+                return;
+            }
+            CGEventSetIntegerValueField(cg_event, EVENT_SOURCE_USER_DATA, marker);
+            CGEventPost(HID_EVENT_TAP, cg_event);
+        }
+    }
 }
 
 fn crossing_target(
@@ -6622,6 +6742,35 @@ fn mac_key_to_windows_vk(code: u16) -> Option<u16> {
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// A Mac media key (IOKit NX_KEYTYPE_*) as the Windows VK the wire carries.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_media_key_to_windows_vk(key: u32) -> Option<u16> {
+    match key {
+        0 => Some(0xAF),       // SOUND_UP -> VK_VOLUME_UP
+        1 => Some(0xAE),       // SOUND_DOWN -> VK_VOLUME_DOWN
+        7 => Some(0xAD),       // MUTE -> VK_VOLUME_MUTE
+        16 => Some(0xB3),      // PLAY -> VK_MEDIA_PLAY_PAUSE
+        17 | 19 => Some(0xB0), // NEXT, FAST -> VK_MEDIA_NEXT_TRACK
+        18 | 20 => Some(0xB1), // PREVIOUS, REWIND -> VK_MEDIA_PREV_TRACK
+        _ => None,
+    }
+}
+
+/// The Mac media key (NX_KEYTYPE_*) for a Windows media VK. A Mac has no stop
+/// key, so VK_MEDIA_STOP pauses.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn windows_vk_to_mac_media_key(vk: u16) -> Option<u32> {
+    match vk {
+        0xAF => Some(0),
+        0xAE => Some(1),
+        0xAD => Some(7),
+        0xB3 | 0xB2 => Some(16),
+        0xB0 => Some(17),
+        0xB1 => Some(18),
+        _ => None,
+    }
+}
+
 fn windows_vk_to_mac_key(code: u16) -> Option<u16> {
     mac_key_to_windows_vk_pairs()
         .iter()
@@ -7434,6 +7583,10 @@ fn inject_key(key_code: u16, down: bool) {
         MAC_INJECT_FLAGS.store(flags, Ordering::Relaxed);
     }
 
+    if let Some(media_key) = windows_vk_to_mac_media_key(key_code) {
+        macos_appkit::post_media_key(media_key, down, MACOS_SELF_EVENT_MARKER);
+        return;
+    }
     let Some(mac_code) = windows_vk_to_mac_key(key_code) else {
         log::debug!("inject_key: no mac keycode for windows vk {key_code:#04x}; dropping");
         return;
@@ -7698,6 +7851,21 @@ fn inject_key(_key_code: u16, _down: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_keys_map_both_ways() {
+        // volume up/down, mute, play, next, previous
+        for (mac, vk) in [(0, 0xAF), (1, 0xAE), (7, 0xAD), (16, 0xB3), (17, 0xB0), (18, 0xB1)] {
+            assert_eq!(mac_media_key_to_windows_vk(mac), Some(vk));
+            assert_eq!(windows_vk_to_mac_media_key(vk), Some(mac));
+        }
+        // fast-forward/rewind ride next/previous; brightness is not a media key
+        assert_eq!(mac_media_key_to_windows_vk(19), Some(0xB0));
+        assert_eq!(mac_media_key_to_windows_vk(20), Some(0xB1));
+        assert_eq!(mac_media_key_to_windows_vk(2), None);
+        // a letter is not a media key
+        assert_eq!(windows_vk_to_mac_media_key(0x41), None);
+    }
 
     #[test]
     fn input_desktop_switch_needs_three_misses_in_a_row() {
