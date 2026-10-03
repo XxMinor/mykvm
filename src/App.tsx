@@ -181,6 +181,8 @@ interface FileTransferProgressEntry {
   error: string | null;
 }
 
+const INPUT_SERVICE_OFFER_DISMISSED_KEY = "mykvm.inputServiceOfferDismissed";
+
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -209,6 +211,15 @@ function App() {
   const [isInputServicePending, setIsInputServicePending] = useState(false);
   const [inputServiceAction, setInputServiceAction] =
     useState<InputServiceAction | null>(null);
+  const [inputServiceOfferDismissed, setInputServiceOfferDismissed] = useState(
+    () => {
+      try {
+        return Boolean(localStorage.getItem(INPUT_SERVICE_OFFER_DISMISSED_KEY));
+      } catch {
+        return true;
+      }
+    },
+  );
   const [boardZoom, setBoardZoom] = useState(1);
   const [manualDeviceName, setManualDeviceName] = useState("");
   const [manualDeviceHost, setManualDeviceHost] = useState("");
@@ -740,12 +751,34 @@ function App() {
     : inputServiceInstalled
       ? ui.settings.inputServiceInstalledStatus
       : ui.settings.inputServiceNeedsInstall;
-  const canManageInputService =
-    usesWindowsChrome &&
-    machineRole === "client" &&
-    Boolean(runtime?.privilege.isElevated);
+  // Install/uninstall elevate on their own (one UAC prompt), so the app does
+  // not have to be running as administrator.
+  const canManageInputService = usesWindowsChrome && machineRole === "client";
+  // Without the input service a Windows client cannot be controlled while
+  // MyKVM restarts (every update) or before sign-in: offer it until it is
+  // installed or the offer is dismissed (remembered across launches).
+  const offerInputService =
+    canManageInputService &&
+    Boolean(runtime) &&
+    !inputServiceInstalled &&
+    !inputServiceOfferDismissed;
+  const shownInputServiceAction: InputServiceAction | null =
+    inputServiceAction ?? (offerInputService ? "install" : null);
+
+  function closeInputServicePrompt() {
+    if (shownInputServiceAction === "install" && !inputServiceInstalled) {
+      setInputServiceOfferDismissed(true);
+      try {
+        localStorage.setItem(INPUT_SERVICE_OFFER_DISMISSED_KEY, "1");
+      } catch {
+        // Storage unavailable: the offer shows again next launch.
+      }
+    }
+    setInputServiceAction(null);
+  }
+
   const hasBlockingOverlay =
-    Boolean(inputServiceAction) ||
+    Boolean(shownInputServiceAction) ||
     Boolean(errorMessage) ||
     isScanningLan ||
     Boolean(serverPairing) ||
@@ -2134,7 +2167,7 @@ function App() {
           <button
             type="button"
             className="pairing-close-button"
-            onClick={() => setInputServiceAction(null)}
+            onClick={closeInputServicePrompt}
             disabled={isInputServicePending}
             title={ui.common.cancel}
             aria-label={ui.common.cancel}
@@ -2162,7 +2195,7 @@ function App() {
             <button
               type="button"
               className="secondary-button compact-button"
-              onClick={() => setInputServiceAction(null)}
+              onClick={closeInputServicePrompt}
               disabled={isInputServicePending}
             >
               {ui.common.cancel}
@@ -2361,7 +2394,9 @@ function App() {
       {errorMessage ? renderErrorDialog(errorMessage) : null}
       {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
       {renderFileTransferToasts()}
-      {inputServiceAction ? renderInputServicePrompt(inputServiceAction) : null}
+      {shownInputServiceAction
+        ? renderInputServicePrompt(shownInputServiceAction)
+        : null}
 
       {machineRole === "server" && currentTab === "layout" ? (
         <section className="workspace-shell">

@@ -106,7 +106,7 @@ export const TEXT = {
       inputServiceEyebrow: "Windows LocalSystem",
       inputServicePromptTitle: "安装无人值守控制服务",
       inputServicePromptCopy:
-        "安装后，这台 Windows 从开机 PIN 登录界面开始即可被已配对设备控制，并继续支持锁屏和 UAC。安装会请求一次管理员授权。",
+        "安装后，这台 Windows 从开机 PIN 登录界面开始即可被已配对设备控制，锁屏、UAC 和 MyKVM 更新重启期间也不会断开。安装会请求一次管理员授权，第一次需要在这台电脑上点“是”。",
       uninstallInputServicePromptTitle: "卸载无人值守控制服务",
       uninstallInputServicePromptCopy:
         "卸载后，这台 Windows 在登录前、锁屏和 UAC 界面将不能接收远端键鼠输入。",
@@ -350,7 +350,7 @@ export const TEXT = {
       inputServiceEyebrow: "Windows LocalSystem",
       inputServicePromptTitle: "Install Unattended Control",
       inputServicePromptCopy:
-        "Once installed, this Windows client can be controlled by an already paired device from the first PIN screen after boot, as well as on the lock screen and UAC desktop. Installing requests administrator approval once.",
+        "Once installed, this Windows client can be controlled by an already paired device from the first PIN screen after boot, and it stays controllable on the lock screen, the UAC desktop and while MyKVM restarts for an update. Installing requests administrator approval once; the first time, click Yes on this PC.",
       uninstallInputServicePromptTitle: "Uninstall Unattended Control",
       uninstallInputServicePromptCopy:
         "After uninstalling, this Windows client cannot receive remote keyboard or mouse input before sign-in, on the lock screen, or on the UAC desktop.",
