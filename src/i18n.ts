@@ -87,6 +87,9 @@ export const TEXT = {
       openLogDirectory: "打开日志目录",
       fetchClientLog: "拉取客户端日志",
       fetchServerLog: "拉取服务端日志",
+      clientUpdateAvailable: "可更新",
+      updateClient: "更新",
+      updateClientSent: "已请求更新，客户端装完会自动重新连接。",
       fetchClientLogSent: "已请求日志，稍候将出现在「MyKVM Remote Logs」文件夹。",
       fetchClientLogNoTarget: "没有在线的对端可拉取日志。",
       name: "名称",
@@ -126,6 +129,9 @@ export const TEXT = {
       fileTransfer: "文件传输 (bate)",
       fileTransferCopy:
         "将文件或文件夹拖到相邻屏幕即可跨设备传输，落在哪个设备上就送到哪台。",
+      lockSync: "锁屏同步",
+      lockSyncCopy:
+        "本机锁屏时，同时锁定在线的客户端。只同步锁屏，解锁仍需在每台电脑上各自输入密码。",
       modifierTitle: "跨平台改键",
       modifierCopy:
         "本机作为控制端时，发往不同系统对端的修饰键映射（仅 Win↔Mac 跨平台时生效）。默认 Ctrl↔Command 对调，让复制、粘贴、全选等快捷键沿用各自系统习惯。",
@@ -325,6 +331,9 @@ export const TEXT = {
       openLogDirectory: "Open Log Folder",
       fetchClientLog: "Fetch Client Log",
       fetchServerLog: "Fetch Server Log",
+      clientUpdateAvailable: "Update available",
+      updateClient: "Update",
+      updateClientSent: "Update requested; the client reconnects on its own once installed.",
       fetchClientLogSent: "Log requested; it will appear in the \"MyKVM Remote Logs\" folder shortly.",
       fetchClientLogNoTarget: "No online peer to fetch a log from.",
       name: "Name",
@@ -364,6 +373,9 @@ export const TEXT = {
       fileTransfer: "File Transfer (bate)",
       fileTransferCopy:
         "Drag files or folders onto an adjacent screen to transfer them across devices — wherever they land is where they go.",
+      lockSync: "Lock sync",
+      lockSyncCopy:
+        "Locking this computer also locks the online clients. Only locking is synced; each computer still unlocks with its own password.",
       modifierTitle: "Cross-platform Keys",
       modifierCopy:
         "When this machine controls a peer on a different OS, remap modifier keys (only applies across Win↔Mac). The default swaps Ctrl↔Command so copy, paste, and select-all keep each platform's shortcut habits.",

@@ -50,6 +50,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Test frontend
+        run: npm test
+
       - name: Check Tauri backend
         run: cargo check --manifest-path src-tauri/Cargo.toml --workspace --all-targets --locked
 

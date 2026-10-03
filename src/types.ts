@@ -75,6 +75,8 @@ export interface LayoutState {
   pairedControllers: PairedController[]
   clipboardSync: boolean
   fileTransferEnabled: boolean
+  /** Controller: locking this machine locks its online clients too. */
+  lockSync?: boolean
   language: AppLanguage
   themeMode: ThemeMode
   performanceMonitor: boolean

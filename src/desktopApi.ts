@@ -297,6 +297,14 @@ export async function sendFilesToDevice(deviceId: string, paths: string[]): Prom
   return invoke<FileTransferSummary>('send_files_to_device', { deviceId, paths })
 }
 
+export async function requestClientUpdate(deviceId: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('request_client_update', { deviceId })
+}
+
 export async function fetchClientLog(deviceId: string): Promise<string> {
   if (!isTauri()) {
     return ''

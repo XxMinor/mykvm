@@ -37,6 +37,7 @@ import {
   saveLayout,
   sendFilesToDevice,
   fetchClientLog,
+  requestClientUpdate,
   setAutostart,
   scanLanPeers,
   startRuntime,
@@ -48,6 +49,7 @@ import {
   writeClipboardText,
 } from "./desktopApi";
 import type { AppUpdateInfo } from "./desktopApi";
+import { compareVersions } from "./versions";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
@@ -980,6 +982,18 @@ function App() {
     }
   }
 
+  async function handleRequestClientUpdate(deviceId: string) {
+    setErrorMessage(null);
+    try {
+      await requestClientUpdate(deviceId);
+      setFileTransferMessage(ui.settings.updateClientSent);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    }
+  }
+
   async function handleFetchClientLog() {
     const layout = snapshotRef.current?.layout;
     // A server fetches its online clients' logs; a client its controller's.
@@ -1468,6 +1482,10 @@ function App() {
       ...layoutState,
       fileTransferEnabled,
     }));
+  }
+
+  function setLockSync(lockSync: boolean) {
+    updateLayout((layoutState) => ({ ...layoutState, lockSync }));
   }
 
   function setModifierRemap(modifierRemap: boolean) {
@@ -2519,6 +2537,14 @@ function App() {
                   const addedDevice = findPeerDevice(layout, peer);
                   const screenCount =
                     peer.screens.length || addedDevice?.screens.length || 0;
+                  // A client older than this controller can be updated from here.
+                  const localVersion = runtime.discovery.localPeer.appVersion;
+                  const canUpdatePeer =
+                    machineRole === "server" &&
+                    Boolean(addedDevice) &&
+                    !addedDevice?.upgrading &&
+                    Boolean(peer.appVersion && localVersion) &&
+                    compareVersions(peer.appVersion, localVersion) < 0;
 
                   return (
                     <article
@@ -2546,6 +2572,11 @@ function App() {
                                   {ui.devices.inputNotReady}
                                 </span>
                               ) : null}
+                              {canUpdatePeer ? (
+                                <span className="tag-pill tag-pill-warning">
+                                  {ui.settings.clientUpdateAvailable}
+                                </span>
+                              ) : null}
                             </div>
                           </div>
                           <p className="connection-meta">
@@ -2558,6 +2589,15 @@ function App() {
                       </div>
 
                       <div className="connection-actions">
+                        {canUpdatePeer && addedDevice ? (
+                          <button
+                            type="button"
+                            className="primary-button compact-button"
+                            onClick={() => void handleRequestClientUpdate(addedDevice.id)}
+                          >
+                            {ui.settings.updateClient}
+                          </button>
+                        ) : null}
                         {addedDevice ? (
                           renderAddedDeviceActions(addedDevice)
                         ) : (
@@ -2880,6 +2920,35 @@ function App() {
                     </button>
                   </div>
                 </div>
+                {machineRole === "server" ? (
+                  <div className="settings-control-row">
+                    <span>
+                      {ui.settings.lockSync}
+                      <span className="info-tooltip-host" tabIndex={0}>
+                        ⓘ
+                        <span className="info-tooltip">
+                          {ui.settings.lockSyncCopy}
+                        </span>
+                      </span>
+                    </span>
+                    <div className="segmented-control">
+                      <button
+                        type="button"
+                        className={layout.lockSync ? "active" : ""}
+                        onClick={() => setLockSync(true)}
+                      >
+                        {ui.common.enabled}
+                      </button>
+                      <button
+                        type="button"
+                        className={!layout.lockSync ? "active" : ""}
+                        onClick={() => setLockSync(false)}
+                      >
+                        {ui.common.disabled}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
                 {machineRole === "client" ? (
                   <div className="settings-control-row paired-controller-row">
                     <span className="paired-controller-label">

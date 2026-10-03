@@ -76,6 +76,11 @@ const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
 const LOG_REQUEST_PROTOCOL: &str = "mykvm.log-request.v1";
+// A paired controller asks a client to update itself (it runs its own updater,
+// so the update is still verified against this app's updater key).
+const REMOTE_UPDATE_PROTOCOL: &str = "mykvm.remote-update.v1";
+// Lock sync: the controller locked its screen and asks its clients to lock too.
+const LOCK_SCREEN_PROTOCOL: &str = "mykvm.lock-screen.v1";
 // A paired peer asks for this device's recent log; the reply is the tail of the
 // device's newest log file, streamed back over the file-transfer path.
 const CLIENT_LOG_TAIL_BYTES: u64 = 512 * 1024;
@@ -249,6 +254,9 @@ struct LayoutState {
     clipboard_sync: bool,
     #[serde(default = "default_file_transfer_enabled")]
     file_transfer_enabled: bool,
+    /// Controller: locking this machine locks its online clients too.
+    #[serde(default)]
+    lock_sync: bool,
     #[serde(default = "default_language")]
     language: String,
     #[serde(default = "default_theme_mode")]
@@ -831,7 +839,7 @@ impl AppRuntime {
                 return true;
             }
 
-            if handle_log_request_packet(
+            if handle_peer_request_packet(
                 &payload,
                 &layout,
                 &current_peer.id,
@@ -1723,7 +1731,10 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
 
     Ok(DiagnosticInfo {
         report: lines.join("\n"),
-        app_version: env!("CARGO_PKG_VERSION").into(),
+        app_version: APP_VERSION
+            .get()
+            .cloned()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
         platform: current_platform().into(),
         role: layout.machine_role,
         runtime_started: runtime.started,
@@ -2376,27 +2387,154 @@ fn send_files_to_device_inner(
 /// Ask an online peer (a client, or the paired controller) for its recent log.
 /// The log arrives asynchronously in the "MyKVM Remote Logs" folder (which this
 /// opens); returns its path.
-#[tauri::command]
-fn fetch_client_log(
-    device_id: String,
-    state: tauri::State<'_, AppRuntime>,
-) -> Result<String, String> {
-    let state = state.inner();
+/// Lock sync (controller side): when this machine locks, ask its online
+/// clients to lock as well. Polled, since neither platform hands a lock to a
+/// tray app without a window to receive it.
+fn spawn_lock_sync_watcher(app: AppHandle) {
+    let _ = thread::Builder::new()
+        .name("mykvm-lock-sync".into())
+        .spawn(move || {
+            let mut was_locked = local_screen_locked();
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let locked = local_screen_locked();
+                if locked && !was_locked {
+                    if let Some(state) = app.try_state::<AppRuntime>() {
+                        lock_online_clients(state.inner());
+                    }
+                }
+                was_locked = locked;
+            }
+        });
+}
+
+fn lock_online_clients(state: &AppRuntime) {
+    let layout = state.layout_snapshot();
+    if layout.machine_role != "server" || !layout.lock_sync {
+        return;
+    }
+    for device in layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local" && device.online)
+    {
+        match send_peer_request(state, &device.id, LOCK_SCREEN_PROTOCOL) {
+            Ok(()) => log::info!("lock sync: locked {}", device.name),
+            Err(error) => log::warn!("lock sync: could not lock {}: {error}", device.name),
+        }
+    }
+}
+
+/// Whether this machine's session is locked. Windows: the session's lock flag
+/// (not the input desktop, which a UAC prompt switches too).
+#[cfg(target_os = "windows")]
+fn local_screen_locked() -> bool {
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW,
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK,
+    };
+    unsafe {
+        let mut buffer: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let mut bytes = 0_u32;
+        if WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            WTS_CURRENT_SESSION,
+            WTSSessionInfoEx,
+            &mut buffer,
+            &mut bytes,
+        ) == 0
+            || buffer.is_null()
+        {
+            return false;
+        }
+        let info = &*(buffer as *const WTSINFOEXW);
+        let locked = info.Level == 1
+            && info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32;
+        WTSFreeMemory(buffer as *mut std::ffi::c_void);
+        locked
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn local_screen_locked() -> bool {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+    }
+    let raw = unsafe { CGSessionCopyCurrentDictionary() };
+    if raw.is_null() {
+        return false;
+    }
+    let session: CFDictionary<CFString, CFType> = unsafe { TCFType::wrap_under_create_rule(raw) };
+    session
+        .find(CFString::from_static_string("CGSSessionScreenIsLocked"))
+        .and_then(|value| value.downcast::<CFBoolean>())
+        .map(bool::from)
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn local_screen_locked() -> bool {
+    false
+}
+
+/// Lock this machine's screen (lock sync, client side).
+#[cfg(target_os = "windows")]
+fn lock_local_screen() {
+    if unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() } == 0 {
+        log::warn!("lock sync: LockWorkStation failed");
+    }
+}
+
+/// The login framework's SACLockScreenImmediate is what the menu bar's Lock
+/// Screen calls; if it is ever gone, press its shortcut (Ctrl+Cmd+Q) instead.
+#[cfg(target_os = "macos")]
+fn lock_local_screen() {
+    use std::os::raw::{c_char, c_int, c_void};
+    extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    const RTLD_LAZY: c_int = 1;
+    unsafe {
+        let framework = dlopen(
+            b"/System/Library/PrivateFrameworks/login.framework/Versions/Current/login\0".as_ptr()
+                as *const c_char,
+            RTLD_LAZY,
+        );
+        if !framework.is_null() {
+            let lock = dlsym(framework, b"SACLockScreenImmediate\0".as_ptr() as *const c_char);
+            if !lock.is_null() {
+                let lock: extern "C" fn() -> c_int = std::mem::transmute(lock);
+                lock();
+                return;
+            }
+        }
+    }
+    input::post_lock_screen_shortcut();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn lock_local_screen() {}
+
+/// Send a paired peer a request (`protocol`) over the stream channel.
+fn send_peer_request(state: &AppRuntime, device_id: &str, protocol: &str) -> Result<(), String> {
     state.start_discovery()?;
     let layout = state.layout_snapshot();
-    if !layout.file_transfer_enabled {
-        return Err("文件传输未开启，无法拉取日志。".into());
-    }
     let mut local_peer = local_peer_from_layout(&layout);
     let quic_transport = state
         .quic_transport_handle()
         .ok_or_else(|| "QUIC transport is not ready; start the runtime first.".to_string())?;
     apply_transport_to_peer(&mut local_peer, &quic_transport);
     let peers = active_peer_snapshot(&state.peers);
-    let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
+    let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
 
-    let packet = LogRequestPacket {
-        protocol: LOG_REQUEST_PROTOCOL.into(),
+    let packet = PeerRequestPacket {
+        protocol: protocol.into(),
         origin_id: local_peer.id.clone(),
         target_id: target.device_id.clone(),
         cluster_id: target.cluster_id.clone(),
@@ -2408,14 +2546,39 @@ fn fetch_client_log(
         target.transport_public_key.clone(),
         target.protocol_version,
     );
-    quic_transport
-        .send_stream_expect_ack(peer, payload)
+    quic_transport.send_stream_expect_ack(peer, payload)
+}
+
+/// Ask an online peer (a client, or the paired controller) for its recent log.
+/// The log arrives asynchronously in the "MyKVM Remote Logs" folder (which this
+/// opens); returns its path.
+#[tauri::command]
+fn fetch_client_log(
+    device_id: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<String, String> {
+    let state = state.inner();
+    if !state.layout_snapshot().file_transfer_enabled {
+        return Err("文件传输未开启，无法拉取日志。".into());
+    }
+    send_peer_request(state, &device_id, LOG_REQUEST_PROTOCOL)
         .map_err(|error| format!("拉取日志失败: {error}"))?;
 
     let dir = client_log_dir(&state.app_handle)?;
     let _ = fs::create_dir_all(&dir);
     let _ = open_external_path(&dir);
     Ok(dir.to_string_lossy().into_owned())
+}
+
+/// Ask a client to update itself; it installs the release its own updater
+/// finds and restarts, while the controller keeps control through the hand-off.
+#[tauri::command]
+fn request_client_update(
+    device_id: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    send_peer_request(state.inner(), &device_id, REMOTE_UPDATE_PROTOCOL)
+        .map_err(|error| format!("请求客户端更新失败: {error}"))
 }
 
 #[tauri::command]
@@ -3290,6 +3453,8 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            let _ = APP_VERSION.set(app.package_info().version.to_string());
+            spawn_lock_sync_watcher(app.handle().clone());
             let silent_launch = launched_from_autostart();
             #[cfg(target_os = "macos")]
             {
@@ -3556,6 +3721,7 @@ pub fn run() {
             send_secure_attention,
             send_files_to_device,
             fetch_client_log,
+            request_client_update,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -4982,6 +5148,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
         file_transfer_enabled: default_file_transfer_enabled(),
+        lock_sync: false,
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -5025,6 +5192,7 @@ fn detect_fallback_layout() -> LayoutState {
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
         file_transfer_enabled: default_file_transfer_enabled(),
+        lock_sync: false,
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -5334,6 +5502,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         paired_controllers: normalize_paired_controllers(saved_layout.paired_controllers),
         clipboard_sync: saved_layout.clipboard_sync,
         file_transfer_enabled: saved_layout.file_transfer_enabled,
+        lock_sync: saved_layout.lock_sync,
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
         performance_monitor: saved_layout.performance_monitor,
@@ -7294,11 +7463,12 @@ fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, Str
     Ok(temp_path)
 }
 
-// Control channel: a paired peer asks a device for its recent log. The reply
-// travels back as an ordinary file transfer tagged `client_log`.
+// Control channel: a paired peer asks this device for something — its recent
+// log (sent back as an ordinary file transfer tagged `client_log`) or, from
+// its controller, to update itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LogRequestPacket {
+struct PeerRequestPacket {
     protocol: String,
     origin_id: String,
     target_id: String,
@@ -7306,43 +7476,82 @@ struct LogRequestPacket {
     pair_secret: String,
 }
 
-/// Device side: a paired peer asked for our log. Reuses the file-transfer trust
-/// checks, then streams our log tail back on a thread (the stream handler must
-/// not block on the round-trip). Returns true if the packet was a log request
-/// addressed to us.
-fn handle_log_request_packet(
-    payload: &[u8],
+/// What a paired peer may ask of this device.
+#[derive(Debug, PartialEq)]
+enum PeerRequest {
+    Log,
+    Update,
+    Lock,
+}
+
+/// Whether `packet` may ask this device for anything, and what (`None` =
+/// refuse). File-transfer trust (same cluster and pair secret) plus: a client
+/// answers only a controller it is paired with — an unpaired client that kept
+/// its old secret answers no one — only a client can be asked to update, and a
+/// log needs file transfer, since it travels back as one.
+fn authorize_peer_request(
+    packet: &PeerRequestPacket,
     layout: &LayoutState,
     local_peer_id: &str,
-    app: &AppHandle,
-) -> bool {
-    let Some(packet) = decode_wire_packet::<LogRequestPacket>(payload) else {
-        return false;
+) -> Option<PeerRequest> {
+    let request = match packet.protocol.as_str() {
+        LOG_REQUEST_PROTOCOL if layout.file_transfer_enabled => PeerRequest::Log,
+        REMOTE_UPDATE_PROTOCOL if layout.machine_role == "client" => PeerRequest::Update,
+        LOCK_SCREEN_PROTOCOL if layout.machine_role == "client" => PeerRequest::Lock,
+        _ => return None,
     };
-    if packet.protocol != LOG_REQUEST_PROTOCOL {
-        return false;
-    }
-    if !layout.file_transfer_enabled {
-        return true;
-    }
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
         || packet.pair_secret != layout.pair_secret
     {
-        return true;
+        return None;
     }
     if layout.machine_role == "client"
-        && !layout.paired_controllers.is_empty()
         && !layout
             .paired_controllers
             .iter()
             .any(|controller| controller.id == packet.origin_id)
     {
-        return true;
+        return None;
     }
     if packet.target_id != local_peer_id || packet.origin_id == local_peer_id {
-        return true;
+        return None;
+    }
+    Some(request)
+}
+
+/// Device side of a peer request: authorize, then do the work off the stream
+/// handler (it must not block on a round-trip). Returns true if the packet was
+/// a peer request.
+fn handle_peer_request_packet(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    app: &AppHandle,
+) -> bool {
+    let Some(packet) = decode_wire_packet::<PeerRequestPacket>(payload) else {
+        return false;
+    };
+    if !matches!(
+        packet.protocol.as_str(),
+        LOG_REQUEST_PROTOCOL | REMOTE_UPDATE_PROTOCOL | LOCK_SCREEN_PROTOCOL
+    ) {
+        return false;
+    }
+    match authorize_peer_request(&packet, layout, local_peer_id) {
+        None => return true,
+        Some(PeerRequest::Update) => {
+            log::info!("update requested by controller {}", packet.origin_id);
+            run_requested_update(app.clone());
+            return true;
+        }
+        Some(PeerRequest::Lock) => {
+            log::info!("lock sync: controller {} locked its screen", packet.origin_id);
+            lock_local_screen();
+            return true;
+        }
+        Some(PeerRequest::Log) => {}
     }
 
     let device_name = local_peer_from_layout(layout).name;
@@ -7369,6 +7578,54 @@ fn handle_log_request_packet(
         let _ = fs::remove_file(&temp_path);
     });
     true
+}
+
+/// Check, download and install the release this app's own updater finds (so
+/// it is verified against our updater key), handing the network over first.
+/// On Windows `install` ends this process and the installer restarts it.
+fn run_requested_update(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        use tauri_plugin_updater::UpdaterExt;
+        let state = app.state::<AppRuntime>();
+        let update = match app
+            .updater_builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|error| error.to_string())
+        {
+            Ok(updater) => updater.check().await.map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        let update = match update {
+            Ok(Some(update)) => update,
+            Ok(None) => {
+                log::info!("requested update: already on the latest release");
+                return;
+            }
+            Err(error) => {
+                log::warn!("requested update: check failed: {error}");
+                return;
+            }
+        };
+        log::info!("requested update: installing {}", update.version);
+        state.upgrading.store(true, Ordering::Relaxed);
+        let bytes = match update.download(|_, _| {}, || {}).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!("requested update: download failed: {error}");
+                state.upgrading.store(false, Ordering::Relaxed);
+                return;
+            }
+        };
+        state.hand_off_network();
+        if let Err(error) = update.install(bytes) {
+            log::warn!("requested update: install failed: {error}");
+            state.upgrading.store(false, Ordering::Relaxed);
+            let _ = start_runtime_inner(state.inner());
+            return;
+        }
+        app.restart();
+    });
 }
 
 #[cfg(test)]
@@ -8055,10 +8312,18 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         screens: local_device
             .map(|device| device.screens.iter().map(screen_to_peer_screen).collect())
             .unwrap_or_default(),
-        app_version: env!("CARGO_PKG_VERSION").into(),
+        app_version: APP_VERSION
+            .get()
+            .cloned()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
         last_seen_ms: now_ms(),
     }
 }
+
+/// The version peers see (and a controller compares to offer an update): the
+/// app's own version, which a build's config can set without touching
+/// Cargo.toml. Set once at startup.
+static APP_VERSION: OnceLock<String> = OnceLock::new();
 
 fn apply_transport_to_peer(peer: &mut LanPeer, transport: &quic_transport::TransportHandle) {
     peer.quic_port = transport.port();
@@ -9356,6 +9621,7 @@ mod tests {
 
     fn test_layout() -> LayoutState {
         LayoutState {
+            lock_sync: false,
             devices: vec![
                 Device {
                     id: "local-device".into(),
@@ -10618,6 +10884,79 @@ mod tests {
             drag_drop: false,
             client_log: false,
         }
+    }
+
+    fn peer_request(protocol: &str, origin: &str) -> PeerRequestPacket {
+        PeerRequestPacket {
+            protocol: protocol.into(),
+            origin_id: origin.into(),
+            target_id: "local-device".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+        }
+    }
+
+    fn paired_client_layout() -> LayoutState {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.cluster_id = "cluster-test".into();
+        layout.pair_secret = "secret-test".into();
+        layout.file_transfer_enabled = true;
+        layout.paired_controllers = vec![PairedController {
+            id: "controller".into(),
+            name: "Controller".into(),
+            host: "controller.local".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: 0,
+        }];
+        layout
+    }
+
+    #[test]
+    fn only_the_paired_controller_can_update_a_client() {
+        let layout = paired_client_layout();
+        let update = |packet: &PeerRequestPacket, layout: &LayoutState| {
+            authorize_peer_request(packet, layout, "local-device")
+        };
+        assert_eq!(
+            update(&peer_request(REMOTE_UPDATE_PROTOCOL, "controller"), &layout),
+            Some(PeerRequest::Update)
+        );
+        assert_eq!(
+            update(&peer_request(LOG_REQUEST_PROTOCOL, "controller"), &layout),
+            Some(PeerRequest::Log)
+        );
+        // Another device that knows the secret is not the paired controller.
+        assert_eq!(update(&peer_request(REMOTE_UPDATE_PROTOCOL, "other"), &layout), None);
+        // A wrong secret, or a request meant for another device.
+        let mut wrong_secret = peer_request(REMOTE_UPDATE_PROTOCOL, "controller");
+        wrong_secret.pair_secret = "guess".into();
+        assert_eq!(update(&wrong_secret, &layout), None);
+        let mut elsewhere = peer_request(REMOTE_UPDATE_PROTOCOL, "controller");
+        elsewhere.target_id = "someone-else".into();
+        assert_eq!(update(&elsewhere, &layout), None);
+        // Unpaired (paired list cleared, secret kept): answers no one.
+        let mut unpaired = layout.clone();
+        unpaired.paired_controllers.clear();
+        assert_eq!(update(&peer_request(REMOTE_UPDATE_PROTOCOL, "controller"), &unpaired), None);
+        // Lock sync: the paired controller may lock a client, nobody else may.
+        assert_eq!(
+            update(&peer_request(LOCK_SCREEN_PROTOCOL, "controller"), &layout),
+            Some(PeerRequest::Lock)
+        );
+        assert_eq!(update(&peer_request(LOCK_SCREEN_PROTOCOL, "other"), &layout), None);
+        // A server is never updated or locked by a peer; no log without file
+        // transfer.
+        let mut server = layout.clone();
+        server.machine_role = "server".into();
+        assert_eq!(update(&peer_request(REMOTE_UPDATE_PROTOCOL, "controller"), &server), None);
+        assert_eq!(update(&peer_request(LOCK_SCREEN_PROTOCOL, "controller"), &server), None);
+        let mut no_transfer = layout.clone();
+        no_transfer.file_transfer_enabled = false;
+        assert_eq!(update(&peer_request(LOG_REQUEST_PROTOCOL, "controller"), &no_transfer), None);
     }
 
     #[test]

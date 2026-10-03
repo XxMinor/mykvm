@@ -4587,6 +4587,25 @@ fn dismiss_macos_dock_ui_if_up() {
 /// Cancels the in-flight local drag session (Escape is the native drag
 /// cancel), so Finder's drag doesn't stay stuck mid-air while the pointer
 /// lives on the remote screen.
+/// Ctrl+Cmd+Q, macOS's Lock Screen shortcut (lock sync fallback).
+#[cfg(target_os = "macos")]
+pub(crate) fn post_lock_screen_shortcut() {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, EventField};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    const Q_KEYCODE: u16 = 12;
+    for down in [true, false] {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            return;
+        };
+        if let Ok(event) = CGEvent::new_keyboard_event(source, Q_KEYCODE, down) {
+            event.set_flags(CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagCommand);
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
+            event.post(CGEventTapLocation::HID);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn post_marked_escape_key() {
     use core_graphics::event::{CGEvent, CGEventTapLocation, EventField};
@@ -7987,6 +8006,7 @@ mod tests {
 
     fn layout_for_target_tests() -> LayoutState {
         LayoutState {
+            lock_sync: false,
             devices: vec![
                 Device {
                     id: "local-device".into(),
