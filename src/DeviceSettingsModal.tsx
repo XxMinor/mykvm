@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { FormModal } from './FormModal'
+import { InfoTip } from './InfoTip'
 import type { Device } from './types'
 
 const POINTER_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2]
@@ -27,16 +28,15 @@ export function DeviceSettingsModal({ device, language, onClose, onSave, onRepai
   return <FormModal title={cn ? '设备设置' : 'Device settings'} description={device.name} pending={pending} onClose={onClose}>
     <form onSubmit={event => { event.preventDefault(); void save() }}>
       <div className="modal-field-grid">
-        <label className="modal-field"><span>{cn ? '指针速度' : 'Pointer speed'}</span>
-          <select value={pointerSpeed} disabled={pending} onChange={event => setPointerSpeed(Number(event.target.value))}>
+        <div className="modal-field"><div><label htmlFor="device-pointer-speed">{cn ? '指针速度' : 'Pointer speed'}</label><InfoTip label={cn ? '速度说明' : 'Speed help'} text={cn ? '1× 保持原始速度。' : '1× keeps the original speed.'} /></div>
+          <select id="device-pointer-speed" value={pointerSpeed} disabled={pending} onChange={event => setPointerSpeed(Number(event.target.value))}>
             {POINTER_SPEEDS.map(speed => <option key={speed} value={speed}>{speed}×{speed === 1 ? (cn ? '（默认）' : ' (default)') : ''}</option>)}
-          </select></label>
+          </select></div>
         <label className="modal-field"><span>{cn ? '滚轮速度' : 'Scroll speed'}</span>
           <select value={scrollSpeed} disabled={pending} onChange={event => setScrollSpeed(Number(event.target.value))}>
             {SCROLL_SPEEDS.map(speed => <option key={speed} value={speed}>{speed}×{speed === 1 ? (cn ? '（默认）' : ' (default)') : ''}</option>)}
           </select></label>
       </div>
-      <p className="modal-help">{cn ? '调整控制这台设备时的鼠标速度。1× 保持原始速度。' : 'Adjust mouse speed when controlling this device. 1× keeps the original speed.'}</p>
       <div className="modal-maintenance"><span>{cn ? '连接维护' : 'Connection maintenance'}</span>
         <div><button type="button" className="secondary-button compact-button" disabled={pending} onClick={onRepair}>{cn ? '重新配对' : 'Re-pair'}</button>
           <button type="button" className="secondary-button compact-button danger-button" disabled={pending} onClick={onRemove}>{cn ? '移除设备' : 'Remove device'}</button></div>

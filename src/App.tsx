@@ -1,4 +1,5 @@
 import { DeviceSettingsModal } from "./DeviceSettingsModal";
+import { HelpHeading, InfoTip } from "./InfoTip";
 import {
   type CSSProperties,
   type FormEvent,
@@ -45,7 +46,6 @@ import {
   startWindowDrag,
   stopRuntime,
   cancelFileTransfer,
-  pasteRemoteClipboard,
   syncWindowChrome,
   toggleMaximizeMainWindow,
   uninstallInputService,
@@ -1530,6 +1530,8 @@ function App() {
     updateLayout((layoutState) => ({
       ...layoutState,
       clipboardSync,
+      clipboardOnDemand: false,
+      clipboardPasteHotkey: "disabled",
     }));
   }
 
@@ -2527,19 +2529,10 @@ function App() {
 
       {machineRole === "server" && currentTab === "devices" ? (
         <section className="page-panel">
-          <div className="page-heading">
-            <div>
-              <p className="eyebrow">{ui.devices.eyebrow}</p>
-              <h1>{ui.devices.title}</h1>
-              <p>{ui.devices.subtitle}</p>
-            </div>
-          </div>
-
           <div className="connection-stack">
             <section className="surface-card connection-add-card">
               <div>
-                <h2>{ui.devices.addTitle}</h2>
-                <p>{ui.devices.addCopy}</p>
+                <HelpHeading label={ui.devices.addTitle} text={ui.devices.addCopy} />
               </div>
               <form
                 className="add-device-form"
@@ -2556,6 +2549,7 @@ function App() {
                   aria-label={ui.devices.hostPlaceholder}
                   onChange={(event) => setManualDeviceHost(event.target.value)}
                   placeholder={ui.devices.hostPlaceholder}
+                  title={ui.devices.hostHelp}
                 />
                 <button
                   type="button"
@@ -2718,18 +2712,10 @@ function App() {
 
       {currentTab === "settings" ? (
         <section className="page-panel">
-          <div className="page-heading">
-            <div>
-              <p className="eyebrow">{ui.settings.eyebrow}</p>
-              <h1>{ui.settings.title}</h1>
-              <p>{ui.settings.subtitle}</p>
-            </div>
-          </div>
-
           <div className="settings-layout">
             <div className="settings-column">
               <section className="surface-card settings-card">
-                <h2>{ui.settings.roleTitle}</h2>
+                <HelpHeading label={ui.settings.roleTitle} text={ui.settings.roleCopy} />
                 <div className="role-switcher">
                   <button
                     type="button"
@@ -2746,12 +2732,10 @@ function App() {
                     {ui.roles.client}
                   </button>
                 </div>
-                <p className="muted-copy">{ui.settings.roleCopy}</p>
               </section>
 
               <section className="surface-card settings-card">
-                <h2>{ui.settings.transport}</h2>
-                <p className="muted-copy">{ui.settings.transportCopy}</p>
+                <HelpHeading label={ui.settings.transport} text={ui.settings.transportCopy} />
                 <div className="settings-control-row">
                   <span>{ui.settings.portMode}</span>
                   <div className="segmented-control">
@@ -2772,7 +2756,7 @@ function App() {
                   </div>
                 </div>
                 <div className="settings-control-row">
-                  <span>{ui.settings.portValue}</span>
+                  <span>{ui.settings.portValue}<InfoTip label={ui.settings.portValue} text={ui.settings.portHelp} /></span>
                   <input
                     className="settings-number-input"
                     type="number"
@@ -2877,15 +2861,7 @@ function App() {
                       </button>
                     </div>
                     <div className="settings-control-row">
-                      <span>
-                        {ui.settings.screenSwitchTitle}
-                        <span className="info-tooltip-host" tabIndex={0}>
-                          ⓘ
-                          <span className="info-tooltip">
-                            {ui.settings.screenSwitchCopy}
-                          </span>
-                        </span>
-                      </span>
+                      <span>{ui.settings.screenSwitchTitle}<InfoTip label={ui.settings.screenSwitchTitle} text={ui.settings.screenSwitchCopy} /></span>
                       <div className="screen-switch-hotkeys">
                         {(["left", "right", "up", "down"] as const).map(
                           (dir) => (
@@ -2922,51 +2898,17 @@ function App() {
                   </>
                 ) : null}
                 <div className="settings-control-row">
-                  <span>{ui.settings.clipboard}</span>
-                  <div className="segmented-control">
-                    <button
-                      type="button"
-                      className={layout.clipboardSync ? "active" : ""}
-                      onClick={() => setClipboardSync(true)}
-                    >
-                      {ui.common.enabled}
-                    </button>
-                    <button
-                      type="button"
-                      className={!layout.clipboardSync ? "active" : ""}
-                      onClick={() => setClipboardSync(false)}
-                    >
-                      {ui.common.disabled}
-                    </button>
-                  </div>
+                  <span>{ui.settings.clipboard}<InfoTip label={ui.settings.clipboard} text={ui.settings.clipboardCopy} /></span>
+                  <button type="button" role="switch" aria-checked={layout.clipboardSync}
+                    aria-label={ui.settings.clipboard} className={`clipboard-toggle ${layout.clipboardSync ? "active" : ""}`}
+                    onClick={() => setClipboardSync(!layout.clipboardSync)}>
+                    <span className="toggle-track" aria-hidden="true"><span /></span>
+                    {layout.clipboardSync ? ui.common.enabled : ui.common.disabled}
+                  </button>
                 </div>
-                {layout.clipboardSync ? <>
-                  <div className="settings-control-row"><span>{language === "cn" ? "剪贴板发送方式" : "Clipboard transfer"}</span>
-                    <div className="segmented-control">
-                      <button type="button" className={!layout.clipboardOnDemand ? "active" : ""} onClick={() => updateLayout(s => ({ ...s, clipboardOnDemand: false }))}>{language === "cn" ? "自动同步" : "Automatic"}</button>
-                      <button type="button" className={layout.clipboardOnDemand ? "active" : ""} onClick={() => updateLayout(s => ({ ...s, clipboardOnDemand: true }))}>{language === "cn" ? "按需粘贴" : "On demand"}</button>
-                    </div>
-                  </div>
-                  <p className="muted-copy">{language === "cn" ? "按需模式保留本机剪贴板。控制客户端时，Ctrl／Command+V 发送本机内容再粘贴；回到本机后，下面的快捷键拉取并粘贴另一台电脑的内容。文件和文件夹通过按需粘贴传输。" : "On-demand mode preserves the local clipboard. Ctrl/Command+V while controlling a client sends and pastes local content. Back here, the shortcut pulls and pastes the other computer's clipboard. Files and folders use on-demand paste."}</p>
-                  {machineRole === "server" ? <div className="settings-control-row">
-                    <label htmlFor="clipboard-paste-hotkey">{language === "cn" ? "远端粘贴快捷键" : "Remote clipboard shortcut"}</label>
-                    <input id="clipboard-paste-hotkey" className="clipboard-paste-shortcut" key={layout.clipboardPasteHotkey ?? "alt+shift+v"} defaultValue={layout.clipboardPasteHotkey ?? "alt+shift+v"}
-                      onBlur={e => updateLayout(s => ({ ...s, clipboardPasteHotkey: e.target.value || "alt+shift+v" }))} />
-                    <button type="button" className="secondary-button compact-button" disabled={!runtime.started}
-                      onClick={() => void pasteRemoteClipboard().catch((error: unknown) => setErrorMessage(formatUnknownError(error, ui.errors.writeClipboard)))}>{language === "cn" ? "粘贴另一台" : "Paste remote"}</button>
-                  </div> : null}
-                </> : null}
 
                 <div className="settings-control-row">
-                  <span>
-                    {ui.settings.fileTransfer}
-                    <span className="info-tooltip-host" tabIndex={0}>
-                      ⓘ
-                      <span className="info-tooltip">
-                        {ui.settings.fileTransferCopy}
-                      </span>
-                    </span>
-                  </span>
+                  <span>{ui.settings.fileTransfer}<InfoTip label={ui.settings.fileTransfer} text={ui.settings.fileTransferCopy} /></span>
                   <div className="segmented-control">
                     <button
                       type="button"
@@ -2986,15 +2928,7 @@ function App() {
                 </div>
                 {machineRole === "server" ? (
                   <div className="settings-control-row">
-                    <span>
-                      {ui.settings.lockSync}
-                      <span className="info-tooltip-host" tabIndex={0}>
-                        ⓘ
-                        <span className="info-tooltip">
-                          {ui.settings.lockSyncCopy}
-                        </span>
-                      </span>
-                    </span>
+                    <span>{ui.settings.lockSync}<InfoTip label={ui.settings.lockSync} text={ui.settings.lockSyncCopy} /></span>
                     <div className="segmented-control">
                       <button
                         type="button"
@@ -3041,7 +2975,7 @@ function App() {
 
               <section className="surface-card modifier-card">
                 <div className="card-title-row">
-                  <h2>{ui.settings.modifierTitle}</h2>
+                  <HelpHeading label={ui.settings.modifierTitle} text={ui.settings.modifierCopy} />
                   <button
                     type="button"
                     className={`switch-button ${layout.modifierRemap ? "active" : ""}`}
@@ -3052,7 +2986,6 @@ function App() {
                       : ui.common.disabled}
                   </button>
                 </div>
-                <p className="muted-copy">{ui.settings.modifierCopy}</p>
                 {(
                   [
                     ["control", ui.settings.modifierRowControl],
@@ -3108,7 +3041,7 @@ function App() {
                     <dd>{activeDevice?.name ?? ui.common.none}</dd>
                   </div>
                   <div>
-                    <dt>{ui.settings.privilege}</dt>
+                    <dt>{ui.settings.privilege}<InfoTip label={ui.settings.privilege} text={ui.settings.privilegeCopy} /></dt>
                     <dd>
                       {runtime.privilege.isElevated
                         ? ui.settings.adminPrivilege
@@ -3124,7 +3057,6 @@ function App() {
                     </div>
                   ) : null}
                 </dl>
-                <p className="muted-copy">{runtime.privilege.detail}</p>
                 {runtime.privilege.canElevate ||
                 canManageInputService ? (
                   <div className="inline-actions">
@@ -3180,18 +3112,11 @@ function App() {
 
               <section className="surface-card settings-card update-card">
                 <div className="card-title-row">
-                  <h2>{ui.settings.updates}</h2>
+                  <HelpHeading label={ui.settings.updates} text={isTauri() ? isPortable ? ui.settings.portableUpdateCopy : ui.settings.updatesCopy : ui.settings.updatesBrowserCopy} />
                   <span className={`update-status-badge ${updateStatus}`}>
                     {updateStatusLabel(updateStatus, ui)}
                   </span>
                 </div>
-                <p className="muted-copy">
-                  {isTauri()
-                    ? isPortable
-                      ? ui.settings.portableUpdateCopy
-                      : ui.settings.updatesCopy
-                    : ui.settings.updatesBrowserCopy}
-                </p>
                 <dl className="network-meta compact-meta">
                   <div>
                     <dt>{ui.settings.currentVersion}</dt>
@@ -3264,7 +3189,7 @@ function App() {
 
               <section className="surface-card performance-card">
                 <div className="card-title-row">
-                  <h2>{ui.settings.performance}</h2>
+                  <HelpHeading label={ui.settings.performance} text={ui.settings.performanceCopy} />
                   <button
                     type="button"
                     className={`switch-button ${layout.performanceMonitor ? "active" : ""}`}
@@ -3277,7 +3202,6 @@ function App() {
                       : ui.common.disabled}
                   </button>
                 </div>
-                <p className="muted-copy">{ui.settings.performanceCopy}</p>
                 <div
                   className="performance-chart"
                   aria-label={ui.settings.performance}
@@ -3325,7 +3249,7 @@ function App() {
 
               <section className="surface-card settings-card diagnostic-card">
                 <div className="card-title-row">
-                  <h2>{ui.settings.diagnostics}</h2>
+                  <HelpHeading label={ui.settings.diagnostics} text={ui.settings.diagnosticsCopy} />
                   <button
                     type="button"
                     className="secondary-button compact-button"
@@ -3337,7 +3261,6 @@ function App() {
                       : ui.common.refresh}
                   </button>
                 </div>
-                <p className="muted-copy">{ui.settings.diagnosticsCopy}</p>
                 <dl className="network-meta compact-meta">
                   <div>
                     <dt>{ui.settings.peers}</dt>
@@ -3350,11 +3273,6 @@ function App() {
                     </dd>
                   </div>
                 </dl>
-                {diagnosticInfo ? (
-                  <p className="muted-copy diagnostic-note">
-                    {diagnosticInfo.networkHint} {diagnosticInfo.firewallHint}
-                  </p>
-                ) : null}
                 <div className="inline-actions">
                   <button
                     type="button"

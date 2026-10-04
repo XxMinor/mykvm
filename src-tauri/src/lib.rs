@@ -1511,7 +1511,8 @@ fn save_layout(
         let previous_layout = stored_layout.clone();
         let mut saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
         saved_layout.input_protection = InputProtection::default();
-        saved_layout.clipboard_paste_hotkey = canonical_runtime_toggle_shortcut(&saved_layout.clipboard_paste_hotkey)?.unwrap_or_else(|| "disabled".into());
+        saved_layout.clipboard_on_demand = false;
+        saved_layout.clipboard_paste_hotkey = default_clipboard_paste_hotkey();
         validate_shared_hotkeys(&saved_layout)?;
         write_layout_to_disk(&state.config_path, &saved_layout)?;
         *stored_layout = saved_layout.clone();
@@ -5646,8 +5647,8 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         pair_secret: normalize_pair_secret(&saved_layout.pair_secret),
         paired_controllers: normalize_paired_controllers(saved_layout.paired_controllers),
         clipboard_sync: saved_layout.clipboard_sync,
-        clipboard_on_demand: saved_layout.clipboard_on_demand,
-        clipboard_paste_hotkey: saved_layout.clipboard_paste_hotkey,
+        clipboard_on_demand: false,
+        clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: saved_layout.file_transfer_enabled,
         lock_sync: saved_layout.lock_sync,
         input_protection: InputProtection::default(),
@@ -6072,7 +6073,7 @@ fn handle_clipboard_files_commit(payload: &[u8], layout: &LayoutState, local_id:
     Some(true)
 }
 
-fn default_clipboard_paste_hotkey() -> String { "alt+shift+v".into() }
+fn default_clipboard_paste_hotkey() -> String { "disabled".into() }
 
 fn default_edge_switch_hotkey() -> String {
     "alt+shift+k".into()
@@ -10029,15 +10030,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_protection_is_disabled_without_changing_the_existing_toggle_shortcut() {
+    fn legacy_extra_controls_are_disabled_without_changing_existing_switches() {
         let mut saved = test_layout();
         saved.edge_switch_hotkey = "ctrl+alt+k".into();
+        saved.clipboard_sync = false;
+        saved.clipboard_on_demand = true;
+        saved.clipboard_paste_hotkey = "alt+shift+v".into();
         saved.input_protection = InputProtection {
             local_only: true, protect_fullscreen: true,
             blocked_applications: vec!["snipaste.exe".into()], lock_hotkey: "alt+shift+l".into(),
         };
         let restored = normalize_saved_layout(saved, test_layout());
         assert_eq!(restored.edge_switch_hotkey, "ctrl+alt+k");
+        assert!(!restored.clipboard_sync);
+        assert!(!restored.clipboard_on_demand);
+        assert_eq!(restored.clipboard_paste_hotkey, "disabled");
         assert_eq!(restored.input_protection, InputProtection::default());
     }
 
