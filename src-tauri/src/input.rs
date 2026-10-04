@@ -4135,18 +4135,26 @@ fn release_forwarded_keys_windows(context: &WindowsCaptureContext, target: &Inpu
 
 #[cfg(target_os = "windows")]
 fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboard: bool) {
-    let target = context
+    let active = context
         .active
         .lock()
         .ok()
-        .and_then(|mut active| active.take().map(|active| active.target));
+        .and_then(|mut active| active.take());
 
-    if let Some(target) = target {
-        release_forwarded_keys_windows(context, &target);
+    if let Some(active) = active {
+        release_forwarded_keys_windows(context, &active.target);
         release_remote_buttons(
             &context.quic_transport,
-            &target,
+            &active.target,
             &context.remote_button_mask,
+            &context.layout_state,
+            &context.input_events,
+        );
+        // Hotkey returns, pause and screenshot takeovers share this exit path.
+        // Park on the actual remote screen before restoring the local cursor.
+        let _ = send_remote_cursor_park(
+            &context.quic_transport,
+            &active,
             &context.layout_state,
             &context.input_events,
         );
@@ -9789,6 +9797,22 @@ mod tests {
             (321.0, 654.0)
         );
         assert_eq!(local_hotkey_return_point(&active, None), (960.0, 540.0));
+    }
+
+    #[test]
+    fn hotkey_return_parks_the_client_cursor_away_from_its_center() {
+        let target = target_for_coordinate_tests();
+        let screen = target.remote_screen.clone();
+        let mut active = ActiveTarget { target, current_screen: screen.clone(),
+            current_screen_id: screen.id.clone(), x: screen.width as f64 / 2.0, y: screen.height as f64 / 2.0 };
+        let center = (active.x as i32, active.y as i32);
+        assert_eq!(remote_park_point(&active), (screen.width - 1, center.1));
+        active.target.target_platform = "macos".into();
+        assert_eq!(remote_park_point(&active), (PARK_CORNER_CLEARANCE, screen.height - 1));
+        // The return must use the monitor currently controlled, not the entry monitor.
+        active.current_screen.width = 1920;
+        active.current_screen.height = 1080;
+        assert_eq!(remote_park_point(&active), (PARK_CORNER_CLEARANCE, 1079));
     }
 
     #[test]
