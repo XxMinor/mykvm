@@ -17,11 +17,12 @@ use windows_sys::Win32::{
     },
 };
 
-/// The keyboard hook has its own message queue. Mouse warps, drag handoffs and
-/// cursor-window messages cannot delay or re-enter the keyboard callback.
+/// Normally the keyboard hook has its own queue. Recovery can instead use the
+/// known-live mouse queue after repeated installs produce no actual callbacks.
 pub(crate) struct KeyboardCapture {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    owner_hook: Option<(isize, Arc<AtomicU32>, u32)>,
 }
 
 impl KeyboardCapture {
@@ -69,6 +70,7 @@ impl KeyboardCapture {
         let mut capture = Self {
             stop,
             thread: Some(thread),
+            owner_hook: None,
         };
         match ready_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Ok(())) => Ok(capture),
@@ -85,8 +87,38 @@ impl KeyboardCapture {
         }
     }
 
+    /// If a rebuilt dedicated queue still receives no physical callbacks,
+    /// use the capture queue whose mouse hook is demonstrably alive.
+    pub(crate) fn start_on_current_thread(
+        owner: Arc<AtomicU32>,
+        callback: HOOKPROC,
+    ) -> Result<Self, String> {
+        let id = unsafe { GetCurrentThreadId() };
+        owner.store(id, Ordering::Relaxed);
+        let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, callback, std::ptr::null_mut(), 0) };
+        if hook.is_null() {
+            let error = format!(
+                "failed to install Windows keyboard hook on the capture thread: {}",
+                std::io::Error::last_os_error()
+            );
+            let _ = owner.compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
+            return Err(error);
+        }
+        Ok(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            owner_hook: Some((hook as isize, owner, id)),
+        })
+    }
+
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some((hook, owner, id)) = self.owner_hook.take() {
+            unsafe {
+                UnhookWindowsHookEx(hook as _);
+            }
+            let _ = owner.compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
+        }
         if let Some(thread) = self.thread.take() {
             // A callback can synchronously ask the mouse thread to service a
             // cursor warp. Keep sent messages/hook callbacks moving while we

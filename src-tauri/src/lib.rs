@@ -47,6 +47,8 @@ pub mod windows_drop_catcher;
 pub mod windows_input;
 #[cfg(any(target_os = "windows", test))]
 mod windows_keyboard_monitor;
+#[cfg(any(target_os = "windows", test))]
+mod windows_mouse_motion;
 #[cfg(target_os = "windows")]
 mod windows_keyboard_capture;
 #[cfg(target_os = "windows")]
@@ -5189,6 +5191,21 @@ fn is_windows_process_elevated() -> Result<bool, String> {
 #[cfg(target_os = "windows")]
 fn restart_current_process_as_admin() -> Result<(), String> {
     launch_current_process_as_admin(&[])
+}
+
+#[cfg(target_os = "windows")]
+pub fn relaunch_as_admin_if_needed() -> Result<bool, String> {
+    if is_windows_process_elevated()? {
+        return Ok(false);
+    }
+
+    // The startup copy has acquired the instance lock but has not started any
+    // runtime yet. Release it so the elevated copy can take over immediately.
+    // Forward --mykvm-autostart so login launches still stay in the tray.
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    release_single_instance();
+    launch_current_process_as_admin(&args)?;
+    Ok(true)
 }
 
 #[cfg(target_os = "windows")]

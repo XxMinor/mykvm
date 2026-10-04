@@ -1429,7 +1429,7 @@
 }
 
 .network-meta {
-  margin-top: 4px;
+  margin: 0;
 }
 
 .compact-meta {
@@ -1532,6 +1532,15 @@
   white-space: nowrap;
 }
 
+.modifier-card {
+  display: grid;
+  gap: 12px;
+}
+
+.modifier-card .settings-control-row + .settings-control-row {
+  margin-top: 0;
+}
+
 .card-title-row,
 .inline-actions {
   display: flex;
@@ -1541,6 +1550,7 @@
 
 .card-title-row {
   justify-content: space-between;
+  min-height: var(--compact-control-height);
 }
 
 .switch-button {
@@ -1570,12 +1580,12 @@
 
 .update-card {
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .diagnostic-card {
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .diagnostic-path {

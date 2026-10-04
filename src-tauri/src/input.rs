@@ -1344,6 +1344,7 @@ fn start_platform_capture(
             local_capture_requested: AtomicBool::new(false),
             local_capture_hold: AtomicBool::new(false),
             raw_keyboard_tick: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            return_edge_gate: Mutex::new(crate::windows_mouse_motion::EdgeReturnGate::default()),
             cursor_hide_calls: Mutex::new(0),
             just_crossed: AtomicBool::new(false),
             local_screen_points: Mutex::new(HashMap::new()),
@@ -1371,7 +1372,7 @@ fn start_platform_capture(
             return;
         }
 
-        let mut keyboard_capture = match start_windows_keyboard_capture(&context) {
+        let mut keyboard_capture = match start_windows_keyboard_capture(&context, false) {
             Ok(capture) => Some(capture),
             Err(error) => {
                 unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
@@ -1393,7 +1394,8 @@ fn start_platform_capture(
         let mut keyboard_watchdog = crate::windows_keyboard_monitor::KeyboardHookWatchdog::default();
         let mut keyboard_monitor = crate::windows_keyboard_monitor::KeyboardMonitor::new(Arc::clone(&context.raw_keyboard_tick));
         let mut last_keyboard_reinstall: Option<Instant> = None;
-        let mut keyboard_recovery_pending: Option<u32> = None;
+        let mut keyboard_recovery = crate::windows_keyboard_monitor::KeyboardCaptureRecovery::default();
+        let mut keyboard_on_owner_thread = false;
         let mut previously_remote = false;
         let mut last_cursor_reassert = Instant::now() - Duration::from_millis(200);
         let mut capture_suspended = false;
@@ -1449,6 +1451,7 @@ fn start_platform_capture(
                     keyboard_monitor = None;
                     context.raw_keyboard_tick.store(0, Ordering::Relaxed);
                     keyboard_watchdog.reset(0);
+                    keyboard_recovery.reset();
                     capture_suspended = true;
                 }
             } else if capture_suspended && last_capture_resume.elapsed() >= Duration::from_millis(500) {
@@ -1457,7 +1460,7 @@ fn start_platform_capture(
                 unsafe {
                     mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(windows_mouse_proc), std::ptr::null_mut(), 0);
                 }
-                keyboard_capture = start_windows_keyboard_capture(&context)
+                keyboard_capture = start_windows_keyboard_capture(&context, keyboard_on_owner_thread)
                     .map_err(|error| log::warn!("{error}")).ok();
                 if mouse_hook.is_null() || keyboard_capture.is_none() {
                     unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
@@ -1504,24 +1507,25 @@ fn start_platform_capture(
             }
             let keyboard_tick = context.keyboard_hook_tick.load(Ordering::Relaxed);
             let raw_tick = context.raw_keyboard_tick.load(Ordering::Relaxed);
-            if keyboard_recovery_pending.is_some_and(|tick| keyboard_tick != tick) {
+            if keyboard_recovery.callbacks_resumed(keyboard_tick) {
                 log::info!("keyboard callbacks resumed on thread {}", context.keyboard_thread_id.load(Ordering::Relaxed));
-                keyboard_recovery_pending = None;
             }
             let remote = context.remote_active.load(Ordering::Relaxed);
-            // A screenshot/global-hotkey handler may have replaced the local
-            // hook chain. Enter a remote session with a fresh keyboard queue.
+            // Keep the proven local keyboard hook when crossing. Rebuilding it
+            // on every mouse entry discarded a working queue before any key.
             let entering_remote = remote && !previously_remote;
             previously_remote = remote;
+            if entering_remote { keyboard_watchdog.reset(raw_tick); }
             if !cached_windows_input_desktop_is_default() {
                 keyboard_watchdog.reset(raw_tick);
-            } else if entering_remote || (keyboard_watchdog.observe(keyboard_tick, raw_tick, Instant::now())
-                && last_keyboard_reinstall.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)))
+            } else if keyboard_watchdog.observe(keyboard_tick, raw_tick, Instant::now())
+                && last_keyboard_reinstall.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
             {
                 last_keyboard_reinstall = Some(Instant::now());
-                if !entering_remote { log::warn!("keyboard input arrived without a keyboard callback; restarting its capture thread (keyboard_tick={keyboard_tick}, raw_keyboard_tick={raw_tick})"); }
+                keyboard_on_owner_thread |= keyboard_recovery.next_rebuild_on_owner_thread();
+                log::warn!("keyboard input arrived without a keyboard callback; rebuilding capture (owner_thread={keyboard_on_owner_thread}, keyboard_tick={keyboard_tick}, raw_keyboard_tick={raw_tick})");
                 drop(keyboard_capture.take());
-                keyboard_capture = start_windows_keyboard_capture(&context)
+                keyboard_capture = start_windows_keyboard_capture(&context, keyboard_on_owner_thread)
                     .map_err(|error| log::error!("{error}")).ok();
                 if keyboard_capture.is_none() {
                     release_windows_remote_control(&context, false);
@@ -1533,10 +1537,10 @@ fn start_platform_capture(
                     continue;
                 }
                 if let Some(active) = remote_target_for_input(&context.active, &context.remote_active) {
-                    if !entering_remote { release_forwarded_keys_windows(&context, &active.target); }
-                    log::info!("keyboard capture worker ready on thread {}; keeping control of {}", context.keyboard_thread_id.load(Ordering::Relaxed), active.target.device_id);
+                    release_forwarded_keys_windows(&context, &active.target);
+                    log::info!("keyboard hook installed on thread {}; awaiting real callbacks for {}", context.keyboard_thread_id.load(Ordering::Relaxed), active.target.device_id);
                 }
-                keyboard_recovery_pending = Some(0);
+                keyboard_recovery.await_callbacks();
                 keyboard_watchdog.reset(raw_tick);
             }
             if last_hook_check.elapsed() >= Duration::from_secs(1) {
@@ -1567,7 +1571,7 @@ fn start_platform_capture(
                             0,
                         );
                     }
-                    keyboard_capture = start_windows_keyboard_capture(&context)
+                    keyboard_capture = start_windows_keyboard_capture(&context, keyboard_on_owner_thread)
                         .map_err(|error| log::error!("{error}")).ok();
                     if mouse_hook.is_null() || keyboard_capture.is_none() {
                         log::error!("failed to reinstall the Windows input hooks");
@@ -3266,6 +3270,7 @@ struct WindowsCaptureContext {
     local_capture_requested: AtomicBool,
     local_capture_hold: AtomicBool,
     raw_keyboard_tick: Arc<std::sync::atomic::AtomicU32>,
+    return_edge_gate: Mutex<crate::windows_mouse_motion::EdgeReturnGate>,
     cursor_hide_calls: Mutex<u8>,
     // Swallow the first post-crossing delta so a fast flick across the edge
     // does not shove the cursor inward on Windows, where we pin by warping.
@@ -3580,6 +3585,10 @@ fn set_control_clipboard_target(
 static LAST_HOOK_EVENT_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cfg(target_os = "windows")]
+static WINDOWS_CURSOR_WARPS: Mutex<crate::windows_mouse_motion::CursorWarps> =
+    Mutex::new(crate::windows_mouse_motion::CursorWarps::new());
+
+#[cfg(target_os = "windows")]
 static WINDOWS_LOCAL_LEFT_DOWN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
@@ -3648,6 +3657,10 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     }
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
+    if wparam as u32 == WM_MOUSEMOVE && WINDOWS_CURSOR_WARPS.lock()
+        .map(|mut warps| warps.take((event.pt.x, event.pt.y), Instant::now())).unwrap_or(false) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
@@ -3778,9 +3791,22 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
 }
 
 #[cfg(target_os = "windows")]
-fn start_windows_keyboard_capture(context: &WindowsCaptureContext) -> Result<crate::windows_keyboard_capture::KeyboardCapture, String> {
+fn start_windows_keyboard_capture(
+    context: &WindowsCaptureContext,
+    on_owner_thread: bool,
+) -> Result<crate::windows_keyboard_capture::KeyboardCapture, String> {
     context.keyboard_hook_tick.store(0, Ordering::Relaxed);
-    crate::windows_keyboard_capture::KeyboardCapture::start(Arc::clone(&context.keyboard_thread_id), Some(windows_keyboard_proc))
+    if on_owner_thread {
+        crate::windows_keyboard_capture::KeyboardCapture::start_on_current_thread(
+            Arc::clone(&context.keyboard_thread_id),
+            Some(windows_keyboard_proc),
+        )
+    } else {
+        crate::windows_keyboard_capture::KeyboardCapture::start(
+            Arc::clone(&context.keyboard_thread_id),
+            Some(windows_keyboard_proc),
+        )
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -3895,6 +3921,7 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
 
     context.remote_active.store(false, Ordering::Relaxed);
     context.just_crossed.store(false, Ordering::Relaxed);
+    if let Ok(mut gate) = context.return_edge_gate.lock() { gate.reset(); }
     reset_mouse_move_timer(&context.last_mouse_move_sent);
     show_windows_cursor_if_needed(context);
     if let Ok(mut anchor) = context.anchor.lock() {
@@ -4083,7 +4110,10 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         active_target.x += dx * active_target.target.pointer_speed;
         active_target.y += dy * active_target.target.pointer_speed;
 
-        if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
+        let confirmed_return = context.return_edge_gate.lock().map(|mut gate|
+            update_windows_remote_screen(active_target, dx, dy, &context.layout_state, &mut gate, Instant::now())
+        ).unwrap_or(false);
+        if confirmed_return {
             // Logged so an unexpected return can be told apart from the others
             // (a stale remote screen size after its displays changed shows here).
             log::info!(
@@ -4478,6 +4508,9 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
 
 #[cfg(target_os = "windows")]
 fn set_windows_cursor(x: i32, y: i32) {
+    if let Ok(mut warps) = WINDOWS_CURSOR_WARPS.lock() {
+        warps.record((x, y), Instant::now());
+    }
     unsafe {
         let _ = windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
     }
@@ -5846,6 +5879,29 @@ fn update_active_remote_screen(
     }
 
     returned_to_local
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn update_windows_remote_screen(
+    active: &mut ActiveTarget,
+    dx: f64,
+    dy: f64,
+    layout: &Arc<Mutex<LayoutState>>,
+    gate: &mut crate::windows_mouse_motion::EdgeReturnGate,
+    now: Instant,
+) -> bool {
+    if update_active_remote_screen(active, dx, dy, layout) {
+        let outward = match active.target.edge {
+            Edge::Right => -dx,
+            Edge::Left => dx,
+            Edge::Bottom => -dy,
+            Edge::Top => dy,
+        };
+        gate.push(outward, now)
+    } else {
+        gate.reset();
+        false
+    }
 }
 
 fn should_ignore_initial_anchor_warp_delta(edge: Edge, dx: f64, dy: f64) -> bool {
@@ -8508,6 +8564,57 @@ mod tests {
             &mut active, dx, dy, &Arc::new(Mutex::new(layout)),
         ));
         // Returning intentionally still lands on the shared edge, not center.
+        assert_eq!(local_return_point(&active).0, 1919.0);
+    }
+
+    #[test]
+    fn windows_client_edge_keeps_control_through_idle_jitter_but_allows_a_real_return() {
+        let layout = layout_for_target_tests();
+        let targets = build_input_targets(&layout, &layout);
+        let mut active = crossing_target(&targets, 1919.0, 540.0, 3.0, 0.0).unwrap();
+        active.x = 0.0; // Reproduce the entry-edge position in the captured log.
+        let layout = Arc::new(Mutex::new(layout));
+        let now = Instant::now();
+        let mut gate = crate::windows_mouse_motion::EdgeReturnGate::default();
+        for second in 0..10 {
+            active.x -= 1.0;
+            assert!(!update_windows_remote_screen(
+                &mut active,
+                -1.0,
+                0.0,
+                &layout,
+                &mut gate,
+                now + Duration::from_secs(second)
+            ));
+            assert_eq!(active.x, 0.0);
+        }
+        active.x += 5.0;
+        assert!(!update_windows_remote_screen(
+            &mut active,
+            5.0,
+            0.0,
+            &layout,
+            &mut gate,
+            now + Duration::from_secs(10)
+        ));
+        active.x -= 7.0;
+        assert!(!update_windows_remote_screen(
+            &mut active,
+            -7.0,
+            0.0,
+            &layout,
+            &mut gate,
+            now + Duration::from_secs(11)
+        ));
+        active.x -= 1.0;
+        assert!(update_windows_remote_screen(
+            &mut active,
+            -1.0,
+            0.0,
+            &layout,
+            &mut gate,
+            now + Duration::from_secs(11) + Duration::from_millis(10)
+        ));
         assert_eq!(local_return_point(&active).0, 1919.0);
     }
 

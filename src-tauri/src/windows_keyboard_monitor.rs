@@ -1,5 +1,37 @@
 use std::time::{Duration, Instant};
 
+/// Successful installation is not evidence of actual keyboard callbacks.
+/// Escalate repeated unconfirmed rebuilds to the live mouse capture queue.
+#[derive(Default)]
+pub(crate) struct KeyboardCaptureRecovery {
+    unconfirmed_rebuilds: u8,
+    pending_tick: Option<u32>,
+}
+
+impl KeyboardCaptureRecovery {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn next_rebuild_on_owner_thread(&mut self) -> bool {
+        self.unconfirmed_rebuilds = self.unconfirmed_rebuilds.saturating_add(1);
+        self.unconfirmed_rebuilds >= 2
+    }
+
+    pub(crate) fn await_callbacks(&mut self) {
+        self.pending_tick = Some(0);
+    }
+
+    pub(crate) fn callbacks_resumed(&mut self, tick: u32) -> bool {
+        if tick != 0 && self.pending_tick.is_some_and(|previous| previous != tick) {
+            self.reset();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Compare keyboard input with keyboard callbacks only. Mouse activity cannot
 /// prove that WH_KEYBOARD_LL is still installed.
 #[derive(Default)]
@@ -178,6 +210,29 @@ pub(crate) use platform::KeyboardMonitor;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_rebuilds_without_callbacks_fall_back_to_the_live_capture_queue() {
+        let mut recovery = KeyboardCaptureRecovery::default();
+        assert!(!recovery.next_rebuild_on_owner_thread());
+        recovery.await_callbacks();
+        assert!(!recovery.callbacks_resumed(0));
+        assert!(recovery.next_rebuild_on_owner_thread());
+        recovery.await_callbacks();
+        assert!(!recovery.callbacks_resumed(0));
+        assert!(recovery.callbacks_resumed(1234));
+        assert!(!recovery.next_rebuild_on_owner_thread());
+    }
+
+    #[test]
+    fn a_rebuilt_queue_with_real_callbacks_does_not_trigger_fallback() {
+        let mut recovery = KeyboardCaptureRecovery::default();
+        for tick in [100, 200, 300] {
+            assert!(!recovery.next_rebuild_on_owner_thread());
+            recovery.await_callbacks();
+            assert!(recovery.callbacks_resumed(tick));
+        }
+    }
 
     #[test]
     fn missing_keyboard_is_detected_even_when_the_user_stops_after_one_key() {

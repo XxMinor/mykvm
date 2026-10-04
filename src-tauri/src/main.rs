@@ -15,5 +15,17 @@ fn main() {
         return;
     }
 
+    // Installed Windows builds request elevation before initializing input,
+    // networking or the UI. Keep development launches usable under cargo.
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    match mykvm_lib::relaunch_as_admin_if_needed() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return;
+        }
+    }
+
     mykvm_lib::run();
 }

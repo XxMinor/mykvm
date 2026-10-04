@@ -50,6 +50,7 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 ## Features
 
 - Runs in Server or Client mode.
+- Windows installed builds request administrator permission at startup. Approve the UAC prompt to start sharing; login launches preserve their tray-only behavior.
 - Discovers nearby peers on the LAN.
 - Supports manual peer connection by host or IP.
 - Detects local displays and lets you arrange multi-monitor layouts.
