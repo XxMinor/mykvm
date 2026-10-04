@@ -33,6 +33,10 @@ export interface FileTransferSummary {
 // renders the layout editor; the real runtime lives in the Tauri backend.
 const STUB_DETAIL = 'Available only in the Tauri desktop runtime.'
 
+export async function setHotkeyRecording(recording: boolean, captured: string | null = null): Promise<void> {
+  if (isTauri()) await invoke('set_hotkey_recording', { recording, captured });
+}
+
 const BROWSER_RUNTIME: RuntimeStatus = {
   started: false,
   transport: { state: 'stubbed', detail: STUB_DETAIL },

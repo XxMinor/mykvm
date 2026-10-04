@@ -13,7 +13,7 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{
         DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, SetWindowsHookExW,
         UnhookWindowsHookEx, HOOKPROC, MSG, PM_NOREMOVE, PM_REMOVE, QS_ALLINPUT, QS_SENDMESSAGE,
-        WH_KEYBOARD_LL,
+        WH_KEYBOARD_LL, WM_INPUT,
     },
 };
 
@@ -23,12 +23,17 @@ pub(crate) struct KeyboardCapture {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     owner_hook: Option<(isize, Arc<AtomicU32>, u32)>,
+    idle: Arc<AtomicBool>,
+    owner: Arc<AtomicU32>,
 }
 
 impl KeyboardCapture {
     pub(crate) fn start(owner: Arc<AtomicU32>, callback: HOOKPROC) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let capture_owner = Arc::clone(&owner);
+        let idle = Arc::new(AtomicBool::new(false));
+        let worker_idle = Arc::clone(&idle);
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("mykvm-keyboard-capture".into())
@@ -40,7 +45,7 @@ impl KeyboardCapture {
                     PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, 0);
                 }
                 owner.store(id, Ordering::Relaxed);
-                let hook =
+                let mut hook =
                     unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, callback, std::ptr::null_mut(), 0) };
                 if hook.is_null() {
                     let error = format!(
@@ -52,11 +57,54 @@ impl KeyboardCapture {
                     return;
                 }
                 let _ = ready_tx.send(Ok(()));
+                let mut last_desktop_check = std::time::Instant::now();
+                let mut desktop_default = true;
+                let mut monitor = None;
+                let mut watchdog = crate::windows_keyboard_monitor::KeyboardHookWatchdog::default();
                 while !worker_stop.load(Ordering::Relaxed) {
+                    let idle = worker_idle.load(Ordering::Relaxed);
+                    if idle && monitor.is_none() {
+                        if let Some((_, raw, keys)) = crate::input::keyboard_hook_health() {
+                            monitor =
+                                crate::windows_keyboard_monitor::KeyboardMonitor::new(raw, keys);
+                        }
+                    } else if !idle {
+                        monitor = None;
+                    }
+                    if worker_idle.load(Ordering::Relaxed)
+                        && last_desktop_check.elapsed() >= Duration::from_millis(200)
+                    {
+                        desktop_default = crate::input::refresh_windows_input_desktop_cache();
+                        last_desktop_check = std::time::Instant::now();
+                    }
                     unsafe {
                         while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0
                         {
-                            DispatchMessageW(&message);
+                            if let Some(monitor) = &monitor {
+                                monitor.observe_message(&message);
+                            }
+                            if message.message != WM_INPUT {
+                                DispatchMessageW(&message);
+                            }
+                        }
+                        if idle && desktop_default {
+                            if let Some((tick, raw, _)) = crate::input::keyboard_hook_health() {
+                                let raw_tick = raw.load(Ordering::Relaxed);
+                                if watchdog.observe(tick, raw_tick, std::time::Instant::now()) {
+                                    if let Some(monitor) = &monitor {
+                                        monitor.reconcile_physical_keys();
+                                    }
+                                    UnhookWindowsHookEx(hook);
+                                    hook = SetWindowsHookExW(
+                                        WH_KEYBOARD_LL,
+                                        callback,
+                                        std::ptr::null_mut(),
+                                        0,
+                                    );
+                                    watchdog.reset(raw_tick);
+                                    log::warn!("restored the idle keyboard shortcut observer");
+                                }
+                            }
                         }
                         MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 20, QS_ALLINPUT);
                     }
@@ -71,6 +119,8 @@ impl KeyboardCapture {
             stop,
             thread: Some(thread),
             owner_hook: None,
+            idle,
+            owner: capture_owner,
         };
         match ready_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Ok(())) => Ok(capture),
@@ -107,8 +157,20 @@ impl KeyboardCapture {
         Ok(Self {
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
-            owner_hook: Some((hook as isize, owner, id)),
+            owner_hook: Some((hook as isize, Arc::clone(&owner), id)),
+            idle: Arc::new(AtomicBool::new(false)),
+            owner,
         })
+    }
+
+    pub(crate) fn keep_for_shortcuts(&self) {
+        self.idle.store(true, Ordering::Relaxed);
+    }
+    pub(crate) fn resume_capture(&self) {
+        self.idle.store(false, Ordering::Relaxed);
+    }
+    pub(crate) fn owner(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.owner)
     }
 
     fn stop(&mut self) {

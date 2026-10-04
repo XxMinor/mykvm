@@ -23,6 +23,8 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 mod clipboard;
+#[cfg(any(target_os = "windows", test))]
+mod shortcut_keys;
 mod rich_clipboard;
 mod clipboard_exchange;
 mod folder_transfer;
@@ -1448,6 +1450,7 @@ impl AppRuntime {
     }
 
     fn stop_input(&self) {
+        input::prepare_input_stop();
         #[cfg(target_os = "macos")]
         input::set_macos_app_nap_suppressed(false);
         self.input_receive_enabled.store(false, Ordering::Relaxed);
@@ -1986,6 +1989,7 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
     }
 
     if let Some(previous) = current.take() {
+        input::set_global_toggle_registered(false);
         if let Err(error) = app.global_shortcut().unregister(previous.as_str()) {
             log::warn!("failed to unregister quick start/stop shortcut {previous}: {error}");
         }
@@ -1998,13 +2002,14 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
                 format!("failed to register quick start/stop shortcut {next}: {error}")
             })?;
         *current = Some(next);
+        input::set_global_toggle_registered(true);
     }
 
     Ok(())
 }
 
 fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<String>, String> {
-    if layout.machine_role != "server" {
+    if layout.machine_role != "server" || input::hotkey_recording() || input::owns_native_shortcuts() {
         return Ok(None);
     }
 
@@ -2030,7 +2035,7 @@ fn sync_screen_switch_shortcuts(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     };
     let layout = state.layout_snapshot();
-    let next = if input_guard::is_paused(&state.input_guard) || layout.input_protection.local_only {
+    let next = if input::hotkey_recording() || input::owns_native_shortcuts() || input_guard::is_paused(&state.input_guard) || layout.input_protection.local_only {
         empty_screen_switch_hotkeys()
     } else { screen_switch_shortcuts_for_layout(&layout) };
 
@@ -2106,12 +2111,13 @@ fn route_global_shortcut(
     let Some(state) = app.try_state::<AppRuntime>() else {
         return Ok(());
     };
-    if state.layout_snapshot().machine_role != "server" {
+    if state.layout_snapshot().machine_role != "server" || input::hotkey_recording() || input::owns_native_shortcuts() {
         return Ok(());
     }
 
     let paste = state.clipboard_paste_shortcut.lock().map_err(|_| "clipboard shortcut is poisoned".to_string())?.clone();
     if paste.as_ref().and_then(|s| s.parse::<tauri_plugin_global_shortcut::Shortcut>().ok()).as_ref() == Some(shortcut) {
+        if !input::prepare_system_shortcut(paste.as_deref().unwrap_or("disabled"), true) { return Ok(()); }
         paste_remote_clipboard(state)?;
         return Ok(());
     }
@@ -2124,6 +2130,7 @@ fn route_global_shortcut(
     if let Some(toggle_str) = toggle.as_ref() {
         if let Ok(toggle_shortcut) = toggle_str.parse::<tauri_plugin_global_shortcut::Shortcut>() {
             if shortcut == &toggle_shortcut {
+                if !input::prepare_system_shortcut(toggle_str, false) { return Ok(()); }
                 drop(toggle);
                 toggle_runtime_from_app(app)?;
                 return Ok(());
@@ -2160,6 +2167,8 @@ fn route_global_shortcut(
     drop(directions);
 
     if let Some(direction) = direction {
+        if !state.runtime.lock().map(|runtime| runtime.started).unwrap_or(false)
+            || !input::prepare_system_shortcut("disabled", true) { return Ok(()); }
         if let Ok(mut request) = state.screen_switch_request.lock() {
             // Only the latest request wins; a rapid double-tap overwrites.
             *request = Some(direction);
@@ -3621,6 +3630,13 @@ pub fn run() {
                 detected_layout,
             );
             app.manage(runtime);
+            let toggle_app = app.handle().clone();
+            input::set_runtime_toggle_sender(Box::new(move || {
+                let app = toggle_app.clone();
+                let _ = toggle_app.run_on_main_thread(move || {
+                    if let Err(error) = toggle_runtime_from_app(&app) { log::warn!("captured quick start/stop failed: {error}"); }
+                });
+            }));
             let pending_files = Arc::downgrade(&app.state::<AppRuntime>().file_transfers);
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(30));
@@ -3862,6 +3878,7 @@ pub fn run() {
             confirm_lan_pairing,
             dismiss_pairing_request,
             reset_pairing,
+            set_hotkey_recording,
             set_autostart,
             is_autostart_enabled,
             restart_as_admin,
@@ -6008,7 +6025,7 @@ fn default_modifier_map() -> ModifierMap {
 fn sync_clipboard_paste_shortcut(app: &AppHandle) -> Result<(), String> {
     let Some(state) = app.try_state::<AppRuntime>() else { return Ok(()); };
     let layout = state.layout_snapshot();
-    let next = if layout.machine_role == "server" && layout.clipboard_sync {
+    let next = if !input::hotkey_recording() && !input::owns_native_shortcuts() && layout.machine_role == "server" && layout.clipboard_sync {
         canonical_runtime_toggle_shortcut(&layout.clipboard_paste_hotkey)?
     } else { None };
     let mut current = state.clipboard_paste_shortcut.lock().map_err(|_| "clipboard shortcut is poisoned".to_string())?;
@@ -6023,6 +6040,24 @@ fn sync_clipboard_paste_shortcut(app: &AppHandle) -> Result<(), String> {
 struct ClipboardFilesCommit {
     protocol: String, origin_id: String, origin_transport_public_key: String, target_id: String,
     cluster_id: String, pair_secret: String, ids: Vec<String>, paste: bool, paste_token: String,
+}
+
+#[tauri::command]
+fn set_hotkey_recording(
+    app: AppHandle,
+    recording: bool,
+    captured: Option<String>,
+) -> Result<(), String> {
+    let was_recording = input::hotkey_recording();
+    if !recording && (was_recording || captured.is_some()) {
+        input::finish_shortcut_recording(captured.as_deref());
+    }
+    input::set_hotkey_recording(recording);
+    sync_runtime_toggle_shortcut(&app)?;
+    sync_screen_switch_shortcuts(&app)?;
+    sync_clipboard_paste_shortcut(&app)?;
+    if recording { input::begin_shortcut_recording(); }
+    Ok(())
 }
 
 fn paste_permitted(layout: &LayoutState, paste: bool, token: &str, source_key: &str) -> bool {

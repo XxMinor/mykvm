@@ -80,8 +80,8 @@ mod platform {
         Foundation::HWND,
         UI::{
             Input::{
-                GetRawInputData, RegisterRawInputDevices, RAWINPUTDEVICE, RAWINPUTHEADER,
-                RIDEV_INPUTSINK, RIDEV_REMOVE, RID_HEADER, RIM_TYPEKEYBOARD,
+                GetRawInputData, RegisterRawInputDevices, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+                RAWKEYBOARD, RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_MESSAGE, MSG, WM_INPUT,
@@ -96,10 +96,16 @@ mod platform {
     pub(crate) struct KeyboardMonitor {
         window: HWND,
         raw_tick: Arc<AtomicU32>,
+        physical: Mutex<crate::shortcut_keys::ShortcutKeys>,
+        shared_keys: Arc<Mutex<crate::shortcut_keys::ShortcutKeys>>,
     }
 
     impl KeyboardMonitor {
-        pub(crate) fn new(raw_tick: Arc<AtomicU32>) -> Option<Self> {
+        pub(crate) fn new(
+            raw_tick: Arc<AtomicU32>,
+            shared_keys: Arc<Mutex<crate::shortcut_keys::ShortcutKeys>>,
+        ) -> Option<Self> {
+            let physical = Mutex::new(shared_keys.lock().ok()?.clone());
             let mut owner = REGISTRATION_OWNER.lock().ok()?;
             let window = unsafe {
                 CreateWindowExW(
@@ -146,7 +152,12 @@ mod platform {
             }
             *owner = window as usize;
             raw_tick.store(0, Ordering::Relaxed);
-            Some(Self { window, raw_tick })
+            Some(Self {
+                window,
+                raw_tick,
+                physical,
+                shared_keys,
+            })
         }
 
         pub(crate) fn observe_message(&self, message: &MSG) {
@@ -154,19 +165,52 @@ mod platform {
                 return;
             }
             if message.hwnd == self.window {
-                let mut header = RAWINPUTHEADER::default();
-                let mut bytes = size_of::<RAWINPUTHEADER>() as u32;
+                let mut input = RAWINPUT::default();
+                let mut bytes = size_of::<RAWINPUT>() as u32;
                 let read = unsafe {
                     GetRawInputData(
                         message.lParam as _,
-                        RID_HEADER,
-                        (&mut header as *mut RAWINPUTHEADER).cast(),
+                        RID_INPUT,
+                        (&mut input as *mut RAWINPUT).cast(),
                         &mut bytes,
                         size_of::<RAWINPUTHEADER>() as u32,
                     )
                 };
-                if read == size_of::<RAWINPUTHEADER>() as u32 && header.dwType == RIM_TYPEKEYBOARD {
+                if read >= (size_of::<RAWINPUTHEADER>() + size_of::<RAWKEYBOARD>()) as u32
+                    && read != u32::MAX
+                    && input.header.dwType == RIM_TYPEKEYBOARD
+                {
                     self.raw_tick.store(message.time, Ordering::Relaxed);
+                    if !input.header.hDevice.is_null() {
+                        let keyboard = unsafe { input.data.keyboard };
+                        let key = match keyboard.VKey {
+                            0x10 => {
+                                if keyboard.MakeCode == 0x36 {
+                                    0xA1
+                                } else {
+                                    0xA0
+                                }
+                            }
+                            0x11 => {
+                                if keyboard.Flags & 2 != 0 {
+                                    0xA3
+                                } else {
+                                    0xA2
+                                }
+                            }
+                            0x12 => {
+                                if keyboard.Flags & 2 != 0 {
+                                    0xA5
+                                } else {
+                                    0xA4
+                                }
+                            }
+                            key => key,
+                        };
+                        if let Ok(mut physical) = self.physical.lock() {
+                            physical.observe(key, keyboard.Flags & 1 == 0);
+                        }
+                    }
                 }
             }
             // Required for WM_INPUT cleanup, including when our app has focus.
@@ -177,6 +221,13 @@ mod platform {
                     message.wParam,
                     message.lParam,
                 );
+            }
+        }
+
+        pub(crate) fn reconcile_physical_keys(&self) {
+            if let (Ok(physical), Ok(mut shared)) = (self.physical.lock(), self.shared_keys.lock())
+            {
+                shared.reconcile_physical(&physical);
             }
         }
     }

@@ -253,6 +253,14 @@ pub struct ClipboardTarget {
 
 type ClipboardPasteSender = Box<dyn Fn(ClipboardTarget) + Send + Sync>;
 static CLIPBOARD_PASTE_SENDER: OnceLock<ClipboardPasteSender> = OnceLock::new();
+static RUNTIME_TOGGLE_SENDER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+static HOTKEY_RECORDING: AtomicBool = AtomicBool::new(false);
+static GLOBAL_TOGGLE_REGISTERED: AtomicBool = AtomicBool::new(false);
+pub(crate) fn set_global_toggle_registered(registered: bool) { GLOBAL_TOGGLE_REGISTERED.store(registered, Ordering::Relaxed); }
+pub(crate) fn set_runtime_toggle_sender(sender: Box<dyn Fn() + Send + Sync>) { let _ = RUNTIME_TOGGLE_SENDER.set(sender); }
+pub(crate) fn set_hotkey_recording(recording: bool) { HOTKEY_RECORDING.store(recording, Ordering::Relaxed); }
+pub(crate) fn hotkey_recording() -> bool { HOTKEY_RECORDING.load(Ordering::Relaxed) }
+fn emit_runtime_toggle() { if let Some(sender) = RUNTIME_TOGGLE_SENDER.get() { sender(); } }
 pub(crate) fn set_clipboard_paste_sender(sender: ClipboardPasteSender) { let _ = CLIPBOARD_PASTE_SENDER.set(sender); }
 fn emit_clipboard_paste(target: ClipboardTarget) { if let Some(sender) = CLIPBOARD_PASTE_SENDER.get() { sender(target); } }
 
@@ -571,6 +579,51 @@ struct HotkeyModifiers {
     alt: bool,
     shift: bool,
     meta: bool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl From<crate::shortcut_keys::Modifiers> for HotkeyModifiers {
+    fn from(value: crate::shortcut_keys::Modifiers) -> Self {
+        Self { ctrl: value.ctrl, alt: value.alt, shift: value.shift, meta: value.meta }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapturedShortcut {
+    Toggle,
+    Switch(SwitchDirection),
+    Paste,
+}
+
+fn captured_shortcut(
+    layout: &LayoutState,
+    key: u16,
+    modifiers: HotkeyModifiers,
+    running: bool,
+) -> Option<CapturedShortcut> {
+    if layout.machine_role != "server" || hotkey_recording() {
+        return None;
+    }
+    if hotkey_matches_vk(&layout.edge_switch_hotkey, key, modifiers) {
+        return Some(CapturedShortcut::Toggle);
+    }
+    if !running {
+        return None;
+    }
+    for (value, direction) in [
+        (&layout.screen_switch_hotkeys.left, SwitchDirection::Left),
+        (&layout.screen_switch_hotkeys.right, SwitchDirection::Right),
+        (&layout.screen_switch_hotkeys.up, SwitchDirection::Up),
+        (&layout.screen_switch_hotkeys.down, SwitchDirection::Down),
+    ] {
+        if hotkey_matches_vk(value, key, modifiers) {
+            return Some(CapturedShortcut::Switch(direction));
+        }
+    }
+    if layout.clipboard_sync && hotkey_matches_vk(&layout.clipboard_paste_hotkey, key, modifiers) {
+        return Some(CapturedShortcut::Paste);
+    }
+    None
 }
 
 fn screen_switch_hotkey_matches_vk(
@@ -1314,6 +1367,7 @@ fn start_platform_capture(
     let (ready_tx, ready_rx) = mpsc::channel();
 
     thread::spawn(move || {
+        let idle_capture = WINDOWS_IDLE_KEYBOARD_CAPTURE.lock().ok().and_then(|mut idle| idle.take());
         refresh_windows_input_desktop_cache();
         WINDOWS_LOCAL_LEFT_DOWN.store(windows_left_button_down(), Ordering::Relaxed);
         let cursor_guard = crate::windows_cursor_guard::CursorGuard::new();
@@ -1338,13 +1392,16 @@ fn start_platform_capture(
             move_pending: AtomicBool::new(false),
             pressed_keys: Mutex::new(Vec::new()),
             keyboard_hook_tick: std::sync::atomic::AtomicU32::new(0),
-            keyboard_thread_id: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            keyboard_thread_id: idle_capture.as_ref().map(|capture| capture.owner())
+                .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU32::new(0))),
             capture_thread_id: unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
             cursor_owner_window: cursor_guard.as_ref().map_or(0, |guard| guard.handle()),
             local_capture_requested: AtomicBool::new(false),
             local_capture_hold: AtomicBool::new(false),
             raw_keyboard_tick: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             return_edge_gate: Mutex::new(crate::windows_mouse_motion::EdgeReturnGate::default()),
+            shortcut_keys: windows_shortcut_keys(),
+            capture_stop: Arc::clone(&stop),
             cursor_hide_calls: Mutex::new(0),
             just_crossed: AtomicBool::new(false),
             local_screen_points: Mutex::new(HashMap::new()),
@@ -1372,7 +1429,10 @@ fn start_platform_capture(
             return;
         }
 
-        let mut keyboard_capture = match start_windows_keyboard_capture(&context, false) {
+        let initial_keyboard = if let Some(capture) = idle_capture {
+            capture.resume_capture(); Ok(capture)
+        } else { start_windows_keyboard_capture(&context, false) };
+        let mut keyboard_capture = match initial_keyboard {
             Ok(capture) => Some(capture),
             Err(error) => {
                 unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
@@ -1392,7 +1452,7 @@ fn start_platform_capture(
         let mut last_hook_reinstall: Option<Instant> = None;
         let mut hook_watchdog = WindowsHookWatchdog::default();
         let mut keyboard_watchdog = crate::windows_keyboard_monitor::KeyboardHookWatchdog::default();
-        let mut keyboard_monitor = crate::windows_keyboard_monitor::KeyboardMonitor::new(Arc::clone(&context.raw_keyboard_tick));
+        let mut keyboard_monitor = crate::windows_keyboard_monitor::KeyboardMonitor::new(Arc::clone(&context.raw_keyboard_tick), Arc::clone(&context.shortcut_keys));
         let mut last_keyboard_reinstall: Option<Instant> = None;
         let mut keyboard_recovery = crate::windows_keyboard_monitor::KeyboardCaptureRecovery::default();
         let mut keyboard_on_owner_thread = false;
@@ -1447,7 +1507,6 @@ fn start_platform_capture(
                         let _ = UnhookWindowsHookEx(mouse_hook);
                     }
                     mouse_hook = std::ptr::null_mut();
-                    keyboard_capture = None;
                     keyboard_monitor = None;
                     context.raw_keyboard_tick.store(0, Ordering::Relaxed);
                     keyboard_watchdog.reset(0);
@@ -1460,8 +1519,10 @@ fn start_platform_capture(
                 unsafe {
                     mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(windows_mouse_proc), std::ptr::null_mut(), 0);
                 }
-                keyboard_capture = start_windows_keyboard_capture(&context, keyboard_on_owner_thread)
-                    .map_err(|error| log::warn!("{error}")).ok();
+                if keyboard_capture.is_none() {
+                    keyboard_capture = start_windows_keyboard_capture(&context, keyboard_on_owner_thread)
+                        .map_err(|error| log::warn!("{error}")).ok();
+                }
                 if mouse_hook.is_null() || keyboard_capture.is_none() {
                     unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
                     mouse_hook = std::ptr::null_mut();
@@ -1473,7 +1534,7 @@ fn start_platform_capture(
                     crate::input_guard::set_capture_available(&context.input_guard, true);
                     hook_watchdog = WindowsHookWatchdog::default();
                     LAST_HOOK_EVENT_TICK.store(0, Ordering::Relaxed);
-                    keyboard_monitor = crate::windows_keyboard_monitor::KeyboardMonitor::new(Arc::clone(&context.raw_keyboard_tick));
+                    keyboard_monitor = crate::windows_keyboard_monitor::KeyboardMonitor::new(Arc::clone(&context.raw_keyboard_tick), Arc::clone(&context.shortcut_keys));
                     keyboard_watchdog.reset(0);
                     WINDOWS_LOCAL_LEFT_DOWN.store(windows_left_button_down(), Ordering::Relaxed);
                     if let Ok(mut point) = context.last_point.lock() { *point = None; }
@@ -1522,6 +1583,7 @@ fn start_platform_capture(
                 && last_keyboard_reinstall.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
             {
                 last_keyboard_reinstall = Some(Instant::now());
+                if let Some(monitor) = &keyboard_monitor { monitor.reconcile_physical_keys(); }
                 keyboard_on_owner_thread |= keyboard_recovery.next_rebuild_on_owner_thread();
                 log::warn!("keyboard input arrived without a keyboard callback; rebuilding capture (owner_thread={keyboard_on_owner_thread}, keyboard_tick={keyboard_tick}, raw_keyboard_tick={raw_tick})");
                 drop(keyboard_capture.take());
@@ -1667,9 +1729,28 @@ fn start_platform_capture(
         unsafe {
             let _ = UnhookWindowsHookEx(mouse_hook);
         }
-        drop(keyboard_capture);
+        let owns_context = WINDOWS_CAPTURE_CONTEXT.lock().map(|slot| slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &context))).unwrap_or(false);
+        if owns_context { release_windows_remote_control(&context, false); }
         show_windows_cursor_if_needed(&context);
-        if clear_windows_capture_context(&context) {
+        let server = context.layout_state.lock().map(|layout| layout.machine_role == "server").unwrap_or(false);
+        if owns_context && server {
+            // Keep only the keyboard shortcut observer while sharing is off.
+            // Physical Alt can stay held through stop/start after logical ups.
+            if keyboard_on_owner_thread || keyboard_capture.is_none() {
+                drop(keyboard_capture.take());
+                keyboard_capture = start_windows_keyboard_capture(&context, false).ok();
+            }
+            if let Some(capture) = keyboard_capture.take() {
+                capture.keep_for_shortcuts();
+                if let Ok(mut idle) = WINDOWS_IDLE_KEYBOARD_CAPTURE.lock() { *idle = Some(capture); }
+            }
+        } else {
+            drop(keyboard_capture);
+        }
+        if !owns_context || !server {
+            clear_windows_capture_context(&context);
+        }
+        if owns_context {
             context.remote_active.store(false, Ordering::Relaxed);
             crate::windows_drop_catcher::disarm();
             clear_clipboard_target(&context.clipboard_target);
@@ -3271,6 +3352,8 @@ struct WindowsCaptureContext {
     local_capture_hold: AtomicBool,
     raw_keyboard_tick: Arc<std::sync::atomic::AtomicU32>,
     return_edge_gate: Mutex<crate::windows_mouse_motion::EdgeReturnGate>,
+    shortcut_keys: Arc<Mutex<crate::shortcut_keys::ShortcutKeys>>,
+    capture_stop: Arc<AtomicBool>,
     cursor_hide_calls: Mutex<u8>,
     // Swallow the first post-crossing delta so a fast flick across the edge
     // does not shove the cursor inward on Windows, where we pin by warping.
@@ -3589,6 +3672,138 @@ static WINDOWS_CURSOR_WARPS: Mutex<crate::windows_mouse_motion::CursorWarps> =
     Mutex::new(crate::windows_mouse_motion::CursorWarps::new());
 
 #[cfg(target_os = "windows")]
+static WINDOWS_IDLE_KEYBOARD_CAPTURE: Mutex<Option<crate::windows_keyboard_capture::KeyboardCapture>> = Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+fn windows_shortcut_keys() -> Arc<Mutex<crate::shortcut_keys::ShortcutKeys>> {
+    static KEYS: OnceLock<Arc<Mutex<crate::shortcut_keys::ShortcutKeys>>> = OnceLock::new();
+    Arc::clone(KEYS.get_or_init(|| {
+        let mut keys = crate::shortcut_keys::ShortcutKeys::default();
+        for key in 8..256_u16 {
+            if matches!(key, 0x10..=0x12) {
+                continue;
+            }
+            if unsafe {
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(key as i32)
+            } as u16
+                & 0x8000
+                != 0
+            {
+                keys.observe(key, true);
+                keys.deliver_local_down(key);
+            }
+        }
+        Arc::new(Mutex::new(keys))
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn release_shortcut_inputs_windows(context: &WindowsCaptureContext) {
+    let local = context
+        .shortcut_keys
+        .lock()
+        .map(|mut keys| keys.release_logical_keys())
+        .unwrap_or_default();
+    for key_code in local {
+        dispatch_input_command(InputCommand::Key {
+            key_code,
+            down: false,
+        });
+    }
+    if let Some(active) = remote_target_for_input(&context.active, &context.remote_active) {
+        release_forwarded_keys_windows(context, &active.target);
+        release_remote_buttons(
+            &context.quic_transport,
+            &active.target,
+            &context.remote_button_mask,
+            &context.layout_state,
+            &context.input_events,
+        );
+        if let Ok(mut held) = SENDER_HELD.lock() {
+            held.held = HeldInputs::default();
+            held.last_attached = None;
+        }
+        send_remote_mouse_move(
+            &context.quic_transport,
+            &active,
+            &context.layout_state,
+            &context.input_events,
+        );
+    }
+}
+
+pub(crate) fn prepare_system_shortcut(value: &str, direction: bool) -> bool {
+    if hotkey_recording() {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(context) = windows_capture_context() {
+        if direction
+            && !context.capture_stop.load(Ordering::Relaxed)
+            && context.keyboard_thread_id.load(Ordering::Relaxed) != 0
+        {
+            return false; // The physical hook is the single direction-shortcut owner.
+        }
+        if let Some(key) = value
+            .split('+')
+            .next_back()
+            .and_then(hotkey_key_to_windows_vk)
+        {
+            if let Ok(mut keys) = context.shortcut_keys.lock() {
+                if keys.consumed_event(key, true) {
+                    return false;
+                }
+                keys.consume(key);
+            }
+        }
+        release_shortcut_inputs_windows(&context);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (value, direction);
+    true
+}
+
+pub(crate) fn owns_native_shortcuts() -> bool {
+    #[cfg(target_os = "windows")]
+    { return windows_capture_context().is_some_and(|context| context.keyboard_thread_id.load(Ordering::Relaxed) != 0); }
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn keyboard_hook_health() -> Option<(u32, Arc<std::sync::atomic::AtomicU32>, Arc<Mutex<crate::shortcut_keys::ShortcutKeys>>)> {
+    windows_capture_context().map(|context| (context.keyboard_hook_tick.load(Ordering::Relaxed), Arc::clone(&context.raw_keyboard_tick), Arc::clone(&context.shortcut_keys)))
+}
+
+pub(crate) fn finish_shortcut_recording(captured: Option<&str>) {
+    #[cfg(target_os = "windows")]
+    if let Some(context) = windows_capture_context() {
+        if let Ok(mut keys) = context.shortcut_keys.lock() { keys.consume_held_keys(); }
+        release_shortcut_inputs_windows(&context);
+    }
+    let _ = captured;
+}
+
+pub(crate) fn prepare_input_stop() {
+    #[cfg(target_os = "windows")]
+    if let Some(context) = windows_capture_context() { release_shortcut_inputs_windows(&context); }
+}
+
+pub(crate) fn begin_shortcut_recording() {
+    #[cfg(target_os = "windows")]
+    if let Some(context) = windows_capture_context() {
+        release_shortcut_inputs_windows(&context);
+        release_windows_remote_control(&context, false);
+        let modifiers = context.shortcut_keys.lock().map(|mut keys| {
+            let modifiers = keys.physical_modifier_keys();
+            for key in &modifiers { keys.deliver_local_down(*key); }
+            modifiers
+        }).unwrap_or_default();
+        for key_code in modifiers { dispatch_input_command(InputCommand::Key { key_code, down: true }); }
+    }
+}
+
+#[cfg(target_os = "windows")]
 static WINDOWS_LOCAL_LEFT_DOWN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
@@ -3708,86 +3923,153 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        WM_SYSKEYUP,
     };
-
+    let next = || unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     if code < 0 {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+        return next();
     }
-
-    // Local typing still proves the hook is alive. Recording only forwarded
-    // keys made the watchdog reinstall healthy hooks and release remote control.
     let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
-    let receipt_tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
-
     let Some(context) = windows_capture_context() else {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+        return next();
     };
-    if context.keyboard_thread_id.load(Ordering::Relaxed) != unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    if context.keyboard_thread_id.load(Ordering::Relaxed)
+        != unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+    {
+        return next();
     }
+    let receipt_tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
     LAST_HOOK_EVENT_TICK.store(receipt_tick, Ordering::Relaxed);
-    context.keyboard_hook_tick.store(receipt_tick, Ordering::Relaxed);
+    context
+        .keyboard_hook_tick
+        .store(receipt_tick, Ordering::Relaxed);
+    // Synthetic logical ups must never change our record of the physical keys.
     if event.dwExtraInfo == crate::windows_input::KEYBOARD_INPUT_MARKER {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+        return next();
+    }
+    let message = wparam as u32;
+    if !matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
+        return next();
+    }
+    let key_code = event.vkCode as u16;
+    let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+    let (modifiers, local_modifiers, consumed, local_up) = {
+        let Ok(mut keys) = context.shortcut_keys.lock() else {
+            return next();
+        };
+        keys.observe(key_code, down);
+        let consumed = keys.consumed_event(key_code, down);
+        let local_up = !down && keys.release_local(key_code);
+        (
+            HotkeyModifiers::from(keys.modifiers()),
+            HotkeyModifiers::from(keys.local_modifiers()),
+            consumed,
+            local_up,
+        )
+    };
+    if consumed {
+        return if local_up { next() } else { 1 };
     }
     if !cached_windows_input_desktop_is_default() {
-        release_windows_remote_control(&context, true);
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+        return next();
     }
-
-    let message = wparam as u32;
-
-    // Serialize forwarding with mouse return/entry. The keyboard queue runs on
-    // another thread now, so a key must be tracked before a return releases it.
+    let running = !context.capture_stop.load(Ordering::Relaxed);
+    let remote = running && context.remote_active.load(Ordering::Relaxed);
+    if down {
+        let action = context.layout_state.try_lock().ok().and_then(|layout| {
+            captured_shortcut(
+                &layout,
+                key_code,
+                modifiers,
+                running && !context.local_capture_hold.load(Ordering::Relaxed),
+            )
+        });
+        // A local chord whose modifiers reached Windows belongs to RegisterHotKey.
+        // Captured/virtually released modifiers need the physical hook instead.
+        let action = action.filter(|action| {
+            *action != CapturedShortcut::Toggle || remote || local_modifiers != modifiers
+                || !GLOBAL_TOGGLE_REGISTERED.load(Ordering::Relaxed)
+        });
+        if let Some(action) = action {
+            if let Ok(mut keys) = context.shortcut_keys.lock() {
+                keys.consume(key_code);
+            }
+            match action {
+                CapturedShortcut::Switch(direction) => {
+                    if let Ok(mut request) = context.switch_request.lock() {
+                        *request = Some(direction);
+                    }
+                    log::info!("physical screen shortcut requested {direction:?} (ctrl={}, alt={}, shift={}, meta={})", modifiers.ctrl, modifiers.alt, modifiers.shift, modifiers.meta);
+                }
+                CapturedShortcut::Toggle => {
+                    release_shortcut_inputs_windows(&context);
+                    emit_runtime_toggle();
+                }
+                CapturedShortcut::Paste => {
+                    release_shortcut_inputs_windows(&context);
+                    if let Some(peer) = current_clipboard_target(&context.clipboard_target) {
+                        emit_clipboard_paste(peer);
+                    }
+                }
+            }
+            return 1;
+        }
+    }
+    // The idle observer passes ordinary typing to Windows while sharing is off.
     let active = context.active.lock().ok();
-    let target = active.as_ref().and_then(|active| active.as_ref())
-        .filter(|_| context.remote_active.load(Ordering::Relaxed))
+    let target = active
+        .as_ref()
+        .and_then(|active| active.as_ref())
+        .filter(|_| remote)
         .map(|active| active.target.clone());
     let Some(target) = target else {
         drop(active);
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+        if down {
+            if let Ok(mut keys) = context.shortcut_keys.lock() {
+                keys.deliver_local_down(key_code);
+            }
+        }
+        return next();
     };
-
-    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
-        let key_code = event.vkCode as u16;
-        let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
-        let modifiers = windows_forwarded_hotkey_modifiers(&context);
-        if down && event.flags & LLKHF_INJECTED == 0 && key_code == 0x70 && modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.meta
-            && crate::input_guard::snipaste_is_running(&context.input_guard)
-        {
-            context.local_capture_requested.store(true, Ordering::Relaxed);
-            return 1;
+    if down
+        && !hotkey_recording()
+        && event.flags & LLKHF_INJECTED == 0
+        && key_code == 0x70
+        && modifiers.ctrl
+        && !modifiers.alt
+        && !modifiers.shift
+        && !modifiers.meta
+        && crate::input_guard::snipaste_is_running(&context.input_guard)
+    {
+        if let Ok(mut keys) = context.shortcut_keys.lock() {
+            keys.consume(key_code);
         }
-        if down && clipboard_paste_matches(&context.layout_state, key_code, windows_forwarded_hotkey_modifiers(&context)) {
-            release_forwarded_keys_windows(&context, &target);
-            if let Some(peer) = current_clipboard_target(&context.clipboard_target) { emit_clipboard_paste(peer); }
-            return 1;
-        }
-        if down && windows_event_matches_screen_switch_hotkey(&context, key_code) {
-            drop(active);
-            log::info!("screen switch hotkey returning to local from keyboard hook");
-            release_windows_remote_control(&context, false);
-            return 1;
-        }
-        let sent = send_packet(
-            &context.quic_transport,
-            &target,
-            InputEvent::Key { key_code, down },
-            &context.layout_state,
-            &context.input_events,
-        );
-        if sent {
-            track_forwarded_key(&context.pressed_keys, key_code, down);
-        }
-        drop(active);
-        if !sent {
-            return_to_local_after_send_failure_windows(&context, "key");
-        }
+        context
+            .local_capture_requested
+            .store(true, Ordering::Relaxed);
         return 1;
     }
-
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    let sent = send_packet(
+        &context.quic_transport,
+        &target,
+        InputEvent::Key { key_code, down },
+        &context.layout_state,
+        &context.input_events,
+    );
+    if sent {
+        track_forwarded_key(&context.pressed_keys, key_code, down);
+    }
+    drop(active);
+    if !sent {
+        return_to_local_after_send_failure_windows(&context, "key");
+    }
+    // A key started on Windows must get its matching up there as well.
+    if local_up {
+        next()
+    } else {
+        1
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -3806,50 +4088,6 @@ fn start_windows_keyboard_capture(
             Arc::clone(&context.keyboard_thread_id),
             Some(windows_keyboard_proc),
         )
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_event_matches_screen_switch_hotkey(
-    context: &WindowsCaptureContext,
-    key_code: u16,
-) -> bool {
-    // While remote, modifiers are forwarded and swallowed, so they never reach
-    // this machine's key state and GetAsyncKeyState reads them as up: the
-    // return hotkey could not match from the controlled side. Count the
-    // forwarded ones as well.
-    let modifiers = windows_forwarded_hotkey_modifiers(context);
-    screen_switch_hotkey_matches_vk(&context.layout_state, key_code, modifiers)
-}
-
-#[cfg(target_os = "windows")]
-fn windows_forwarded_hotkey_modifiers(context: &WindowsCaptureContext) -> HotkeyModifiers {
-    let mut modifiers = windows_current_hotkey_modifiers();
-    if let Ok(pressed) = context.pressed_keys.lock() {
-        let held = |codes: &[u16]| codes.iter().any(|code| pressed.contains(code));
-        modifiers.ctrl |= held(&[0x11, 0xA2, 0xA3]);
-        modifiers.alt |= held(&[0x12, 0xA4, 0xA5]);
-        modifiers.shift |= held(&[0x10, 0xA0, 0xA1]);
-        modifiers.meta |= held(&[0x5B, 0x5C]);
-    }
-    modifiers
-}
-
-#[cfg(target_os = "windows")]
-fn windows_current_hotkey_modifiers() -> HotkeyModifiers {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
-    };
-
-    fn down(vk: u16) -> bool {
-        unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
-    }
-
-    HotkeyModifiers {
-        ctrl: down(VK_CONTROL),
-        alt: down(VK_MENU),
-        shift: down(VK_SHIFT),
-        meta: down(VK_LWIN) || down(VK_RWIN),
     }
 }
 
@@ -3958,7 +4196,7 @@ fn cached_windows_input_desktop_is_default() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn refresh_windows_input_desktop_cache() -> bool {
+pub(crate) fn refresh_windows_input_desktop_cache() -> bool {
     use std::sync::atomic::AtomicU32;
     // Consecutive probes that did not find the Default desktop.
     static MISSES: AtomicU32 = AtomicU32::new(0);
@@ -4556,7 +4794,8 @@ pub(crate) fn diagnostic_summary() -> String {
         let Some(context) = windows_capture_context() else { return "capture_context=none".into(); };
         let target = context.active.lock().ok().and_then(|active| active.as_ref().map(|active| active.target.device_id.clone()));
         let anchor = context.anchor.lock().ok().and_then(|anchor| *anchor);
-        format!("remote_active={} target={target:?} anchor={anchor:?} cursor={:?} cursor_flags={:?} cursor_owner={} capture_thread={} keyboard_thread={} hook_receipt_tick={} keyboard_hook_tick={} raw_keyboard_tick={} held_buttons={} local_capture_hold={} screenshot_active={} guard={:?}",
+        let modifiers = context.shortcut_keys.lock().ok().map(|keys| (keys.modifiers(), keys.local_modifiers()));
+        format!("remote_active={} target={target:?} anchor={anchor:?} cursor={:?} cursor_flags={:?} cursor_owner={} capture_thread={} keyboard_thread={} hook_receipt_tick={} keyboard_hook_tick={} raw_keyboard_tick={} held_buttons={} local_capture_hold={} screenshot_active={} guard={:?} modifiers={modifiers:?}",
             context.remote_active.load(Ordering::Relaxed), windows_current_cursor_point(),
             crate::windows_cursor_guard::visibility(), context.cursor_owner_window, context.capture_thread_id, context.keyboard_thread_id.load(Ordering::Relaxed),
             LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed), context.keyboard_hook_tick.load(Ordering::Relaxed),
@@ -6415,6 +6654,7 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         current_point,
     ) {
         SwitchOutcome::Enter(active_target) => {
+            release_shortcut_inputs_windows(context);
             log::info!(
                 "screen switch entering device={}",
                 active_target.target.device_id
@@ -6454,6 +6694,7 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         }
         SwitchOutcome::Return => {
             log::info!("screen switch returning to local");
+            release_shortcut_inputs_windows(context);
             release_windows_remote_control(context, false);
         }
         SwitchOutcome::LocalMove {
@@ -6462,6 +6703,7 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
             x,
             y,
         } => {
+            release_shortcut_inputs_windows(context);
             let (x, y) = remembered_local_screen_point(
                 &context.local_screen_points,
                 &from_screen_id,
@@ -8616,6 +8858,53 @@ mod tests {
             now + Duration::from_secs(11) + Duration::from_millis(10)
         ));
         assert_eq!(local_return_point(&active).0, 1919.0);
+    }
+
+    #[test]
+    fn every_default_shortcut_releases_logical_keys_without_losing_physical_modifiers() {
+        let layout = layout_for_target_tests();
+        for (key, held, expected) in [
+            (0x25, vec![0xA4], CapturedShortcut::Switch(SwitchDirection::Left)),
+            (0x27, vec![0xA4], CapturedShortcut::Switch(SwitchDirection::Right)),
+            (0x26, vec![0xA4], CapturedShortcut::Switch(SwitchDirection::Up)),
+            (0x28, vec![0xA4], CapturedShortcut::Switch(SwitchDirection::Down)),
+            (0x4B, vec![0xA4, 0xA0], CapturedShortcut::Toggle),
+        ] {
+            let mut state = crate::shortcut_keys::ShortcutKeys::default();
+            for modifier in &held { state.observe(*modifier, true); state.deliver_local_down(*modifier); }
+            state.observe(key, true);
+            assert_eq!(captured_shortcut(&layout, key, state.modifiers().into(), true), Some(expected));
+            state.consume(key);
+            state.release_logical_keys();
+            assert_eq!(state.local_modifiers(), crate::shortcut_keys::Modifiers::default());
+            assert!(state.consumed_event(key, true)); // Holding the trigger is one action.
+            state.observe(key, false);
+            assert!(state.consumed_event(key, false));
+            state.observe(key, true);
+            assert_eq!(captured_shortcut(&layout, key, state.modifiers().into(), true), Some(expected));
+            for modifier in &held { state.observe(*modifier, false); }
+            for arrow in [0x25, 0x26, 0x27, 0x28] {
+                assert_eq!(captured_shortcut(&layout, arrow, state.modifiers().into(), true), None);
+            }
+        }
+    }
+
+    #[test]
+    fn shortcut_roles_disabled_bindings_and_modifier_aliases_stay_consistent() {
+        let mut layout = layout_for_target_tests();
+        layout.edge_switch_hotkey = "control+option+shift+command+f24".into();
+        let mut keys = crate::shortcut_keys::ShortcutKeys::default();
+        for modifier in [0x11, 0x12, 0x10, 0x5B] { keys.observe(modifier, true); }
+        assert_eq!(captured_shortcut(&layout, 0x87, keys.modifiers().into(), false), Some(CapturedShortcut::Toggle));
+        layout.edge_switch_hotkey = "disabled".into();
+        assert_eq!(captured_shortcut(&layout, 0x87, keys.modifiers().into(), true), None);
+        layout.machine_role = "client".into();
+        assert_eq!(captured_shortcut(&layout, 0x27, HotkeyModifiers { alt: true, ..Default::default() }, true), None);
+        layout.machine_role = "server".into();
+        assert_eq!(captured_shortcut(&layout, 0x27, HotkeyModifiers { alt: true, ..Default::default() }, false), None);
+        layout.clipboard_sync = true;
+        layout.clipboard_paste_hotkey = "disabled".into();
+        assert_eq!(captured_shortcut(&layout, 0x56, HotkeyModifiers { ctrl: true, ..Default::default() }, true), None);
     }
 
     #[cfg(target_os = "windows")]

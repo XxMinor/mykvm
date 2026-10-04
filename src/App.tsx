@@ -41,6 +41,7 @@ import {
   fetchClientLog,
   requestClientUpdate,
   setAutostart,
+  setHotkeyRecording,
   scanLanPeers,
   startRuntime,
   startWindowDrag,
@@ -1603,6 +1604,7 @@ function App() {
 
     event.preventDefault();
     event.stopPropagation();
+    void setHotkeyRecording(false, hotkey).catch((error: unknown) => setErrorMessage(String(error)));
     commitEdgeSwitchHotkey(hotkey);
     setIsCapturingEdgeSwitchHotkey(false);
   });
@@ -1662,6 +1664,7 @@ function App() {
     }
     event.preventDefault();
     event.stopPropagation();
+    void setHotkeyRecording(false, hotkey).catch((error: unknown) => setErrorMessage(String(error)));
     setScreenSwitchHotkey(direction, hotkey);
     setCapturingDirection(null);
   });
@@ -1695,6 +1698,12 @@ function App() {
       window.removeEventListener("blur", cancelRecording);
     };
   }, [capturingDirection]);
+
+  useEffect(() => {
+    const recording = isCapturingEdgeSwitchHotkey || capturingDirection !== null;
+    void setHotkeyRecording(recording).catch(() => {});
+    return () => { if (recording) void setHotkeyRecording(false).catch(() => {}); };
+  }, [isCapturingEdgeSwitchHotkey, capturingDirection]);
 
   function setTransportPortMode(transportPortMode: TransportPortMode) {
     updateLayout((layoutState) => ({

@@ -51,6 +51,7 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 
 - Runs in Server or Client mode.
 - Windows installed builds request administrator permission at startup. Approve the UAC prompt to start sharing; login launches preserve their tray-only behavior.
+- Windows shortcut handling keeps physical modifiers separate from device key state. Start/stop and screen switches release logical keys, so holding Alt permits repeated switches and releasing it restores ordinary arrow input. Existing bindings pause during shortcut recording.
 - Discovers nearby peers on the LAN.
 - Supports manual peer connection by host or IP.
 - Detects local displays and lets you arrange multi-monitor layouts.
