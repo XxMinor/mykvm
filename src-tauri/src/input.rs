@@ -1306,8 +1306,8 @@ fn start_platform_capture(
     input_guard: crate::input_guard::SharedGuard,
 ) -> NativeStageStatus {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, MsgWaitForMultipleObjects, PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
-        PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT,
+        DefWindowProcW, DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
+        PM_REMOVE, QS_ALLINPUT, WH_MOUSE_LL, WM_INPUT,
     };
 
     let target_count = targets.len();
@@ -1316,6 +1316,8 @@ fn start_platform_capture(
     thread::spawn(move || {
         refresh_windows_input_desktop_cache();
         WINDOWS_LOCAL_LEFT_DOWN.store(windows_left_button_down(), Ordering::Relaxed);
+        let cursor_guard = crate::windows_cursor_guard::CursorGuard::new();
+        if cursor_guard.is_none() { log::warn!("could not create remote cursor owner window: {}", std::io::Error::last_os_error()); }
         let context = Arc::new(WindowsCaptureContext {
             quic_transport,
             layout_state,
@@ -1336,6 +1338,11 @@ fn start_platform_capture(
             move_pending: AtomicBool::new(false),
             pressed_keys: Mutex::new(Vec::new()),
             keyboard_hook_tick: std::sync::atomic::AtomicU32::new(0),
+            keyboard_thread_id: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            capture_thread_id: unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+            cursor_owner_window: cursor_guard.as_ref().map_or(0, |guard| guard.handle()),
+            local_capture_requested: AtomicBool::new(false),
+            local_capture_hold: AtomicBool::new(false),
             raw_keyboard_tick: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             cursor_hide_calls: Mutex::new(0),
             just_crossed: AtomicBool::new(false),
@@ -1364,24 +1371,17 @@ fn start_platform_capture(
             return;
         }
 
-        let mut keyboard_hook = unsafe {
-            SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(windows_keyboard_proc),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if keyboard_hook.is_null() {
-            unsafe {
-                let _ = UnhookWindowsHookEx(mouse_hook);
+        let mut keyboard_capture = match start_windows_keyboard_capture(&context) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
+                context.remote_active.store(false, Ordering::Relaxed);
+                clear_clipboard_target(&context.clipboard_target);
+                clear_windows_capture_context(&context);
+                let _ = ready_tx.send(Err(error));
+                return;
             }
-            context.remote_active.store(false, Ordering::Relaxed);
-            clear_clipboard_target(&context.clipboard_target);
-            clear_windows_capture_context(&context);
-            let _ = ready_tx.send(Err("failed to install Windows keyboard hook".into()));
-            return;
-        }
+        };
 
         let _ = ready_tx.send(Ok(()));
         let mut message = MSG::default();
@@ -1393,8 +1393,12 @@ fn start_platform_capture(
         let mut keyboard_watchdog = crate::windows_keyboard_monitor::KeyboardHookWatchdog::default();
         let mut keyboard_monitor = crate::windows_keyboard_monitor::KeyboardMonitor::new(Arc::clone(&context.raw_keyboard_tick));
         let mut last_keyboard_reinstall: Option<Instant> = None;
+        let mut keyboard_recovery_pending: Option<u32> = None;
+        let mut previously_remote = false;
+        let mut last_cursor_reassert = Instant::now() - Duration::from_millis(200);
         let mut capture_suspended = false;
         let mut last_capture_resume = Instant::now() - Duration::from_secs(1);
+        let mut local_capture: Option<(ActiveTarget, crate::local_capture_session::LocalCaptureSession)> = None;
         while !stop.load(Ordering::Relaxed) {
             // Service pending hook callbacks before judging whether hooks died.
             unsafe {
@@ -1404,18 +1408,44 @@ fn start_platform_capture(
                     } else if message.message == WM_INPUT {
                         DefWindowProcW(message.hwnd, message.message, message.wParam, message.lParam);
                     }
+                    if message.message != WM_INPUT { DispatchMessageW(&message); }
                 }
             }
-            if crate::input_guard::suspend_for_session(&context.input_guard, context.remote_active.load(Ordering::Relaxed)) {
+            // Keyboard callbacks request a local return from another thread;
+            // restore this thread's cursor counter on the mouse owner thread.
+            if !context.remote_active.load(Ordering::Relaxed) {
+                show_windows_cursor_if_needed(&context);
+            } else if last_cursor_reassert.elapsed() >= Duration::from_millis(200) {
+                last_cursor_reassert = Instant::now();
+                hide_windows_cursor_if_needed(&context);
+            }
+            let screenshot_active = crate::input_guard::screenshot_is_active(&context.input_guard);
+            let requested_capture = context.local_capture_requested.swap(false, Ordering::Relaxed);
+            if requested_capture || (screenshot_active && context.remote_active.load(Ordering::Relaxed)) {
+                if let Some(active) = remote_target_for_input(&context.active, &context.remote_active) {
+                    local_capture = Some((active, crate::local_capture_session::LocalCaptureSession::new(screenshot_active, Instant::now())));
+                    context.local_capture_hold.store(true, Ordering::Relaxed);
+                    release_windows_remote_control(&context, false);
+                    log::info!("local screenshot took control; preserving the client target and clipboard connection");
+                }
+                if requested_capture {
+                    // Ctrl was swallowed while remote. Replay the complete
+                    // local shortcut after releasing it on the client, so
+                    // Snipaste sees balanced modifiers and a single F1 press.
+                    for (key_code, down) in [(0x11, true), (0x70, true), (0x70, false), (0x11, false)] {
+                        dispatch_input_command(InputCommand::Key { key_code, down });
+                    }
+                }
+            }
+            if screenshot_active || crate::input_guard::suspend_for_session(&context.input_guard, context.remote_active.load(Ordering::Relaxed)) {
                 if !capture_suspended {
                     release_windows_remote_control(&context, false);
                     crate::windows_drop_catcher::disarm();
                     unsafe {
                         let _ = UnhookWindowsHookEx(mouse_hook);
-                        let _ = UnhookWindowsHookEx(keyboard_hook);
                     }
                     mouse_hook = std::ptr::null_mut();
-                    keyboard_hook = std::ptr::null_mut();
+                    keyboard_capture = None;
                     keyboard_monitor = None;
                     context.raw_keyboard_tick.store(0, Ordering::Relaxed);
                     keyboard_watchdog.reset(0);
@@ -1426,12 +1456,13 @@ fn start_platform_capture(
                 refresh_windows_input_desktop_cache();
                 unsafe {
                     mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(windows_mouse_proc), std::ptr::null_mut(), 0);
-                    keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(windows_keyboard_proc), std::ptr::null_mut(), 0);
                 }
-                if mouse_hook.is_null() || keyboard_hook.is_null() {
-                    unsafe { let _ = UnhookWindowsHookEx(mouse_hook); let _ = UnhookWindowsHookEx(keyboard_hook); }
+                keyboard_capture = start_windows_keyboard_capture(&context)
+                    .map_err(|error| log::warn!("{error}")).ok();
+                if mouse_hook.is_null() || keyboard_capture.is_none() {
+                    unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
                     mouse_hook = std::ptr::null_mut();
-                    keyboard_hook = std::ptr::null_mut();
+                    keyboard_capture = None;
                     crate::input_guard::set_capture_available(&context.input_guard, false);
                     log::warn!("input protection: could not restore input hooks; retrying");
                 } else {
@@ -1447,39 +1478,65 @@ fn start_platform_capture(
             }
             if capture_suspended {
                 if let Ok(mut request) = context.switch_request.lock() { *request = None; }
+                previously_remote = false;
                 unsafe { let _ = MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 100, QS_ALLINPUT); }
                 continue;
             }
+            if local_capture.as_mut().is_some_and(|(_, session)| session.ready_to_restore(screenshot_active, Instant::now())) {
+                if let Some((mut active, session)) = local_capture.take() {
+                    let targets = current_input_targets(&context.layout_state, &context.native_layout);
+                    if let Some(target) = targets.iter().find(|target| target.device_id == active.target.device_id) {
+                        active.target = target.clone();
+                        if send_remote_mouse_move(&context.quic_transport, &active, &context.layout_state, &context.input_events) {
+                            let anchor = windows_remote_anchor_point(&active);
+                            set_control_clipboard_target(&context.clipboard_target, &active, &context.layout_state);
+                            if let Ok(mut slot) = context.active.lock() { *slot = Some(active); }
+                            if let Ok(mut slot) = context.anchor.lock() { *slot = Some(anchor); }
+                            context.just_crossed.store(true, Ordering::Relaxed);
+                            context.remote_active.store(true, Ordering::Relaxed);
+                            context.local_capture_hold.store(false, Ordering::Relaxed);
+                            hide_windows_cursor_if_needed(&context);
+                            set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+                            log::info!("local screenshot finished; restored mouse and keyboard to the client");
+                        } else { local_capture = Some((active, session)); }
+                    } else { context.local_capture_hold.store(false, Ordering::Relaxed); }
+                }
+            }
             let keyboard_tick = context.keyboard_hook_tick.load(Ordering::Relaxed);
             let raw_tick = context.raw_keyboard_tick.load(Ordering::Relaxed);
+            if keyboard_recovery_pending.is_some_and(|tick| keyboard_tick != tick) {
+                log::info!("keyboard callbacks resumed on thread {}", context.keyboard_thread_id.load(Ordering::Relaxed));
+                keyboard_recovery_pending = None;
+            }
+            let remote = context.remote_active.load(Ordering::Relaxed);
+            // A screenshot/global-hotkey handler may have replaced the local
+            // hook chain. Enter a remote session with a fresh keyboard queue.
+            let entering_remote = remote && !previously_remote;
+            previously_remote = remote;
             if !cached_windows_input_desktop_is_default() {
                 keyboard_watchdog.reset(raw_tick);
-            } else if keyboard_watchdog.observe(keyboard_tick, raw_tick, Instant::now())
-                && last_keyboard_reinstall.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+            } else if entering_remote || (keyboard_watchdog.observe(keyboard_tick, raw_tick, Instant::now())
+                && last_keyboard_reinstall.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)))
             {
                 last_keyboard_reinstall = Some(Instant::now());
-                log::warn!("keyboard input arrived without a keyboard hook callback; restoring keyboard capture (keyboard_tick={keyboard_tick}, raw_keyboard_tick={raw_tick})");
-                // Install the replacement first to avoid an extra capture gap.
-                let replacement = unsafe {
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(windows_keyboard_proc), std::ptr::null_mut(), 0)
-                };
-                if replacement.is_null() {
-                    log::error!("failed to restore keyboard capture: {}", std::io::Error::last_os_error());
+                if !entering_remote { log::warn!("keyboard input arrived without a keyboard callback; restarting its capture thread (keyboard_tick={keyboard_tick}, raw_keyboard_tick={raw_tick})"); }
+                drop(keyboard_capture.take());
+                keyboard_capture = start_windows_keyboard_capture(&context)
+                    .map_err(|error| log::error!("{error}")).ok();
+                if keyboard_capture.is_none() {
                     release_windows_remote_control(&context, false);
-                    unsafe { let _ = UnhookWindowsHookEx(mouse_hook); let _ = UnhookWindowsHookEx(keyboard_hook); }
+                    unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
                     mouse_hook = std::ptr::null_mut();
-                    keyboard_hook = std::ptr::null_mut();
                     keyboard_monitor = None;
                     crate::input_guard::set_capture_available(&context.input_guard, false);
                     capture_suspended = true;
                     continue;
                 }
-                unsafe { let _ = UnhookWindowsHookEx(keyboard_hook); }
-                keyboard_hook = replacement;
                 if let Some(active) = remote_target_for_input(&context.active, &context.remote_active) {
-                    release_forwarded_keys_windows(&context, &active.target);
-                    log::info!("keyboard capture restored; keeping control of {}", active.target.device_id);
+                    if !entering_remote { release_forwarded_keys_windows(&context, &active.target); }
+                    log::info!("keyboard capture worker ready on thread {}; keeping control of {}", context.keyboard_thread_id.load(Ordering::Relaxed), active.target.device_id);
                 }
+                keyboard_recovery_pending = Some(0);
                 keyboard_watchdog.reset(raw_tick);
             }
             if last_hook_check.elapsed() >= Duration::from_secs(1) {
@@ -1500,28 +1557,24 @@ fn start_platform_capture(
                         hook_watchdog.last_hook_tick,
                         hook_watchdog.last_input_tick,
                     );
+                    drop(keyboard_capture.take());
                     unsafe {
                         let _ = UnhookWindowsHookEx(mouse_hook);
-                        let _ = UnhookWindowsHookEx(keyboard_hook);
                         mouse_hook = SetWindowsHookExW(
                             WH_MOUSE_LL,
                             Some(windows_mouse_proc),
                             std::ptr::null_mut(),
                             0,
                         );
-                        keyboard_hook = SetWindowsHookExW(
-                            WH_KEYBOARD_LL,
-                            Some(windows_keyboard_proc),
-                            std::ptr::null_mut(),
-                            0,
-                        );
                     }
-                    if mouse_hook.is_null() || keyboard_hook.is_null() {
+                    keyboard_capture = start_windows_keyboard_capture(&context)
+                        .map_err(|error| log::error!("{error}")).ok();
+                    if mouse_hook.is_null() || keyboard_capture.is_none() {
                         log::error!("failed to reinstall the Windows input hooks");
                         release_windows_remote_control(&context, false);
-                        unsafe { let _ = UnhookWindowsHookEx(mouse_hook); let _ = UnhookWindowsHookEx(keyboard_hook); }
+                        unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
                         mouse_hook = std::ptr::null_mut();
-                        keyboard_hook = std::ptr::null_mut();
+                        keyboard_capture = None;
                         keyboard_monitor = None;
                         crate::input_guard::set_capture_available(&context.input_guard, false);
                         capture_suspended = true;
@@ -1609,8 +1662,8 @@ fn start_platform_capture(
 
         unsafe {
             let _ = UnhookWindowsHookEx(mouse_hook);
-            let _ = UnhookWindowsHookEx(keyboard_hook);
         }
+        drop(keyboard_capture);
         show_windows_cursor_if_needed(&context);
         if clear_windows_capture_context(&context) {
             context.remote_active.store(false, Ordering::Relaxed);
@@ -3207,6 +3260,11 @@ struct WindowsCaptureContext {
     move_pending: AtomicBool,
     pressed_keys: Mutex<Vec<u16>>,
     keyboard_hook_tick: std::sync::atomic::AtomicU32,
+    keyboard_thread_id: Arc<std::sync::atomic::AtomicU32>,
+    capture_thread_id: u32,
+    cursor_owner_window: usize,
+    local_capture_requested: AtomicBool,
+    local_capture_hold: AtomicBool,
     raw_keyboard_tick: Arc<std::sync::atomic::AtomicU32>,
     cursor_hide_calls: Mutex<u8>,
     // Swallow the first post-crossing delta so a fast flick across the edge
@@ -3590,6 +3648,12 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     }
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
+    let Some(context) = windows_capture_context() else {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    };
+    if context.capture_thread_id != unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
     LAST_HOOK_EVENT_TICK.store(unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() }, Ordering::Relaxed);
     let message = wparam as u32;
     if event.dwExtraInfo == crate::windows_drag::DRAG_INPUT_MARKER {
@@ -3603,9 +3667,6 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
         }
     }
 
-    let Some(context) = windows_capture_context() else {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
-    };
     if !cached_windows_input_desktop_is_default() {
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
@@ -3634,7 +3695,7 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
     if code < 0 {
@@ -3645,12 +3706,18 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     // keys made the watchdog reinstall healthy hooks and release remote control.
     let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
     let receipt_tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
-    LAST_HOOK_EVENT_TICK.store(receipt_tick, Ordering::Relaxed);
 
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
+    if context.keyboard_thread_id.load(Ordering::Relaxed) != unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    LAST_HOOK_EVENT_TICK.store(receipt_tick, Ordering::Relaxed);
     context.keyboard_hook_tick.store(receipt_tick, Ordering::Relaxed);
+    if event.dwExtraInfo == crate::windows_input::KEYBOARD_INPUT_MARKER {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
     if !cached_windows_input_desktop_is_default() {
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
@@ -3658,39 +3725,62 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
 
     let message = wparam as u32;
 
-    let active = remote_target_for_input(&context.active, &context.remote_active).map(|active| active.target);
-    let Some(target) = active else {
+    // Serialize forwarding with mouse return/entry. The keyboard queue runs on
+    // another thread now, so a key must be tracked before a return releases it.
+    let active = context.active.lock().ok();
+    let target = active.as_ref().and_then(|active| active.as_ref())
+        .filter(|_| context.remote_active.load(Ordering::Relaxed))
+        .map(|active| active.target.clone());
+    let Some(target) = target else {
+        drop(active);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
 
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
         let key_code = event.vkCode as u16;
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let modifiers = windows_forwarded_hotkey_modifiers(&context);
+        if down && event.flags & LLKHF_INJECTED == 0 && key_code == 0x70 && modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.meta
+            && crate::input_guard::snipaste_is_running(&context.input_guard)
+        {
+            context.local_capture_requested.store(true, Ordering::Relaxed);
+            return 1;
+        }
         if down && clipboard_paste_matches(&context.layout_state, key_code, windows_forwarded_hotkey_modifiers(&context)) {
             release_forwarded_keys_windows(&context, &target);
             if let Some(peer) = current_clipboard_target(&context.clipboard_target) { emit_clipboard_paste(peer); }
             return 1;
         }
         if down && windows_event_matches_screen_switch_hotkey(&context, key_code) {
+            drop(active);
             log::info!("screen switch hotkey returning to local from keyboard hook");
             release_windows_remote_control(&context, false);
             return 1;
         }
-        if send_packet(
+        let sent = send_packet(
             &context.quic_transport,
             &target,
             InputEvent::Key { key_code, down },
             &context.layout_state,
             &context.input_events,
-        ) {
+        );
+        if sent {
             track_forwarded_key(&context.pressed_keys, key_code, down);
-        } else {
+        }
+        drop(active);
+        if !sent {
             return_to_local_after_send_failure_windows(&context, "key");
         }
         return 1;
     }
 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows_keyboard_capture(context: &WindowsCaptureContext) -> Result<crate::windows_keyboard_capture::KeyboardCapture, String> {
+    context.keyboard_hook_tick.store(0, Ordering::Relaxed);
+    crate::windows_keyboard_capture::KeyboardCapture::start(Arc::clone(&context.keyboard_thread_id), Some(windows_keyboard_proc))
 }
 
 #[cfg(target_os = "windows")]
@@ -3910,6 +4000,10 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         drop(active);
         release_windows_remote_control(context, false);
         log::warn!("cleared a stale remote target after local control resumed");
+        return false;
+    }
+    if active.is_none() && (context.local_capture_hold.load(Ordering::Relaxed) || crate::input_guard::screenshot_is_active(&context.input_guard)) {
+        if let Ok(mut last_point) = context.last_point.lock() { *last_point = Some((x, y)); }
         return false;
     }
 
@@ -4404,6 +4498,9 @@ fn windows_current_cursor_point() -> Option<(f64, f64)> {
 
 #[cfg(target_os = "windows")]
 fn hide_windows_cursor_if_needed(context: &WindowsCaptureContext) {
+    if unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } != context.capture_thread_id { return; }
+    let point = context.anchor.lock().ok().and_then(|anchor| *anchor).or_else(windows_current_cursor_point);
+    if let Some((x, y)) = point { crate::windows_cursor_guard::show_at(context.cursor_owner_window, x.round() as i32, y.round() as i32); }
     let Ok(mut calls) = context.cursor_hide_calls.lock() else {
         return;
     };
@@ -4426,10 +4523,12 @@ pub(crate) fn diagnostic_summary() -> String {
         let Some(context) = windows_capture_context() else { return "capture_context=none".into(); };
         let target = context.active.lock().ok().and_then(|active| active.as_ref().map(|active| active.target.device_id.clone()));
         let anchor = context.anchor.lock().ok().and_then(|anchor| *anchor);
-        format!("remote_active={} target={target:?} anchor={anchor:?} cursor={:?} hook_receipt_tick={} keyboard_hook_tick={} raw_keyboard_tick={} held_buttons={} guard={:?}",
+        format!("remote_active={} target={target:?} anchor={anchor:?} cursor={:?} cursor_flags={:?} cursor_owner={} capture_thread={} keyboard_thread={} hook_receipt_tick={} keyboard_hook_tick={} raw_keyboard_tick={} held_buttons={} local_capture_hold={} screenshot_active={} guard={:?}",
             context.remote_active.load(Ordering::Relaxed), windows_current_cursor_point(),
+            crate::windows_cursor_guard::visibility(), context.cursor_owner_window, context.capture_thread_id, context.keyboard_thread_id.load(Ordering::Relaxed),
             LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed), context.keyboard_hook_tick.load(Ordering::Relaxed),
             context.raw_keyboard_tick.load(Ordering::Relaxed), context.remote_button_mask.load(Ordering::Relaxed),
+            context.local_capture_hold.load(Ordering::Relaxed), crate::input_guard::screenshot_is_active(&context.input_guard),
             crate::input_guard::snapshot(&context.input_guard).reason)
     }
     #[cfg(not(target_os = "windows"))]
@@ -4438,9 +4537,12 @@ pub(crate) fn diagnostic_summary() -> String {
 
 #[cfg(target_os = "windows")]
 fn show_windows_cursor_if_needed(context: &WindowsCaptureContext) {
+    if unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } != context.capture_thread_id { return; }
     let Ok(mut calls) = context.cursor_hide_calls.lock() else {
         return;
     };
+    if *calls == 0 { return; }
+    crate::windows_cursor_guard::hide(context.cursor_owner_window);
 
     for _ in 0..*calls {
         unsafe {

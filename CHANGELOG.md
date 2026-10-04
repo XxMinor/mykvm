@@ -10,10 +10,10 @@ release will reuse them).
 
 ### Added
 
+- Device settings use a modal form. Pointer and scroll speeds are saved together; pairing and removal actions are grouped inside the form.
 - Folder transfers preserve nested directories and empty folders. Windows native drags include directory descriptors; ordinary transfers unpack into the receiving folder. New folder and file-clipboard protocols require both peers to be updated.
 - Rich clipboard sharing includes HTML and RTF with a plain-text fallback. On-demand mode keeps local clipboard contents separate, sends Ctrl/Command+V to the controlled peer only after content is received, and uses Alt+Shift+V to paste the other machine's clipboard locally.
 - File clipboard paste transfers selected files/folders without requiring network file shares. Active transfer toasts have a Cancel button.
-- Controller input protection: lock mouse/keyboard to this computer with a separate shortcut (default Alt+Shift+L), and pause screen switching for fullscreen or selected foreground apps while the connection stays available. Automatic protection does not pull back an existing remote session.
 - Manually added peers keep their selected connection IP, including after pairing, rediscovery, and address changes (#26).
 - Drag-and-drop files across machines (ShareMouse-style, experimental): drag files on the machine that owns the keyboard and mouse onto a controlled machine. Controlling Windows → Mac: drag files toward the screen edge that borders the Mac — a document icon follows the cursor onto the Mac, and releasing over an open Finder folder drops the files there (otherwise the Desktop). Controlling Mac → Windows client is also in. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
 - Drag files the other way too — from a controlled machine back to the controller. While controlling a Mac from Windows, grab a file on the Mac and drag it back across the edge onto Windows: it becomes a real native drag on Windows that you can drop into any folder, app, or field. Requires both sides on this version or newer.
@@ -26,6 +26,8 @@ release will reuse them).
 
 ### Fixed
 
+- Windows: keyboard capture uses a separate message thread and a fresh worker after screenshot capture or a remote-screen handoff. Snipaste Ctrl+F1 temporarily returns both inputs to Windows for capture, then restores the original client. Remote cursor hiding uses a dedicated non-activating owner window.
+- The separate screen-protection UI and local-lock shortcut are removed. Existing quick start/stop shortcuts are preserved and legacy protection settings are disabled during migration.
 - Windows: keyboard capture recovers independently when mouse sharing still works, including after a single missed key. Recovery keeps the current controlled screen; returning the mouse to the server is no longer needed to restore typing.
 - Windows native file drags spool data to disk instead of retaining whole files in memory. Cancellation wakes blocked readers; received transfers do not overwrite existing destinations and expired partial transfers are removed.
 - Version labels and updater comparisons use the configured package version, including local beta test builds, so an older published beta is not offered as an upgrade.

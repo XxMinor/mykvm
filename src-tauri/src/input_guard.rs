@@ -13,10 +13,10 @@ mod platform;
 mod platform;
 
 fn enabled() -> bool {
-    true
+    false
 }
 fn default_lock_hotkey() -> String {
-    "alt+shift+l".into()
+    "disabled".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -36,13 +36,14 @@ impl Default for InputProtection {
     fn default() -> Self {
         Self {
             local_only: false,
-            protect_fullscreen: true,
+            protect_fullscreen: false,
             blocked_applications: Vec::new(),
             lock_hotkey: default_lock_hotkey(),
         }
     }
 }
 
+#[cfg(test)]
 impl InputProtection {
     pub fn normalize(&mut self) -> Result<(), String> {
         let mut names = Vec::new();
@@ -103,6 +104,8 @@ impl Default for GuardStatus {
 pub(crate) struct GuardState {
     paused: AtomicBool,
     capture_available: AtomicBool,
+    screenshot_active: AtomicBool,
+    snipaste_running: AtomicBool,
     status: Mutex<GuardStatus>,
     notifier: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -112,6 +115,8 @@ impl Default for GuardState {
         Self {
             paused: AtomicBool::new(false),
             capture_available: AtomicBool::new(true),
+            screenshot_active: AtomicBool::new(false),
+            snipaste_running: AtomicBool::new(false),
             status: Mutex::new(GuardStatus::default()),
             notifier: Mutex::new(None),
         }
@@ -155,6 +160,8 @@ pub(crate) fn spawn_monitor(
 ) {
     std::thread::spawn(move || {
         let mut protection = InputProtection::default();
+        #[cfg(target_os = "windows")]
+        let mut last_snipaste_check = std::time::Instant::now() - Duration::from_secs(2);
         while !stop.load(Ordering::Relaxed) {
             if let Ok(layout) = layout.try_lock() {
                 protection = layout.input_protection.clone();
@@ -162,14 +169,20 @@ pub(crate) fn spawn_monitor(
             let remote = remote_active.load(Ordering::Relaxed);
             // Window/AX queries may block on another app. Keep them on this
             // monitor thread, never on the native input callback/capture loop.
-            let foreground = if !protection.local_only
+            let foreground = if cfg!(target_os = "windows") || (!protection.local_only
                 && !remote
-                && (protection.protect_fullscreen || !protection.blocked_applications.is_empty())
+                && (protection.protect_fullscreen || !protection.blocked_applications.is_empty()))
             {
                 foreground_application()
             } else {
                 ForegroundApplication::default()
             };
+            guard.screenshot_active.store(foreground.fullscreen && foreground.names.iter().any(|name| name.eq_ignore_ascii_case("snipaste.exe")), Ordering::Relaxed);
+            #[cfg(target_os = "windows")]
+            if last_snipaste_check.elapsed() >= Duration::from_secs(2) {
+                last_snipaste_check = std::time::Instant::now();
+                guard.snipaste_running.store(platform::snipaste_is_running(), Ordering::Relaxed);
+            }
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -181,6 +194,13 @@ pub(crate) fn spawn_monitor(
             std::thread::sleep(Duration::from_millis(200));
         }
     });
+}
+
+pub(crate) fn screenshot_is_active(guard: &SharedGuard) -> bool {
+    guard.screenshot_active.load(Ordering::Relaxed)
+}
+pub(crate) fn snipaste_is_running(guard: &SharedGuard) -> bool {
+    guard.snipaste_running.load(Ordering::Relaxed)
 }
 
 pub(crate) fn pause_reason(
@@ -268,11 +288,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_config_gets_fullscreen_protection_without_locking_local_input() {
+    fn old_config_defaults_to_manual_control_without_extra_protection_shortcuts() {
         let protection: InputProtection = serde_json::from_str("{}").unwrap();
-        assert!(protection.protect_fullscreen);
+        assert!(!protection.protect_fullscreen);
         assert!(!protection.local_only);
-        assert_eq!(protection.lock_hotkey, "alt+shift+l");
+        assert_eq!(protection.lock_hotkey, "disabled");
     }
 
     #[test]
@@ -298,6 +318,7 @@ mod tests {
     #[test]
     fn leaving_a_fullscreen_app_restores_capture_and_disabling_the_rule_allows_entry() {
         let mut protection = InputProtection::default();
+        protection.protect_fullscreen = true;
         let mut app = ForegroundApplication {
             names: vec!["player.exe".into()],
             fullscreen: true,

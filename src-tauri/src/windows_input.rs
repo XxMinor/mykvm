@@ -8,6 +8,10 @@ use std::{
 
 use crate::shared_input::{mouse_button_mask, InputCommand, MouseButton};
 
+// Input injected by our own receiver/shortcut dispatcher remains local, even
+// if the controller resumes sharing before a queued injection is delivered.
+pub const KEYBOARD_INPUT_MARKER: usize = 0x4D59_4B53;
+
 /// Explains a refused button/key injection, throttled to one line per 10s.
 ///
 /// Windows blocks `SendInput` from a standard-user process into an elevated or
@@ -386,7 +390,7 @@ pub fn inject_key(key_code: u16, down: bool) -> Result<(), u32> {
                 wScan: scan,
                 dwFlags: dw_flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: KEYBOARD_INPUT_MARKER,
             },
         },
     };

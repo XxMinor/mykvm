@@ -16,6 +16,44 @@ thread_local! {
     static PROCESS_NAME: RefCell<(u32, Vec<String>)> = RefCell::new((0, Vec::new()));
 }
 
+pub(super) fn snipaste_is_running() -> bool {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut process = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snapshot, &mut process) != 0;
+        let mut running = false;
+        while more {
+            let length = process
+                .szExeFile
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(process.szExeFile.len());
+            if String::from_utf16_lossy(&process.szExeFile[..length])
+                .eq_ignore_ascii_case("snipaste.exe")
+            {
+                running = true;
+                break;
+            }
+            more = Process32NextW(snapshot, &mut process) != 0;
+        }
+        CloseHandle(snapshot);
+        running
+    }
+}
+
 pub(super) fn foreground_application() -> ForegroundApplication {
     unsafe {
         let window = GetForegroundWindow();

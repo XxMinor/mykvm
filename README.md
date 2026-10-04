@@ -55,7 +55,7 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 - Detects local displays and lets you arrange multi-monitor layouts.
 - Shares keyboard and mouse input over an encrypted QUIC connection.
 - Syncs text, images and rich clipboard formats over the same encrypted connection.
-- Controller input protection locks mouse/keyboard locally (Alt+Shift+L by default), prevents entry while fullscreen or selected apps are foreground, and leaves existing remote sessions alone.
+- Device mouse speeds are configured in a modal form. The existing quick start/stop shortcut remains the way to pause sharing; separate input protection and lock shortcuts have been removed.
 - On-demand clipboard mode preserves local content. Ctrl/Command+V on a controlled client sends and pastes local content; Alt+Shift+V back on the controller pulls and pastes the other computer's clipboard. Files and folders use this mode.
 - Folder transfers keep nested and empty directories and can be cancelled. Both peers must be updated. Linux native X11/Wayland input is not implemented yet.
 - Provides light, dark, and system theme modes.

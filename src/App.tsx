@@ -1,5 +1,4 @@
-import { InputProtectionSettings } from "./InputProtectionSettings";
-import { DEFAULT_INPUT_PROTECTION } from "./inputProtection";
+import { DeviceSettingsModal } from "./DeviceSettingsModal";
 import {
   type CSSProperties,
   type FormEvent,
@@ -45,7 +44,6 @@ import {
   startRuntime,
   startWindowDrag,
   stopRuntime,
-  setLocalControlLocked,
   cancelFileTransfer,
   pasteRemoteClipboard,
   syncWindowChrome,
@@ -187,8 +185,6 @@ interface FileTransferProgressEntry {
 }
 
 const INPUT_SERVICE_OFFER_DISMISSED_KEY = "mykvm.inputServiceOfferDismissed";
-const POINTER_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
-const SCROLL_SPEEDS = [0.5, 1, 1.5, 2, 3];
 
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
@@ -198,6 +194,7 @@ function App() {
     height: DEFAULT_BOARD_HEIGHT,
   });
   const [isSaving, setIsSaving] = useState(false);
+  const [editingDevice, setEditingDevice] = useState<Device | null>(null);
   const [isRuntimePending, setIsRuntimePending] = useState(false);
   const [isScanningLan, setIsScanningLan] = useState(false);
   const [scanCountdown, setScanCountdown] = useState(0);
@@ -1095,6 +1092,14 @@ function App() {
     }
   }
 
+  async function saveModalLayout(mutator: (current: LayoutState) => LayoutState) {
+    const current = snapshotRef.current?.layout;
+    if (!current) throw new Error(ui.errors.saveLayout);
+    setIsSaving(true);
+    try { setSnapshot(await saveLayout(mutator(current))); }
+    finally { setIsSaving(false); }
+  }
+
   const sendDroppedFiles = useEffectEvent(
     async (targetDeviceId: string, paths: string[]) => {
       if (snapshotRef.current?.layout.fileTransferEnabled === false) {
@@ -1926,19 +1931,6 @@ function App() {
     }
   }
 
-  function setDeviceSpeed(
-    deviceId: string,
-    field: "pointerSpeed" | "scrollSpeed",
-    value: number,
-  ) {
-    updateLayout((layoutState) => ({
-      ...layoutState,
-      devices: layoutState.devices.map((device) =>
-        device.id === deviceId ? { ...device, [field]: value } : device,
-      ),
-    }));
-  }
-
   function handleRemoveDevice(deviceId: string) {
     updateLayout((layoutState) => {
       const nextDevices = layoutState.devices.filter(
@@ -2335,53 +2327,11 @@ function App() {
       return null;
     }
 
-    // The controller applies these when it drives the device.
-    const speedSelect = (
-      field: "pointerSpeed" | "scrollSpeed",
-      label: string,
-      speeds: number[],
-    ) => (
-      <label className="speed-select" title={label}>
-        <span>{label}</span>
-        <select
-          value={device[field] ?? 1}
-          onChange={(event) =>
-            setDeviceSpeed(device.id, field, Number(event.target.value))
-          }
-        >
-          {speeds.map((speed) => (
-            <option key={speed} value={speed}>
-              {speed}×
-            </option>
-          ))}
-        </select>
-      </label>
-    );
-
     return (
-      <>
-        {machineRole === "server" ? (
-          <>
-            {speedSelect("pointerSpeed", ui.devices.pointerSpeed, POINTER_SPEEDS)}
-            {speedSelect("scrollSpeed", ui.devices.scrollSpeed, SCROLL_SPEEDS)}
-          </>
-        ) : null}
-        <button
-          type="button"
-          className="secondary-button compact-button"
-          onClick={() => void handleRepairDevice(device)}
-          disabled={isPairingDevice}
-        >
-          {ui.devices.repair}
-        </button>
-        <button
-          type="button"
-          className="secondary-button compact-button danger-button"
-          onClick={() => handleRemoveDevice(device.id)}
-        >
-          {ui.common.remove}
-        </button>
-      </>
+      <button type="button" className="secondary-button compact-button"
+        disabled={isPairingDevice || isSaving} onClick={() => setEditingDevice(device)}>
+        {language === "cn" ? "设置" : "Settings"}
+      </button>
     );
   }
 
@@ -3000,7 +2950,7 @@ function App() {
                   <p className="muted-copy">{language === "cn" ? "按需模式保留本机剪贴板。控制客户端时，Ctrl／Command+V 发送本机内容再粘贴；回到本机后，下面的快捷键拉取并粘贴另一台电脑的内容。文件和文件夹通过按需粘贴传输。" : "On-demand mode preserves the local clipboard. Ctrl/Command+V while controlling a client sends and pastes local content. Back here, the shortcut pulls and pastes the other computer's clipboard. Files and folders use on-demand paste."}</p>
                   {machineRole === "server" ? <div className="settings-control-row">
                     <label htmlFor="clipboard-paste-hotkey">{language === "cn" ? "远端粘贴快捷键" : "Remote clipboard shortcut"}</label>
-                    <input id="clipboard-paste-hotkey" className="input-protection-hotkey" key={layout.clipboardPasteHotkey ?? "alt+shift+v"} defaultValue={layout.clipboardPasteHotkey ?? "alt+shift+v"}
+                    <input id="clipboard-paste-hotkey" className="clipboard-paste-shortcut" key={layout.clipboardPasteHotkey ?? "alt+shift+v"} defaultValue={layout.clipboardPasteHotkey ?? "alt+shift+v"}
                       onBlur={e => updateLayout(s => ({ ...s, clipboardPasteHotkey: e.target.value || "alt+shift+v" }))} />
                     <button type="button" className="secondary-button compact-button" disabled={!runtime.started}
                       onClick={() => void pasteRemoteClipboard().catch((error: unknown) => setErrorMessage(formatUnknownError(error, ui.errors.writeClipboard)))}>{language === "cn" ? "粘贴另一台" : "Paste remote"}</button>
@@ -3088,18 +3038,6 @@ function App() {
                   </div>
                 ) : null}
               </section>
-
-              {machineRole === "server" ? <InputProtectionSettings
-                settings={layout.inputProtection ?? DEFAULT_INPUT_PROTECTION}
-                status={runtime.inputProtection} language={language} pending={isRuntimePending}
-                onChange={(inputProtection) => updateLayout(current => ({ ...current, inputProtection }))}
-                onLock={(locked) => {
-                  setIsRuntimePending(true);
-                  void setLocalControlLocked(locked, layout).then(setSnapshot)
-                    .catch((error: unknown) => setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime)))
-                    .finally(() => setIsRuntimePending(false));
-                }}
-              /> : null}
 
               <section className="surface-card modifier-card">
                 <div className="card-title-row">
@@ -3457,6 +3395,16 @@ function App() {
           </div>
         </section>
       ) : null}
+
+      {editingDevice ? <DeviceSettingsModal key={editingDevice.id} device={editingDevice} language={language}
+        onClose={() => setEditingDevice(null)}
+        onSave={(pointerSpeed, scrollSpeed) => saveModalLayout(current => {
+          if (!current.devices.some(device => device.id === editingDevice.id)) throw new Error(language === "cn" ? "设备已移除。" : "Device no longer available.");
+          return { ...current, devices: current.devices.map(device => device.id === editingDevice.id ? { ...device, pointerSpeed, scrollSpeed } : device) };
+        })}
+        onRepair={() => { setEditingDevice(null); void handleRepairDevice(editingDevice); }}
+        onRemove={() => { handleRemoveDevice(editingDevice.id); setEditingDevice(null); }}
+      /> : null}
 
       {serverPairing ? (
         <div className="pairing-modal-backdrop" role="presentation">

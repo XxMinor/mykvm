@@ -47,6 +47,12 @@ pub mod windows_drop_catcher;
 pub mod windows_input;
 #[cfg(any(target_os = "windows", test))]
 mod windows_keyboard_monitor;
+#[cfg(target_os = "windows")]
+mod windows_keyboard_capture;
+#[cfg(target_os = "windows")]
+mod windows_cursor_guard;
+#[cfg(any(target_os = "windows", test))]
+mod local_capture_session;
 
 use clipboard::{ClipboardContent, ClipboardImage};
 use performance::PerformanceSample;
@@ -657,7 +663,6 @@ struct AppRuntime {
     input_guard: SharedGuard,
     clipboard_packets: Arc<AtomicU64>,
     runtime_toggle_shortcut: Mutex<Option<String>>,
-    local_lock_shortcut: Mutex<Option<String>>,
     clipboard_paste_shortcut: Mutex<Option<String>>,
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
@@ -712,7 +717,6 @@ impl AppRuntime {
             input_guard,
             clipboard_packets: Arc::new(AtomicU64::new(0)),
             runtime_toggle_shortcut: Mutex::new(None),
-            local_lock_shortcut: Mutex::new(None),
             clipboard_paste_shortcut: Mutex::new(None),
             runtime_toggle_menu_item: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
@@ -1506,9 +1510,9 @@ fn save_layout(
             .map_err(|_| "layout state lock poisoned".to_string())?;
         let previous_layout = stored_layout.clone();
         let mut saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
-        saved_layout.input_protection.normalize()?;
+        saved_layout.input_protection = InputProtection::default();
         saved_layout.clipboard_paste_hotkey = canonical_runtime_toggle_shortcut(&saved_layout.clipboard_paste_hotkey)?.unwrap_or_else(|| "disabled".into());
-        validate_protection_hotkey(&saved_layout)?;
+        validate_shared_hotkeys(&saved_layout)?;
         write_layout_to_disk(&state.config_path, &saved_layout)?;
         *stored_layout = saved_layout.clone();
         (previous_layout, saved_layout)
@@ -1533,7 +1537,6 @@ fn save_layout(
     }
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
-    sync_local_lock_shortcut(&state.app_handle)?;
     sync_clipboard_paste_shortcut(&state.app_handle)?;
     Ok(state.snapshot())
 }
@@ -1548,7 +1551,6 @@ fn merge_runtime_owned_layout_fields(
     // clear them and force the client to be paired again.
     incoming.cluster_id = current.cluster_id.clone();
     incoming.pair_secret = current.pair_secret.clone();
-    incoming.input_protection.local_only = current.input_protection.local_only;
 
     if current.machine_role == "client"
         && incoming.machine_role == "client"
@@ -1996,50 +1998,15 @@ fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<Str
     canonical_runtime_toggle_shortcut(&layout.edge_switch_hotkey)
 }
 
-fn validate_protection_hotkey(layout: &LayoutState) -> Result<(), String> {
+fn validate_shared_hotkeys(layout: &LayoutState) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
-    for value in [&layout.input_protection.lock_hotkey, &layout.clipboard_paste_hotkey, &layout.edge_switch_hotkey,
+    for value in [&layout.clipboard_paste_hotkey, &layout.edge_switch_hotkey,
         &layout.screen_switch_hotkeys.left, &layout.screen_switch_hotkeys.right, &layout.screen_switch_hotkeys.up, &layout.screen_switch_hotkeys.down] {
         if let Some(shortcut) = canonical_runtime_toggle_shortcut(value)? {
-            if !seen.insert(shortcut) { return Err("启停、锁本机、粘贴和切屏快捷键不能重复。".into()); }
+            if !seen.insert(shortcut) { return Err("启停、粘贴和切屏快捷键不能重复。".into()); }
         }
     }
     Ok(())
-}
-
-fn sync_local_lock_shortcut(app: &AppHandle) -> Result<(), String> {
-    let Some(state) = app.try_state::<AppRuntime>() else { return Ok(()); };
-    let layout = state.layout_snapshot();
-    let next = if layout.machine_role == "server" {
-        canonical_runtime_toggle_shortcut(&layout.input_protection.lock_hotkey)?
-    } else { None };
-    let mut current = state.local_lock_shortcut.lock().map_err(|_| "local lock shortcut is poisoned".to_string())?;
-    if *current == next { return Ok(()); }
-    if let Some(previous) = current.take() { let _ = app.global_shortcut().unregister(previous.as_str()); }
-    if let Some(next) = next {
-        app.global_shortcut().register(next.as_str()).map_err(|e| format!("无法注册锁本机快捷键：{e}"))?;
-        *current = Some(next);
-    }
-    Ok(())
-}
-
-fn set_local_control_locked_inner(state: &AppRuntime, locked: bool) -> Result<AppStateSnapshot, String> {
-    let protection = {
-        let mut layout = state.layout.lock().map_err(|_| "layout state is poisoned".to_string())?;
-        if layout.machine_role != "server" { return Err("只有服务端可以锁定本机键鼠。".into()); }
-        let mut saved = layout.clone();
-        saved.input_protection.local_only = locked;
-        write_layout_to_disk(&state.config_path, &saved)?;
-        *layout = saved;
-        layout.input_protection.clone()
-    };
-    let _ = state.app_handle.emit("input-protection-changed", protection);
-    Ok(state.snapshot())
-}
-
-#[tauri::command]
-fn set_local_control_locked(locked: bool, state: tauri::State<'_, AppRuntime>) -> Result<AppStateSnapshot, String> {
-    set_local_control_locked_inner(state.inner(), locked)
 }
 
 /// Register/unregister the four direction hotkeys so they stay in sync with the
@@ -2127,13 +2094,6 @@ fn route_global_shortcut(
         return Ok(());
     };
     if state.layout_snapshot().machine_role != "server" {
-        return Ok(());
-    }
-
-    let lock = state.local_lock_shortcut.lock().map_err(|_| "local lock shortcut is poisoned".to_string())?.clone();
-    if lock.as_ref().and_then(|s| s.parse::<tauri_plugin_global_shortcut::Shortcut>().ok()).as_ref() == Some(shortcut) {
-        let locked = !state.layout_snapshot().input_protection.local_only;
-        set_local_control_locked_inner(state.inner(), locked)?;
         return Ok(());
     }
 
@@ -3709,9 +3669,6 @@ pub fn run() {
             if let Err(error) = sync_screen_switch_shortcuts(app.handle()) {
                 log::warn!("failed to register screen switch shortcuts: {error}");
             }
-            if let Err(error) = sync_local_lock_shortcut(app.handle()) {
-                log::warn!("failed to register local lock shortcut: {error}");
-            }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
             let _ = sync_clipboard_paste_shortcut(app.handle());
@@ -3876,7 +3833,6 @@ pub fn run() {
             read_diagnostic_info,
             open_log_directory,
             save_layout,
-            set_local_control_locked,
             cancel_file_transfer,
             paste_remote_clipboard,
             start_runtime,
@@ -5694,7 +5650,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         clipboard_paste_hotkey: saved_layout.clipboard_paste_hotkey,
         file_transfer_enabled: saved_layout.file_transfer_enabled,
         lock_sync: saved_layout.lock_sync,
-        input_protection: saved_layout.input_protection,
+        input_protection: InputProtection::default(),
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
         performance_monitor: saved_layout.performance_monitor,
@@ -10070,6 +10026,19 @@ mod tests {
             unchanged,
             &mut Vec::new()
         ));
+    }
+
+    #[test]
+    fn legacy_protection_is_disabled_without_changing_the_existing_toggle_shortcut() {
+        let mut saved = test_layout();
+        saved.edge_switch_hotkey = "ctrl+alt+k".into();
+        saved.input_protection = InputProtection {
+            local_only: true, protect_fullscreen: true,
+            blocked_applications: vec!["snipaste.exe".into()], lock_hotkey: "alt+shift+l".into(),
+        };
+        let restored = normalize_saved_layout(saved, test_layout());
+        assert_eq!(restored.edge_switch_hotkey, "ctrl+alt+k");
+        assert_eq!(restored.input_protection, InputProtection::default());
     }
 
     fn test_layout() -> LayoutState {
