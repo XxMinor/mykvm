@@ -23,9 +23,18 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 mod clipboard;
+mod rich_clipboard;
+mod clipboard_exchange;
+mod folder_transfer;
+mod transfer_jobs;
+#[cfg(any(target_os = "windows", test))]
+mod drag_buffer;
 #[cfg(target_os = "windows")]
 pub mod headless_client;
 mod input;
+mod input_guard;
+#[cfg(any(target_os = "windows", test))]
+mod native_drag;
 mod performance;
 mod quic_transport;
 pub mod shared_input;
@@ -39,6 +48,7 @@ pub mod windows_input;
 
 use clipboard::{ClipboardContent, ClipboardImage};
 use performance::PerformanceSample;
+use input_guard::{InputProtection, SharedGuard};
 
 const DISCOVERY_PORT: u16 = 47833;
 const TRANSPORT_PORT_MIN: u16 = 1024;
@@ -74,6 +84,9 @@ const CLIPBOARD_RETRY_MAX_MS: u64 = 60_000;
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 10;
 const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
+const DRAG_TREE_PROTOCOL: &str = "mykvm.drag-tree.v1";
+const CLIPBOARD_FILES_PROTOCOL: &str = "mykvm.clipboard-files.v1";
+const CLIPBOARD_PULL_PROTOCOL: &str = "mykvm.clipboard-pull.v1";
 const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
 const LOG_REQUEST_PROTOCOL: &str = "mykvm.log-request.v1";
 // A paired controller asks a client to update itself (it runs its own updater,
@@ -258,11 +271,17 @@ struct LayoutState {
     paired_controllers: Vec<PairedController>,
     #[serde(default = "default_clipboard_sync")]
     clipboard_sync: bool,
+    #[serde(default)]
+    clipboard_on_demand: bool,
+    #[serde(default = "default_clipboard_paste_hotkey")]
+    clipboard_paste_hotkey: String,
     #[serde(default = "default_file_transfer_enabled")]
     file_transfer_enabled: bool,
     /// Controller: locking this machine locks its online clients too.
     #[serde(default)]
     lock_sync: bool,
+    #[serde(default)]
+    input_protection: InputProtection,
     #[serde(default = "default_language")]
     language: String,
     #[serde(default = "default_theme_mode")]
@@ -400,6 +419,7 @@ struct RuntimeStatus {
     pairing: PairingStatus,
     privilege: PrivilegeStatus,
     input_service: InputServiceStatus,
+    input_protection: input_guard::GuardStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,6 +510,8 @@ struct TransferFile {
     path: PathBuf,
     name: String,
     total_bytes: u64,
+    directory: bool,
+    bundle: Option<Arc<folder_transfer::FolderBundle>>,
 }
 
 #[derive(Debug)]
@@ -500,6 +522,9 @@ struct IncomingFileTransfer {
     total_bytes: u64,
     received_bytes: u64,
     next_chunk_index: u64,
+    directory_bundle: bool,
+    clipboard_transfer: bool,
+    touched_ms: u64,
     temp_path: PathBuf,
     final_path: PathBuf,
     // ShareMouse-style drag: on finish, hand the completed file to the drag
@@ -596,6 +621,10 @@ struct FileTransferPacket {
     // folder instead of the transfers folder.
     #[serde(default)]
     client_log: bool,
+    #[serde(default)]
+    directory_bundle: bool,
+    #[serde(default)]
+    clipboard_transfer: bool,
 }
 
 struct AppRuntime {
@@ -623,8 +652,11 @@ struct AppRuntime {
     clipboard_receive_enabled: Arc<AtomicBool>,
     transport_packets: Arc<AtomicU64>,
     input_events: Arc<AtomicU64>,
+    input_guard: SharedGuard,
     clipboard_packets: Arc<AtomicU64>,
     runtime_toggle_shortcut: Mutex<Option<String>>,
+    local_lock_shortcut: Mutex<Option<String>>,
+    clipboard_paste_shortcut: Mutex<Option<String>>,
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
@@ -639,6 +671,17 @@ impl AppRuntime {
             .map(|saved_layout| normalize_saved_layout(saved_layout, detected_layout.clone()))
             .unwrap_or_else(|| detected_layout.clone());
         align_native_screen_ids(&mut detected_layout, &layout);
+        let input_guard = SharedGuard::default();
+        let notify_app = app_handle.clone();
+        input_guard::set_notifier(&input_guard, Arc::new(move || {
+            let handle = notify_app.clone();
+            let _ = notify_app.run_on_main_thread(move || {
+                let _ = sync_screen_switch_shortcuts(&handle);
+                if let Some(state) = handle.try_state::<AppRuntime>() {
+                    notify_runtime_state_changed(&handle, &state.runtime_status());
+                }
+            });
+        }));
         Self {
             app_handle,
             layout: Arc::new(Mutex::new(layout)),
@@ -664,8 +707,11 @@ impl AppRuntime {
             clipboard_receive_enabled: Arc::new(AtomicBool::new(false)),
             transport_packets: Arc::new(AtomicU64::new(0)),
             input_events: Arc::new(AtomicU64::new(0)),
+            input_guard,
             clipboard_packets: Arc::new(AtomicU64::new(0)),
             runtime_toggle_shortcut: Mutex::new(None),
+            local_lock_shortcut: Mutex::new(None),
+            clipboard_paste_shortcut: Mutex::new(None),
             runtime_toggle_menu_item: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
@@ -721,6 +767,16 @@ impl AppRuntime {
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
+        if runtime.started && layout.machine_role == "server" {
+            let protection = input_guard::snapshot(&self.input_guard);
+            if !protection.capture_available {
+                runtime.capture = NativeStageStatus { state: "error".into(), detail: "输入捕获未就绪，请检查系统权限或重新启动共享。".into() };
+            } else if protection.reason.is_some() {
+                runtime.capture = NativeStageStatus { state: "paused".into(),
+                    detail: format!("输入保护已暂停跨屏：{:?}", protection.reason) };
+            }
+        }
+        runtime.input_protection = input_guard::snapshot(&self.input_guard);
 
         runtime
     }
@@ -854,6 +910,8 @@ impl AppRuntime {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
+
+            if let Some(accepted) = handle_clipboard_files_commit(&payload, &layout, &current_peer.id) { return accepted; }
 
             if handle_file_transfer_packet(
                 &payload,
@@ -1228,6 +1286,7 @@ impl AppRuntime {
         };
 
         let stop = Arc::new(AtomicBool::new(false));
+        input_guard::set_capture_available(&self.input_guard, true);
         let statuses = input::start_input_runtime(
             layout,
             Arc::clone(&self.layout),
@@ -1240,6 +1299,7 @@ impl AppRuntime {
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
             Arc::clone(&self.screen_switch_request),
+            Arc::clone(&self.input_guard),
         );
         *input_stop = Some(stop);
         #[cfg(target_os = "macos")]
@@ -1281,6 +1341,7 @@ impl AppRuntime {
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let transport_packets = Arc::clone(&self.transport_packets);
         let clipboard_packets = Arc::clone(&self.clipboard_packets);
+        let clipboard_layout = Arc::clone(&self.layout);
         let Some(quic_transport) = self.quic_transport_handle() else {
             return NativeStageStatus {
                 state: "error".into(),
@@ -1298,6 +1359,7 @@ impl AppRuntime {
                 transport_packets,
                 clipboard_packets,
                 thread_stop,
+                clipboard_layout,
             );
         });
 
@@ -1381,6 +1443,7 @@ impl AppRuntime {
         // Drop any modifier flags we were holding for injection so a lost
         // key-up cannot leave Shift/Ctrl/Cmd stuck for the next session.
         input::reset_injected_modifiers();
+        input_guard::update_status(&self.input_guard, None, &Default::default());
     }
 
     fn stop_clipboard(&self) {
@@ -1440,7 +1503,10 @@ fn save_layout(
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
         let previous_layout = stored_layout.clone();
-        let saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
+        let mut saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
+        saved_layout.input_protection.normalize()?;
+        saved_layout.clipboard_paste_hotkey = canonical_runtime_toggle_shortcut(&saved_layout.clipboard_paste_hotkey)?.unwrap_or_else(|| "disabled".into());
+        validate_protection_hotkey(&saved_layout)?;
         write_layout_to_disk(&state.config_path, &saved_layout)?;
         *stored_layout = saved_layout.clone();
         (previous_layout, saved_layout)
@@ -1465,6 +1531,8 @@ fn save_layout(
     }
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
+    sync_local_lock_shortcut(&state.app_handle)?;
+    sync_clipboard_paste_shortcut(&state.app_handle)?;
     Ok(state.snapshot())
 }
 
@@ -1478,6 +1546,7 @@ fn merge_runtime_owned_layout_fields(
     // clear them and force the client to be paired again.
     incoming.cluster_id = current.cluster_id.clone();
     incoming.pair_secret = current.pair_secret.clone();
+    incoming.input_protection.local_only = current.input_protection.local_only;
 
     if current.machine_role == "client"
         && incoming.machine_role == "client"
@@ -1622,6 +1691,7 @@ fn start_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
         pairing: state.pairing_status_for_layout(&layout),
         privilege: current_privilege_status(),
         input_service: current_input_service_status(),
+        input_protection: Default::default(),
     };
 
     Ok(runtime.clone())
@@ -1924,6 +1994,52 @@ fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<Str
     canonical_runtime_toggle_shortcut(&layout.edge_switch_hotkey)
 }
 
+fn validate_protection_hotkey(layout: &LayoutState) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for value in [&layout.input_protection.lock_hotkey, &layout.clipboard_paste_hotkey, &layout.edge_switch_hotkey,
+        &layout.screen_switch_hotkeys.left, &layout.screen_switch_hotkeys.right, &layout.screen_switch_hotkeys.up, &layout.screen_switch_hotkeys.down] {
+        if let Some(shortcut) = canonical_runtime_toggle_shortcut(value)? {
+            if !seen.insert(shortcut) { return Err("启停、锁本机、粘贴和切屏快捷键不能重复。".into()); }
+        }
+    }
+    Ok(())
+}
+
+fn sync_local_lock_shortcut(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else { return Ok(()); };
+    let layout = state.layout_snapshot();
+    let next = if layout.machine_role == "server" {
+        canonical_runtime_toggle_shortcut(&layout.input_protection.lock_hotkey)?
+    } else { None };
+    let mut current = state.local_lock_shortcut.lock().map_err(|_| "local lock shortcut is poisoned".to_string())?;
+    if *current == next { return Ok(()); }
+    if let Some(previous) = current.take() { let _ = app.global_shortcut().unregister(previous.as_str()); }
+    if let Some(next) = next {
+        app.global_shortcut().register(next.as_str()).map_err(|e| format!("无法注册锁本机快捷键：{e}"))?;
+        *current = Some(next);
+    }
+    Ok(())
+}
+
+fn set_local_control_locked_inner(state: &AppRuntime, locked: bool) -> Result<AppStateSnapshot, String> {
+    let protection = {
+        let mut layout = state.layout.lock().map_err(|_| "layout state is poisoned".to_string())?;
+        if layout.machine_role != "server" { return Err("只有服务端可以锁定本机键鼠。".into()); }
+        let mut saved = layout.clone();
+        saved.input_protection.local_only = locked;
+        write_layout_to_disk(&state.config_path, &saved)?;
+        *layout = saved;
+        layout.input_protection.clone()
+    };
+    let _ = state.app_handle.emit("input-protection-changed", protection);
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+fn set_local_control_locked(locked: bool, state: tauri::State<'_, AppRuntime>) -> Result<AppStateSnapshot, String> {
+    set_local_control_locked_inner(state.inner(), locked)
+}
+
 /// Register/unregister the four direction hotkeys so they stay in sync with the
 /// saved layout. Mirrors `sync_runtime_toggle_shortcut`: compares against the
 /// stored values and only touches the ones that changed.
@@ -1932,7 +2048,9 @@ fn sync_screen_switch_shortcuts(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     };
     let layout = state.layout_snapshot();
-    let next = screen_switch_shortcuts_for_layout(&layout);
+    let next = if input_guard::is_paused(&state.input_guard) || layout.input_protection.local_only {
+        empty_screen_switch_hotkeys()
+    } else { screen_switch_shortcuts_for_layout(&layout) };
 
     let mut current = state
         .screen_switch_shortcuts
@@ -2010,6 +2128,19 @@ fn route_global_shortcut(
         return Ok(());
     }
 
+    let lock = state.local_lock_shortcut.lock().map_err(|_| "local lock shortcut is poisoned".to_string())?.clone();
+    if lock.as_ref().and_then(|s| s.parse::<tauri_plugin_global_shortcut::Shortcut>().ok()).as_ref() == Some(shortcut) {
+        let locked = !state.layout_snapshot().input_protection.local_only;
+        set_local_control_locked_inner(state.inner(), locked)?;
+        return Ok(());
+    }
+
+    let paste = state.clipboard_paste_shortcut.lock().map_err(|_| "clipboard shortcut is poisoned".to_string())?.clone();
+    if paste.as_ref().and_then(|s| s.parse::<tauri_plugin_global_shortcut::Shortcut>().ok()).as_ref() == Some(shortcut) {
+        paste_remote_clipboard(state)?;
+        return Ok(());
+    }
+
     // Runtime toggle (quick start/stop).
     let toggle = state
         .runtime_toggle_shortcut
@@ -2026,6 +2157,9 @@ fn route_global_shortcut(
     }
     drop(toggle);
 
+    if input_guard::is_paused(&state.input_guard) || state.layout_snapshot().input_protection.local_only {
+        return Ok(());
+    }
     // Direction switch hotkeys.
     let directions = state
         .screen_switch_shortcuts
@@ -2541,7 +2675,7 @@ fn send_peer_request(state: &AppRuntime, device_id: &str, protocol: &str) -> Res
 
     let packet = PeerRequestPacket {
         protocol: protocol.into(),
-        origin_id: local_peer.id.clone(),
+            paste_token: String::new(),        origin_id: local_peer.id.clone(),
         target_id: target.device_id.clone(),
         cluster_id: target.cluster_id.clone(),
         pair_secret: target.pair_secret.clone(),
@@ -2993,13 +3127,16 @@ fn arg_value(args: &[String], key: &str) -> Option<String> {
 pub fn acquire_single_instance() -> bool {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_ALREADY_EXISTS},
-        System::Threading::CreateMutexW,
+        System::Threading::{CreateMutexExW, SYNCHRONIZATION_SYNCHRONIZE},
     };
 
     let mutex_name = wide_null(SINGLE_INSTANCE_MUTEX_NAME);
-    let mutex = unsafe { CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr()) };
+    // We only need a lifetime handle and existence check, not mutex ownership.
+    // Minimal access also lets a normal process detect an elevated instance.
+    let mutex = unsafe { CreateMutexExW(std::ptr::null_mut(), mutex_name.as_ptr(), 0, SYNCHRONIZATION_SYNCHRONIZE) };
     if mutex.is_null() {
-        return true;
+        log::error!("cannot acquire the single-instance lock (error {}); refusing a competing input runtime", unsafe { windows_sys::Win32::Foundation::GetLastError() });
+        return false;
     }
 
     let already_exists =
@@ -3459,7 +3596,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let _ = APP_VERSION.set(app.package_info().version.to_string());
+            let _ = APP_VERSION.set(app.config().version.clone().unwrap_or_else(|| app.package_info().version.to_string()));
             spawn_lock_sync_watcher(app.handle().clone());
             let silent_launch = launched_from_autostart();
             #[cfg(target_os = "macos")]
@@ -3469,7 +3606,10 @@ pub fn run() {
             }
             if let Err(error) = app
                 .handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())
+                .plugin(tauri_plugin_updater::Builder::new().default_version_comparator(|current, release| {
+                    let installed = APP_VERSION.get().and_then(|version| version.parse().ok()).unwrap_or(current);
+                    release.version > installed
+                }).build())
             {
                 eprintln!("failed to initialize updater plugin: {error}");
             }
@@ -3502,6 +3642,19 @@ pub fn run() {
                 detected_layout,
             );
             app.manage(runtime);
+            let pending_files = Arc::downgrade(&app.state::<AppRuntime>().file_transfers);
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(30));
+                let Some(files) = pending_files.upgrade() else { break; };
+                if let Ok(mut transfers) = files.lock() {
+                    let now = now_ms();
+                    transfers.retain(|_, transfer| {
+                        if now.saturating_sub(transfer.touched_ms) <= 5 * 60 * 1000 { return true; }
+                        let _ = fs::remove_file(&transfer.temp_path);
+                        false
+                    });
+                };
+            });
 
             // Eagerly start discovery + input BEFORE the WebView2/frontend is
             // ready. The old flow waited for the frontend to call
@@ -3533,6 +3686,7 @@ pub fn run() {
                         pairing,
                         privilege,
                         input_service,
+                        input_protection: Default::default(),
                     };
                 }
             }
@@ -3550,8 +3704,19 @@ pub fn run() {
             if let Err(error) = sync_screen_switch_shortcuts(app.handle()) {
                 log::warn!("failed to register screen switch shortcuts: {error}");
             }
+            if let Err(error) = sync_local_lock_shortcut(app.handle()) {
+                log::warn!("failed to register local lock shortcut: {error}");
+            }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
+            let _ = sync_clipboard_paste_shortcut(app.handle());
+            let clipboard_app = app.handle().clone();
+            input::set_clipboard_paste_sender(Box::new(move |target| {
+                let app = clipboard_app.clone();
+                thread::spawn(move || { if let Err(error) = request_clipboard_paste(app.state::<AppRuntime>().inner(), target, true) {
+                    let _ = app.emit("clipboard-paste-error", error);
+                }});
+            }));
             setup_single_instance_events(app.handle().clone());
 
             // Edge drag-drop (ShareMouse-style): the capture tap hands us drag
@@ -3625,7 +3790,8 @@ pub fn run() {
                                     Err(error) => {
                                         log::warn!("native drag start failed: {error}");
                                         if error.starts_with(DRAG_CONTROL_FAILED) {
-                                            refused = Some((device_id, paths));
+                                            if state.layout_snapshot().machine_role == "client" { deliver_to_desktop(device_id, paths, "refused controller drag"); }
+                                            else { refused = Some((device_id, paths)); }
                                         }
                                     }
                                 }
@@ -3705,6 +3871,9 @@ pub fn run() {
             read_diagnostic_info,
             open_log_directory,
             save_layout,
+            set_local_control_locked,
+            cancel_file_transfer,
+            paste_remote_clipboard,
             start_runtime,
             stop_runtime,
             read_clipboard_text,
@@ -4008,6 +4177,7 @@ fn default_runtime(layout: &LayoutState) -> RuntimeStatus {
         },
         privilege: current_privilege_status(),
         input_service: current_input_service_status(),
+        input_protection: Default::default(),
         discovery: DiscoveryStatus {
             state: "idle".into(),
             detail: "LAN discovery is stopped. Start runtime or scan the LAN to find peers.".into(),
@@ -5153,8 +5323,11 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         pair_secret: default_pair_secret(),
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
+        clipboard_on_demand: false,
+        clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: default_file_transfer_enabled(),
         lock_sync: false,
+        input_protection: Default::default(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -5199,8 +5372,11 @@ fn detect_fallback_layout() -> LayoutState {
         pair_secret: default_pair_secret(),
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
+        clipboard_on_demand: false,
+        clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: default_file_transfer_enabled(),
         lock_sync: false,
+        input_protection: Default::default(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -5509,8 +5685,11 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         pair_secret: normalize_pair_secret(&saved_layout.pair_secret),
         paired_controllers: normalize_paired_controllers(saved_layout.paired_controllers),
         clipboard_sync: saved_layout.clipboard_sync,
+        clipboard_on_demand: saved_layout.clipboard_on_demand,
+        clipboard_paste_hotkey: saved_layout.clipboard_paste_hotkey,
         file_transfer_enabled: saved_layout.file_transfer_enabled,
         lock_sync: saved_layout.lock_sync,
+        input_protection: saved_layout.input_protection,
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
         performance_monitor: saved_layout.performance_monitor,
@@ -5836,6 +6015,104 @@ fn default_modifier_map() -> ModifierMap {
     }
 }
 
+fn sync_clipboard_paste_shortcut(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else { return Ok(()); };
+    let layout = state.layout_snapshot();
+    let next = if layout.machine_role == "server" && layout.clipboard_sync {
+        canonical_runtime_toggle_shortcut(&layout.clipboard_paste_hotkey)?
+    } else { None };
+    let mut current = state.clipboard_paste_shortcut.lock().map_err(|_| "clipboard shortcut is poisoned".to_string())?;
+    if *current == next { return Ok(()); }
+    if let Some(previous) = current.take() { let _ = app.global_shortcut().unregister(previous.as_str()); }
+    if let Some(next) = next { app.global_shortcut().register(next.as_str()).map_err(|e| e.to_string())?; *current = Some(next); }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardFilesCommit {
+    protocol: String, origin_id: String, origin_transport_public_key: String, target_id: String,
+    cluster_id: String, pair_secret: String, ids: Vec<String>, paste: bool, paste_token: String,
+}
+
+fn paste_permitted(layout: &LayoutState, paste: bool, token: &str, source_key: &str) -> bool {
+    paste && (layout.machine_role == "client" || clipboard_exchange::consume_paste(token, source_key))
+}
+
+fn send_current_clipboard(state: &AppRuntime, target: &FileTransferTarget, paste: bool, token: String) -> Result<(), String> {
+    let layout = state.layout_snapshot();
+    if !layout.clipboard_sync { return Err("剪贴板同步未开启。".into()); }
+    let transport = state.quic_transport_handle().ok_or("传输尚未就绪。")?;
+    let mut local = local_peer_from_layout(&layout); apply_transport_to_peer(&mut local, &transport);
+    let peer = transport.peer(target.addr.clone(), target.transport_public_key.clone(), target.protocol_version);
+    let paths = rich_clipboard::read_files();
+    if !paths.is_empty() {
+        if paths.len() > 64 { return Err("一次最多可粘贴 64 个文件或文件夹。".into()); }
+        if !layout.file_transfer_enabled { return Err("文件传输未开启。".into()); }
+        let probe = file_transfer_packet("clipboard-probe", "", &local.id, target, "", 0, 0, 0, Vec::new(), DropMode::Clipboard, false);
+        send_file_transfer_packet(&transport, target, probe).map_err(|_| "对端尚不支持文件剪贴板，请更新两端。".to_string())?;
+        let files = collect_transfer_files(&paths)?;
+        let mut ids = Vec::new();
+        for file in files {
+            let id = new_transfer_id("clipboard");
+            send_transfer_file(&transport, &local.id, target, &file, &id, DropMode::Clipboard, None)?;
+            ids.push(id);
+        }
+        let commit = ClipboardFilesCommit { protocol: CLIPBOARD_FILES_PROTOCOL.into(), origin_id: local.id,
+            origin_transport_public_key: transport.public_key().into(), target_id: target.device_id.clone(),
+            cluster_id: target.cluster_id.clone(), pair_secret: target.pair_secret.clone(), ids, paste, paste_token: token };
+        return transport.send_stream_expect_ack(peer, encode_wire_packet(&commit)?);
+    }
+    let content = clipboard::read_content().ok_or("剪贴板中没有可传输的内容。")?;
+    if content.is_oversized() { return Err("剪贴板内容超过大小上限。".into()); }
+    let mut packet = clipboard_packet_from_content(content, local.id, transport.public_key().into(), target.device_id.clone(),
+        target.cluster_id.clone(), target.pair_secret.clone(), next_clipboard_sequence());
+    packet.paste = paste; packet.paste_token = token;
+    transport.send_stream_expect_ack(peer, encode_wire_packet(&packet)?)
+}
+
+fn request_clipboard_paste(state: &AppRuntime, target: input::ClipboardTarget, remote: bool) -> Result<(), String> {
+    let destination = FileTransferTarget { device_id: target.device_id, name: String::new(), addr: target.addr,
+        transport_public_key: target.transport_public_key, protocol_version: target.protocol_version,
+        cluster_id: target.cluster_id, pair_secret: target.pair_secret };
+    if remote { return send_current_clipboard(state, &destination, true, String::new()); }
+    let layout = state.layout_snapshot();
+    let transport = state.quic_transport_handle().ok_or("传输尚未就绪。")?;
+    let local = local_peer_from_layout(&layout);
+    let token = clipboard_exchange::expect_paste(&destination.transport_public_key);
+    let packet = PeerRequestPacket { protocol: CLIPBOARD_PULL_PROTOCOL.into(), paste_token: token,
+        origin_id: local.id, target_id: destination.device_id, cluster_id: destination.cluster_id, pair_secret: destination.pair_secret };
+    transport.send_stream_expect_ack(transport.peer(destination.addr, destination.transport_public_key, destination.protocol_version), encode_wire_packet(&packet)?)
+}
+
+#[tauri::command]
+fn paste_remote_clipboard(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    let target = input::current_clipboard_target(&state.clipboard_target).ok_or("请先切换到目标电脑一次。")?;
+    let remote = state.remote_input_active.load(Ordering::Relaxed);
+    let app = state.app_handle.clone();
+    thread::spawn(move || { if let Err(error) = request_clipboard_paste(app.state::<AppRuntime>().inner(), target, remote) {
+        let _ = app.emit("clipboard-paste-error", error);
+    }});
+    Ok(())
+}
+
+fn handle_clipboard_files_commit(payload: &[u8], layout: &LayoutState, local_id: &str) -> Option<bool> {
+    let packet = decode_wire_packet::<ClipboardFilesCommit>(payload)?;
+    if packet.protocol != CLIPBOARD_FILES_PROTOCOL { return None; }
+    if !layout.clipboard_sync || !layout.file_transfer_enabled { return Some(false); }
+    if packet.paste && layout.machine_role != "client"
+        && !clipboard_exchange::paste_expected(&packet.paste_token, &packet.origin_transport_public_key) { return Some(false); }
+    let auth = clipboard_packet_from_content(ClipboardContent::Text(String::new()), packet.origin_id.clone(), packet.origin_transport_public_key.clone(),
+        packet.target_id.clone(), packet.cluster_id, packet.pair_secret, 0);
+    if !clipboard_packet_authorized(layout, &auth) || !clipboard_packet_targets_local(layout, &auth, local_id) { return Some(false); }
+    let Some(paths) = clipboard_exchange::take_files(&packet.origin_id, &packet.ids) else { return Some(false); };
+    if rich_clipboard::write_files(&paths).is_err() { return Some(false); }
+    if paste_permitted(layout, packet.paste, &packet.paste_token, &packet.origin_transport_public_key) { input::paste_received_clipboard(); }
+    Some(true)
+}
+
+fn default_clipboard_paste_hotkey() -> String { "alt+shift+v".into() }
+
 fn default_edge_switch_hotkey() -> String {
     "alt+shift+k".into()
 }
@@ -6023,6 +6300,10 @@ fn clipboard_ready_status() -> NativeStageStatus {
 #[serde(rename_all = "camelCase")]
 struct ClipboardPacket {
     protocol: String,
+    #[serde(default)]
+    paste: bool,
+    #[serde(default)]
+    paste_token: String,
     origin_id: String,
     // The sender's QUIC transport public key. Defaulted so packets from older
     // peers (which never sent it) still decode as an empty string. Authorization
@@ -6063,6 +6344,15 @@ struct ClipboardFormat {
     image: Option<ClipboardImage>,
 }
 
+fn next_clipboard_sequence() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let previous = SEQUENCE.load(Ordering::Relaxed);
+        let next = now_ms().max(previous.saturating_add(1));
+        if SEQUENCE.compare_exchange(previous, next, Ordering::Relaxed, Ordering::Relaxed).is_ok() { return next; }
+    }
+}
+
 fn clipboard_packet_from_content(
     content: ClipboardContent,
     origin_id: String,
@@ -6073,48 +6363,22 @@ fn clipboard_packet_from_content(
     sequence: u64,
 ) -> ClipboardPacket {
     let signature = content.signature();
-    match content {
-        ClipboardContent::Text(text) => ClipboardPacket {
-            protocol: CLIPBOARD_PROTOCOL.into(),
-            origin_id,
-            origin_transport_public_key,
-            target_id,
-            cluster_id,
-            pair_secret,
-            signature,
-            formats: vec![ClipboardFormat {
-                kind: "plainText".into(),
-                text: text.clone(),
-                image: None,
-            }],
-            text,
-            image: None,
-            sequence,
-        },
-        ClipboardContent::Image(image) => ClipboardPacket {
-            protocol: CLIPBOARD_PROTOCOL.into(),
-            origin_id,
-            origin_transport_public_key,
-            target_id,
-            cluster_id,
-            pair_secret,
-            signature,
-            formats: vec![ClipboardFormat {
-                kind: "imageRgba".into(),
-                text: String::new(),
-                image: Some(image),
-            }],
-            text: String::new(),
-            // The formats envelope is supported by the current stable release.
-            // Keep accepting the legacy alias, but do not send a second bitmap.
-            image: None,
-            sequence,
-        },
-    }
+    let (text, formats) = match content {
+        ClipboardContent::Text(text) => (text.clone(), vec![ClipboardFormat { kind: "plainText".into(), text, image: None }]),
+        ClipboardContent::Image(image) => (String::new(), vec![ClipboardFormat { kind: "imageRgba".into(), text: String::new(), image: Some(image) }]),
+        ClipboardContent::Rich(rich) => {
+            let mut formats = Vec::new();
+            if let Some(html) = rich.html { formats.push(ClipboardFormat { kind: "htmlFragment".into(), text: html, image: None }); }
+            if let Some(rtf) = rich.rtf { formats.push(ClipboardFormat { kind: "rtfBytes".into(), text: { use base64::Engine as _; base64::engine::general_purpose::STANDARD.encode(rtf) }, image: None }); }
+            formats.push(ClipboardFormat { kind: "plainText".into(), text: rich.text.clone(), image: None });
+            (rich.text, formats)
+        }
+    };
+    ClipboardPacket { protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(), origin_id, origin_transport_public_key,
+        target_id, cluster_id, pair_secret, signature, formats, text, image: None, sequence }
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Wait before resending content that failed `failures` times in a row.
 fn clipboard_retry_delay(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(5);
     Duration::from_millis((CLIPBOARD_RETRY_INTERVAL_MS << doublings).min(CLIPBOARD_RETRY_MAX_MS))
@@ -6129,15 +6393,19 @@ fn run_clipboard_sync(
     transport_packets: Arc<AtomicU64>,
     clipboard_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    layout_state: Arc<Mutex<LayoutState>>,
 ) {
     let mut last_sent: Option<(String, String, String)> = None;
     // (device, addr, signature, failed_at, consecutive failures)
     let mut last_failed: Option<(String, String, String, Instant, u32)> = None;
     let mut last_read: Option<(u64, String, String)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
-    let mut sequence = now_ms();
 
     while !stop.load(Ordering::Relaxed) {
+        if layout_state.try_lock().map(|layout| layout.clipboard_on_demand).unwrap_or(false) {
+            thread::sleep(Duration::from_millis(150)); continue;
+        }
+
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
             thread::sleep(Duration::from_millis(120));
             last_poll = Instant::now() - Duration::from_secs(1);
@@ -6231,7 +6499,7 @@ fn run_clipboard_sync(
             continue;
         }
 
-        sequence = sequence.saturating_add(1);
+        let sequence = next_clipboard_sequence();
         let packet = clipboard_packet_from_content(
             content,
             local_peer_id.clone(),
@@ -6374,7 +6642,7 @@ fn handle_clipboard_packet(
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> bool {
-    handle_clipboard_packet_with_writer(
+    let accepted = handle_clipboard_packet_with_writer(
         payload,
         layout,
         local_peer_id,
@@ -6382,7 +6650,19 @@ fn handle_clipboard_packet(
         clipboard_echo_until,
         clipboard_last_sequences,
         write_clipboard_content_with_retry,
-    )
+    );
+    if accepted {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Intent { #[serde(default)] paste: bool, #[serde(default)] paste_token: String,
+            #[serde(default)] origin_transport_public_key: String, origin_id: String }
+        if let Some(intent) = decode_wire_packet::<Intent>(payload) {
+            if intent.origin_id != local_peer_id && paste_permitted(layout, intent.paste, &intent.paste_token, &intent.origin_transport_public_key) {
+                input::paste_received_clipboard();
+            }
+        }
+    }
+    accepted
 }
 
 fn handle_clipboard_packet_with_writer<F>(
@@ -6404,6 +6684,10 @@ where
     if packet.protocol != CLIPBOARD_PROTOCOL {
         return false;
     }
+
+    if layout.clipboard_on_demand && !packet.paste { return false; }
+    if packet.paste && layout.machine_role != "client"
+        && !clipboard_exchange::paste_expected(&packet.paste_token, &packet.origin_transport_public_key) { return false; }
 
     if !clipboard_packet_authorized(layout, &packet) {
         return false;
@@ -6512,6 +6796,14 @@ fn clipboard_packet_targets_local(
 }
 
 fn clipboard_content_from_packet(packet: ClipboardPacket) -> Option<ClipboardContent> {
+    let html = packet.formats.iter().find(|f| f.kind == "htmlFragment").map(|f| f.text.clone());
+    let rtf = packet.formats.iter().find(|f| f.kind == "rtfBytes").and_then(|f| {
+        use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(&f.text).ok()
+    });
+    if html.is_some() || rtf.is_some() {
+        let text = packet.formats.iter().find(|f| f.kind == "plainText").map(|f| f.text.clone()).unwrap_or_else(|| packet.text.clone());
+        return Some(ClipboardContent::Rich(rich_clipboard::RichText { text, html, rtf }));
+    }
     if let Some(content) = packet
         .formats
         .into_iter()
@@ -6673,6 +6965,12 @@ fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String>
         let path = PathBuf::from(path_value);
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("无法读取文件 {}: {error}", path.display()))?;
+        if metadata.is_dir() {
+            let bundle = Arc::new(folder_transfer::bundle(&path)?);
+            files.push(TransferFile { path: bundle.path().to_path_buf(), name: transfer_file_name(&path)?,
+                total_bytes: bundle.size().map_err(|e| e.to_string())?, directory: false, bundle: Some(bundle) });
+            continue;
+        }
         if !metadata.is_file() {
             return Err(format!("暂不支持传输文件夹或特殊文件：{}", path.display()));
         }
@@ -6688,14 +6986,35 @@ fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String>
             path,
             name,
             total_bytes: metadata.len(),
+            directory: false,
+            bundle: None,
         });
     }
 
     if files.is_empty() {
         Err("请选择要传输的文件。".into())
     } else {
-        Ok(files)
+    Ok(files)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_native_drag_files(paths: &[String]) -> Result<Vec<TransferFile>, String> {
+    let mut files = Vec::new();
+    for raw in paths {
+        let root = Path::new(raw);
+        let name = transfer_file_name(root)?;
+        if root.is_dir() {
+            for (relative, directory, size) in folder_transfer::walk(root)? {
+                let virtual_name = Path::new(&name).join(&relative).to_string_lossy().replace('\\', "/");
+                if virtual_name.encode_utf16().count() >= 260 { return Err(format!("{DRAG_CONTROL_FAILED}: 文件夹路径过长，请使用普通文件传输。")); }
+                files.push(TransferFile { path: root.join(relative), name: virtual_name, total_bytes: size, directory, bundle: None });
+            }
+        } else { files.extend(collect_transfer_files(&[raw.clone()])?); }
+        if files.len() > folder_transfer::MAX_ENTRIES { return Err("拖放条目过多。".into()); }
+    }
+    if files.is_empty() { return Err("请选择要传输的文件。".into()); }
+    Ok(files)
 }
 
 fn transfer_file_name(path: &Path) -> Result<String, String> {
@@ -6725,10 +7044,17 @@ fn send_transfer_file(
     drop_mode: DropMode,
     reporter: Option<&FileTransferProgressReporter>,
 ) -> Result<u64, String> {
+    if file.directory { return Ok(0); }
+    if file.bundle.is_some() {
+        let probe = file_transfer_packet("directory-probe", "", origin_id, target, &file.name, 0, 0, 0, Vec::new(), drop_mode, true);
+        send_file_transfer_packet(quic_transport, target, probe)
+            .map_err(|_| "对端版本不支持文件夹，请先更新两端 MyKVM。".to_string())?;
+    }
     if let Some(reporter) = reporter {
         reporter.emit(transfer_id, file, 0, false, None);
     }
 
+    let job = transfer_jobs::TransferJob::new(transfer_id);
     let outcome = send_transfer_file_bytes(
         quic_transport,
         origin_id,
@@ -6737,7 +7063,13 @@ fn send_transfer_file(
         drop_mode,
         transfer_id,
         reporter,
+        &job,
     );
+    if outcome.is_err() {
+        let abort = file_transfer_packet("abort", transfer_id, origin_id, target, &file.name,
+            file.total_bytes, 0, 0, Vec::new(), drop_mode, file.bundle.is_some());
+        let _ = send_file_transfer_packet(quic_transport, target, abort);
+    }
 
     if let Some(reporter) = reporter {
         match &outcome {
@@ -6762,6 +7094,7 @@ fn send_transfer_file_bytes(
     drop_mode: DropMode,
     transfer_id: &str,
     reporter: Option<&FileTransferProgressReporter>,
+    job: &transfer_jobs::TransferJob,
 ) -> Result<u64, String> {
     let mut packet_count = 0_u64;
 
@@ -6779,6 +7112,7 @@ fn send_transfer_file_bytes(
             0,
             Vec::new(),
             drop_mode,
+            file.bundle.is_some(),
         ),
     )?;
     packet_count += 1;
@@ -6790,6 +7124,7 @@ fn send_transfer_file_bytes(
     let mut chunk_index = 0_u64;
     let mut last_progress = Instant::now();
     loop {
+        if job.cancelled() { return Err("传输已取消。".into()); }
         let read = file_handle
             .read(&mut buffer)
             .map_err(|error| format!("读取文件 {} 失败: {error}", file.path.display()))?;
@@ -6811,6 +7146,7 @@ fn send_transfer_file_bytes(
                 offset,
                 data,
                 drop_mode,
+                file.bundle.is_some(),
             ),
         )?;
         packet_count += 1;
@@ -6838,11 +7174,65 @@ fn send_transfer_file_bytes(
             offset,
             Vec::new(),
             drop_mode,
+            file.bundle.is_some(),
         ),
     )?;
     packet_count += 1;
 
     Ok(packet_count)
+}
+
+#[tauri::command]
+fn cancel_file_transfer(transfer_id: String) -> bool { transfer_jobs::cancel(&transfer_id) }
+
+fn abort_incoming_file_transfer(packet: FileTransferPacket, transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>) -> bool {
+    let Ok(mut transfers) = transfers.lock() else { return false; };
+    let Some(transfer) = transfers.get(&packet.transfer_id) else { return true; };
+    if transfer.origin_id != packet.origin_id || transfer.target_id != packet.target_id { return false; }
+    if let Some(transfer) = transfers.remove(&packet.transfer_id) { let _ = fs::remove_file(transfer.temp_path); }
+    true
+}
+
+fn finalize_received_transfer(temp: &Path, final_path: &mut PathBuf, directory: bool) -> std::io::Result<()> {
+    let parent = final_path.parent().ok_or_else(|| std::io::Error::other("missing destination directory"))?.to_path_buf();
+    let name = final_path.file_name().ok_or_else(|| std::io::Error::other("missing file name"))?.to_string_lossy().into_owned();
+    loop {
+        if directory {
+            match fs::create_dir(&*final_path) {
+                Ok(()) => {
+                    if let Err(error) = folder_transfer::extract(temp, final_path) {
+                        let _ = fs::remove_dir_all(&*final_path);
+                        return Err(std::io::Error::other(error));
+                    }
+                    fs::remove_file(temp)?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        } else {
+            match fs::hard_link(temp, &*final_path) {
+                Ok(()) => { fs::remove_file(temp)?; return Ok(()); }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    *final_path = unique_transfer_destination(&parent, &name);
+                    continue;
+                }
+                Err(_) => {}
+            }
+            match fs::OpenOptions::new().write(true).create_new(true).open(&*final_path) {
+                Ok(mut output) => {
+                    let copy = fs::File::open(temp).and_then(|mut input| std::io::copy(&mut input, &mut output));
+                    drop(output);
+                    if let Err(error) = copy { let _ = fs::remove_file(&*final_path); return Err(error); }
+                    fs::remove_file(temp)?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        *final_path = unique_transfer_destination(&parent, &name);
+    }
 }
 
 // Where a transfer should land on the receiver.
@@ -6857,6 +7247,7 @@ enum DropMode {
     DragDrop,
     /// A device's log fetched on request; lands in the "MyKVM Remote Logs" folder.
     ClientLog,
+    Clipboard,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6871,9 +7262,10 @@ fn file_transfer_packet(
     offset: u64,
     data: Vec<u8>,
     drop_mode: DropMode,
+    directory_bundle: bool,
 ) -> FileTransferPacket {
     FileTransferPacket {
-        protocol: FILE_TRANSFER_PROTOCOL.into(),
+        protocol: if drop_mode == DropMode::Clipboard { CLIPBOARD_FILES_PROTOCOL } else { FILE_TRANSFER_PROTOCOL }.into(),
         kind: kind.into(),
         transfer_id: transfer_id.into(),
         origin_id: origin_id.into(),
@@ -6888,6 +7280,8 @@ fn file_transfer_packet(
         drop_to_desktop: drop_mode == DropMode::Desktop,
         drag_drop: drop_mode == DropMode::DragDrop,
         client_log: drop_mode == DropMode::ClientLog,
+        directory_bundle,
+        clipboard_transfer: drop_mode == DropMode::Clipboard,
     }
 }
 
@@ -6929,6 +7323,8 @@ struct DragControlFile {
     transfer_id: String,
     name: String,
     size: u64,
+    #[serde(default)]
+    directory: bool,
 }
 
 /// Windows target: what a sent drag start still has to stream (edge drag-drop
@@ -6963,7 +7359,8 @@ fn send_ole_drag_start(
 
     let peers = active_peer_snapshot(&state.peers);
     let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
-    let files = collect_transfer_files(paths)?;
+    let files = collect_native_drag_files(paths)?;
+    let tree = files.iter().any(|file| file.directory);
 
     // Pre-assign a transfer id per file so the client can match the streamed
     // bytes to the drag session it is about to open.
@@ -6978,10 +7375,11 @@ fn send_ole_drag_start(
             transfer_id: id.clone(),
             name: file.name.clone(),
             size: file.total_bytes,
+            directory: file.directory,
         })
         .collect();
     let start = DragControlPacket {
-        protocol: DRAG_CONTROL_PROTOCOL.into(),
+        protocol: if tree { DRAG_TREE_PROTOCOL } else { DRAG_CONTROL_PROTOCOL }.into(),
         kind: "start".into(),
         origin_id: local_peer.id.clone(),
         target_id: target.device_id.clone(),
@@ -7126,11 +7524,11 @@ fn handle_drag_control_packet(
     let Some(packet) = decode_wire_packet::<DragControlPacket>(payload) else {
         return false;
     };
-    if packet.protocol != DRAG_CONTROL_PROTOCOL {
+    if packet.protocol != DRAG_CONTROL_PROTOCOL && packet.protocol != DRAG_TREE_PROTOCOL {
         return false;
     }
     if !layout.file_transfer_enabled {
-        return true;
+        return false;
     }
     // Reuse the file-transfer trust checks: same cluster, same pair secret, and
     // (on a client) an origin we are paired to.
@@ -7139,7 +7537,7 @@ fn handle_drag_control_packet(
         || packet.cluster_id != layout.cluster_id
         || packet.pair_secret != layout.pair_secret
     {
-        return true;
+        return false;
     }
     if layout.machine_role == "client"
         && !layout.paired_controllers.is_empty()
@@ -7148,10 +7546,10 @@ fn handle_drag_control_packet(
             .iter()
             .any(|controller| controller.id == packet.origin_id)
     {
-        return true;
+        return false;
     }
     if packet.target_id != local_peer_id || packet.origin_id == local_peer_id {
-        return true;
+        return false;
     }
 
     #[cfg(target_os = "windows")]
@@ -7165,11 +7563,13 @@ fn handle_drag_control_packet(
                         transfer_id: file.transfer_id,
                         name: file.name,
                         size: file.size,
+                        directory: file.directory,
                     })
                     .collect();
-                if windows_drag::start_drag_session(files) {
+                let mode = native_drag::NativeDragMode::for_role(&layout.machine_role);
+                if windows_drag::start_drag_session(files, mode) {
                     log::info!("native drag session started from {}", packet.origin_id);
-                }
+                } else { return false; }
             }
             "drop" => windows_drag::signal_drop(),
             "cancel" => windows_drag::cancel_session(),
@@ -7354,11 +7754,9 @@ mod drag_place {
             });
             index += 1;
         }
-        let moved = fs::rename(staged, &dest).or_else(|_| {
-            fs::copy(staged, &dest).map(|_| {
-                let _ = fs::remove_file(staged);
-            })
-        });
+        let moved = if staged.is_dir() {
+            crate::folder_transfer::copy_directory(staged, &dest).and_then(|_| fs::remove_dir_all(staged))
+        } else { super::finalize_received_transfer(staged, &mut dest, false) };
         match moved {
             Ok(()) => log::info!("drag drop placed {} -> {}", name.to_string_lossy(), dest.display()),
             Err(error) => log::warn!("drag drop placement failed: {error}"),
@@ -7469,6 +7867,10 @@ fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, Str
 
     let tail = tail_of_file(&newest, CLIENT_LOG_TAIL_BYTES)
         .map_err(|error| format!("failed to read log: {error}"))?;
+    let header = format!("MyKVM diagnostics: pid={} version={} elevated={} {}\n", std::process::id(),
+        app.config().version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
+        current_privilege_status().is_elevated, input::diagnostic_summary());
+    let tail = [header.as_bytes(), tail.as_slice()].concat();
 
     let safe_name = device_name
         .chars()
@@ -7487,6 +7889,8 @@ fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, Str
 #[serde(rename_all = "camelCase")]
 struct PeerRequestPacket {
     protocol: String,
+    #[serde(default)]
+    paste_token: String,
     origin_id: String,
     target_id: String,
     cluster_id: String,
@@ -7499,6 +7903,7 @@ enum PeerRequest {
     Log,
     Update,
     Lock,
+    Clipboard,
 }
 
 /// Whether `packet` may ask this device for anything, and what (`None` =
@@ -7513,6 +7918,7 @@ fn authorize_peer_request(
 ) -> Option<PeerRequest> {
     let request = match packet.protocol.as_str() {
         LOG_REQUEST_PROTOCOL if layout.file_transfer_enabled => PeerRequest::Log,
+        CLIPBOARD_PULL_PROTOCOL if layout.clipboard_sync => PeerRequest::Clipboard,
         REMOTE_UPDATE_PROTOCOL if layout.machine_role == "client" => PeerRequest::Update,
         LOCK_SCREEN_PROTOCOL if layout.machine_role == "client" => PeerRequest::Lock,
         _ => return None,
@@ -7552,12 +7958,12 @@ fn handle_peer_request_packet(
     };
     if !matches!(
         packet.protocol.as_str(),
-        LOG_REQUEST_PROTOCOL | REMOTE_UPDATE_PROTOCOL | LOCK_SCREEN_PROTOCOL
+        LOG_REQUEST_PROTOCOL | REMOTE_UPDATE_PROTOCOL | LOCK_SCREEN_PROTOCOL | CLIPBOARD_PULL_PROTOCOL
     ) {
         return false;
     }
     match authorize_peer_request(&packet, layout, local_peer_id) {
-        None => return true,
+        None => return packet.protocol != CLIPBOARD_PULL_PROTOCOL,
         Some(PeerRequest::Update) => {
             log::info!("update requested by controller {}", packet.origin_id);
             run_requested_update(app.clone());
@@ -7566,6 +7972,20 @@ fn handle_peer_request_packet(
         Some(PeerRequest::Lock) => {
             log::info!("lock sync: controller {} locked its screen", packet.origin_id);
             lock_local_screen();
+            return true;
+        }
+        Some(PeerRequest::Clipboard) => {
+            let origin = packet.origin_id;
+            let token = packet.paste_token;
+            let app = app.clone();
+            thread::spawn(move || {
+                let state = app.state::<AppRuntime>();
+                let layout = state.layout_snapshot();
+                let peers = active_peer_snapshot(&state.peers);
+                let result = file_transfer_target_for_device(&layout, &peers, &origin)
+                    .and_then(|target| send_current_clipboard(state.inner(), &target, true, token));
+                if let Err(error) = result { log::warn!("requested clipboard send failed: {error}"); }
+            });
             return true;
         }
         Some(PeerRequest::Log) => {}
@@ -7667,7 +8087,7 @@ fn handle_decoded_file_transfer_packet(
     receive_root: &Path,
     drop_root: Option<&Path>,
 ) -> bool {
-    if packet.protocol != FILE_TRANSFER_PROTOCOL {
+    if packet.protocol != FILE_TRANSFER_PROTOCOL && packet.protocol != CLIPBOARD_FILES_PROTOCOL {
         return false;
     }
     if !layout.file_transfer_enabled {
@@ -7682,6 +8102,8 @@ fn handle_decoded_file_transfer_packet(
     if packet.origin_id == local_peer_id {
         return true;
     }
+    if packet.protocol == CLIPBOARD_FILES_PROTOCOL && !layout.clipboard_sync { return false; }
+    if packet.kind == "directory-probe" || packet.kind == "clipboard-probe" { return true; }
 
     // A file that belongs to an active native drag session feeds that session's
     // in-memory stream (read by the OLE drop target) instead of landing on disk.
@@ -7691,6 +8113,7 @@ fn handle_decoded_file_transfer_packet(
             "start" => true,
             "chunk" => windows_drag::feed_chunk(&packet.transfer_id, &packet.data),
             "finish" => windows_drag::finish_file(&packet.transfer_id),
+            "abort" => windows_drag::abort_file(&packet.transfer_id),
             _ => false,
         };
     }
@@ -7699,6 +8122,7 @@ fn handle_decoded_file_transfer_packet(
         "start" => start_incoming_file_transfer(packet, transfers, receive_root, drop_root),
         "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
         "finish" => finish_incoming_file_transfer(packet, transfers),
+        "abort" => abort_incoming_file_transfer(packet, transfers),
         _ => false,
     }
 }
@@ -7744,6 +8168,7 @@ fn start_incoming_file_transfer(
     ));
 
     if let Ok(mut transfers) = transfers.lock() {
+        if transfers.len() >= 32 || transfers.values().filter(|transfer| transfer.origin_id == packet.origin_id).count() >= 8 { return false; }
         if let Some(previous) = transfers.remove(&packet.transfer_id) {
             let _ = fs::remove_file(previous.temp_path);
         }
@@ -7768,6 +8193,9 @@ fn start_incoming_file_transfer(
         total_bytes: packet.total_bytes,
         received_bytes: 0,
         next_chunk_index: 0,
+        directory_bundle: packet.directory_bundle,
+        clipboard_transfer: packet.clipboard_transfer,
+        touched_ms: now_ms(),
         temp_path,
         final_path,
         staged: packet.drag_drop,
@@ -7799,6 +8227,8 @@ fn append_incoming_file_transfer_chunk(
         || packet.target_id != transfer.target_id
         || packet.file_name != transfer.file_name
         || packet.total_bytes != transfer.total_bytes
+        || packet.directory_bundle != transfer.directory_bundle
+        || packet.clipboard_transfer != transfer.clipboard_transfer
         || packet.chunk_index != transfer.next_chunk_index
         || packet.offset != transfer.received_bytes
         || transfer
@@ -7822,6 +8252,7 @@ fn append_incoming_file_transfer_chunk(
         .received_bytes
         .saturating_add(packet.data.len() as u64);
     transfer.next_chunk_index = transfer.next_chunk_index.saturating_add(1);
+    transfer.touched_ms = now_ms();
     true
 }
 
@@ -7832,7 +8263,7 @@ fn finish_incoming_file_transfer(
     if !packet.data.is_empty() {
         return false;
     }
-    let (temp_path, final_path, file_name, total_bytes, staged) = {
+    let (temp_path, mut final_path, file_name, total_bytes, staged, directory_bundle) = {
         let Ok(transfers) = transfers.lock() else {
             return false;
         };
@@ -7843,6 +8274,8 @@ fn finish_incoming_file_transfer(
             || packet.target_id != transfer.target_id
             || packet.file_name != transfer.file_name
             || packet.total_bytes != transfer.total_bytes
+            || packet.directory_bundle != transfer.directory_bundle
+            || packet.clipboard_transfer != transfer.clipboard_transfer
             || packet.offset != transfer.received_bytes
             || packet.chunk_index != transfer.next_chunk_index
             || transfer.received_bytes != transfer.total_bytes
@@ -7855,18 +8288,16 @@ fn finish_incoming_file_transfer(
             transfer.file_name.clone(),
             transfer.total_bytes,
             transfer.staged,
+            transfer.directory_bundle,
         )
     };
 
     // The staging dir and the final dir can sit on different volumes (e.g. a
     // redirected Desktop), where rename fails — fall back to copy + delete.
-    let finalize = fs::rename(&temp_path, &final_path).or_else(|_| {
-        fs::copy(&temp_path, &final_path).map(|_| {
-            let _ = fs::remove_file(&temp_path);
-        })
-    });
+    let finalize = finalize_received_transfer(&temp_path, &mut final_path, directory_bundle);
     match finalize {
         Ok(()) => {
+            if packet.clipboard_transfer { clipboard_exchange::remember_file(&packet.origin_id, &packet.transfer_id, final_path.clone()); }
             if let Ok(mut transfers) = transfers.lock() {
                 transfers.remove(&packet.transfer_id);
             }
@@ -9639,6 +10070,7 @@ mod tests {
     fn test_layout() -> LayoutState {
         LayoutState {
             lock_sync: false,
+            input_protection: Default::default(),
             devices: vec![
                 Device {
                     pointer_speed: 1.0,
@@ -9689,6 +10121,8 @@ mod tests {
             pair_secret: "secret-test".into(),
             paired_controllers: Vec::new(),
             clipboard_sync: false,
+            clipboard_on_demand: false,
+            clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
             file_transfer_enabled: true,
             language: "cn".into(),
             theme_mode: "system".into(),
@@ -10320,6 +10754,7 @@ mod tests {
         }];
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(),
             origin_id: "attacker".into(),
             origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
@@ -10361,6 +10796,7 @@ mod tests {
         }];
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(),
             // id no longer matches the recorded controller (IP moved),
             origin_id: "server-10-0-0-77".into(),
             origin_transport_public_key: "server-key".into(),
@@ -10514,6 +10950,7 @@ mod tests {
         let layout = test_layout();
         let packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(),
             origin_id: "peer-client-10-0-0-2".into(),
             origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
@@ -10604,6 +11041,7 @@ mod tests {
         let layout = test_layout();
         let packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(),
             origin_id: "peer-client-10-0-0-2".into(),
             origin_transport_public_key: String::new(),
             target_id: String::new(),
@@ -10886,6 +11324,46 @@ mod tests {
         assert!(sanitize_transfer_file_name("  ").is_none());
     }
 
+    #[test]
+    fn directory_packets_restore_the_tree_and_empty_folders() {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("empty")).unwrap();
+        fs::create_dir_all(source.path().join("nested")).unwrap();
+        fs::write(source.path().join("nested/example.txt"), "hello").unwrap();
+        let bundle = folder_transfer::bundle(source.path()).unwrap();
+        let bytes = fs::read(bundle.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut layout = test_layout();
+        layout.file_transfer_enabled = true;
+        layout.cluster_id = "cluster-test".into();
+        layout.pair_secret = "secret-test".into();
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        for (kind, index, offset, data) in [
+            ("start", 0, 0, &[][..]), ("chunk", 0, 0, bytes.as_slice()),
+            ("finish", 1, bytes.len() as u64, &[][..]),
+        ] {
+            let mut packet = test_file_transfer_packet(kind, "directory-test", "photos", bytes.len() as u64, index, offset, data);
+            packet.directory_bundle = true;
+            assert!(handle_decoded_file_transfer_packet(packet, &layout, "local-device", &transfers, root.path(), None));
+        }
+        assert!(root.path().join("photos/empty").is_dir());
+        assert_eq!(fs::read_to_string(root.path().join("photos/nested/example.txt")).unwrap(), "hello");
+        assert!(transfers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn finalizing_a_transfer_never_overwrites_an_existing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let temp = root.path().join("incoming.part");
+        let mut destination = root.path().join("existing.txt");
+        fs::write(&destination, "original").unwrap();
+        fs::write(&temp, "new").unwrap();
+        finalize_received_transfer(&temp, &mut destination, false).unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("existing.txt")).unwrap(), "original");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "new");
+        assert!(!temp.exists());
+    }
+
     fn temp_test_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("{name}-{}", random_hex(4)));
         fs::create_dir_all(&path).expect("temp test dir");
@@ -10917,13 +11395,15 @@ mod tests {
             drop_to_desktop: false,
             drag_drop: false,
             client_log: false,
+            directory_bundle: false,
+            clipboard_transfer: false,
         }
     }
 
     fn peer_request(protocol: &str, origin: &str) -> PeerRequestPacket {
         PeerRequestPacket {
             protocol: protocol.into(),
-            origin_id: origin.into(),
+            paste_token: String::new(),            origin_id: origin.into(),
             target_id: "local-device".into(),
             cluster_id: "cluster-test".into(),
             pair_secret: "secret-test".into(),
@@ -11000,6 +11480,41 @@ mod tests {
         assert_eq!(clipboard_retry_delay(5), Duration::from_secs(32));
         assert_eq!(clipboard_retry_delay(6), Duration::from_secs(60));
         assert_eq!(clipboard_retry_delay(40), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn rich_clipboard_formats_round_trip_and_keep_a_plain_text_fallback() {
+        let packet = clipboard_packet_from_content(ClipboardContent::Rich(rich_clipboard::RichText {
+            text: "中文".into(), html: Some("<b>中文</b>".into()), rtf: Some(b"{\\rtf1 sample}".to_vec()),
+        }), "peer".into(), "key".into(), "local-device".into(), "cluster-test".into(), "secret-test".into(), 1);
+        let bytes = encode_wire_packet(&packet).unwrap();
+        let decoded = decode_wire_packet::<ClipboardPacket>(&bytes).unwrap();
+        assert_eq!(decoded.text, "中文");
+        let content = clipboard_content_from_packet(decoded).unwrap();
+        let ClipboardContent::Rich(rich) = content else { panic!("rich formats lost"); };
+        assert_eq!(rich.html.as_deref(), Some("<b>中文</b>"));
+        assert_eq!(rich.rtf.as_deref(), Some(&b"{\\rtf1 sample}"[..]));
+        let mut legacy = decode_wire_packet::<ClipboardPacket>(&bytes).unwrap();
+        legacy.formats.retain(|format| format.kind == "plainText");
+        assert!(matches!(clipboard_content_from_packet(legacy), Some(ClipboardContent::Text(text)) if text == "中文"));
+    }
+
+    #[test]
+    fn on_demand_clipboard_does_not_overwrite_local_content_without_a_requested_paste() {
+        let mut layout = test_layout();
+        layout.cluster_id = "cluster-test".into(); layout.pair_secret = "secret-test".into();
+        layout.clipboard_on_demand = true;
+        let mut packet = clipboard_packet_from_content(ClipboardContent::Text("remote".into()), "peer".into(), "key".into(),
+            "local-device".into(), layout.cluster_id.clone(), layout.pair_secret.clone(), 1);
+        let seen = Arc::new(Mutex::new(None)); let echo = Arc::new(Mutex::new(None)); let sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut writes = 0;
+        assert!(!handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        packet.paste = true;
+        assert!(!handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        assert_eq!(writes, 0);
+        packet.paste_token = clipboard_exchange::expect_paste("key");
+        assert!(handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        assert_eq!(writes, 1);
     }
 
     #[test]

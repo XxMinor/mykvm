@@ -17,6 +17,7 @@ pub(crate) struct ClipboardImage {
 pub(crate) enum ClipboardContent {
     Text(String),
     Image(ClipboardImage),
+    Rich(crate::rich_clipboard::RichText),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,9 @@ fn clipboard_signature_hash(bytes: &[u8]) -> u64 {
 impl ClipboardContent {
     pub(crate) fn is_oversized(&self) -> bool {
         match self {
+            ClipboardContent::Rich(rich) => rich.text.len() > CLIPBOARD_MAX_TEXT_BYTES
+                || rich.html.as_ref().is_some_and(|s| s.len() > crate::rich_clipboard::MAX_FORMAT_BYTES)
+                || rich.rtf.as_ref().is_some_and(|s| s.len() > crate::rich_clipboard::MAX_FORMAT_BYTES),
             ClipboardContent::Text(text) => text.len() > CLIPBOARD_MAX_TEXT_BYTES,
             ClipboardContent::Image(image) => {
                 // base64 inflates ~4/3; compare against the decoded RGBA budget.
@@ -55,6 +59,9 @@ impl ClipboardContent {
     /// suppress echoing content we just received from a peer.
     pub(crate) fn signature(&self) -> String {
         match self {
+            ClipboardContent::Rich(rich) => format!("rich:{:x}:{:x}:{:x}", clipboard_signature_hash(rich.text.as_bytes()),
+                clipboard_signature_hash(rich.html.as_deref().unwrap_or("").as_bytes()),
+                clipboard_signature_hash(rich.rtf.as_deref().unwrap_or(&[]))),
             ClipboardContent::Text(text) => format!("text:{text}"),
             ClipboardContent::Image(image) => {
                 format!(
@@ -85,6 +92,7 @@ pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let _pool = crate::input::macos_appkit::autorelease_pool();
     match content {
+        ClipboardContent::Rich(rich) => crate::rich_clipboard::write(rich),
         ClipboardContent::Text(text) => write_text(text),
         ClipboardContent::Image(image) => write_image(image),
     }
@@ -98,6 +106,8 @@ pub(crate) fn read_content() -> Option<ClipboardContent> {
     // `Clipboard::new()`, and this runs on the pool-less clipboard thread.
     #[cfg(target_os = "macos")]
     let _pool = crate::input::macos_appkit::autorelease_pool();
+    if !crate::rich_clipboard::read_files().is_empty() { return None; }
+    if let Some(rich) = crate::rich_clipboard::read() { return Some(ClipboardContent::Rich(rich)); }
     read_content_for_hint(content_hint(), read_text_content, read_image_content)
 }
 

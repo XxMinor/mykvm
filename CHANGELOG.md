@@ -10,6 +10,10 @@ release will reuse them).
 
 ### Added
 
+- Folder transfers preserve nested directories and empty folders. Windows native drags include directory descriptors; ordinary transfers unpack into the receiving folder. New folder and file-clipboard protocols require both peers to be updated.
+- Rich clipboard sharing includes HTML and RTF with a plain-text fallback. On-demand mode keeps local clipboard contents separate, sends Ctrl/Command+V to the controlled peer only after content is received, and uses Alt+Shift+V to paste the other machine's clipboard locally.
+- File clipboard paste transfers selected files/folders without requiring network file shares. Active transfer toasts have a Cancel button.
+- Controller input protection: lock mouse/keyboard to this computer with a separate shortcut (default Alt+Shift+L), and pause screen switching for fullscreen or selected foreground apps while the connection stays available. Automatic protection does not pull back an existing remote session.
 - Manually added peers keep their selected connection IP, including after pairing, rediscovery, and address changes (#26).
 - Drag-and-drop files across machines (ShareMouse-style, experimental): drag files on the machine that owns the keyboard and mouse onto a controlled machine. Controlling Windows → Mac: drag files toward the screen edge that borders the Mac — a document icon follows the cursor onto the Mac, and releasing over an open Finder folder drops the files there (otherwise the Desktop). Controlling Mac → Windows client is also in. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
 - Drag files the other way too — from a controlled machine back to the controller. While controlling a Mac from Windows, grab a file on the Mac and drag it back across the edge onto Windows: it becomes a real native drag on Windows that you can drop into any folder, app, or field. Requires both sides on this version or newer.
@@ -22,6 +26,13 @@ release will reuse them).
 
 ### Fixed
 
+- Windows native file drags spool data to disk instead of retaining whole files in memory. Cancellation wakes blocked readers; received transfers do not overwrite existing destinations and expired partial transfers are removed.
+- Version labels and updater comparisons use the configured package version, including local beta test builds, so an older published beta is not offered as an upgrade.
+- Windows: an old capture thread cannot clear a newer thread's context, and local control cannot forward clicks/keys through a stale remote target. Hook health uses callback receipt time rather than delayed event timestamps. A second instance cannot start when access to the existing instance's lock is refused.
+- Windows: dragging files back from a controlled Mac finishes on the local mouse release instead of waiting for a remote drop signal. Its own drag input stays local, failed drag startup cancels cleanly, and Escape cancels in either direction.
+- Windows: local keyboard activity no longer makes the input monitor mistake healthy hooks for removed ones. Returning to the screen edge briefly prevents bouncing straight back into the controlled machine.
+- Windows: after an idle period, a queued input callback no longer triggers a false hook restart. The hidden pointer stays at the display center during remote control, so a fullscreen game recentering it there does not look like a jump back to the controlling machine. Screen-layout refreshes run outside the mouse callback to reduce work while using the local mouse.
+- Windows: leaving the mouse still no longer restarts the input hooks just because two input timestamps differ. A successful hook repair keeps control on the current machine instead of sending the cursor back to the controller.
 - Windows: the controlling machine no longer takes control back on its own when one check of the input desktop fails; only a secure desktop (UAC prompt, lock screen) that stays up does.
 - Quitting or updating MyKVM tells the other machine at once, so it reconnects right away — on a Windows client, to the input service, which keeps the machine controllable while the installer runs — instead of sending into a dead connection for about 10 seconds.
 - Windows installer: upgrading over an older version, including "uninstall before installing", keeps the input service and no longer asks to restart Windows; an interactive install starts MyKVM as soon as its files are in place instead of at the finish page; it no longer waits 12 seconds trying to stop a service it has no rights to stop, and it runs standard Windows tools instead of hidden PowerShell that security software flagged.

@@ -77,9 +77,12 @@ export interface LayoutState {
   pairSecret: string
   pairedControllers: PairedController[]
   clipboardSync: boolean
+  clipboardOnDemand?: boolean
+  clipboardPasteHotkey?: string
   fileTransferEnabled: boolean
   /** Controller: locking this machine locks its online clients too. */
   lockSync?: boolean
+  inputProtection?: InputProtection
   language: AppLanguage
   themeMode: ThemeMode
   performanceMonitor: boolean
@@ -90,4 +93,11 @@ export interface LayoutState {
   modifierMap: ModifierMap
   edgeSwitchHotkey: string
   screenSwitchHotkeys: ScreenSwitchHotkeys
+}
+
+export interface InputProtection {
+  localOnly: boolean
+  protectFullscreen: boolean
+  blockedApplications: string[]
+  lockHotkey: string
 }

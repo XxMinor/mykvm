@@ -83,10 +83,12 @@ const BROWSER_RUNTIME: RuntimeStatus = {
   },
 }
 
+let browserLayout = defaultLayout
+
 export async function loadAppState(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
     return {
-      layout: defaultLayout,
+      layout: browserLayout,
       runtime: BROWSER_RUNTIME,
     }
   }
@@ -96,6 +98,7 @@ export async function loadAppState(): Promise<AppStateSnapshot> {
 
 export async function saveLayout(layout: LayoutState): Promise<AppStateSnapshot> {
   if (!isTauri()) {
+    browserLayout = layout
     return {
       layout,
       runtime: BROWSER_RUNTIME,
@@ -185,6 +188,28 @@ export async function stopRuntime(): Promise<RuntimeStatus> {
   }
 
   return invoke<RuntimeStatus>('stop_runtime')
+}
+
+export async function setLocalControlLocked(locked: boolean, layout: LayoutState): Promise<AppStateSnapshot> {
+  if (!isTauri()) {
+    browserLayout = { ...layout, inputProtection: {
+      localOnly: locked, protectFullscreen: layout.inputProtection?.protectFullscreen ?? true,
+      blockedApplications: layout.inputProtection?.blockedApplications ?? [],
+      lockHotkey: layout.inputProtection?.lockHotkey ?? 'alt+shift+l',
+    } }
+    return { layout: browserLayout, runtime: BROWSER_RUNTIME }
+  }
+  return invoke<AppStateSnapshot>('set_local_control_locked', { locked })
+}
+
+export async function pasteRemoteClipboard(): Promise<void> {
+  if (!isTauri()) return
+  await invoke('paste_remote_clipboard')
+}
+
+export async function cancelFileTransfer(transferId: string): Promise<boolean> {
+  if (!isTauri()) return false
+  return invoke<boolean>('cancel_file_transfer', { transferId })
 }
 
 export async function scanLanPeers(): Promise<DiscoveryStatus> {

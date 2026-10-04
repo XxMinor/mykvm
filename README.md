@@ -39,9 +39,9 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 
 ## Limitations
 
-- **Trusted LAN only.** There is no user pairing/PIN yet, and LAN discovery is plaintext and unauthenticated. Do not expose the ports to public or untrusted networks.
+- **Trusted LAN only.** Pairing codes and paired certificate binding are supported; discovery remains plaintext. Do not expose the ports to public or untrusted networks.
 - Input and clipboard ride an **encrypted QUIC/TLS** connection pinned to the peer's advertised certificate, but MyKVM is a prototype and is not hardened for hostile networks.
-- The clipboard syncs **text and images**, not files.
+- The clipboard supports text, images, HTML and RTF. Files/folders use on-demand paste and require both peers updated; file/folder contents are limited to 2 GiB.
 - macOS builds are **self-signed, not notarized** — expect a Gatekeeper prompt on first open.
 - Experimental software: the protocol and behavior may change between versions.
 
@@ -54,7 +54,10 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 - Supports manual peer connection by host or IP.
 - Detects local displays and lets you arrange multi-monitor layouts.
 - Shares keyboard and mouse input over an encrypted QUIC connection.
-- Syncs clipboard text and images over the same encrypted connection.
+- Syncs text, images and rich clipboard formats over the same encrypted connection.
+- Controller input protection locks mouse/keyboard locally (Alt+Shift+L by default), prevents entry while fullscreen or selected apps are foreground, and leaves existing remote sessions alone.
+- On-demand clipboard mode preserves local content. Ctrl/Command+V on a controlled client sends and pastes local content; Alt+Shift+V back on the controller pulls and pastes the other computer's clipboard. Files and folders use this mode.
+- Folder transfers keep nested and empty directories and can be cancelled. Both peers must be updated. Linux native X11/Wayland input is not implemented yet.
 - Provides light, dark, and system theme modes.
 - Includes English and Simplified Chinese UI.
 - Supports tray behavior for hiding and restoring the main window.
@@ -69,7 +72,7 @@ MyKVM is an experimental early release. It is useful for local testing and itera
 - Clipboard payload caps: 256 KB text, 32 MB image
 - Transport security: input and clipboard run over a TLS 1.3 (QUIC) connection pinned to the peer's advertised certificate
 - Security model: trusted LAN prototype
-- Not yet included: user pairing/PIN, authenticated discovery, and production transport hardening
+- Not yet included: fully authenticated discovery and production transport hardening for untrusted networks
 
 Do not expose the transport ports to public or untrusted networks.
 

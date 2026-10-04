@@ -1,3 +1,5 @@
+import { InputProtectionSettings } from "./InputProtectionSettings";
+import { DEFAULT_INPUT_PROTECTION } from "./inputProtection";
 import {
   type CSSProperties,
   type FormEvent,
@@ -43,6 +45,9 @@ import {
   startRuntime,
   startWindowDrag,
   stopRuntime,
+  setLocalControlLocked,
+  cancelFileTransfer,
+  pasteRemoteClipboard,
   syncWindowChrome,
   toggleMaximizeMainWindow,
   uninstallInputService,
@@ -499,6 +504,16 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    let dispose: (() => void) | null = null;
+    void import("@tauri-apps/api/event").then(({ listen }) => listen<string>("clipboard-paste-error", ({ payload }) => {
+      if (active) setErrorMessage(payload);
+    })).then(stop => { if (active) dispose = stop; else stop(); }).catch(() => {});
+    return () => { active = false; dispose?.(); };
+  }, []);
+
+  useEffect(() => {
     let active = true;
 
     isPortableMode()
@@ -689,6 +704,7 @@ function App() {
   const layout = snapshot?.layout;
   const runtime = snapshot?.runtime;
   const discovery = runtime?.discovery;
+  const appVersion = discovery?.localPeer.appVersion || APP_VERSION;
   const displayLayout = useMemo(
     () => (layout ? applyPeerPresence(layout, discovery?.peers ?? []) : null),
     [layout, discovery],
@@ -2132,6 +2148,8 @@ function App() {
                   {status}
                   {counter}
                 </span>
+                {!transfer.done ? <button type="button" className="secondary-button compact-button"
+                  onClick={() => void cancelFileTransfer(transfer.transferId)}>{ui.common.cancel}</button> : null}
               </div>
               <div className="file-transfer-toast-track">
                 <div
@@ -2972,6 +2990,23 @@ function App() {
                     </button>
                   </div>
                 </div>
+                {layout.clipboardSync ? <>
+                  <div className="settings-control-row"><span>{language === "cn" ? "剪贴板发送方式" : "Clipboard transfer"}</span>
+                    <div className="segmented-control">
+                      <button type="button" className={!layout.clipboardOnDemand ? "active" : ""} onClick={() => updateLayout(s => ({ ...s, clipboardOnDemand: false }))}>{language === "cn" ? "自动同步" : "Automatic"}</button>
+                      <button type="button" className={layout.clipboardOnDemand ? "active" : ""} onClick={() => updateLayout(s => ({ ...s, clipboardOnDemand: true }))}>{language === "cn" ? "按需粘贴" : "On demand"}</button>
+                    </div>
+                  </div>
+                  <p className="muted-copy">{language === "cn" ? "按需模式保留本机剪贴板。控制客户端时，Ctrl／Command+V 发送本机内容再粘贴；回到本机后，下面的快捷键拉取并粘贴另一台电脑的内容。文件和文件夹通过按需粘贴传输。" : "On-demand mode preserves the local clipboard. Ctrl/Command+V while controlling a client sends and pastes local content. Back here, the shortcut pulls and pastes the other computer's clipboard. Files and folders use on-demand paste."}</p>
+                  {machineRole === "server" ? <div className="settings-control-row">
+                    <label htmlFor="clipboard-paste-hotkey">{language === "cn" ? "远端粘贴快捷键" : "Remote clipboard shortcut"}</label>
+                    <input id="clipboard-paste-hotkey" className="input-protection-hotkey" key={layout.clipboardPasteHotkey ?? "alt+shift+v"} defaultValue={layout.clipboardPasteHotkey ?? "alt+shift+v"}
+                      onBlur={e => updateLayout(s => ({ ...s, clipboardPasteHotkey: e.target.value || "alt+shift+v" }))} />
+                    <button type="button" className="secondary-button compact-button" disabled={!runtime.started}
+                      onClick={() => void pasteRemoteClipboard().catch((error: unknown) => setErrorMessage(formatUnknownError(error, ui.errors.writeClipboard)))}>{language === "cn" ? "粘贴另一台" : "Paste remote"}</button>
+                  </div> : null}
+                </> : null}
+
                 <div className="settings-control-row">
                   <span>
                     {ui.settings.fileTransfer}
@@ -3053,6 +3088,18 @@ function App() {
                   </div>
                 ) : null}
               </section>
+
+              {machineRole === "server" ? <InputProtectionSettings
+                settings={layout.inputProtection ?? DEFAULT_INPUT_PROTECTION}
+                status={runtime.inputProtection} language={language} pending={isRuntimePending}
+                onChange={(inputProtection) => updateLayout(current => ({ ...current, inputProtection }))}
+                onLock={(locked) => {
+                  setIsRuntimePending(true);
+                  void setLocalControlLocked(locked, layout).then(setSnapshot)
+                    .catch((error: unknown) => setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime)))
+                    .finally(() => setIsRuntimePending(false));
+                }}
+              /> : null}
 
               <section className="surface-card modifier-card">
                 <div className="card-title-row">
@@ -3210,7 +3257,7 @@ function App() {
                 <dl className="network-meta compact-meta">
                   <div>
                     <dt>{ui.settings.currentVersion}</dt>
-                    <dd>v{APP_VERSION}</dd>
+                    <dd>v{appVersion}</dd>
                   </div>
                   <div>
                     <dt>{ui.settings.latestVersion}</dt>
@@ -3537,7 +3584,7 @@ function App() {
               MyKVM
             </a>
           </span>
-          <span>v{APP_VERSION}</span>
+          <span>v{appVersion}</span>
         </span>
         <a
           href={REPOSITORY_URL}

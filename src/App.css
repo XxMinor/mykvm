@@ -2280,3 +2280,10 @@
 .theme-light .file-transfer-toast-meta {
   color: #475569;
 }
+
+.input-protection-status { font-size: 12px; color: var(--text-muted); }
+.input-protection-status.paused { color: #b97722; }
+.input-protection-hotkey, .input-protection-apps textarea { font: inherit; color: inherit; background: transparent; border: 1px solid var(--border-color, #7775); border-radius: 8px; padding: 8px 10px; }
+.input-protection-hotkey { width: 200px; }
+.input-protection-apps { display: grid; gap: 8px; margin-top: 16px; }
+.input-protection-apps textarea { width: 100%; box-sizing: border-box; resize: vertical; }
