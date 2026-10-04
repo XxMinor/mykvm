@@ -917,7 +917,15 @@ impl AppRuntime {
                 return true;
             }
 
-            if let Some(accepted) = handle_clipboard_files_commit(&payload, &layout, &current_peer.id) { return accepted; }
+            if let Some(accepted) = handle_clipboard_files_commit(
+                &payload, &layout, &current_peer.id, &clipboard_seen_text, &clipboard_echo_until,
+            ) {
+                if accepted {
+                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                    clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                }
+                return accepted;
+            }
 
             if handle_file_transfer_packet(
                 &payload,
@@ -1348,6 +1356,7 @@ impl AppRuntime {
         let transport_packets = Arc::clone(&self.transport_packets);
         let clipboard_packets = Arc::clone(&self.clipboard_packets);
         let clipboard_layout = Arc::clone(&self.layout);
+        let clipboard_app = self.app_handle.clone();
         let Some(quic_transport) = self.quic_transport_handle() else {
             return NativeStageStatus {
                 state: "error".into(),
@@ -1366,6 +1375,7 @@ impl AppRuntime {
                 clipboard_packets,
                 thread_stop,
                 clipboard_layout,
+                clipboard_app,
             );
         });
 
@@ -2472,6 +2482,7 @@ fn send_files_to_device_inner(
             &new_transfer_id("file"),
             drop_mode,
             Some(&reporter),
+            None,
         )?;
         state
             .transport_packets
@@ -6001,6 +6012,97 @@ fn paste_permitted(layout: &LayoutState, paste: bool, token: &str, source_key: &
     paste && (layout.machine_role == "client" || clipboard_exchange::consume_paste(token, source_key))
 }
 
+const CLIPBOARD_FILES_SUPERSEDED: &str = "文件剪贴板已改变或同步已关闭。";
+
+fn ensure_file_transfer_current(keep_going: Option<&dyn Fn() -> bool>) -> Result<(), String> {
+    if keep_going.is_some_and(|check| !check()) {
+        Err(CLIPBOARD_FILES_SUPERSEDED.into())
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_clipboard_files(
+    transport: &quic_transport::TransportHandle,
+    local_id: &str,
+    target: &FileTransferTarget,
+    paths: &[String],
+    paste: bool,
+    token: String,
+    app: Option<&AppHandle>,
+    keep_going: Option<&dyn Fn() -> bool>,
+) -> Result<u64, String> {
+    if paths.len() > 64 {
+        return Err("一次最多可粘贴 64 个文件或文件夹。".into());
+    }
+    ensure_file_transfer_current(keep_going)?;
+    let probe = file_transfer_packet(
+        "clipboard-probe",
+        "",
+        local_id,
+        target,
+        "",
+        0,
+        0,
+        0,
+        Vec::new(),
+        DropMode::Clipboard,
+        false,
+    );
+    send_file_transfer_packet(transport, target, probe)?;
+    let mut ids = Vec::new();
+    let mut packet_count = 1;
+    for (index, path) in paths.iter().enumerate() {
+        ensure_file_transfer_current(keep_going)?;
+        // Prepare one entry at a time rather than spooling every selected folder.
+        let files = collect_transfer_files(std::slice::from_ref(path))?;
+        for file in files {
+            let id = new_transfer_id("clipboard");
+            let reporter = app.map(|app| FileTransferProgressReporter {
+                app,
+                target_name: &target.name,
+                file_index: index + 1,
+                file_count: paths.len(),
+            });
+            packet_count += send_transfer_file(
+                transport,
+                local_id,
+                target,
+                &file,
+                &id,
+                DropMode::Clipboard,
+                reporter.as_ref(),
+                keep_going,
+            )?;
+            ids.push(id);
+        }
+    }
+    // A large file may finish after another copy or after the switch is disabled.
+    // Leave the new clipboard alone instead of committing that old selection.
+    ensure_file_transfer_current(keep_going)?;
+    let commit = ClipboardFilesCommit {
+        protocol: CLIPBOARD_FILES_PROTOCOL.into(),
+        origin_id: local_id.into(),
+        origin_transport_public_key: transport.public_key().into(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        ids,
+        paste,
+        paste_token: token,
+    };
+    transport.send_stream_expect_ack(
+        transport.peer(
+            target.addr.clone(),
+            target.transport_public_key.clone(),
+            target.protocol_version,
+        ),
+        encode_wire_packet(&commit)?,
+    )?;
+    Ok(packet_count + 1)
+}
+
 fn send_current_clipboard(state: &AppRuntime, target: &FileTransferTarget, paste: bool, token: String) -> Result<(), String> {
     let layout = state.layout_snapshot();
     if !layout.clipboard_sync { return Err("剪贴板同步未开启。".into()); }
@@ -6009,21 +6111,9 @@ fn send_current_clipboard(state: &AppRuntime, target: &FileTransferTarget, paste
     let peer = transport.peer(target.addr.clone(), target.transport_public_key.clone(), target.protocol_version);
     let paths = rich_clipboard::read_files();
     if !paths.is_empty() {
-        if paths.len() > 64 { return Err("一次最多可粘贴 64 个文件或文件夹。".into()); }
         if !layout.file_transfer_enabled { return Err("文件传输未开启。".into()); }
-        let probe = file_transfer_packet("clipboard-probe", "", &local.id, target, "", 0, 0, 0, Vec::new(), DropMode::Clipboard, false);
-        send_file_transfer_packet(&transport, target, probe).map_err(|_| "对端尚不支持文件剪贴板，请更新两端。".to_string())?;
-        let files = collect_transfer_files(&paths)?;
-        let mut ids = Vec::new();
-        for file in files {
-            let id = new_transfer_id("clipboard");
-            send_transfer_file(&transport, &local.id, target, &file, &id, DropMode::Clipboard, None)?;
-            ids.push(id);
-        }
-        let commit = ClipboardFilesCommit { protocol: CLIPBOARD_FILES_PROTOCOL.into(), origin_id: local.id,
-            origin_transport_public_key: transport.public_key().into(), target_id: target.device_id.clone(),
-            cluster_id: target.cluster_id.clone(), pair_secret: target.pair_secret.clone(), ids, paste, paste_token: token };
-        return transport.send_stream_expect_ack(peer, encode_wire_packet(&commit)?);
+        return send_clipboard_files(&transport, &local.id, target, &paths, paste, token,
+            Some(&state.app_handle), None).map(|_| ());
     }
     let content = clipboard::read_content().ok_or("剪贴板中没有可传输的内容。")?;
     if content.is_oversized() { return Err("剪贴板内容超过大小上限。".into()); }
@@ -6058,18 +6148,95 @@ fn paste_remote_clipboard(state: tauri::State<'_, AppRuntime>) -> Result<(), Str
     Ok(())
 }
 
-fn handle_clipboard_files_commit(payload: &[u8], layout: &LayoutState, local_id: &str) -> Option<bool> {
+fn handle_clipboard_files_commit(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_id: &str,
+    clipboard_seen: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+) -> Option<bool> {
+    let accepted = handle_clipboard_files_commit_with_writer(
+        payload,
+        layout,
+        local_id,
+        clipboard_seen,
+        clipboard_echo_until,
+        |paths| {
+            retry_clipboard_write(
+                CLIPBOARD_WRITE_ATTEMPTS,
+                Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
+                || rich_clipboard::write_files(paths),
+            )
+        },
+    );
+    if accepted == Some(true) {
+        let packet = decode_wire_packet::<ClipboardFilesCommit>(payload)?;
+        if paste_permitted(
+            layout,
+            packet.paste,
+            &packet.paste_token,
+            &packet.origin_transport_public_key,
+        ) {
+            input::paste_received_clipboard();
+        }
+    }
+    accepted
+}
+
+fn handle_clipboard_files_commit_with_writer<F>(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_id: &str,
+    clipboard_seen: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+    mut write_files: F,
+) -> Option<bool>
+where
+    F: FnMut(&[String]) -> Result<(), String>,
+{
     let packet = decode_wire_packet::<ClipboardFilesCommit>(payload)?;
-    if packet.protocol != CLIPBOARD_FILES_PROTOCOL { return None; }
-    if !layout.clipboard_sync || !layout.file_transfer_enabled { return Some(false); }
-    if packet.paste && layout.machine_role != "client"
-        && !clipboard_exchange::paste_expected(&packet.paste_token, &packet.origin_transport_public_key) { return Some(false); }
-    let auth = clipboard_packet_from_content(ClipboardContent::Text(String::new()), packet.origin_id.clone(), packet.origin_transport_public_key.clone(),
-        packet.target_id.clone(), packet.cluster_id, packet.pair_secret, 0);
-    if !clipboard_packet_authorized(layout, &auth) || !clipboard_packet_targets_local(layout, &auth, local_id) { return Some(false); }
-    let Some(paths) = clipboard_exchange::take_files(&packet.origin_id, &packet.ids) else { return Some(false); };
-    if rich_clipboard::write_files(&paths).is_err() { return Some(false); }
-    if paste_permitted(layout, packet.paste, &packet.paste_token, &packet.origin_transport_public_key) { input::paste_received_clipboard(); }
+    if packet.protocol != CLIPBOARD_FILES_PROTOCOL {
+        return None;
+    }
+    if !layout.clipboard_sync || !layout.file_transfer_enabled {
+        return Some(false);
+    }
+    if packet.paste
+        && layout.machine_role != "client"
+        && !clipboard_exchange::paste_expected(
+            &packet.paste_token,
+            &packet.origin_transport_public_key,
+        )
+    {
+        return Some(false);
+    }
+    let auth = clipboard_packet_from_content(
+        ClipboardContent::Text(String::new()),
+        packet.origin_id.clone(),
+        packet.origin_transport_public_key.clone(),
+        packet.target_id.clone(),
+        packet.cluster_id,
+        packet.pair_secret,
+        0,
+    );
+    if !clipboard_packet_authorized(layout, &auth)
+        || !clipboard_packet_targets_local(layout, &auth, local_id)
+    {
+        return Some(false);
+    }
+    let Some(paths) = clipboard_exchange::take_files(&packet.origin_id, &packet.ids) else {
+        return Some(false);
+    };
+    // Serialize the native write and its echo marker with the polling thread.
+    let Ok(mut seen) = clipboard_seen.lock() else {
+        return Some(false);
+    };
+    if let Err(error) = write_files(&paths) {
+        log::warn!("file clipboard receive write failed: {error}");
+        return Some(false);
+    }
+    *seen = Some(clipboard::files_signature(&paths));
+    arm_clipboard_echo_guard(clipboard_echo_until);
     Some(true)
 }
 
@@ -6356,16 +6523,39 @@ fn run_clipboard_sync(
     clipboard_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     layout_state: Arc<Mutex<LayoutState>>,
+    app: AppHandle,
 ) {
     let mut last_sent: Option<(String, String, String)> = None;
     // (device, addr, signature, failed_at, consecutive failures)
     let mut last_failed: Option<(String, String, String, Instant, u32)> = None;
     let mut last_read: Option<(u64, String, String)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
+    let mut last_file_sync_enabled = false;
 
     while !stop.load(Ordering::Relaxed) {
-        if layout_state.try_lock().map(|layout| layout.clipboard_on_demand).unwrap_or(false) {
-            thread::sleep(Duration::from_millis(150)); continue;
+        let Some((sync, on_demand, file_transfer_enabled)) =
+            layout_state.lock().ok().map(|layout| {
+                (
+                    layout.clipboard_sync,
+                    layout.clipboard_on_demand,
+                    layout.file_transfer_enabled,
+                )
+            })
+        else {
+            break;
+        };
+        if !sync {
+            break;
+        }
+        if on_demand {
+            thread::sleep(Duration::from_millis(150));
+            continue;
+        }
+        if file_transfer_enabled != last_file_sync_enabled {
+            last_read = None;
+            last_sent = None;
+            last_failed = None;
+            last_file_sync_enabled = file_transfer_enabled;
         }
 
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
@@ -6389,7 +6579,7 @@ fn run_clipboard_sync(
         if clipboard_poll_unchanged(version, &last_read, &target, retry_due) {
             continue;
         }
-        let Some(content) = clipboard::read_content() else {
+        let Some(content) = clipboard::read_snapshot() else {
             continue;
         };
         // Only cache a stable read. A copy racing the read must be polled again.
@@ -6397,6 +6587,8 @@ fn run_clipboard_sync(
             .filter(|version| Some(*version) == clipboard::change_count())
             .map(|version| (version, target.device_id.clone(), target.addr.clone()));
         let signature = content.signature();
+        let send_key = content.send_key(version);
+        let is_files = matches!(&content, clipboard::ClipboardSnapshot::Files(_));
 
         // If this is the content we just wrote after receiving a peer packet,
         // suppress it. A different signature during the grace window is treated
@@ -6415,7 +6607,9 @@ fn run_clipboard_sync(
             }
         }
 
-        if content.is_oversized() {
+        if matches!(&content, clipboard::ClipboardSnapshot::Content(content) if content.is_oversized())
+            || (is_files && !file_transfer_enabled)
+        {
             last_failed = None;
             continue;
         }
@@ -6423,7 +6617,7 @@ fn run_clipboard_sync(
         if last_sent
             .as_ref()
             .map(|(device_id, addr, previous)| {
-                device_id == &target.device_id && addr == &target.addr && previous == &signature
+                device_id == &target.device_id && addr == &target.addr && previous == &send_key
             })
             .unwrap_or(false)
         {
@@ -6435,7 +6629,7 @@ fn run_clipboard_sync(
             .map(|(device_id, addr, previous, failed_at, failures)| {
                 device_id == &target.device_id
                     && addr == &target.addr
-                    && previous == &signature
+                    && previous == &send_key
                     && failed_at.elapsed() < clipboard_retry_delay(*failures)
             })
             .unwrap_or(false)
@@ -6457,73 +6651,139 @@ fn run_clipboard_sync(
 
         if !should_send {
             last_failed = None;
-            last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
+            last_sent = Some((target.device_id.clone(), target.addr.clone(), send_key));
             continue;
         }
 
-        let sequence = next_clipboard_sequence();
-        let packet = clipboard_packet_from_content(
-            content,
-            local_peer_id.clone(),
-            quic_transport.public_key().to_string(),
-            target.device_id.clone(),
-            target.cluster_id.clone(),
-            target.pair_secret.clone(),
-            sequence,
-        );
-
-        if let Ok(payload) = encode_wire_packet(&packet) {
-            let peer = quic_transport.peer(
-                target.addr.clone(),
-                target.transport_public_key.clone(),
-                target.protocol_version,
-            );
-            let send_result = quic_transport.send_stream_expect_ack(peer, payload);
-            // Retries of this same content (the peer is still down).
-            let failures = last_failed
-                .as_ref()
-                .filter(|(device_id, addr, previous, _, _)| {
-                    device_id == &target.device_id
-                        && addr == &target.addr
-                        && previous == &signature
-                })
-                .map_or(0, |(_, _, _, _, failures)| *failures);
-            if send_result.is_ok() {
-                transport_packets.fetch_add(1, Ordering::Relaxed);
-                clipboard_packets.fetch_add(1, Ordering::Relaxed);
-                if failures > 0 {
-                    log::info!("clipboard send recovered after {failures} failed attempt(s)");
-                }
-                last_failed = None;
-                last_sent = Some((target.device_id, target.addr, signature));
-            } else {
-                let error = send_result.err().unwrap_or_default();
-                // One warning per content; a peer that stays down filled the
-                // log every 2 s (1.7k lines in an afternoon, rotating out
-                // everything useful).
-                if failures == 0 {
-                    log::warn!("clipboard send failed: {error}");
-                } else {
-                    log::debug!("clipboard send failed again ({failures}): {error}");
-                }
-                if error.starts_with(quic_transport::STREAM_REJECTED) {
-                    // The receiver refused it (clipboard sync off, unpaired, too
-                    // old) and will refuse the same content again; wait for the
-                    // next copy instead of resending every retry interval.
-                    last_failed = None;
-                    last_sent = Some((target.device_id, target.addr, signature));
-                } else {
-                    last_failed = Some((
-                        target.device_id.clone(),
+        let send_result = match content {
+            clipboard::ClipboardSnapshot::Files(paths) => {
+                let Some(layout) = layout_state.lock().ok().map(|layout| layout.clone()) else {
+                    break;
+                };
+                let name = layout
+                    .devices
+                    .iter()
+                    .find(|device| device.id == target.device_id)
+                    .map(|device| device.name.clone())
+                    .or_else(|| {
+                        layout
+                            .paired_controllers
+                            .iter()
+                            .find(|peer| peer.id == target.device_id)
+                            .map(|peer| peer.name.clone())
+                    })
+                    .unwrap_or_else(|| target.device_id.clone());
+                let destination = FileTransferTarget {
+                    device_id: target.device_id.clone(),
+                    name,
+                    addr: target.addr.clone(),
+                    transport_public_key: target.transport_public_key.clone(),
+                    protocol_version: target.protocol_version,
+                    cluster_id: target.cluster_id.clone(),
+                    pair_secret: target.pair_secret.clone(),
+                };
+                let keep_going = || {
+                    file_clipboard_sync_current(
+                        &layout_state,
+                        &stop,
+                        version,
+                        clipboard::change_count(),
+                    )
+                };
+                send_clipboard_files(
+                    &quic_transport,
+                    &local_peer_id,
+                    &destination,
+                    &paths,
+                    false,
+                    String::new(),
+                    Some(&app),
+                    Some(&keep_going),
+                )
+            }
+            clipboard::ClipboardSnapshot::Content(content) => {
+                let packet = clipboard_packet_from_content(
+                    content,
+                    local_peer_id.clone(),
+                    quic_transport.public_key().into(),
+                    target.device_id.clone(),
+                    target.cluster_id.clone(),
+                    target.pair_secret.clone(),
+                    next_clipboard_sequence(),
+                );
+                encode_wire_packet(&packet).and_then(|payload| {
+                    let peer = quic_transport.peer(
                         target.addr.clone(),
-                        signature,
-                        Instant::now(),
-                        failures.saturating_add(1),
-                    ));
-                }
+                        target.transport_public_key.clone(),
+                        target.protocol_version,
+                    );
+                    quic_transport
+                        .send_stream_expect_ack(peer, payload)
+                        .map(|_| 1)
+                })
+            }
+        };
+        // Retries of this same content (the peer is still down).
+        let failures = last_failed
+            .as_ref()
+            .filter(|(device_id, addr, previous, _, _)| {
+                device_id == &target.device_id && addr == &target.addr && previous == &send_key
+            })
+            .map_or(0, |(_, _, _, _, failures)| *failures);
+        if let Ok(packet_count) = send_result {
+            transport_packets.fetch_add(packet_count, Ordering::Relaxed);
+            clipboard_packets.fetch_add(1, Ordering::Relaxed);
+            if failures > 0 {
+                log::info!("clipboard send recovered after {failures} failed attempt(s)");
+            }
+            last_failed = None;
+            last_sent = Some((target.device_id, target.addr, send_key));
+        } else {
+            let error = send_result.err().unwrap_or_default();
+            if error == CLIPBOARD_FILES_SUPERSEDED || error == "传输已取消。" {
+                last_failed = None;
+                last_sent = Some((target.device_id, target.addr, send_key));
+                continue;
+            }
+            // One warning per content; a peer that stays down filled the
+            // log every 2 s (1.7k lines in an afternoon, rotating out
+            // everything useful).
+            if failures == 0 {
+                log::warn!("clipboard send failed: {error}");
+            } else {
+                log::debug!("clipboard send failed again ({failures}): {error}");
+            }
+            if error.contains(quic_transport::STREAM_REJECTED) {
+                // The receiver refused it (clipboard sync off, unpaired, too
+                // old) and will refuse the same content again; wait for the
+                // next copy instead of resending every retry interval.
+                last_failed = None;
+                last_sent = Some((target.device_id, target.addr, send_key));
+            } else {
+                last_failed = Some((
+                    target.device_id.clone(),
+                    target.addr.clone(),
+                    send_key,
+                    Instant::now(),
+                    failures.saturating_add(1),
+                ));
             }
         }
     }
+}
+
+fn file_clipboard_sync_current(
+    layout: &Arc<Mutex<LayoutState>>,
+    stop: &AtomicBool,
+    expected_version: Option<u64>,
+    current_version: Option<u64>,
+) -> bool {
+    !stop.load(Ordering::Relaxed)
+        && expected_version == current_version
+        && layout
+            .lock()
+            .map(|layout| layout.clipboard_sync && layout.file_transfer_enabled)
+            .unwrap_or(false)
 }
 
 fn clipboard_poll_unchanged(
@@ -6581,10 +6841,21 @@ fn retry_clipboard_content_write<F>(
 where
     F: FnMut(&ClipboardContent) -> Result<(), String>,
 {
+    retry_clipboard_write(attempts, retry_delay, || write_content(content))
+}
+
+fn retry_clipboard_write<F>(
+    attempts: usize,
+    retry_delay: Duration,
+    mut write: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
     let attempts = attempts.max(1);
     let mut last_error = None;
     for attempt in 0..attempts {
-        match write_content(content) {
+        match write() {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -7005,10 +7276,26 @@ fn send_transfer_file(
     transfer_id: &str,
     drop_mode: DropMode,
     reporter: Option<&FileTransferProgressReporter>,
+    keep_going: Option<&dyn Fn() -> bool>,
 ) -> Result<u64, String> {
-    if file.directory { return Ok(0); }
+    ensure_file_transfer_current(keep_going)?;
+    if file.directory {
+        return Ok(0);
+    }
     if file.bundle.is_some() {
-        let probe = file_transfer_packet("directory-probe", "", origin_id, target, &file.name, 0, 0, 0, Vec::new(), drop_mode, true);
+        let probe = file_transfer_packet(
+            "directory-probe",
+            "",
+            origin_id,
+            target,
+            &file.name,
+            0,
+            0,
+            0,
+            Vec::new(),
+            drop_mode,
+            true,
+        );
         send_file_transfer_packet(quic_transport, target, probe)
             .map_err(|_| "对端版本不支持文件夹，请先更新两端 MyKVM。".to_string())?;
     }
@@ -7026,10 +7313,22 @@ fn send_transfer_file(
         transfer_id,
         reporter,
         &job,
+        keep_going,
     );
     if outcome.is_err() {
-        let abort = file_transfer_packet("abort", transfer_id, origin_id, target, &file.name,
-            file.total_bytes, 0, 0, Vec::new(), drop_mode, file.bundle.is_some());
+        let abort = file_transfer_packet(
+            "abort",
+            transfer_id,
+            origin_id,
+            target,
+            &file.name,
+            file.total_bytes,
+            0,
+            0,
+            Vec::new(),
+            drop_mode,
+            file.bundle.is_some(),
+        );
         let _ = send_file_transfer_packet(quic_transport, target, abort);
     }
 
@@ -7057,7 +7356,9 @@ fn send_transfer_file_bytes(
     transfer_id: &str,
     reporter: Option<&FileTransferProgressReporter>,
     job: &transfer_jobs::TransferJob,
+    keep_going: Option<&dyn Fn() -> bool>,
 ) -> Result<u64, String> {
+    ensure_file_transfer_current(keep_going)?;
     let mut packet_count = 0_u64;
 
     send_file_transfer_packet(
@@ -7086,7 +7387,10 @@ fn send_transfer_file_bytes(
     let mut chunk_index = 0_u64;
     let mut last_progress = Instant::now();
     loop {
-        if job.cancelled() { return Err("传输已取消。".into()); }
+        if job.cancelled() {
+            return Err("传输已取消。".into());
+        }
+        ensure_file_transfer_current(keep_going)?;
         let read = file_handle
             .read(&mut buffer)
             .map_err(|error| format!("读取文件 {} 失败: {error}", file.path.display()))?;
@@ -7115,13 +7419,15 @@ fn send_transfer_file_bytes(
         offset = offset.saturating_add(read as u64);
         chunk_index = chunk_index.saturating_add(1);
         if let Some(reporter) = reporter {
-            if last_progress.elapsed() >= Duration::from_millis(FILE_TRANSFER_PROGRESS_INTERVAL_MS) {
+            if last_progress.elapsed() >= Duration::from_millis(FILE_TRANSFER_PROGRESS_INTERVAL_MS)
+            {
                 reporter.emit(transfer_id, file, offset, false, None);
                 last_progress = Instant::now();
             }
         }
     }
 
+    ensure_file_transfer_current(keep_going)?;
     send_file_transfer_packet(
         quic_transport,
         target,
@@ -7391,6 +7697,7 @@ fn stream_ole_drag_files(state: &AppRuntime, stream: OleDragStream) -> Result<us
             transfer_id,
             DropMode::TransfersFolder,
             Some(&reporter),
+            None,
         )?;
         state
             .transport_packets
@@ -10820,6 +11127,254 @@ mod tests {
         });
 
         assert_ne!(first.signature(), second.signature());
+    }
+
+    #[test]
+    fn file_clipboard_stops_when_copy_changes_or_either_switch_is_disabled() {
+        let mut enabled = test_layout();
+        enabled.clipboard_sync = true;
+        let layout = Arc::new(Mutex::new(enabled));
+        let stop = AtomicBool::new(false);
+        assert!(file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(7)
+        ));
+        assert!(!file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(8)
+        ));
+        layout.lock().unwrap().file_transfer_enabled = false;
+        assert!(!file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(7)
+        ));
+        layout.lock().unwrap().file_transfer_enabled = true;
+        layout.lock().unwrap().clipboard_sync = false;
+        assert!(!file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(7)
+        ));
+        layout.lock().unwrap().clipboard_sync = true;
+        stop.store(true, Ordering::Relaxed);
+        assert!(!file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(7)
+        ));
+    }
+
+    #[test]
+    fn file_clipboard_commit_respects_switches_and_pairing() {
+        let mut layout = test_layout();
+        layout.clipboard_sync = true;
+        let id = new_transfer_id("test-clipboard-receipt");
+        let origin = layout.devices[1].id.clone();
+        clipboard_exchange::remember_file(&origin, &id, PathBuf::from("/received.txt"));
+        let mut packet = ClipboardFilesCommit {
+            protocol: CLIPBOARD_FILES_PROTOCOL.into(),
+            origin_id: origin,
+            origin_transport_public_key: layout.devices[1].transport_public_key.clone(),
+            target_id: "local-device".into(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            ids: vec![id],
+            paste: false,
+            paste_token: String::new(),
+        };
+        let seen = Arc::new(Mutex::new(None));
+        let echo = Arc::new(Mutex::new(None));
+        for disabled in ["clipboard", "files", "identity"] {
+            let mut blocked = layout.clone();
+            match disabled {
+                "clipboard" => blocked.clipboard_sync = false,
+                "files" => blocked.file_transfer_enabled = false,
+                _ => packet.pair_secret = "unpaired-secret".into(),
+            }
+            let result = handle_clipboard_files_commit_with_writer(
+                &encode_wire_packet(&packet).unwrap(),
+                &blocked,
+                "local-device",
+                &seen,
+                &echo,
+                |_| panic!("a rejected file clipboard must not be written"),
+            );
+            assert_eq!(result, Some(false));
+        }
+        packet.pair_secret = layout.pair_secret.clone();
+        assert_eq!(
+            handle_clipboard_files_commit_with_writer(
+                &encode_wire_packet(&packet).unwrap(),
+                &layout,
+                "local-device",
+                &seen,
+                &echo,
+                |paths| {
+                    assert_eq!(paths, ["/received.txt"]);
+                    Ok(())
+                },
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some(clipboard::files_signature(&["/received.txt".into()]).as_str())
+        );
+        assert!(clipboard_echo_active(&echo));
+    }
+
+    #[test]
+    fn file_clipboard_streams_files_and_folders_then_commits_without_a_paste() {
+        let free_port = || UdpSocket::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let sandbox = tempfile::tempdir().unwrap();
+        let source = sandbox.path().join("source");
+        let destination = sandbox.path().join("received");
+        fs::create_dir_all(source.join("中文文件夹/empty")).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("note.txt"), b"hello file").unwrap();
+        fs::write(source.join("中文文件夹/nested.txt"), b"hello folder").unwrap();
+        let sender = quic_transport::start(
+            free_port(),
+            sandbox.path().join("sender-id"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        )
+        .unwrap();
+        let mut layout = test_layout();
+        layout.clipboard_sync = true;
+        layout.devices[1].transport_public_key = sender.public_key().into();
+        let origin = layout.devices[1].id.clone();
+        let seen = Arc::new(Mutex::new(None));
+        let echo = Arc::new(Mutex::new(None));
+        let written = Arc::new(Mutex::new(Vec::<String>::new()));
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let keep_running = Arc::new(AtomicBool::new(true));
+        let stop_on_chunk = Arc::new(AtomicBool::new(false));
+        let (
+            receive_layout,
+            receive_root,
+            receive_seen,
+            receive_echo,
+            receive_written,
+            receive_transfers,
+            receive_running,
+            receive_stop,
+        ) = (
+            layout.clone(),
+            destination.clone(),
+            Arc::clone(&seen),
+            Arc::clone(&echo),
+            Arc::clone(&written),
+            Arc::clone(&transfers),
+            Arc::clone(&keep_running),
+            Arc::clone(&stop_on_chunk),
+        );
+        let receiver = quic_transport::start(
+            free_port(),
+            sandbox.path().join("receiver-id"),
+            Arc::new(|_, _| {}),
+            Arc::new(move |payload, _| {
+                if let Some(commit) = decode_wire_packet::<ClipboardFilesCommit>(&payload) {
+                    assert!(
+                        !commit.paste,
+                        "automatic sync must wait for the user's normal paste"
+                    );
+                }
+                if let Some(accepted) = handle_clipboard_files_commit_with_writer(
+                    &payload,
+                    &receive_layout,
+                    "local-device",
+                    &receive_seen,
+                    &receive_echo,
+                    |paths| {
+                        *receive_written.lock().unwrap() = paths.to_vec();
+                        Ok(())
+                    },
+                ) {
+                    return accepted;
+                }
+                if receive_stop.load(Ordering::Relaxed)
+                    && decode_wire_packet::<FileTransferPacket>(&payload)
+                        .is_some_and(|p| p.kind == "chunk")
+                {
+                    receive_running.store(false, Ordering::Relaxed);
+                }
+                handle_file_transfer_packet_with_root(
+                    &payload,
+                    &receive_layout,
+                    "local-device",
+                    &receive_transfers,
+                    &receive_root,
+                )
+            }),
+        )
+        .unwrap();
+        let target = FileTransferTarget {
+            device_id: "local-device".into(),
+            name: "Test receiver".into(),
+            addr: format!("127.0.0.1:{}", receiver.port()),
+            transport_public_key: receiver.public_key().into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id,
+            pair_secret: layout.pair_secret,
+        };
+        let paths = [source.join("note.txt"), source.join("中文文件夹")]
+            .map(|p| p.to_string_lossy().into_owned());
+        let guard = || keep_running.load(Ordering::Relaxed);
+        send_clipboard_files(
+            &sender,
+            &origin,
+            &target,
+            &paths,
+            false,
+            String::new(),
+            None,
+            Some(&guard),
+        )
+        .unwrap();
+        let received = written.lock().unwrap().clone();
+        assert_eq!(received.len(), 2);
+        assert_eq!(fs::read(&received[0]).unwrap(), b"hello file");
+        assert_eq!(
+            fs::read(Path::new(&received[1]).join("nested.txt")).unwrap(),
+            b"hello folder"
+        );
+        assert!(Path::new(&received[1]).join("empty").is_dir());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(clipboard::files_signature(&received))
+        );
+        assert!(clipboard_echo_active(&echo));
+
+        // A later copy cancels the old upload before it can replace the clipboard.
+        stop_on_chunk.store(true, Ordering::Relaxed);
+        let error = send_clipboard_files(
+            &sender,
+            &origin,
+            &target,
+            &paths,
+            false,
+            String::new(),
+            None,
+            Some(&guard),
+        )
+        .unwrap_err();
+        assert_eq!(error, CLIPBOARD_FILES_SUPERSEDED);
+        assert_eq!(*written.lock().unwrap(), received);
+        assert!(
+            transfers.lock().unwrap().is_empty(),
+            "cancelled partial uploads must be removed"
+        );
+        sender.stop_and_wait().unwrap();
+        receiver.stop_and_wait().unwrap();
     }
 
     #[test]

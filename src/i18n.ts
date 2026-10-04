@@ -127,7 +127,7 @@ export const TEXT = {
       portPlaceholder: "1024-65535",
       activeDevice: "当前设备",
       clipboard: "剪贴板同步",
-      clipboardCopy: "自动同步文字、图片和富文本。",
+      clipboardCopy: "同步文字、图片和文件；文件同步需开启文件传输。",
       fileTransfer: "文件传输 (bate)",
       fileTransferCopy:
         "拖放文件或文件夹到另一台设备。",
@@ -376,7 +376,7 @@ export const TEXT = {
       portPlaceholder: "1024-65535",
       activeDevice: "Active Device",
       clipboard: "Clipboard Sync",
-      clipboardCopy: "Automatically sync text, images, and rich text.",
+      clipboardCopy: "Sync text, images, and files. File sync requires File Transfer.",
       fileTransfer: "File Transfer (bate)",
       fileTransferCopy:
         "Drag files or folders to another device.",

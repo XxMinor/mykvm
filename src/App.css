@@ -1,4 +1,8 @@
 .app-shell {
+  --compact-control-height: 32px;
+  --compact-control-font-size: 12px;
+  --compact-control-padding: 10px;
+  --card-control-min-width: 96px;
   min-height: 100vh;
   padding: 18px 24px;
   display: flex;
@@ -490,12 +494,12 @@
 }
 
 .header-tabs button {
-  min-height: 34px;
+  min-height: var(--compact-control-height);
   padding: 0 14px;
   border-radius: 8px;
   background: transparent;
   color: #a1a1aa;
-  font-size: 13px;
+  font-size: var(--compact-control-font-size);
   font-weight: 700;
   white-space: nowrap;
 }
@@ -641,9 +645,9 @@
 }
 
 .compact-button {
-  min-height: 32px;
-  padding: 0 10px;
-  font-size: 13px;
+  min-height: var(--compact-control-height);
+  padding: 0 var(--compact-control-padding);
+  font-size: var(--compact-control-font-size);
 }
 
 .workspace-shell {
@@ -690,12 +694,15 @@
 .status-pill {
   display: inline-flex;
   align-items: center;
-  min-height: 28px;
-  padding: 0 10px;
+  height: var(--compact-control-height);
+  min-width: var(--card-control-min-width);
+  justify-content: center;
+  padding: 0 var(--compact-control-padding);
   border-radius: 999px;
   background: rgba(16, 185, 129, 0.12);
   color: #34d399;
-  font-size: 12px;
+  font-size: var(--compact-control-font-size);
+  line-height: 1;
   font-weight: 800;
 }
 
@@ -1257,13 +1264,6 @@
 
 .help-heading { display: flex; align-items: center; }
 
-.clipboard-toggle { display: inline-flex; align-items: center; gap: 10px; justify-self: start; padding: 4px 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; }
-.toggle-track { display: block; width: 38px; height: 22px; border-radius: 99px; padding: 3px; background: #71717a; transition: background 150ms; }
-.toggle-track > span { display: block; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform 150ms; }
-.clipboard-toggle.active .toggle-track { background: #2786ff; }
-.clipboard-toggle.active .toggle-track > span { transform: translateX(16px); }
-.clipboard-toggle:focus-visible { outline: 2px solid #2786ff; outline-offset: 4px; border-radius: 4px; }
-
 .info-tooltip {
   position: absolute;
   top: calc(100% + 8px);
@@ -1544,14 +1544,21 @@
 }
 
 .switch-button {
-  min-height: 32px;
-  padding: 0 10px;
+  height: var(--compact-control-height);
+  min-width: var(--card-control-min-width);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 var(--compact-control-padding);
   border: 1px solid rgba(63, 63, 70, 0.92);
   border-radius: 999px;
   background: #18181b;
   color: #a1a1aa;
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--compact-control-font-size);
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
   font-weight: 800;
 }
 
@@ -1590,16 +1597,31 @@
 }
 
 .update-status-badge {
-  min-height: 26px;
+  height: var(--compact-control-height);
+  min-width: var(--card-control-min-width);
   display: inline-flex;
   align-items: center;
-  padding: 0 9px;
+  justify-content: center;
+  padding: 0 var(--compact-control-padding);
+  border: 1px solid transparent;
   border-radius: 999px;
   background: rgba(63, 63, 70, 0.72);
   color: #d4d4d8;
-  font-size: 12px;
+  font-size: var(--compact-control-font-size);
+  line-height: 1;
   font-weight: 800;
   white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.card-title-row > .compact-button {
+  height: var(--compact-control-height);
+  min-width: var(--card-control-min-width);
+  border-radius: 999px;
+  justify-content: center;
+  font-size: var(--compact-control-font-size);
+  line-height: 1;
+  flex-shrink: 0;
 }
 
 .update-status-badge.available {

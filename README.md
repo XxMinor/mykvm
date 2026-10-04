@@ -55,6 +55,7 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 - Detects local displays and lets you arrange multi-monitor layouts.
 - Shares keyboard and mouse input over an encrypted QUIC connection.
 - Syncs text, images and rich clipboard formats over the same encrypted connection.
+- With Clipboard Sync and File Transfer enabled on both Windows/macOS peers, copied files and folders transfer automatically. Wait for the transfer to finish, then paste normally in Explorer or Finder (up to 64 selections; 2 GiB per file/folder).
 - Device mouse speeds are configured in a modal form. The existing quick start/stop shortcut remains the way to pause sharing; separate input protection and lock shortcuts have been removed.
 - Clipboard sync automatically shares copied content; it has no separate mode or paste-shortcut controls.
 - Folder transfers keep nested and empty directories and can be cancelled. Both peers must be updated. Linux native X11/Wayland input is not implemented yet.

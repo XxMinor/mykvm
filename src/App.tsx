@@ -2715,7 +2715,7 @@ function App() {
           <div className="settings-layout">
             <div className="settings-column">
               <section className="surface-card settings-card">
-                <HelpHeading label={ui.settings.roleTitle} text={ui.settings.roleCopy} />
+                <h2>{ui.settings.roleTitle}</h2>
                 <div className="role-switcher">
                   <button
                     type="button"
@@ -2735,9 +2735,9 @@ function App() {
               </section>
 
               <section className="surface-card settings-card">
-                <HelpHeading label={ui.settings.transport} text={ui.settings.transportCopy} />
+                <h2>{ui.settings.transport}</h2>
                 <div className="settings-control-row">
-                  <span>{ui.settings.portMode}</span>
+                  <span>{ui.settings.portMode}<InfoTip label={ui.settings.portMode} text={ui.settings.transportCopy} /></span>
                   <div className="segmented-control">
                     {(["auto", "fixed"] as TransportPortMode[]).map((mode) => (
                       <button
@@ -2899,12 +2899,16 @@ function App() {
                 ) : null}
                 <div className="settings-control-row">
                   <span>{ui.settings.clipboard}<InfoTip label={ui.settings.clipboard} text={ui.settings.clipboardCopy} /></span>
-                  <button type="button" role="switch" aria-checked={layout.clipboardSync}
-                    aria-label={ui.settings.clipboard} className={`clipboard-toggle ${layout.clipboardSync ? "active" : ""}`}
-                    onClick={() => setClipboardSync(!layout.clipboardSync)}>
-                    <span className="toggle-track" aria-hidden="true"><span /></span>
-                    {layout.clipboardSync ? ui.common.enabled : ui.common.disabled}
-                  </button>
+                  <div className="segmented-control" role="group" aria-label={ui.settings.clipboard}>
+                    <button type="button" className={layout.clipboardSync ? "active" : ""}
+                      aria-pressed={layout.clipboardSync} onClick={() => setClipboardSync(true)}>
+                      {ui.settings.autostartOn}
+                    </button>
+                    <button type="button" className={!layout.clipboardSync ? "active" : ""}
+                      aria-pressed={!layout.clipboardSync} onClick={() => setClipboardSync(false)}>
+                      {ui.settings.autostartOff}
+                    </button>
+                  </div>
                 </div>
 
                 <div className="settings-control-row">
@@ -3112,7 +3116,7 @@ function App() {
 
               <section className="surface-card settings-card update-card">
                 <div className="card-title-row">
-                  <HelpHeading label={ui.settings.updates} text={isTauri() ? isPortable ? ui.settings.portableUpdateCopy : ui.settings.updatesCopy : ui.settings.updatesBrowserCopy} />
+                  <h2>{ui.settings.updates}</h2>
                   <span className={`update-status-badge ${updateStatus}`}>
                     {updateStatusLabel(updateStatus, ui)}
                   </span>
@@ -3189,7 +3193,7 @@ function App() {
 
               <section className="surface-card performance-card">
                 <div className="card-title-row">
-                  <HelpHeading label={ui.settings.performance} text={ui.settings.performanceCopy} />
+                  <h2>{ui.settings.performance}</h2>
                   <button
                     type="button"
                     className={`switch-button ${layout.performanceMonitor ? "active" : ""}`}
@@ -3249,7 +3253,7 @@ function App() {
 
               <section className="surface-card settings-card diagnostic-card">
                 <div className="card-title-row">
-                  <HelpHeading label={ui.settings.diagnostics} text={ui.settings.diagnosticsCopy} />
+                  <h2>{ui.settings.diagnostics}</h2>
                   <button
                     type="button"
                     className="secondary-button compact-button"
