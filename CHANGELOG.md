@@ -26,6 +26,7 @@ release will reuse them).
 
 ### Fixed
 
+- Windows: keyboard capture recovers independently when mouse sharing still works, including after a single missed key. Recovery keeps the current controlled screen; returning the mouse to the server is no longer needed to restore typing.
 - Windows native file drags spool data to disk instead of retaining whole files in memory. Cancellation wakes blocked readers; received transfers do not overwrite existing destinations and expired partial transfers are removed.
 - Version labels and updater comparisons use the configured package version, including local beta test builds, so an older published beta is not offered as an upgrade.
 - Windows: an old capture thread cannot clear a newer thread's context, and local control cannot forward clicks/keys through a stale remote target. Hook health uses callback receipt time rather than delayed event timestamps. A second instance cannot start when access to the existing instance's lock is refused.

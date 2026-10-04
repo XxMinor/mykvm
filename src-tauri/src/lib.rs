@@ -45,6 +45,8 @@ mod windows_drag_overlay;
 pub mod windows_drop_catcher;
 #[cfg(target_os = "windows")]
 pub mod windows_input;
+#[cfg(any(target_os = "windows", test))]
+mod windows_keyboard_monitor;
 
 use clipboard::{ClipboardContent, ClipboardImage};
 use performance::PerformanceSample;
@@ -3568,6 +3570,9 @@ fn macos_display_fingerprint() -> Vec<(u32, i64, i64, i64, i64)> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // The capture thread owns the keyboard raw-input sink used for hook
+        // health. Tao's unused DeviceEvents must not compete for registration.
+        .device_event_filter(tauri::DeviceEventFilter::Always)
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
