@@ -299,6 +299,8 @@ struct InputPacketRef<'a> {
     event: &'a InputEvent,
     #[serde(skip_serializing_if = "Option::is_none")]
     held: Option<&'a HeldInputs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<RemoteCursorState>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -322,6 +324,62 @@ struct InputPacket {
     event: InputEvent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     held: Option<HeldInputs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor: Option<RemoteCursorState>,
+}
+
+/// Travels with a Mac cursor move, so parking and hiding cannot arrive as
+/// separate datagrams. Older receivers still see an ordinary MouseMove.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+struct RemoteCursorState {
+    sequence: u64,
+    parked: bool,
+}
+
+fn next_cursor_sequence() -> u64 {
+    // Seed once from wall time so restarting a controller on the same address
+    // does not reuse its previous sequence. Movement never reads the clock.
+    static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+    SEQUENCE.get_or_init(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        AtomicU64::new(seed)
+    }).fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Default)]
+struct RemoteCursorSequences(HashMap<SocketAddr, (u64, Instant)>);
+
+impl RemoteCursorSequences {
+    fn accept(&mut self, source: SocketAddr, sequence: u64, now: Instant) -> bool {
+        // Keep only recent paired origins. The TTL also permits recovery after
+        // a controller restart accompanied by a backwards system-clock change.
+        const TTL: Duration = Duration::from_secs(20);
+        if self.0.get(&source).is_some_and(|(last, at)|
+            now.saturating_duration_since(*at) < TTL && sequence <= *last)
+        {
+            return false;
+        }
+        if self.0.len() >= 64 {
+            self.0.retain(|_, (_, at)| now.saturating_duration_since(*at) < TTL);
+            if self.0.len() >= 64 && !self.0.contains_key(&source) {
+                if let Some(oldest) = self.0.iter().min_by_key(|(_, (_, at))| *at).map(|(addr, _)| *addr) {
+                    self.0.remove(&oldest);
+                }
+            }
+        }
+        self.0.insert(source, (sequence, now));
+        true
+    }
+}
+
+fn accept_remote_cursor_sequence(source: SocketAddr, sequence: u64) -> bool {
+    static SEQUENCES: OnceLock<Mutex<RemoteCursorSequences>> = OnceLock::new();
+    SEQUENCES.get_or_init(|| Mutex::new(RemoteCursorSequences::default()))
+        .lock().map(|mut sequences| sequences.accept(source, sequence, Instant::now()))
+        .unwrap_or(false)
 }
 
 /// Keys (as sent, after the remap) and mouse buttons the controller is holding
@@ -2059,6 +2117,20 @@ fn send_packet(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    send_packet_with_cursor_state(quic_transport, target, event, layout_state, input_events, false)
+}
+
+fn send_packet_with_cursor_state(
+    quic_transport: &quic_transport::TransportHandle,
+    target: &InputTarget,
+    event: InputEvent,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+    parked: bool,
+) -> bool {
+    let cursor = (target.target_platform.eq_ignore_ascii_case("macos")
+        && matches!(event, InputEvent::MouseMove { .. }))
+        .then(|| RemoteCursorState { sequence: next_cursor_sequence(), parked });
     let mut packet_context = input_packet_context(target, event);
     let held = SENDER_HELD
         .lock()
@@ -2100,6 +2172,7 @@ fn send_packet(
         },
         event: &packet_context.event,
         held: held.as_ref(),
+        cursor,
     };
 
     let payload = match rmp_serde::to_vec_named(&packet) {
@@ -2125,6 +2198,9 @@ fn send_packet(
     }
     match result {
         Ok(true) => {
+            if let InputEvent::Scroll { delta_x, delta_y } = &packet_context.event {
+                log_scroll_event(false, *delta_x, *delta_y);
+            }
             input_events.fetch_add(1, Ordering::Relaxed);
             INPUT_SEND_FAILING_SINCE_MS.store(0, Ordering::Relaxed);
             true
@@ -2368,6 +2444,15 @@ pub(crate) fn handle_input_datagram_with_sink(
             if !packet_targets_local(&layout, &packet.target_device_id, &local_peer_id) {
                 return true;
             }
+            if matches!(packet.event, InputEvent::MouseMove { .. }) {
+                if let Some(cursor) = packet.cursor {
+                    // Reject a delayed park after re-entry, and a delayed move
+                    // after parking, before either can warp or show the cursor.
+                    if !accept_remote_cursor_sequence(source, cursor.sequence) {
+                        return true;
+                    }
+                }
+            }
             // No-op for credential-less packets (empty key); the clipboard
             // target was set by the last credentialled packet and persists.
             refresh_clipboard_target(clipboard_target, &layout, &packet, source);
@@ -2379,6 +2464,15 @@ pub(crate) fn handle_input_datagram_with_sink(
         let Some(command) = command else {
             return true;
         };
+        if let InputCommand::Scroll { delta_x, delta_y } = &command {
+            log_scroll_event(true, *delta_x, *delta_y);
+        }
+        #[cfg(target_os = "macos")]
+        let command = match (command, packet.cursor) {
+            (InputCommand::MouseMove { x, y, .. }, Some(RemoteCursorState { parked: true, .. })) =>
+                InputCommand::ParkCursor { x, y },
+            (command, _) => command,
+        };
         if let Ok(mut state) = RECEIVED_HELD.lock() {
             state.track(&command, Instant::now());
         }
@@ -2387,6 +2481,9 @@ pub(crate) fn handle_input_datagram_with_sink(
         let heartbeat_repeat = held.is_some()
             && matches!(command, InputCommand::MouseMove { x, y, .. }
                 if pack_remote_position(x, y) == position_before);
+        #[cfg(target_os = "macos")]
+        let heartbeat_repeat = heartbeat_repeat
+            && !MACOS_CLIENT_CURSOR_HIDDEN.lock().map(|hidden| *hidden).unwrap_or(false);
         if !heartbeat_repeat && sink(command) {
             input_events.fetch_add(1, Ordering::Relaxed);
         }
@@ -2925,13 +3022,48 @@ fn input_event_to_command(
 }
 
 fn inject_input_command(command: InputCommand) {
+    #[cfg(target_os = "macos")]
+    if matches!(command, InputCommand::MouseMove { .. }) {
+        set_macos_client_cursor_hidden(false);
+    }
     match command {
+        #[cfg(target_os = "macos")]
+        InputCommand::ParkCursor { x, y } => {
+            // A posted MouseMoved can be processed AFTER the hide and undo it.
+            // Warping produces no event, leaving the next real movement to show it.
+            let _ = core_graphics::display::CGDisplay::warp_mouse_cursor_position(
+                core_graphics::geometry::CGPoint::new(x as f64, y as f64),
+            );
+            set_macos_client_cursor_hidden(true);
+        }
         InputCommand::MouseMove { x, y, drag_button } => inject_mouse_move(x, y, drag_button),
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
         InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
         InputCommand::ReleaseAll | InputCommand::SecureAttention => {}
     }
+}
+
+/// Event-driven and capped at two lines/second per direction. Counts let a
+/// stuck-scroll report distinguish repeated network input from app-side motion.
+fn log_scroll_event(received: bool, delta_x: i32, delta_y: i32) {
+    static TX: Mutex<(u64, Option<Instant>)> = Mutex::new((0, None));
+    static RX: Mutex<(u64, Option<Instant>)> = Mutex::new((0, None));
+    let Ok(mut sample) = (if received { &RX } else { &TX }).lock() else { return; };
+    sample.0 += 1;
+    let now = Instant::now();
+    if sample.1.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_millis(500)) {
+        return;
+    }
+    sample.1 = Some(now);
+    let buttons = if received {
+        REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed)
+    } else {
+        SENDER_HELD.lock().map(|state| state.held.buttons).unwrap_or(0)
+    };
+    log::info!("[scroll] {} count={} delta=({},{}) remote_buttons={:#x}",
+        if received { "rx" } else { "tx" }, sample.0, delta_x, delta_y,
+        buttons);
 }
 
 #[cfg(target_os = "windows")]
@@ -3785,6 +3917,8 @@ pub(crate) fn finish_shortcut_recording(captured: Option<&str>) {
 }
 
 pub(crate) fn prepare_input_stop() {
+    #[cfg(target_os = "macos")]
+    set_macos_client_cursor_hidden(false);
     #[cfg(target_os = "windows")]
     if let Some(context) = windows_capture_context() { release_shortcut_inputs_windows(&context); }
 }
@@ -6342,8 +6476,8 @@ fn windows_remote_anchor_point(active: &ActiveTarget) -> (f64, f64) {
 }
 
 /// When control returns to the local machine, tuck the controlled cursor out
-/// of the way. True cursor hiding isn't reliably possible on the controlled
-/// side, so tucking it is the seamless-feeling approximation.
+/// of the way. Mac receivers additionally hide it until the next movement;
+/// clipping remains a fallback for older peers and background cursor behavior.
 ///
 /// Controlled macOS: park ON a clipping edge, at the end nearest this
 /// machine. The arrow's hotspot is its top-left tip and the body extends
@@ -6365,7 +6499,7 @@ fn send_remote_cursor_park(
     input_events: &Arc<AtomicU64>,
 ) -> bool {
     let (park_x, park_y) = remote_park_point(active);
-    send_packet(
+    send_packet_with_cursor_state(
         quic_transport,
         &active.target,
         InputEvent::MouseMove {
@@ -6375,6 +6509,7 @@ fn send_remote_cursor_park(
         },
         layout_state,
         input_events,
+        true,
     )
 }
 
@@ -6855,6 +6990,39 @@ pub(crate) fn set_macos_app_nap_suppressed(suppress: bool) {
             release(activity, release_sel);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+static MACOS_CLIENT_CURSOR_HIDDEN: Mutex<bool> = Mutex::new(false);
+
+#[cfg(target_os = "macos")]
+fn set_macos_client_cursor_hidden(hidden: bool) {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    // This API is non-nesting and macOS restores it on physical mouse movement,
+    // so a receive-only client needs no extra event tap or polling thread.
+    let Ok(mut owned) = MACOS_CLIENT_CURSOR_HIDDEN.lock() else { return; };
+    if !hidden && !*owned { return; }
+    if hidden { enable_macos_background_cursor_hide(); }
+    let _pool = macos_appkit::autorelease_pool();
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    unsafe {
+        let class = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
+        if class.is_null() { return; }
+        let selector = sel_registerName(b"setHiddenUntilMouseMoves:\0".as_ptr() as *const c_char);
+        let send: extern "C" fn(*mut c_void, *mut c_void, i8) =
+            std::mem::transmute(objc_msgSend as *const ());
+        send(class, selector, i8::from(hidden));
+    }
+    *owned = hidden;
+    log::info!("macOS client cursor {}", if hidden { "hidden until mouse moves" } else { "restored" });
 }
 
 #[cfg(target_os = "macos")]
@@ -8244,19 +8412,31 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
 
 #[cfg(target_os = "macos")]
 fn inject_scroll(delta_x: i32, delta_y: i32) {
+    if let Ok(event) = macos_scroll_event(delta_x, delta_y, MAC_INJECT_FLAGS.load(Ordering::Relaxed)) {
+        event.post(core_graphics::event::CGEventTapLocation::HID);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_scroll_event(delta_x: i32, delta_y: i32, flags: u64) -> Result<core_graphics::event::CGEvent, ()> {
     use core_graphics::{
-        event::{CGEvent, CGEventTapLocation, ScrollEventUnit},
+        event::{CGEvent, CGEventFlags, EventField, ScrollEventUnit},
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
-        return;
-    };
-    if let Ok(event) =
-        CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
-    {
-        event.post(CGEventTapLocation::HID);
-    }
+    if delta_x == 0 && delta_y == 0 { return Err(()); }
+    // Remote wheel ticks must not inherit local hardware/trackpad scroll state.
+    // Apple recommends private event state for remote-control applications.
+    let source = CGEventSource::new(CGEventSourceStateID::Private)?;
+    let event = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)?;
+    event.set_flags(CGEventFlags::from_bits_truncate(flags));
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
+    event.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 0);
+    // Public CGEventField values in CGEventTypes.h (not exposed by this crate).
+    event.set_integer_value_field(99, 0); // kCGScrollWheelEventScrollPhase: none
+    event.set_integer_value_field(100, 1); // kCGScrollWheelEventScrollCount
+    event.set_integer_value_field(123, 0); // kCGScrollWheelEventMomentumPhase: none
+    Ok(event)
 }
 
 /// Held modifier flags to stamp on injected macOS events. Posting a bare
@@ -9873,6 +10053,122 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_remote_wheel_events_are_discrete_and_isolated_from_hardware() {
+        use core_graphics::event::{CGEventFlags, EventField};
+        for (x, y) in [(0, 1), (0, -1), (2, 0), (-2, 0)] {
+            let flags = CGEventFlags::CGEventFlagControl;
+            let event = macos_scroll_event(x, y, flags.bits()).expect("construct wheel event");
+            assert_eq!(event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1), i64::from(y));
+            assert_eq!(event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2), i64::from(x));
+            assert_eq!(event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS), 0);
+            assert_eq!(event.get_integer_value_field(99), 0);
+            assert_eq!(event.get_integer_value_field(100), 1);
+            assert_eq!(event.get_integer_value_field(123), 0);
+            assert_ne!(event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID), 1);
+            assert_eq!(event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA), MACOS_SELF_EVENT_MARKER);
+            assert_eq!(event.get_flags(), flags);
+        }
+        assert!(macos_scroll_event(0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn cursor_park_requires_authorization_and_does_not_skip_an_idle_position() {
+        let mut layout = layout_for_target_tests();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![crate::PairedController {
+            id: "cursor-test-server".into(), name: "Server".into(), host: "server".into(),
+            ip: "192.0.2.12".into(), transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(), paired_at_ms: 1,
+        }];
+        let mut packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(), target_device_id: "local-device".into(),
+            origin_device_id: "cursor-test-server".into(), origin_port: 47834,
+            origin_transport_public_key: "server-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(), pair_secret: "wrong".into(),
+            event: InputEvent::MouseMove {
+                screen_id: layout.devices[0].screens[0].id.clone(), x: 100, y: 200,
+            },
+            held: Some(HeldInputs::default()),
+            cursor: Some(RemoteCursorState { sequence: 100, parked: true }),
+        };
+        let native = Arc::new(Mutex::new(layout.clone()));
+        let layout = Arc::new(Mutex::new(layout));
+        let events = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(Mutex::new(None));
+        let source = "192.0.2.12:47834".parse().unwrap();
+        let receive = |packet: &InputPacket, sink: &dyn Fn(InputCommand) -> bool| {
+            handle_input_datagram_with_sink(&layout, &native,
+                &rmp_serde::to_vec_named(packet).unwrap(), source, &events, &target, sink)
+        };
+        assert!(receive(&packet, &|_| panic!("unauthorized park reached the sink")));
+        packet.pair_secret = layout.lock().unwrap().pair_secret.clone();
+        assert!(receive(&packet, &|command| {
+            #[cfg(target_os = "macos")]
+            assert!(matches!(command, InputCommand::ParkCursor { .. }));
+            #[cfg(not(target_os = "macos"))]
+            assert!(matches!(command, InputCommand::MouseMove { .. }));
+            true
+        }));
+        // Even a newer park with an unchanged position must hide again: a
+        // physical mouse could have moved and automatically restored the cursor.
+        #[cfg(target_os = "macos")]
+        {
+            packet.cursor.as_mut().unwrap().sequence += 1;
+            assert!(receive(&packet, &|command| {
+                assert!(matches!(command, InputCommand::ParkCursor { .. })); true
+            }));
+            assert_eq!(events.load(Ordering::Relaxed), 2);
+        }
+        assert!(receive(&packet, &|_| panic!("duplicate park reached the sink")));
+    }
+
+    #[test]
+    fn cursor_sequences_reject_delayed_park_and_moves_without_blocking_other_peers() {
+        let mut sequences = RemoteCursorSequences::default();
+        let source = "192.0.2.10:47834".parse().unwrap();
+        let other = "192.0.2.11:47834".parse().unwrap();
+        let now = Instant::now();
+        assert!(sequences.accept(source, 10, now)); // park
+        assert!(sequences.accept(source, 11, now)); // re-enter
+        assert!(!sequences.accept(source, 10, now)); // delayed park
+        assert!(!sequences.accept(source, 11, now)); // duplicate
+        assert!(sequences.accept(source, 12, now)); // park again
+        assert!(!sequences.accept(source, 11, now)); // delayed movement
+        assert!(sequences.accept(other, 1, now));
+        assert!(sequences.accept(source, 1, now + Duration::from_secs(20)));
+        assert!(next_cursor_sequence() < next_cursor_sequence());
+    }
+
+    #[test]
+    fn cursor_metadata_is_optional_and_legacy_receivers_can_read_a_park() {
+        #[derive(Deserialize)]
+        struct OlderInputPacket { event: InputEvent }
+        let event = InputEvent::MouseMove { screen_id: "display-1".into(), x: 100, y: 200 };
+        let cursor = RemoteCursorState { sequence: 123, parked: true };
+        let packet = InputPacketRef {
+            protocol: INPUT_PROTOCOL,
+            target_device_id: "local-device",
+            origin_device_id: "server",
+            origin_port: 47834,
+            origin_transport_public_key: "server-key",
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test",
+            pair_secret: "secret-test",
+            event: &event,
+            held: None,
+            cursor: Some(cursor),
+        };
+        let with = rmp_serde::to_vec_named(&packet).unwrap();
+        assert_eq!(rmp_serde::from_slice::<OlderInputPacket>(&with).unwrap().event, event);
+        assert_eq!(decode_input_packet(&with).unwrap().cursor, Some(cursor));
+        let without = rmp_serde::to_vec_named(&InputPacketRef { cursor: None, ..packet }).unwrap();
+        assert_eq!(decode_input_packet(&without).unwrap().cursor, None);
+    }
+
+    #[test]
     fn input_packet_round_trips_as_messagepack() {
         let packet = InputPacket {
             protocol: INPUT_PROTOCOL.into(),
@@ -9889,6 +10185,7 @@ mod tests {
                 y: 240,
             },
             held: None,
+            cursor: None,
         };
         let payload = rmp_serde::to_vec_named(&packet).expect("encode input packet");
         let decoded = decode_input_packet(&payload).expect("decode input packet");
@@ -9947,6 +10244,7 @@ mod tests {
                 y: 240,
             },
             held: None,
+            cursor: None,
         };
         let mirror = InputPacketRef {
             protocol: &packet.protocol,
@@ -9959,6 +10257,7 @@ mod tests {
             pair_secret: &packet.pair_secret,
             event: &packet.event,
             held: None,
+            cursor: None,
         };
 
         assert_eq!(
@@ -9987,6 +10286,7 @@ mod tests {
             pair_secret: "secret-test",
             event: &event,
             held: None,
+            cursor: None,
         };
         let lean = InputPacketRef {
             protocol: INPUT_PROTOCOL,
@@ -9999,6 +10299,7 @@ mod tests {
             pair_secret: "",
             event: &event,
             held: None,
+            cursor: None,
         };
 
         let full_bytes = rmp_serde::to_vec_named(&full).expect("encode full");
@@ -10168,6 +10469,7 @@ mod tests {
             pair_secret: "",
             event: &event,
             held,
+            cursor: None,
         };
         let with = rmp_serde::to_vec_named(&packet(Some(&held))).expect("encode");
         let without = rmp_serde::to_vec_named(&packet(None)).expect("encode");
@@ -10237,6 +10539,7 @@ mod tests {
                 y: 1,
             },
             held: None,
+            cursor: None,
         };
 
         assert!(!packet_authorized(&layout, &packet));
@@ -10279,6 +10582,7 @@ mod tests {
                 y: 1,
             },
             held: None,
+            cursor: None,
         };
 
         assert!(packet_authorized(&layout, &packet));
@@ -10356,6 +10660,7 @@ mod tests {
                 y: 200,
             },
             held: None,
+            cursor: None,
         })
         .unwrap();
         let native = Arc::new(Mutex::new(layout.clone()));

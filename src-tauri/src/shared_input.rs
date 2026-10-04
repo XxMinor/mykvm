@@ -36,6 +36,12 @@ pub enum MouseButton {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum InputCommand {
+    // Receiver-only on macOS; the wire event remains a legacy MouseMove.
+    #[cfg(target_os = "macos")]
+    ParkCursor {
+        x: i32,
+        y: i32,
+    },
     MouseMove {
         x: i32,
         y: i32,
