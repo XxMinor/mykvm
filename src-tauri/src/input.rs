@@ -230,6 +230,9 @@ struct InputTarget {
 #[derive(Debug, Clone)]
 struct ActiveTarget {
     target: InputTarget,
+    // Snapshot before any hidden-cursor anchor warp. Owned by this session so
+    // edge returns cannot leave a stale hotkey return point for the next one.
+    return_point: Option<(f64, f64)>,
     // The remote screen the cursor is currently over and the wire id we send for
     // it. These start as the screen we crossed into and change as the cursor
     // roams across the remote device's other screens. `x`/`y` are coordinates
@@ -238,6 +241,30 @@ struct ActiveTarget {
     current_screen_id: String,
     x: f64,
     y: f64,
+}
+
+type RemoteScreenPoints = HashMap<(String, String), (f64, f64)>;
+
+fn remote_screen_points() -> &'static Mutex<RemoteScreenPoints> {
+    // Keep memory through capture restarts without writing on every mouse move.
+    static POINTS: OnceLock<Mutex<RemoteScreenPoints>> = OnceLock::new();
+    POINTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_remote_screen_point(points: &Mutex<RemoteScreenPoints>, active: &ActiveTarget) {
+    if let Ok(mut points) = points.lock() {
+        points.insert((active.target.device_id.clone(), active.current_screen_id.clone()),
+            (active.x, active.y));
+    }
+}
+
+fn remembered_remote_screen_point(points: &Mutex<RemoteScreenPoints>, target: &InputTarget) -> (f64, f64) {
+    let fallback = (target.remote_screen.width as f64 / 2.0, target.remote_screen.height as f64 / 2.0);
+    let (x, y) = points.lock().ok()
+        .and_then(|points| points.get(&(target.device_id.clone(), target.screen_id.clone())).copied())
+        .unwrap_or(fallback);
+    (x.clamp(0.0, (target.remote_screen.width - 1).max(0) as f64),
+        y.clamp(0.0, (target.remote_screen.height - 1).max(0) as f64))
 }
 
 #[derive(Debug, Clone)]
@@ -804,7 +831,7 @@ fn request_screen_switch(
     native_layout: &LayoutState,
     active: &Mutex<Option<ActiveTarget>>,
 ) -> SwitchOutcome {
-    request_screen_switch_from_point(direction, layout_state, native_layout, active, None)
+    request_screen_switch_from_point(direction, layout_state, native_layout, active, None, &Mutex::new(HashMap::new()))
 }
 
 fn request_screen_switch_from_point(
@@ -813,6 +840,7 @@ fn request_screen_switch_from_point(
     native_layout: &LayoutState,
     active: &Mutex<Option<ActiveTarget>>,
     current_point: Option<(f64, f64)>,
+    remote_points: &Mutex<RemoteScreenPoints>,
 ) -> SwitchOutcome {
     let currently_remote = active.lock().map(|a| a.is_some()).unwrap_or(false);
     if currently_remote {
@@ -861,19 +889,16 @@ fn request_screen_switch_from_point(
         return SwitchOutcome::Noop;
     };
 
-    // Land the remote cursor at the centre of the entry screen — there is no
-    // mouse trajectory to derive an entry offset from, so the middle is the
-    // least surprising landing spot.
-    let remote_x = (target.remote_screen.width as f64 / 2.0)
-        .clamp(0.0, (target.remote_screen.width - 1) as f64);
-    let remote_y = (target.remote_screen.height as f64 / 2.0)
-        .clamp(0.0, (target.remote_screen.height - 1) as f64);
+    // Only the first visit uses the centre; subsequent hotkey visits restore
+    // the last controlled point, not the client cursor's hidden parking point.
+    let (remote_x, remote_y) = remembered_remote_screen_point(remote_points, target);
 
     let mut current_screen = target.remote_screen.clone();
     current_screen.id = target.screen_id.clone();
 
     SwitchOutcome::Enter(ActiveTarget {
         target: target.clone(),
+        return_point: current_point,
         current_screen,
         current_screen_id: target.screen_id.clone(),
         x: remote_x,
@@ -1209,7 +1234,6 @@ fn start_platform_capture(
             just_crossed: AtomicBool::new(false),
             decouple_pending: AtomicBool::new(false),
             suppress_next_mouse_delta: AtomicBool::new(false),
-            hotkey_return_point: Mutex::new(None),
             local_screen_points: Mutex::new(HashMap::new()),
             display_snapshots,
             drag_count_at_left_down: std::sync::atomic::AtomicI64::new(
@@ -1375,6 +1399,7 @@ fn start_platform_capture(
             .ok()
             .and_then(|mut active| active.take());
         if let Some(active) = active {
+            remember_remote_screen_point(remote_screen_points(), &active);
             release_held_remote_inputs_macos(&context, &active.target);
         }
         set_macos_cursor_decoupled(false);
@@ -3268,7 +3293,6 @@ struct MacCaptureContext {
     // stays attached until that event draws the hide (hide_and_pin_macos_cursor).
     decouple_pending: AtomicBool,
     suppress_next_mouse_delta: AtomicBool,
-    hotkey_return_point: Mutex<Option<(f64, f64)>>,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     display_snapshots: Vec<MacDisplaySnapshot>,
     // Edge drag-drop (ShareMouse-style): the drag pasteboard's changeCount as
@@ -4274,6 +4298,7 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
         .lock()
         .ok()
         .and_then(|mut active| active.take());
+    let return_point = active.as_ref().map(local_hotkey_return_point);
 
     if let Some(active) = active {
         release_forwarded_keys_windows(context, &active.target);
@@ -4303,6 +4328,7 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
     context.just_crossed.store(false, Ordering::Relaxed);
     if let Ok(mut gate) = context.return_edge_gate.lock() { gate.reset(); }
     reset_mouse_move_timer(&context.last_mouse_move_sent);
+    if let Some((x, y)) = return_point { set_windows_cursor(x.round() as i32, y.round() as i32); }
     show_windows_cursor_if_needed(context);
     if let Ok(mut anchor) = context.anchor.lock() {
         *anchor = None;
@@ -4595,6 +4621,8 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
                 context.move_pending.store(true, Ordering::Relaxed);
             } else {
                 log::warn!("remote mouse moves kept failing; returning control to the local machine");
+                remember_remote_screen_point(remote_screen_points(), active_target);
+                let point = local_hotkey_return_point(active_target);
                 *active = None;
                 context.remote_active.store(false, Ordering::Relaxed);
                 crate::windows_drop_catcher::disarm();
@@ -4604,6 +4632,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
                 if let Ok(mut pressed) = context.pressed_keys.lock() {
                     pressed.clear();
                 }
+                set_windows_cursor(point.0.round() as i32, point.1.round() as i32);
                 show_windows_cursor_if_needed(context);
                 if let Ok(mut anchor) = context.anchor.lock() {
                     *anchor = None;
@@ -5333,6 +5362,8 @@ fn handle_macos_mouse_move(
                     log::warn!(
                         "remote mouse moves kept failing; returning control to the local machine"
                     );
+                    remember_remote_screen_point(remote_screen_points(), active_target);
+                    let point = local_hotkey_return_point(active_target);
                     *active = None;
                     context.remote_active.store(false, Ordering::Relaxed);
                     context.just_crossed.store(false, Ordering::Relaxed);
@@ -5350,8 +5381,10 @@ fn handle_macos_mouse_move(
                     if let Ok(mut anchor) = context.anchor.lock() {
                         *anchor = None;
                     }
-                    set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+                    set_macos_warp_suppression_interval(0.0);
+                    move_macos_cursor_without_event(context, CGPoint::new(point.0, point.1));
                     set_macos_cursor_decoupled(false);
+                    set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
                     show_macos_cursor_if_needed(context);
                     return CallbackResult::Keep;
                 }
@@ -6106,6 +6139,7 @@ fn crossing_target(
 
             ActiveTarget {
                 target: target.clone(),
+                return_point: Some((x, y)),
                 current_screen,
                 current_screen_id: target.screen_id.clone(),
                 x: remote_x,
@@ -6403,12 +6437,8 @@ fn local_center_point(active: &ActiveTarget) -> (f64, f64) {
     )
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn local_hotkey_return_point(
-    active: &ActiveTarget,
-    recorded_point: Option<(f64, f64)>,
-) -> (f64, f64) {
-    recorded_point.unwrap_or_else(|| local_center_point(active))
+fn local_hotkey_return_point(active: &ActiveTarget) -> (f64, f64) {
+    active.return_point.unwrap_or_else(|| local_center_point(active))
 }
 
 /// Send the position a paced-out move left behind, once the pacing allows.
@@ -6498,6 +6528,7 @@ fn send_remote_cursor_park(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    remember_remote_screen_point(remote_screen_points(), active);
     let (park_x, park_y) = remote_park_point(active);
     send_packet_with_cursor_state(
         quic_transport,
@@ -6588,7 +6619,6 @@ fn hide_and_pin_macos_cursor(context: &MacCaptureContext, edge: Edge, anchor: (f
 
 #[cfg(target_os = "macos")]
 fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveTarget) {
-    let return_point = macos_current_cursor_location().map(|point| (point.x, point.y));
     let anchor = local_anchor_point(&active_target);
     if !send_remote_mouse_move(
         &context.quic_transport,
@@ -6606,9 +6636,6 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
         context
             .suppress_next_mouse_delta
             .store(false, Ordering::Relaxed);
-        if let Ok(mut hotkey_return_point) = context.hotkey_return_point.lock() {
-            *hotkey_return_point = None;
-        }
         return;
     }
     dismiss_macos_dock_ui_if_up();
@@ -6628,10 +6655,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
     if let Ok(mut anchor_state) = context.anchor.lock() {
         *anchor_state = Some(anchor);
     }
-    if let Ok(mut hotkey_return_point) = context.hotkey_return_point.lock() {
-        *hotkey_return_point = return_point;
-    }
-    // Hotkey entry lands at the remote screen centre. macOS can still emit one
+    // Hotkey entry restores the remote point. macOS can still emit one
     // synthetic delta from the local anchor warp; drop only that next delta.
     context.just_crossed.store(false, Ordering::Relaxed);
     context
@@ -6647,12 +6671,7 @@ fn return_to_local_macos(context: &MacCaptureContext) {
         Some(target) => target,
         None => return,
     };
-    let recorded_point = context
-        .hotkey_return_point
-        .lock()
-        .ok()
-        .and_then(|mut point| point.take());
-    let point = local_hotkey_return_point(&active_target, recorded_point);
+    let point = local_hotkey_return_point(&active_target);
     let target = active_target.target.clone();
     let _ = send_remote_cursor_park(
         &context.quic_transport,
@@ -6743,6 +6762,7 @@ fn drain_switch_request_macos(context: &MacCaptureContext) {
         &context.native_layout,
         &context.active,
         current_point,
+        remote_screen_points(),
     ) {
         SwitchOutcome::Enter(active_target) => {
             log::info!(
@@ -6795,6 +6815,7 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         &context.native_layout,
         &context.active,
         current_point,
+        remote_screen_points(),
     ) {
         SwitchOutcome::Enter(active_target) => {
             release_shortcut_inputs_windows(context);
@@ -6826,12 +6847,14 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
                 if let Ok(mut anchor_state) = context.anchor.lock() {
                     *anchor_state = Some(anchor);
                 }
-                // Hotkey entry lands at the remote centre. The edge-crossing
+                // Hotkey entry restores the remote point. The edge-crossing
                 // first-delta guard would eat the user's first real movement.
                 context.just_crossed.store(false, Ordering::Relaxed);
             } else {
                 reset_mouse_move_timer(&context.last_mouse_move_sent);
                 reset_remote_button_mask(&context.remote_button_mask);
+                let (x, y) = local_hotkey_return_point(&active_target);
+                set_windows_cursor(x.round() as i32, y.round() as i32);
                 show_windows_cursor_if_needed(context);
             }
         }
@@ -9538,6 +9561,7 @@ mod tests {
         current_screen.id = "scr-1".into();
         let mut active = ActiveTarget {
             target,
+            return_point: None,
             current_screen,
             current_screen_id: "scr-1".into(),
             x: 100.0,
@@ -9595,6 +9619,7 @@ mod tests {
         current_screen.id = "local-display-1".into();
         let mut active = ActiveTarget {
             target,
+            return_point: None,
             current_screen,
             current_screen_id: "local-display-1".into(),
             x: 0.0,
@@ -9645,6 +9670,7 @@ mod tests {
         current_screen.id = "local-display-1".into();
         let active = ActiveTarget {
             target,
+            return_point: None,
             current_screen,
             current_screen_id: "local-display-1".into(),
             x: 1.0,
@@ -9777,6 +9803,7 @@ mod tests {
         let remote = target.remote_screen.clone();
         let mut active = ActiveTarget {
             target,
+            return_point: None,
             current_screen: remote.clone(),
             current_screen_id: remote.id.clone(),
             x: 12.0,
@@ -9868,7 +9895,55 @@ mod tests {
     }
 
     #[test]
-    fn screen_switch_request_enters_remote_at_screen_center() {
+    fn hotkey_round_trip_restores_both_cursors_without_remembering_the_park() {
+        let layout = layout_for_target_tests();
+        let state = Arc::new(Mutex::new(layout.clone()));
+        let points = Mutex::new(HashMap::new());
+        let active = Mutex::new(None);
+        let SwitchOutcome::Enter(mut first) = request_screen_switch_from_point(
+            SwitchDirection::Right, &state, &layout, &active, Some((333.0, 444.0)), &points,
+        ) else { panic!("enter client"); };
+        assert_eq!(local_hotkey_return_point(&first), (333.0, 444.0));
+        first.x = 456.0;
+        first.y = 789.0;
+        remember_remote_screen_point(&points, &first);
+        assert_ne!(remote_park_point(&first), (456, 789));
+        *active.lock().unwrap() = Some(first);
+        assert!(matches!(request_screen_switch_from_point(
+            SwitchDirection::Left, &state, &layout, &active, Some((960.0, 540.0)), &points,
+        ), SwitchOutcome::Return));
+        let previous = active.lock().unwrap().take().unwrap();
+        assert_eq!(local_hotkey_return_point(&previous), (333.0, 444.0));
+        let SwitchOutcome::Enter(next) = request_screen_switch_from_point(
+            SwitchDirection::Right, &state, &layout, &active, Some((123.0, 234.0)), &points,
+        ) else { panic!("re-enter client"); };
+        assert_eq!((next.x, next.y), (456.0, 789.0));
+        assert_eq!(local_hotkey_return_point(&next), (123.0, 234.0));
+    }
+
+    #[test]
+    fn remote_cursor_memory_separates_devices_and_screens_and_clamps_a_resized_screen() {
+        let points = Mutex::new(HashMap::new());
+        let target = target_for_coordinate_tests();
+        let mut active = crossing_target(&[target.clone()], 1919.0, 500.0, 40.0, 0.0).unwrap();
+        active.x = 2000.0;
+        active.y = 1200.0;
+        remember_remote_screen_point(&points, &active);
+        assert_eq!(remembered_remote_screen_point(&points, &target), (2000.0, 1200.0));
+        let mut other = target.clone();
+        other.device_id = "other-device".into();
+        assert_eq!(remembered_remote_screen_point(&points, &other), (1280.0, 720.0));
+        other = target.clone();
+        other.screen_id = "other-screen".into();
+        assert_eq!(remembered_remote_screen_point(&points, &other), (1280.0, 720.0));
+        let mut resized = target;
+        resized.remote_screen.width = 1280;
+        resized.remote_screen.height = 720;
+        assert_eq!(remembered_remote_screen_point(&points, &resized), (1279.0, 719.0));
+    }
+
+    #[test]
+    fn first_screen_switch_request_enters_remote_at_screen_center() {
         let layout = layout_for_target_tests();
         let layout_state = Arc::new(Mutex::new(layout.clone()));
         let active = Mutex::new(None);
@@ -9903,6 +9978,7 @@ mod tests {
             &layout,
             &active,
             Some((960.0, 540.0)),
+            &Mutex::new(HashMap::new()),
         ) {
             SwitchOutcome::LocalMove {
                 from_screen_id,
@@ -9924,6 +10000,7 @@ mod tests {
             &layout,
             &active,
             Some((1268.0, 1571.0)),
+            &Mutex::new(HashMap::new()),
         ) {
             SwitchOutcome::LocalMove {
                 from_screen_id,
@@ -9969,21 +10046,23 @@ mod tests {
 
     #[test]
     fn hotkey_return_uses_recorded_point_then_local_screen_center() {
-        let active = crossing_target(&[target_for_coordinate_tests()], 1919.0, 500.0, 40.0, 0.0)
+        let mut active = crossing_target(&[target_for_coordinate_tests()], 1919.0, 500.0, 40.0, 0.0)
         .expect("target should be active");
-
+        assert_eq!(local_hotkey_return_point(&active), (1919.0, 500.0));
+        active.return_point = Some((321.0, 654.0));
         assert_eq!(
-            local_hotkey_return_point(&active, Some((321.0, 654.0))),
+            local_hotkey_return_point(&active),
             (321.0, 654.0)
         );
-        assert_eq!(local_hotkey_return_point(&active, None), (960.0, 540.0));
+        active.return_point = None;
+        assert_eq!(local_hotkey_return_point(&active), (960.0, 540.0));
     }
 
     #[test]
     fn hotkey_return_parks_the_client_cursor_away_from_its_center() {
         let target = target_for_coordinate_tests();
         let screen = target.remote_screen.clone();
-        let mut active = ActiveTarget { target, current_screen: screen.clone(),
+        let mut active = ActiveTarget { target, return_point: None, current_screen: screen.clone(),
             current_screen_id: screen.id.clone(), x: screen.width as f64 / 2.0, y: screen.height as f64 / 2.0 };
         let center = (active.x as i32, active.y as i32);
         assert_eq!(remote_park_point(&active), (screen.width - 1, center.1));
@@ -10035,6 +10114,7 @@ mod tests {
             current_screen.id = "local-display-1".into();
             let mut active = ActiveTarget {
                 target,
+                return_point: None,
                 current_screen,
                 current_screen_id: "local-display-1".into(),
                 x: x + dx,
