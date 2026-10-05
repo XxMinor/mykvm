@@ -1,14 +1,18 @@
 # MyKVM
 
-**One keyboard, one mouse, one clipboard — shared across your Mac, Windows, and Linux machines on the same LAN.**
+**One keyboard, one mouse, one clipboard — shared across your Mac and Windows machines on the same LAN.**
 
 Move your cursor off the edge of one screen and it lands on the next machine. Your keyboard follows, and the clipboard (text and images) syncs automatically. No KVM hardware, no cables.
+
+Linux builds are available, but Linux keyboard/mouse capture and injection are not implemented yet ([#11](https://github.com/XxMinor/mykvm/issues/11), [#31](https://github.com/XxMinor/mykvm/issues/31)).
 
 [![Download](https://img.shields.io/github/v/release/XxMinor/mykvm?label=Download&style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
 [![Stars](https://img.shields.io/github/stars/XxMinor/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/stargazers)
 [![Forks](https://img.shields.io/github/forks/XxMinor/mykvm?label=Forks&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/forks)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-2786ff?style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](./LICENSE)
+[![LINUX DO](https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+&style=for-the-badge)](https://linux.do/)
+[![XQAPI](https://img.shields.io/badge/XQAPI-AI-2786FF.svg?logo=data%3aimage%2fpng%3bbase64%2ciVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2f9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAACkElEQVQ4EZVTTUhUURT%2b3pvne%2fPn5MZo1Ewc1MUMJE1t8o9oHZQTBQpty8pdQbQp6Fcq%2bqEoopD%2bFoW%2f7YoWiaUoTjALNQMHrLHAmphxGuf33du5V2coCMID591zz%2fnOd8859z4Fa8I5LyHTnclkNMMweMH%2f50oxhXBmOGz95vUq2WIsl8vtZIyNMpPFSRNkSzVNMyH35DOFfzUWp%2fj7VCrVKgmI0c1Mc4HWdQmRRFaiK1Uqnb5HUdVq8H9WXayyaAgcqaIolVqp1q4JQwRFukI6MDiM5y%2f6yMHQ2dkBi6ri8dNntGUIBNpx8MB%2byicCgVcsVRqtjFQw4sHDXvQ%2beoLTp07C0A2cu3AJ2Vye9ifgdDpx%2fmIPfkSjONZ1WKSQECu1cEY0H4vFeHPbbv5xbo4z2g8ODfOpYJBHIos8nU7z%2fv4BPjY%2bzptadvFo9KdI4ZR7WV1lAggIh8OBhvp6TExMYt%2feAEZGRlFZWYFXr99Q%2bQHMzMzC7d5E2Mhamooigd1uRz7PSPOwGgacZWVwuVwSaLdZYXVsgE5tpdIZCGxBigTV1ZvhKnXg7r37aGzcivF3b7Hw%2bQuuXL2OtrZWBCfHsLT0nUhKUFOzZS2fQREz0DTtrPDMz4dx5Gi3bMXQdVg0TU4%2fm82SbUF8OYHbN6%2bhrq5OwEW1PeIWZBU0E3g8tXg51Iep4AeEQiF4amuhWjRMT09jx3Y%2f%2fP5tsnyBFbdGqapGzzVGFch7FQGbzYaW5iZsLC%2fHjVt3wMw8uo93wefziUPlG5AGfWhmMSwvpxvonccpeV1CB%2f9KJBJeSZZKZTrobS%2bS%2fpdEYEi%2f0s90SCSLRqQkk8kKXdcbAJoW8gX3Xyt1SmXDpMF%2foqtcFMHfSC7T5ZzIvHoAAAAASUVORK5CYII%3d&style=for-the-badge)](https://xqapi.com/)
 
 [中文说明](./README.zh-CN.md)
 
@@ -37,9 +41,9 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 
 ## Limitations
 
-- **Trusted LAN only.** There is no user pairing/PIN yet, and LAN discovery is plaintext and unauthenticated. Do not expose the ports to public or untrusted networks.
+- **Trusted LAN only.** Pairing codes and paired certificate binding are supported; discovery remains plaintext. Do not expose the ports to public or untrusted networks.
 - Input and clipboard ride an **encrypted QUIC/TLS** connection pinned to the peer's advertised certificate, but MyKVM is a prototype and is not hardened for hostile networks.
-- The clipboard syncs **text and images**, not files.
+- Clipboard sharing supports text, images, HTML and RTF through one sync switch. File/folder transfers are limited to 2 GiB.
 - macOS builds are **self-signed, not notarized** — expect a Gatekeeper prompt on first open.
 - Experimental software: the protocol and behavior may change between versions.
 
@@ -48,11 +52,17 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 ## Features
 
 - Runs in Server or Client mode.
+- Windows installed builds request administrator permission at startup. Approve the UAC prompt to start sharing; login launches preserve their tray-only behavior.
+- Windows shortcut handling keeps physical modifiers separate from device key state. Start/stop and screen switches release logical keys, so holding Alt permits repeated switches and releasing it restores ordinary arrow input. Existing bindings pause during shortcut recording.
 - Discovers nearby peers on the LAN.
 - Supports manual peer connection by host or IP.
 - Detects local displays and lets you arrange multi-monitor layouts.
 - Shares keyboard and mouse input over an encrypted QUIC connection.
-- Syncs clipboard text and images over the same encrypted connection.
+- Syncs text, images and rich clipboard formats over the same encrypted connection.
+- With Clipboard Sync and File Transfer enabled on both Windows/macOS peers, copied files and folders transfer automatically. Wait for the transfer to finish, then paste normally in Explorer or Finder (up to 64 selections; 2 GiB per file/folder).
+- Device mouse speeds are configured in a modal form. The existing quick start/stop shortcut remains the way to pause sharing; separate input protection and lock shortcuts have been removed.
+- Clipboard sync automatically shares copied content; it has no separate mode or paste-shortcut controls.
+- Folder transfers keep nested and empty directories and can be cancelled. Both peers must be updated. Linux native X11/Wayland input is not implemented yet.
 - Provides light, dark, and system theme modes.
 - Includes English and Simplified Chinese UI.
 - Supports tray behavior for hiding and restoring the main window.
@@ -67,7 +77,7 @@ MyKVM is an experimental early release. It is useful for local testing and itera
 - Clipboard payload caps: 256 KB text, 32 MB image
 - Transport security: input and clipboard run over a TLS 1.3 (QUIC) connection pinned to the peer's advertised certificate
 - Security model: trusted LAN prototype
-- Not yet included: user pairing/PIN, authenticated discovery, and production transport hardening
+- Not yet included: fully authenticated discovery and production transport hardening for untrusted networks
 
 Do not expose the transport ports to public or untrusted networks.
 

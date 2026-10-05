@@ -265,6 +265,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Test frontend
+        run: npm test
+
+      - name: Test Tauri backend and input helper
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --locked
+
       - name: Validate updater signing key
         shell: bash
         env:
@@ -654,6 +660,17 @@ jobs:
           );
           if (linuxAsset) {
             addPlatform('linux-x86_64', linuxAsset);
+          }
+          // tauri-plugin-updater looks up `{os}-{arch}-{installer}` before
+          // `{os}-{arch}`, so without these a .deb or .rpm install was offered
+          // the AppImage. Assets without a signature are skipped.
+          const debAsset = files.find((name) => /_amd64\.deb$/i.test(name));
+          if (debAsset) {
+            addPlatform('linux-x86_64-deb', debAsset);
+          }
+          const rpmAsset = files.find((name) => /\.x86_64\.rpm$/i.test(name));
+          if (rpmAsset) {
+            addPlatform('linux-x86_64-rpm', rpmAsset);
           }
 
           fs.writeFileSync(

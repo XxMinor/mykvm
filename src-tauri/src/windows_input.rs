@@ -8,6 +8,10 @@ use std::{
 
 use crate::shared_input::{mouse_button_mask, InputCommand, MouseButton};
 
+// Input injected by our own receiver/shortcut dispatcher remains local, even
+// if the controller resumes sharing before a queued injection is delivered.
+pub const KEYBOARD_INPUT_MARKER: usize = 0x4D59_4B53;
+
 /// Explains a refused button/key injection, throttled to one line per 10s.
 ///
 /// Windows blocks `SendInput` from a standard-user process into an elevated or
@@ -32,10 +36,10 @@ fn note_injection_refused(kind: &str, error: u32) {
 
     if error == ERROR_ACCESS_DENIED {
         log::warn!(
-            "injected {kind} refused by Windows (ERROR_ACCESS_DENIED): an elevated or \
-             uiAccess window (e.g. Task Manager, a UAC-elevated app) has focus. A \
-             standard-user MyKVM cannot hook or inject into higher-privilege windows — \
-             restart MyKVM as administrator (Settings) on this machine to control them."
+            "injected {kind} refused by Windows (ERROR_ACCESS_DENIED): the foreground window \
+             runs at another integrity level (Task Manager, a UAC prompt, an elevated app). \
+             The app retries such input through the MyKVM input service; if that service \
+             is not installed, install it in Settings or run MyKVM as administrator."
         );
     } else {
         log::warn!("injected {kind} was refused: SendInput failed with error {error}");
@@ -49,7 +53,7 @@ pub fn inject_command(command: &InputCommand, pressed_keys: &mut Vec<u16>, butto
     }
 
     track_pressed_inputs(command, pressed_keys, button_mask);
-    inject_command_without_tracking(command);
+    let _ = inject_command_without_tracking(command);
 }
 
 pub fn release_pressed_inputs_on_fresh_input_desktop(
@@ -88,15 +92,20 @@ pub fn track_pressed_inputs(
     }
 }
 
-pub fn inject_command_without_tracking(command: &InputCommand) {
+/// Injects `command`; `Err` carries the Win32 error of a refused SendInput.
+pub fn inject_command_without_tracking(command: &InputCommand) -> Result<(), u32> {
     match *command {
-        InputCommand::MouseMove { x, y, .. } => inject_mouse_move(x, y, None),
+        InputCommand::MouseMove { x, y, .. } => {
+            inject_mouse_move(x, y, None);
+            Ok(())
+        }
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
         InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
-        InputCommand::ReleaseAll => {}
+        InputCommand::ReleaseAll => Ok(()),
         InputCommand::SecureAttention => {
             let _ = send_secure_attention();
+            Ok(())
         }
     }
 }
@@ -104,13 +113,19 @@ pub fn inject_command_without_tracking(command: &InputCommand) {
 pub fn release_pressed_inputs(pressed_keys: &mut Vec<u16>, button_mask: &mut u64) {
     let keys = std::mem::take(pressed_keys);
     for key_code in keys.into_iter().rev() {
-        inject_key(key_code, false);
+        let _ = inject_key(key_code, false);
     }
 
-    for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+    for button in [
+        MouseButton::Left,
+        MouseButton::Right,
+        MouseButton::Middle,
+        MouseButton::Back,
+        MouseButton::Forward,
+    ] {
         let mask = mouse_button_mask(button);
         if *button_mask & mask != 0 {
-            inject_mouse_button(button, false, 0, 0);
+            let _ = inject_mouse_button(button, false, 0, 0);
         }
     }
     *button_mask = 0;
@@ -256,10 +271,10 @@ pub fn inject_mouse_move(x: i32, y: i32, _drag_button: Option<MouseButton>) {
     }
 }
 
-pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
+pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) -> Result<(), u32> {
     use windows_sys::Win32::UI::{
         Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
             MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
             MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
         },
@@ -304,16 +319,27 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
             },
         },
     };
-    unsafe {
-        if SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 0 {
-            note_injection_refused("mouse button", windows_sys::Win32::Foundation::GetLastError());
-        }
-    }
+    sent_or_refused(&input, "mouse button")
 }
 
-pub fn inject_scroll(delta_x: i32, delta_y: i32) {
+/// SendInput of one event; a refusal is noted and its error returned.
+fn sent_or_refused(
+    input: &windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT,
+    kind: &str,
+) -> Result<(), u32> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT};
+
+    if unsafe { SendInput(1, input, std::mem::size_of::<INPUT>() as i32) } != 0 {
+        return Ok(());
+    }
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    note_injection_refused(kind, error);
+    Err(error)
+}
+
+pub fn inject_scroll(delta_x: i32, delta_y: i32) -> Result<(), u32> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT,
     };
 
     for (flag, delta) in [(MOUSEEVENTF_WHEEL, delta_y), (MOUSEEVENTF_HWHEEL, delta_x)] {
@@ -335,15 +361,14 @@ pub fn inject_scroll(delta_x: i32, delta_y: i32) {
             },
         };
 
-        unsafe {
-            let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-        }
+        sent_or_refused(&input, "scroll")?;
     }
+    Ok(())
 }
 
-pub fn inject_key(key_code: u16, down: bool) {
+pub fn inject_key(key_code: u16, down: bool) -> Result<(), u32> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+        MapVirtualKeyW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
         KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
     };
 
@@ -365,15 +390,11 @@ pub fn inject_key(key_code: u16, down: bool) {
                 wScan: scan,
                 dwFlags: dw_flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: KEYBOARD_INPUT_MARKER,
             },
         },
     };
-    unsafe {
-        if SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 0 {
-            note_injection_refused("key", windows_sys::Win32::Foundation::GetLastError());
-        }
-    }
+    sent_or_refused(&input, "key")
 }
 
 fn is_extended_key_vk(vk: u16) -> bool {
@@ -396,6 +417,8 @@ fn is_extended_key_vk(vk: u16) -> bool {
             | 0x90
             | 0xA3
             | 0xA5
+            // browser, volume and media keys (E0-prefixed on a keyboard)
+            | 0xA6..=0xB7
     )
 }
 

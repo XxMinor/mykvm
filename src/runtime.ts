@@ -1,7 +1,7 @@
 import type { LayoutState } from './types'
 
 export interface NativeStageStatus {
-  state: 'stubbed' | 'idle' | 'ready' | 'error'
+  state: 'stubbed' | 'idle' | 'ready' | 'paused' | 'error'
   detail: string
 }
 
@@ -64,6 +64,13 @@ export interface RuntimeStatus {
   pairing: PairingStatus
   privilege: PrivilegeStatus
   inputService: InputServiceStatus
+  inputProtection?: InputProtectionStatus
+}
+
+export interface InputProtectionStatus {
+  reason: 'localOnly' | 'fullscreen' | 'application' | null
+  application: string
+  captureAvailable: boolean
 }
 
 export interface AppStateSnapshot {

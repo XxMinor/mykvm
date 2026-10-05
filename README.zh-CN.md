@@ -1,14 +1,18 @@
 # MyKVM
 
-**一套键盘、一只鼠标、一份剪贴板 —— 在同一局域网内的 Mac、Windows、Linux 之间共享。**
+**一套键盘、一只鼠标、一份剪贴板 —— 在同一局域网内的 Mac 和 Windows 之间共享。**
 
 把光标移出一台屏幕的边缘，它就落到下一台机器上；键盘随之切换，剪贴板（文本和图片）自动同步。不需要 KVM 硬件，也不用插线。
+
+Linux 提供安装包，但 Linux 键鼠采集和注入尚未实现（[#11](https://github.com/XxMinor/mykvm/issues/11)、[#31](https://github.com/XxMinor/mykvm/issues/31)）。
 
 [![下载](https://img.shields.io/github/v/release/XxMinor/mykvm?label=%E4%B8%8B%E8%BD%BD&style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
 [![Stars](https://img.shields.io/github/stars/XxMinor/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/stargazers)
 [![Forks](https://img.shields.io/github/forks/XxMinor/mykvm?label=Forks&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/forks)
 [![平台](https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-2786ff?style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
 [![许可证: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](./LICENSE)
+[![LINUX DO](https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+&style=for-the-badge)](https://linux.do/)
+[![XQAPI](https://img.shields.io/badge/XQAPI-AI-2786FF.svg?logo=data%3aimage%2fpng%3bbase64%2ciVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2f9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAACkElEQVQ4EZVTTUhUURT%2b3pvne%2fPn5MZo1Ewc1MUMJE1t8o9oHZQTBQpty8pdQbQp6Fcq%2bqEoopD%2bFoW%2f7YoWiaUoTjALNQMHrLHAmphxGuf33du5V2coCMID591zz%2fnOd8859z4Fa8I5LyHTnclkNMMweMH%2f50oxhXBmOGz95vUq2WIsl8vtZIyNMpPFSRNkSzVNMyH35DOFfzUWp%2fj7VCrVKgmI0c1Mc4HWdQmRRFaiK1Uqnb5HUdVq8H9WXayyaAgcqaIolVqp1q4JQwRFukI6MDiM5y%2f6yMHQ2dkBi6ri8dNntGUIBNpx8MB%2byicCgVcsVRqtjFQw4sHDXvQ%2beoLTp07C0A2cu3AJ2Vye9ifgdDpx%2fmIPfkSjONZ1WKSQECu1cEY0H4vFeHPbbv5xbo4z2g8ODfOpYJBHIos8nU7z%2fv4BPjY%2bzptadvFo9KdI4ZR7WV1lAggIh8OBhvp6TExMYt%2feAEZGRlFZWYFXr99Q%2bQHMzMzC7d5E2Mhamooigd1uRz7PSPOwGgacZWVwuVwSaLdZYXVsgE5tpdIZCGxBigTV1ZvhKnXg7r37aGzcivF3b7Hw%2bQuuXL2OtrZWBCfHsLT0nUhKUFOzZS2fQREz0DTtrPDMz4dx5Gi3bMXQdVg0TU4%2fm82SbUF8OYHbN6%2bhrq5OwEW1PeIWZBU0E3g8tXg51Iep4AeEQiF4amuhWjRMT09jx3Y%2f%2fP5tsnyBFbdGqapGzzVGFch7FQGbzYaW5iZsLC%2fHjVt3wMw8uo93wefziUPlG5AGfWhmMSwvpxvonccpeV1CB%2f9KJBJeSZZKZTrobS%2bS%2fpdEYEi%2f0s90SCSLRqQkk8kKXdcbAJoW8gX3Xyt1SmXDpMF%2foqtcFMHfSC7T5ZzIvHoAAAAASUVORK5CYII%3d&style=for-the-badge)](https://xqapi.com/)
 
 [English README](./README.md)
 
@@ -37,9 +41,9 @@
 
 ## 已知限制
 
-- **仅限可信局域网。** 暂无用户配对/PIN，且局域网发现是明文、未认证。请勿把端口暴露到公网或不可信网络。
+- **仅限可信局域网。** 支持配对码和已配对设备证书绑定；局域网发现仍是明文。请勿把端口暴露到公网或不可信网络。
 - 输入和剪贴板走 **加密的 QUIC/TLS** 连接，并绑定对端广播的证书；但 MyKVM 仍是原型，未针对恶意网络做加固。
-- 剪贴板同步 **文本和图片**，不同步文件。
+- 剪贴板通过单一同步开关共享文字、图片和 HTML／RTF。文件及文件夹传输上限为 2 GiB。
 - macOS 版本是 **自签名、未公证**，首次打开会有 Gatekeeper 提示。
 - 实验性软件：协议和行为可能在版本间变化。
 
@@ -48,11 +52,17 @@
 ## 功能
 
 - 支持 Server / Client 两种工作模式。
+- Windows 安装版启动时自动申请管理员权限，确认系统 UAC 提示后开始共享；登录自启仍保持托盘运行。
+- Windows 服务端的启停和四向切屏单独记录实际按键，每次执行释放设备上的逻辑按键。按住 Alt 可连续切屏；松开后，普通方向键正常输入。录制快捷键时暂停已绑定的快捷键。
 - 支持局域网设备发现。
 - 支持通过主机名或 IP 手动连接设备。
 - 支持本机显示器检测和多显示器布局编辑。
 - 通过加密的 QUIC 连接共享键盘和鼠标输入。
-- 通过同一条加密连接同步剪贴板的文本和图片。
+- 通过同一条加密连接同步剪贴板的文本、图片和富文本。
+- Windows／macOS 两端开启剪贴板同步和文件传输后，复制的文件或文件夹会自动传到另一台电脑。传输完成后，在资源管理器或 Finder 中正常粘贴即可（最多 64 个选中项，单个文件／文件夹上限 2 GiB）。
+- 设备的指针和滚轮速度在弹窗表单中设置。暂停共享沿用原有快捷启停，已移除独立的跨屏保护和锁定快捷键入口。
+- 开启剪贴板同步后自动共享复制内容，不再提供独立的发送模式或远端粘贴快捷键。
+- 支持文件夹层级和空目录、传输取消；新协议需两端更新。Linux 原生 X11／Wayland 键鼠后端尚未实现。
 - 支持浅色、深色和跟随系统主题。
 - 支持英文和简体中文界面。
 - 支持托盘隐藏和恢复主窗口。
@@ -67,7 +77,7 @@ MyKVM 是一个实验性的早期版本，适合在本地可信网络中测试�
 - 剪贴板载荷上限：文本 256 KB，图片 32 MB
 - 传输安全：输入和剪贴板走 TLS 1.3（QUIC）连接，并绑定对端在发现阶段广播的证书
 - 安全模型：可信局域网原型
-- 暂未包含：用户配对/PIN、发现通道身份认证和生产级传输加固
+- 暂未包含：完整的发现通道身份认证和面向不可信网络的生产级传输加固
 
 请不要把传输端口暴露到公网或不可信网络。
 

@@ -1,3 +1,5 @@
+import { DeviceSettingsModal } from "./DeviceSettingsModal";
+import { HelpHeading, InfoTip } from "./InfoTip";
 import {
   type CSSProperties,
   type FormEvent,
@@ -36,17 +38,22 @@ import {
   restartAsAdmin,
   saveLayout,
   sendFilesToDevice,
+  fetchClientLog,
+  requestClientUpdate,
   setAutostart,
+  setHotkeyRecording,
   scanLanPeers,
   startRuntime,
   startWindowDrag,
   stopRuntime,
+  cancelFileTransfer,
   syncWindowChrome,
   toggleMaximizeMainWindow,
   uninstallInputService,
   writeClipboardText,
 } from "./desktopApi";
 import type { AppUpdateInfo } from "./desktopApi";
+import { compareVersions } from "./versions";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
@@ -129,6 +136,8 @@ type InputServiceAction = "install" | "uninstall";
 interface ServerPairingState {
   peer: LanPeer;
   host: string;
+  manual: boolean;
+  alias: string;
 }
 
 interface DragState {
@@ -163,6 +172,21 @@ type NativeFileDragPayload =
   | { type: "cancel" }
   | { type: string; paths?: string[]; position?: FileDropPosition };
 
+// Mirrors the Rust FileTransferProgress payload (camelCase serde).
+interface FileTransferProgressEntry {
+  transferId: string;
+  fileName: string;
+  targetName: string;
+  sentBytes: number;
+  totalBytes: number;
+  fileIndex: number;
+  fileCount: number;
+  done: boolean;
+  error: string | null;
+}
+
+const INPUT_SERVICE_OFFER_DISMISSED_KEY = "mykvm.inputServiceOfferDismissed";
+
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -171,6 +195,7 @@ function App() {
     height: DEFAULT_BOARD_HEIGHT,
   });
   const [isSaving, setIsSaving] = useState(false);
+  const [editingDevice, setEditingDevice] = useState<Device | null>(null);
   const [isRuntimePending, setIsRuntimePending] = useState(false);
   const [isScanningLan, setIsScanningLan] = useState(false);
   const [scanCountdown, setScanCountdown] = useState(0);
@@ -183,11 +208,23 @@ function App() {
   const [fileTransferMessage, setFileTransferMessage] = useState<string | null>(
     null,
   );
+  const [fileTransfers, setFileTransfers] = useState<
+    Record<string, FileTransferProgressEntry>
+  >({});
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
   const [isInputServicePending, setIsInputServicePending] = useState(false);
   const [inputServiceAction, setInputServiceAction] =
     useState<InputServiceAction | null>(null);
+  const [inputServiceOfferDismissed, setInputServiceOfferDismissed] = useState(
+    () => {
+      try {
+        return Boolean(localStorage.getItem(INPUT_SERVICE_OFFER_DISMISSED_KEY));
+      } catch {
+        return true;
+      }
+    },
+  );
   const [boardZoom, setBoardZoom] = useState(1);
   const [manualDeviceName, setManualDeviceName] = useState("");
   const [manualDeviceHost, setManualDeviceHost] = useState("");
@@ -292,6 +329,69 @@ function App() {
     }
 
     let active = true;
+    let unlisten: (() => void) | null = null;
+    const removalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<FileTransferProgressEntry>(
+          "file-transfer-progress",
+          ({ payload }) => {
+            if (!active) {
+              return;
+            }
+            setFileTransfers((current) => ({
+              ...current,
+              [payload.transferId]: payload,
+            }));
+            // A finished (or failed) toast lingers briefly, then disappears.
+            if (payload.done) {
+              const existing = removalTimers.get(payload.transferId);
+              if (existing) {
+                clearTimeout(existing);
+              }
+              removalTimers.set(
+                payload.transferId,
+                setTimeout(() => {
+                  setFileTransfers((current) => {
+                    const next = { ...current };
+                    delete next[payload.transferId];
+                    return next;
+                  });
+                  removalTimers.delete(payload.transferId);
+                }, 3000),
+              );
+            }
+          },
+        ),
+      )
+      .then((stop) => {
+        if (active) {
+          unlisten = stop;
+          return;
+        }
+        stop();
+      })
+      .catch(() => {
+        // Progress toasts are a nicety; a missing listener just hides them.
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+      for (const timer of removalTimers.values()) {
+        clearTimeout(timer);
+      }
+      removalTimers.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let active = true;
     let unlistenRuntime: (() => void) | null = null;
 
     void import("@tauri-apps/api/event")
@@ -346,8 +446,11 @@ function App() {
           nextSnapshot.layout.machineRole === "client" &&
           !localStorage.getItem("mykvm.clientAutostartInit")
         ) {
-          localStorage.setItem("mykvm.clientAutostartInit", "1");
-          void setAutostart(true).catch(() => {});
+          void setAutostart(true)
+            .then(() =>
+              localStorage.setItem("mykvm.clientAutostartInit", "1"),
+            )
+            .catch(() => {});
         }
         if (
           active &&
@@ -396,6 +499,16 @@ function App() {
     return () => {
       active = false;
     };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    let dispose: (() => void) | null = null;
+    void import("@tauri-apps/api/event").then(({ listen }) => listen<string>("clipboard-paste-error", ({ payload }) => {
+      if (active) setErrorMessage(payload);
+    })).then(stop => { if (active) dispose = stop; else stop(); }).catch(() => {});
+    return () => { active = false; dispose?.(); };
   }, []);
 
   useEffect(() => {
@@ -524,7 +637,8 @@ function App() {
           const currentSnapshot = snapshotRef.current;
           if (
             currentSnapshot?.layout.machineRole === "client" &&
-            currentSnapshot.layout.pairedControllers.length === 0 &&
+            (currentSnapshot.layout.pairedControllers.length === 0 ||
+              currentSnapshot.runtime?.pairing.state === "requested") &&
             nextRuntime.pairing.state === "paired"
           ) {
             void loadAppState()
@@ -588,6 +702,7 @@ function App() {
   const layout = snapshot?.layout;
   const runtime = snapshot?.runtime;
   const discovery = runtime?.discovery;
+  const appVersion = discovery?.localPeer.appVersion || APP_VERSION;
   const displayLayout = useMemo(
     () => (layout ? applyPeerPresence(layout, discovery?.peers ?? []) : null),
     [layout, discovery],
@@ -652,12 +767,34 @@ function App() {
     : inputServiceInstalled
       ? ui.settings.inputServiceInstalledStatus
       : ui.settings.inputServiceNeedsInstall;
-  const canManageInputService =
-    usesWindowsChrome &&
-    machineRole === "client" &&
-    Boolean(runtime?.privilege.isElevated);
+  // Install/uninstall elevate on their own (one UAC prompt), so the app does
+  // not have to be running as administrator.
+  const canManageInputService = usesWindowsChrome && machineRole === "client";
+  // Without the input service a Windows client cannot be controlled while
+  // MyKVM restarts (every update) or before sign-in: offer it until it is
+  // installed or the offer is dismissed (remembered across launches).
+  const offerInputService =
+    canManageInputService &&
+    Boolean(runtime) &&
+    !inputServiceInstalled &&
+    !inputServiceOfferDismissed;
+  const shownInputServiceAction: InputServiceAction | null =
+    inputServiceAction ?? (offerInputService ? "install" : null);
+
+  function closeInputServicePrompt() {
+    if (shownInputServiceAction === "install" && !inputServiceInstalled) {
+      setInputServiceOfferDismissed(true);
+      try {
+        localStorage.setItem(INPUT_SERVICE_OFFER_DISMISSED_KEY, "1");
+      } catch {
+        // Storage unavailable: the offer shows again next launch.
+      }
+    }
+    setInputServiceAction(null);
+  }
+
   const hasBlockingOverlay =
-    Boolean(inputServiceAction) ||
+    Boolean(shownInputServiceAction) ||
     Boolean(errorMessage) ||
     isScanningLan ||
     Boolean(serverPairing) ||
@@ -894,6 +1031,54 @@ function App() {
     }
   }
 
+  async function handleRequestClientUpdate(deviceId: string) {
+    setErrorMessage(null);
+    try {
+      await requestClientUpdate(deviceId);
+      setFileTransferMessage(ui.settings.updateClientSent);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    }
+  }
+
+  async function handleFetchClientLog() {
+    const layout = snapshotRef.current?.layout;
+    // A server fetches its online clients' logs; a client its controller's.
+    const targetIds = !layout
+      ? []
+      : layout.machineRole === "client"
+        ? layout.pairedControllers.map((controller) => controller.id)
+        : layout.devices
+            .filter(
+              (device) =>
+                device.role !== "local" &&
+                device.online &&
+                device.inputReady &&
+                device.transportPublicKey.trim().length > 0,
+            )
+            .map((device) => device.id);
+    if (targetIds.length === 0) {
+      setDiagnosticMessage(ui.settings.fetchClientLogNoTarget);
+      return;
+    }
+    setIsDiagnosticPending(true);
+    setDiagnosticMessage(null);
+    try {
+      for (const deviceId of targetIds) {
+        await fetchClientLog(deviceId);
+      }
+      setDiagnosticMessage(ui.settings.fetchClientLogSent);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsDiagnosticPending(false);
+    }
+  }
+
   async function persistLayout(nextLayout: LayoutState) {
     setIsSaving(true);
     try {
@@ -906,6 +1091,14 @@ function App() {
     } finally {
       setIsSaving(false);
     }
+  }
+
+  async function saveModalLayout(mutator: (current: LayoutState) => LayoutState) {
+    const current = snapshotRef.current?.layout;
+    if (!current) throw new Error(ui.errors.saveLayout);
+    setIsSaving(true);
+    try { setSnapshot(await saveLayout(mutator(current))); }
+    finally { setIsSaving(false); }
   }
 
   const sendDroppedFiles = useEffectEvent(
@@ -1338,6 +1531,8 @@ function App() {
     updateLayout((layoutState) => ({
       ...layoutState,
       clipboardSync,
+      clipboardOnDemand: false,
+      clipboardPasteHotkey: "disabled",
     }));
   }
 
@@ -1346,6 +1541,10 @@ function App() {
       ...layoutState,
       fileTransferEnabled,
     }));
+  }
+
+  function setLockSync(lockSync: boolean) {
+    updateLayout((layoutState) => ({ ...layoutState, lockSync }));
   }
 
   function setModifierRemap(modifierRemap: boolean) {
@@ -1405,6 +1604,7 @@ function App() {
 
     event.preventDefault();
     event.stopPropagation();
+    void setHotkeyRecording(false, hotkey).catch((error: unknown) => setErrorMessage(String(error)));
     commitEdgeSwitchHotkey(hotkey);
     setIsCapturingEdgeSwitchHotkey(false);
   });
@@ -1464,6 +1664,7 @@ function App() {
     }
     event.preventDefault();
     event.stopPropagation();
+    void setHotkeyRecording(false, hotkey).catch((error: unknown) => setErrorMessage(String(error)));
     setScreenSwitchHotkey(direction, hotkey);
     setCapturingDirection(null);
   });
@@ -1497,6 +1698,12 @@ function App() {
       window.removeEventListener("blur", cancelRecording);
     };
   }, [capturingDirection]);
+
+  useEffect(() => {
+    const recording = isCapturingEdgeSwitchHotkey || capturingDirection !== null;
+    void setHotkeyRecording(recording).catch(() => {});
+    return () => { if (recording) void setHotkeyRecording(false).catch(() => {}); };
+  }, [isCapturingEdgeSwitchHotkey, capturingDirection]);
 
   function setTransportPortMode(transportPortMode: TransportPortMode) {
     updateLayout((layoutState) => ({
@@ -1607,13 +1814,14 @@ function App() {
         return;
       }
 
-      if (peer.pairingRequired) {
-        await beginPairing(host);
+      if (peer.pairingRequired || !layout?.devices.some((device) =>
+        device.transportPublicKey.length > 0 && device.transportPublicKey === peer.transportPublicKey)) {
+        await beginPairing(host, true, manualDeviceName.trim());
         return;
       }
 
       updateLayout((layoutState) =>
-        upsertPeerDevice(layoutState, peer, manualDeviceName.trim()),
+        upsertPeerDevice(layoutState, peer, manualDeviceName.trim(), true),
       );
       setManualDeviceName("");
       setManualDeviceHost("");
@@ -1634,7 +1842,8 @@ function App() {
       return;
     }
 
-    if (peer.pairingRequired) {
+    if (peer.pairingRequired || !layout?.devices.some((device) =>
+      device.transportPublicKey.length > 0 && device.transportPublicKey === peer.transportPublicKey)) {
       void beginPairing(peer.ip || peer.host);
       return;
     }
@@ -1644,7 +1853,7 @@ function App() {
     });
   }
 
-  async function beginPairing(hostInput: string) {
+  async function beginPairing(hostInput: string, manual = false, alias = "") {
     const host = hostInput.trim();
     if (!host) {
       setErrorMessage(ui.errors.manualHostRequired);
@@ -1656,7 +1865,7 @@ function App() {
 
     try {
       const challengePeer = await requestLanPairing(host);
-      setServerPairing({ peer: challengePeer, host });
+      setServerPairing({ peer: challengePeer, host, manual, alias });
       setServerPairingCode("");
       setServerPairingError(null);
     } catch (error: unknown) {
@@ -1675,7 +1884,7 @@ function App() {
       setErrorMessage(ui.errors.manualHostRequired);
       return;
     }
-    await beginPairing(host);
+    await beginPairing(host, device.source === "manual");
   }
 
   async function confirmPairing(event: FormEvent<HTMLFormElement>) {
@@ -1701,7 +1910,7 @@ function App() {
         );
         return;
       }
-      updateLayout((layoutState) => upsertPeerDevice(layoutState, pairedPeer));
+      updateLayout((layoutState) => upsertPeerDevice(layoutState, pairedPeer, serverPairing.alias, serverPairing.manual));
       setServerPairing(null);
       setServerPairingCode("");
       setServerPairingError(null);
@@ -1793,7 +2002,14 @@ function App() {
       setUpdateMessage(ui.settings.updateCurrent);
     } catch (error: unknown) {
       setUpdateStatus("error");
-      setUpdateMessage(formatUnknownError(error, ui.errors.checkUpdate));
+      setUpdateMessage(
+        formatUpdaterError(
+          error,
+          ui.errors.checkUpdate,
+          ui.errors.updateSignatureMismatch,
+          ui.errors.updateManifestUnavailable,
+        ),
+      );
     }
   }
 
@@ -1822,6 +2038,7 @@ function App() {
         error,
         ui.errors.installUpdate,
         ui.errors.updateSignatureMismatch,
+        ui.errors.updateManifestUnavailable,
       );
       setUpdateStatus("error");
       setUpdateMessage(`${errorText} ${ui.settings.updateFallback}`);
@@ -1888,6 +2105,75 @@ function App() {
     );
   }
 
+  function renderFileTransferToasts() {
+    const transfers = Object.values(fileTransfers);
+    if (transfers.length === 0) {
+      return null;
+    }
+    // Newest first, so a fresh transfer appears on top of the stack.
+    transfers.sort((a, b) => b.transferId.localeCompare(a.transferId));
+
+    return (
+      <div className="file-transfer-toasts" aria-live="polite">
+        {transfers.map((transfer) => {
+          const percent =
+            transfer.totalBytes > 0
+              ? Math.min(
+                  100,
+                  Math.round((transfer.sentBytes / transfer.totalBytes) * 100),
+                )
+              : transfer.done && !transfer.error
+                ? 100
+                : 0;
+          const failed = Boolean(transfer.error);
+          const status = failed
+            ? ui.devices.fileTransferFailed
+            : transfer.done
+              ? ui.devices.fileTransferSent
+              : ui.devices.fileTransferSending;
+          const counter =
+            transfer.fileCount > 1
+              ? ` (${transfer.fileIndex}/${transfer.fileCount})`
+              : "";
+          return (
+            <div
+              key={transfer.transferId}
+              className={`file-transfer-toast${failed ? " failed" : ""}${
+                transfer.done && !failed ? " done" : ""
+              }`}
+              role="status"
+            >
+              <div className="file-transfer-toast-head">
+                <span className="file-transfer-toast-name" title={transfer.fileName}>
+                  {transfer.fileName}
+                </span>
+                <span className="file-transfer-toast-status">
+                  {status}
+                  {counter}
+                </span>
+                {!transfer.done ? <button type="button" className="secondary-button compact-button"
+                  onClick={() => void cancelFileTransfer(transfer.transferId)}>{ui.common.cancel}</button> : null}
+              </div>
+              <div className="file-transfer-toast-track">
+                <div
+                  className="file-transfer-toast-fill"
+                  style={{ width: `${failed ? 100 : percent}%` }}
+                />
+              </div>
+              <div className="file-transfer-toast-meta">
+                {failed
+                  ? transfer.error
+                  : `${formatFileTransferBytes(transfer.sentBytes)} / ${formatFileTransferBytes(
+                      transfer.totalBytes,
+                    )} · ${transfer.targetName}`}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   function renderInputServicePrompt(action: InputServiceAction) {
     const title =
       action === "uninstall"
@@ -1917,7 +2203,7 @@ function App() {
           <button
             type="button"
             className="pairing-close-button"
-            onClick={() => setInputServiceAction(null)}
+            onClick={closeInputServicePrompt}
             disabled={isInputServicePending}
             title={ui.common.cancel}
             aria-label={ui.common.cancel}
@@ -1945,7 +2231,7 @@ function App() {
             <button
               type="button"
               className="secondary-button compact-button"
-              onClick={() => setInputServiceAction(null)}
+              onClick={closeInputServicePrompt}
               disabled={isInputServicePending}
             >
               {ui.common.cancel}
@@ -2053,23 +2339,10 @@ function App() {
     }
 
     return (
-      <>
-        <button
-          type="button"
-          className="secondary-button compact-button"
-          onClick={() => void handleRepairDevice(device)}
-          disabled={isPairingDevice}
-        >
-          {ui.devices.repair}
-        </button>
-        <button
-          type="button"
-          className="secondary-button compact-button danger-button"
-          onClick={() => handleRemoveDevice(device.id)}
-        >
-          {ui.common.remove}
-        </button>
-      </>
+      <button type="button" className="secondary-button compact-button"
+        disabled={isPairingDevice || isSaving} onClick={() => setEditingDevice(device)}>
+        {language === "cn" ? "设置" : "Settings"}
+      </button>
     );
   }
 
@@ -2143,7 +2416,10 @@ function App() {
 
       {errorMessage ? renderErrorDialog(errorMessage) : null}
       {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
-      {inputServiceAction ? renderInputServicePrompt(inputServiceAction) : null}
+      {renderFileTransferToasts()}
+      {shownInputServiceAction
+        ? renderInputServicePrompt(shownInputServiceAction)
+        : null}
 
       {machineRole === "server" && currentTab === "layout" ? (
         <section className="workspace-shell">
@@ -2262,19 +2538,10 @@ function App() {
 
       {machineRole === "server" && currentTab === "devices" ? (
         <section className="page-panel">
-          <div className="page-heading">
-            <div>
-              <p className="eyebrow">{ui.devices.eyebrow}</p>
-              <h1>{ui.devices.title}</h1>
-              <p>{ui.devices.subtitle}</p>
-            </div>
-          </div>
-
           <div className="connection-stack">
             <section className="surface-card connection-add-card">
               <div>
-                <h2>{ui.devices.addTitle}</h2>
-                <p>{ui.devices.addCopy}</p>
+                <HelpHeading label={ui.devices.addTitle} text={ui.devices.addCopy} />
               </div>
               <form
                 className="add-device-form"
@@ -2282,13 +2549,16 @@ function App() {
               >
                 <input
                   value={manualDeviceName}
+                  aria-label={ui.devices.deviceNamePlaceholder}
                   onChange={(event) => setManualDeviceName(event.target.value)}
                   placeholder={ui.devices.deviceNamePlaceholder}
                 />
                 <input
                   value={manualDeviceHost}
+                  aria-label={ui.devices.hostPlaceholder}
                   onChange={(event) => setManualDeviceHost(event.target.value)}
                   placeholder={ui.devices.hostPlaceholder}
+                  title={ui.devices.hostHelp}
                 />
                 <button
                   type="button"
@@ -2317,6 +2587,14 @@ function App() {
                   const addedDevice = findPeerDevice(layout, peer);
                   const screenCount =
                     peer.screens.length || addedDevice?.screens.length || 0;
+                  // A client older than this controller can be updated from here.
+                  const localVersion = runtime.discovery.localPeer.appVersion;
+                  const canUpdatePeer =
+                    machineRole === "server" &&
+                    Boolean(addedDevice) &&
+                    !addedDevice?.upgrading &&
+                    Boolean(peer.appVersion && localVersion) &&
+                    compareVersions(peer.appVersion, localVersion) < 0;
 
                   return (
                     <article
@@ -2344,6 +2622,11 @@ function App() {
                                   {ui.devices.inputNotReady}
                                 </span>
                               ) : null}
+                              {canUpdatePeer ? (
+                                <span className="tag-pill tag-pill-warning">
+                                  {ui.settings.clientUpdateAvailable}
+                                </span>
+                              ) : null}
                             </div>
                           </div>
                           <p className="connection-meta">
@@ -2356,6 +2639,15 @@ function App() {
                       </div>
 
                       <div className="connection-actions">
+                        {canUpdatePeer && addedDevice ? (
+                          <button
+                            type="button"
+                            className="primary-button compact-button"
+                            onClick={() => void handleRequestClientUpdate(addedDevice.id)}
+                          >
+                            {ui.settings.updateClient}
+                          </button>
+                        ) : null}
                         {addedDevice ? (
                           renderAddedDeviceActions(addedDevice)
                         ) : (
@@ -2429,14 +2721,6 @@ function App() {
 
       {currentTab === "settings" ? (
         <section className="page-panel">
-          <div className="page-heading">
-            <div>
-              <p className="eyebrow">{ui.settings.eyebrow}</p>
-              <h1>{ui.settings.title}</h1>
-              <p>{ui.settings.subtitle}</p>
-            </div>
-          </div>
-
           <div className="settings-layout">
             <div className="settings-column">
               <section className="surface-card settings-card">
@@ -2457,14 +2741,12 @@ function App() {
                     {ui.roles.client}
                   </button>
                 </div>
-                <p className="muted-copy">{ui.settings.roleCopy}</p>
               </section>
 
               <section className="surface-card settings-card">
                 <h2>{ui.settings.transport}</h2>
-                <p className="muted-copy">{ui.settings.transportCopy}</p>
                 <div className="settings-control-row">
-                  <span>{ui.settings.portMode}</span>
+                  <span>{ui.settings.portMode}<InfoTip label={ui.settings.portMode} text={ui.settings.transportCopy} /></span>
                   <div className="segmented-control">
                     {(["auto", "fixed"] as TransportPortMode[]).map((mode) => (
                       <button
@@ -2483,7 +2765,7 @@ function App() {
                   </div>
                 </div>
                 <div className="settings-control-row">
-                  <span>{ui.settings.portValue}</span>
+                  <span>{ui.settings.portValue}<InfoTip label={ui.settings.portValue} text={ui.settings.portHelp} /></span>
                   <input
                     className="settings-number-input"
                     type="number"
@@ -2588,15 +2870,7 @@ function App() {
                       </button>
                     </div>
                     <div className="settings-control-row">
-                      <span>
-                        {ui.settings.screenSwitchTitle}
-                        <span className="info-tooltip-host" tabIndex={0}>
-                          ⓘ
-                          <span className="info-tooltip">
-                            {ui.settings.screenSwitchCopy}
-                          </span>
-                        </span>
-                      </span>
+                      <span>{ui.settings.screenSwitchTitle}<InfoTip label={ui.settings.screenSwitchTitle} text={ui.settings.screenSwitchCopy} /></span>
                       <div className="screen-switch-hotkeys">
                         {(["left", "right", "up", "down"] as const).map(
                           (dir) => (
@@ -2633,34 +2907,21 @@ function App() {
                   </>
                 ) : null}
                 <div className="settings-control-row">
-                  <span>{ui.settings.clipboard}</span>
-                  <div className="segmented-control">
-                    <button
-                      type="button"
-                      className={layout.clipboardSync ? "active" : ""}
-                      onClick={() => setClipboardSync(true)}
-                    >
-                      {ui.common.enabled}
+                  <span>{ui.settings.clipboard}<InfoTip label={ui.settings.clipboard} text={ui.settings.clipboardCopy} /></span>
+                  <div className="segmented-control" role="group" aria-label={ui.settings.clipboard}>
+                    <button type="button" className={layout.clipboardSync ? "active" : ""}
+                      aria-pressed={layout.clipboardSync} onClick={() => setClipboardSync(true)}>
+                      {ui.settings.autostartOn}
                     </button>
-                    <button
-                      type="button"
-                      className={!layout.clipboardSync ? "active" : ""}
-                      onClick={() => setClipboardSync(false)}
-                    >
-                      {ui.common.disabled}
+                    <button type="button" className={!layout.clipboardSync ? "active" : ""}
+                      aria-pressed={!layout.clipboardSync} onClick={() => setClipboardSync(false)}>
+                      {ui.settings.autostartOff}
                     </button>
                   </div>
                 </div>
+
                 <div className="settings-control-row">
-                  <span>
-                    {ui.settings.fileTransfer}
-                    <span className="info-tooltip-host" tabIndex={0}>
-                      ⓘ
-                      <span className="info-tooltip">
-                        {ui.settings.fileTransferCopy}
-                      </span>
-                    </span>
-                  </span>
+                  <span>{ui.settings.fileTransfer}<InfoTip label={ui.settings.fileTransfer} text={ui.settings.fileTransferCopy} /></span>
                   <div className="segmented-control">
                     <button
                       type="button"
@@ -2678,6 +2939,27 @@ function App() {
                     </button>
                   </div>
                 </div>
+                {machineRole === "server" ? (
+                  <div className="settings-control-row">
+                    <span>{ui.settings.lockSync}<InfoTip label={ui.settings.lockSync} text={ui.settings.lockSyncCopy} /></span>
+                    <div className="segmented-control">
+                      <button
+                        type="button"
+                        className={layout.lockSync ? "active" : ""}
+                        onClick={() => setLockSync(true)}
+                      >
+                        {ui.common.enabled}
+                      </button>
+                      <button
+                        type="button"
+                        className={!layout.lockSync ? "active" : ""}
+                        onClick={() => setLockSync(false)}
+                      >
+                        {ui.common.disabled}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
                 {machineRole === "client" ? (
                   <div className="settings-control-row paired-controller-row">
                     <span className="paired-controller-label">
@@ -2706,7 +2988,7 @@ function App() {
 
               <section className="surface-card modifier-card">
                 <div className="card-title-row">
-                  <h2>{ui.settings.modifierTitle}</h2>
+                  <HelpHeading label={ui.settings.modifierTitle} text={ui.settings.modifierCopy} />
                   <button
                     type="button"
                     className={`switch-button ${layout.modifierRemap ? "active" : ""}`}
@@ -2717,7 +2999,6 @@ function App() {
                       : ui.common.disabled}
                   </button>
                 </div>
-                <p className="muted-copy">{ui.settings.modifierCopy}</p>
                 {(
                   [
                     ["control", ui.settings.modifierRowControl],
@@ -2773,7 +3054,7 @@ function App() {
                     <dd>{activeDevice?.name ?? ui.common.none}</dd>
                   </div>
                   <div>
-                    <dt>{ui.settings.privilege}</dt>
+                    <dt>{ui.settings.privilege}<InfoTip label={ui.settings.privilege} text={ui.settings.privilegeCopy} /></dt>
                     <dd>
                       {runtime.privilege.isElevated
                         ? ui.settings.adminPrivilege
@@ -2789,7 +3070,6 @@ function App() {
                     </div>
                   ) : null}
                 </dl>
-                <p className="muted-copy">{runtime.privilege.detail}</p>
                 {runtime.privilege.canElevate ||
                 canManageInputService ? (
                   <div className="inline-actions">
@@ -2805,7 +3085,7 @@ function App() {
                           : ui.settings.restartAsAdmin}
                       </button>
                     ) : null}
-                    {canManageInputService && !inputServiceInstalled ? (
+                    {canManageInputService ? (
                       <button
                         type="button"
                         className="primary-button compact-button"
@@ -2814,7 +3094,9 @@ function App() {
                       >
                         {isInputServicePending
                           ? ui.common.pending
-                          : ui.settings.installInputService}
+                          : inputServiceInstalled
+                            ? ui.settings.reinstallInputService
+                            : ui.settings.installInputService}
                       </button>
                     ) : null}
                     {canManageInputService && runtime.inputService.installed ? (
@@ -2848,17 +3130,10 @@ function App() {
                     {updateStatusLabel(updateStatus, ui)}
                   </span>
                 </div>
-                <p className="muted-copy">
-                  {isTauri()
-                    ? isPortable
-                      ? ui.settings.portableUpdateCopy
-                      : ui.settings.updatesCopy
-                    : ui.settings.updatesBrowserCopy}
-                </p>
                 <dl className="network-meta compact-meta">
                   <div>
                     <dt>{ui.settings.currentVersion}</dt>
-                    <dd>v{APP_VERSION}</dd>
+                    <dd>v{appVersion}</dd>
                   </div>
                   <div>
                     <dt>{ui.settings.latestVersion}</dt>
@@ -2940,7 +3215,6 @@ function App() {
                       : ui.common.disabled}
                   </button>
                 </div>
-                <p className="muted-copy">{ui.settings.performanceCopy}</p>
                 <div
                   className="performance-chart"
                   aria-label={ui.settings.performance}
@@ -3000,7 +3274,6 @@ function App() {
                       : ui.common.refresh}
                   </button>
                 </div>
-                <p className="muted-copy">{ui.settings.diagnosticsCopy}</p>
                 <dl className="network-meta compact-meta">
                   <div>
                     <dt>{ui.settings.peers}</dt>
@@ -3013,11 +3286,6 @@ function App() {
                     </dd>
                   </div>
                 </dl>
-                {diagnosticInfo ? (
-                  <p className="muted-copy diagnostic-note">
-                    {diagnosticInfo.networkHint} {diagnosticInfo.firewallHint}
-                  </p>
-                ) : null}
                 <div className="inline-actions">
                   <button
                     type="button"
@@ -3035,6 +3303,18 @@ function App() {
                   >
                     {ui.settings.openLogDirectory}
                   </button>
+                  {machineRole === "server" || machineRole === "client" ? (
+                    <button
+                      type="button"
+                      className="secondary-button compact-button"
+                      onClick={() => void handleFetchClientLog()}
+                      disabled={isDiagnosticPending || !isTauri()}
+                    >
+                      {machineRole === "client"
+                        ? ui.settings.fetchServerLog
+                        : ui.settings.fetchClientLog}
+                    </button>
+                  ) : null}
                 </div>
                 {diagnosticMessage ? (
                   <p className="muted-copy diagnostic-message">
@@ -3046,6 +3326,16 @@ function App() {
           </div>
         </section>
       ) : null}
+
+      {editingDevice ? <DeviceSettingsModal key={editingDevice.id} device={editingDevice} language={language}
+        onClose={() => setEditingDevice(null)}
+        onSave={(pointerSpeed, scrollSpeed) => saveModalLayout(current => {
+          if (!current.devices.some(device => device.id === editingDevice.id)) throw new Error(language === "cn" ? "设备已移除。" : "Device no longer available.");
+          return { ...current, devices: current.devices.map(device => device.id === editingDevice.id ? { ...device, pointerSpeed, scrollSpeed } : device) };
+        })}
+        onRepair={() => { setEditingDevice(null); void handleRepairDevice(editingDevice); }}
+        onRemove={() => { handleRemoveDevice(editingDevice.id); setEditingDevice(null); }}
+      /> : null}
 
       {serverPairing ? (
         <div className="pairing-modal-backdrop" role="presentation">
@@ -3173,7 +3463,7 @@ function App() {
               MyKVM
             </a>
           </span>
-          <span>v{APP_VERSION}</span>
+          <span>v{appVersion}</span>
         </span>
         <a
           href={REPOSITORY_URL}
@@ -3565,7 +3855,7 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
         ...device,
         online: true,
         inputReady: peer.inputReady,
-        host: peer.ip || peer.host || device.host,
+        host: device.source === "manual" ? device.host : peer.ip || peer.host || device.host,
         transportPort: peer.transportPort,
         quicPort: peer.quicPort,
         transportPublicKey: peer.transportPublicKey,
@@ -3582,6 +3872,7 @@ function upsertPeerDevice(
   layout: LayoutState,
   peer: LanPeer,
   alias = "",
+  manual = false,
 ): LayoutState {
   const existingIndex = layout.devices.findIndex(
     (device) =>
@@ -3591,7 +3882,7 @@ function upsertPeerDevice(
   );
   const existingDevice =
     existingIndex >= 0 ? layout.devices[existingIndex] : undefined;
-  const nextDevice = createDeviceFromPeer(layout, peer, alias, existingDevice);
+  const nextDevice = createDeviceFromPeer(layout, peer, alias, existingDevice, manual);
   const devices =
     existingIndex >= 0
       ? layout.devices.map((device, index) =>
@@ -3613,14 +3904,15 @@ function createDeviceFromPeer(
   peer: LanPeer,
   alias = "",
   existingDevice?: Device,
+  manual = false,
 ): Device {
-  const id = peerDeviceId(peer);
+  const id = existingDevice?.id ?? peerDeviceId(peer);
 
   return {
     id,
     name: alias || existingDevice?.name || peer.name,
     platform: normalizePlatform(peer.platform),
-    host: peer.ip || peer.host,
+    host: !manual && existingDevice?.source === "manual" ? existingDevice.host : peer.ip || peer.host,
     transportPort: peer.transportPort,
     quicPort: peer.quicPort,
     transportPublicKey: peer.transportPublicKey,
@@ -3629,7 +3921,7 @@ function createDeviceFromPeer(
     online: true,
     inputReady: peer.inputReady,
     role: "client",
-    source: "detected",
+    source: manual || existingDevice?.source === "manual" ? "manual" : "detected",
     screens: createScreensFromPeer(layout, id, peer.screens, existingDevice),
   };
 }
@@ -3782,8 +4074,12 @@ function formatUpdaterError(
   error: unknown,
   fallback: string,
   signatureMismatch: string,
+  manifestUnavailable: string,
 ) {
   const message = formatUnknownError(error, fallback);
+  if (/could not fetch a valid release json/i.test(message)) {
+    return manifestUnavailable;
+  }
   return /different key|signature.*key/i.test(message)
     ? signatureMismatch
     : message;
@@ -3810,10 +4106,11 @@ function findPeerDevice(layout: LayoutState, peer: LanPeer) {
 }
 
 function deviceMatchesPeer(layout: LayoutState, device: Device, peer: LanPeer) {
+  if (device.transportPublicKey.trim().length > 0) {
+    return device.transportPublicKey === peer.transportPublicKey;
+  }
   return (
     device.id === peerDeviceId(peer) ||
-    (device.transportPublicKey.trim().length > 0 &&
-      device.transportPublicKey === peer.transportPublicKey) ||
     sameClusterHost(layout, device, peer)
   );
 }

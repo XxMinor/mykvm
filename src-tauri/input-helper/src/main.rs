@@ -13,22 +13,92 @@ fn main() {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn worker_status_due(
+    previous: Option<&(std::time::Instant, String, String)>,
+    now: std::time::Instant,
+    desktop: &str,
+    error: &str,
+) -> bool {
+    previous.map_or(true, |(written_at, old_desktop, old_error)| {
+        desktop != old_desktop
+            || error != old_error
+            || now.saturating_duration_since(*written_at) >= std::time::Duration::from_secs(1)
+    })
+}
+
+#[cfg(test)]
+mod status_tests {
+    #[test]
+    fn unavailable_desktop_does_not_receive_new_keys() {
+        use mykvm_lib::shared_input::InputCommand;
+        let key = InputCommand::Key { key_code: 0x41, down: true };
+        assert!(!super::worker_can_inject(false, &key));
+        assert!(super::worker_can_inject(true, &key));
+        assert!(super::worker_can_inject(false, &InputCommand::ReleaseAll));
+        assert!(super::worker_can_inject(false, &InputCommand::SecureAttention));
+    }
+
+    #[test]
+    fn status_writes_are_bounded_but_desktop_and_error_changes_are_immediate() {
+        let now = std::time::Instant::now();
+        let previous = (now, "Default".into(), String::new());
+        assert!(super::worker_status_due(None, now, "Default", ""));
+        assert!(!super::worker_status_due(
+            Some(&previous),
+            now,
+            "Default",
+            ""
+        ));
+        assert!(super::worker_status_due(
+            Some(&previous),
+            now,
+            "Winlogon",
+            ""
+        ));
+        assert!(super::worker_status_due(
+            Some(&previous),
+            now,
+            "Default",
+            "denied"
+        ));
+        assert!(super::worker_status_due(
+            Some(&previous),
+            now + std::time::Duration::from_secs(1),
+            "Default",
+            "",
+        ));
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn worker_can_inject(desktop_ready: bool, command: &mykvm_lib::shared_input::InputCommand) -> bool {
+    desktop_ready || matches!(command,
+        mykvm_lib::shared_input::InputCommand::ReleaseAll
+        | mykvm_lib::shared_input::InputCommand::SecureAttention)
+}
+
 #[cfg(target_os = "windows")]
 mod windows_helper {
     use std::{
         env,
-        ffi::OsString,
-        fs, mem,
+        ffi::{OsStr, OsString},
+        fs::{self, OpenOptions},
+        io::Write as _,
+        mem,
         path::PathBuf,
         ptr,
-        sync::mpsc,
+        sync::{mpsc, OnceLock},
+        thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use mykvm_lib::{
+        headless_client::{self, HeadlessClientHandle},
         shared_input::{
             decode_input_command, input_helper_status_path, input_pipe_name, InputCommand,
-            INPUT_SERVICE_NAME,
+            INPUT_SERVICE_NAME, SERVICE_CONFIG_PATH_ARG, SERVICE_CONTROL_PIPE,
+            SERVICE_OWNER_SID_ARG,
         },
         windows_input::{self, DesktopAttachment},
     };
@@ -36,7 +106,7 @@ mod windows_helper {
         define_windows_service,
         service::{
             ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-            ServiceType, SessionChangeReason,
+            ServiceType,
         },
         service_control_handler::{self, ServiceControlHandlerResult},
         service_dispatcher,
@@ -56,7 +126,9 @@ mod windows_helper {
             TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
             TOKEN_QUERY, TOKEN_USER,
         },
-        Storage::FileSystem::{ReadFile, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND},
+        Storage::FileSystem::{
+            ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+        },
         System::{
             Pipes::{
                 ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
@@ -76,24 +148,85 @@ mod windows_helper {
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
     const INVALID_SESSION_ID: u32 = u32::MAX;
     const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
+    static SERVICE_ARGS: OnceLock<ServiceArgs> = OnceLock::new();
 
     pub fn main() -> Result<(), String> {
-        let mut args = env::args().skip(1);
-        match args.next().as_deref() {
-            Some("--service") => service_dispatcher::start(INPUT_SERVICE_NAME, ffi_service_main)
-                .map_err(|error| format!("start service dispatcher: {error}")),
-            Some("--worker") => run_worker(),
+        let mut args = env::args_os().skip(1);
+        match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("--service") => {
+                let service_args = ServiceArgs::parse(args).map_err(|error| {
+                    log_service_error("parse service arguments", &error);
+                    error
+                })?;
+                if SERVICE_ARGS.set(service_args).is_err() {
+                    return Err("service arguments already initialized".into());
+                }
+                service_dispatcher::start(INPUT_SERVICE_NAME, ffi_service_main)
+                    .map_err(|error| format!("start service dispatcher: {error}"))
+            }
+            Some("--worker") => run_worker().map_err(|error| {
+                log_service_error("input worker stopped with error", &error);
+                error
+            }),
             _ => Err("expected --service or --worker".into()),
+        }
+    }
+
+    #[derive(Debug)]
+    struct ServiceArgs {
+        config_path: Option<PathBuf>,
+        owner_sid: Option<String>,
+    }
+
+    impl ServiceArgs {
+        fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Self, String> {
+            let mut config_path = None;
+            let mut owner_sid = None;
+            while let Some(arg) = args.next() {
+                if arg == OsStr::new(SERVICE_CONFIG_PATH_ARG) {
+                    config_path =
+                        Some(PathBuf::from(args.next().ok_or_else(|| {
+                            format!("missing value for {SERVICE_CONFIG_PATH_ARG}")
+                        })?));
+                } else if arg == OsStr::new(SERVICE_OWNER_SID_ARG) {
+                    owner_sid = Some(
+                        args.next()
+                            .ok_or_else(|| format!("missing value for {SERVICE_OWNER_SID_ARG}"))?
+                            .into_string()
+                            .map_err(|_| "owner SID is not valid Unicode".to_string())?,
+                    );
+                } else {
+                    return Err(format!(
+                        "unexpected service argument: {}",
+                        arg.to_string_lossy()
+                    ));
+                }
+            }
+
+            match (&config_path, &owner_sid) {
+                (Some(_), None) => return Err(format!("missing {SERVICE_OWNER_SID_ARG}")),
+                (None, Some(_)) => return Err(format!("missing {SERVICE_CONFIG_PATH_ARG}")),
+                _ => {}
+            }
+            Ok(Self {
+                config_path,
+                owner_sid,
+            })
         }
     }
 
     define_windows_service!(ffi_service_main, service_main);
 
     fn service_main(_arguments: Vec<OsString>) {
-        let _ = run_service();
+        if let Err(error) = run_service() {
+            log_service_error("service stopped with error", &error.to_string());
+        }
     }
 
     fn run_service() -> windows_service::Result<()> {
+        let service_args = SERVICE_ARGS
+            .get()
+            .expect("service arguments are initialized before dispatch");
         let (event_tx, event_rx) = mpsc::channel::<ServiceEvent>();
         let handler_tx = event_tx.clone();
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
@@ -103,8 +236,8 @@ mod windows_helper {
                     let _ = handler_tx.send(ServiceEvent::Stop);
                     ServiceControlHandlerResult::NoError
                 }
-                ServiceControl::SessionChange(change) => {
-                    let _ = handler_tx.send(ServiceEvent::SessionChange(change.reason));
+                ServiceControl::SessionChange(_) => {
+                    let _ = handler_tx.send(ServiceEvent::SessionChange);
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -123,24 +256,68 @@ mod windows_helper {
         })?;
 
         let mut worker = WorkerProcess::default();
-        let _ = worker.restart();
+        restart_worker(&mut worker);
+        let mut receiver = service_args.config_path.as_ref().and_then(start_receiver);
+        let mut network_leased = false;
+        let mut network_shutdown_failed = false;
+        if let Some(owner_sid) = service_args.owner_sid.clone() {
+            let control_tx = event_tx.clone();
+            if let Err(error) = thread::Builder::new()
+                .name("mykvm-service-control".into())
+                .spawn(move || run_control_pipe(control_tx, owner_sid))
+            {
+                log_service_error("start service control pipe", &error.to_string());
+            }
+        }
 
         loop {
             match event_rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(ServiceEvent::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Ok(ServiceEvent::SessionChange(reason)) => {
-                    if should_restart_worker(reason) {
-                        let _ = worker.restart();
+                Ok(ServiceEvent::Takeover(ack)) => {
+                    if network_shutdown_failed {
+                        let _ = ack.send(false);
+                        continue;
                     }
+                    if let Err(error) = stop_receiver(&mut receiver) {
+                        log_service_error("stop headless receiver for GUI takeover", &error);
+                        network_shutdown_failed = true;
+                        network_leased = true;
+                        let _ = ack.send(false);
+                        continue;
+                    }
+                    network_leased = true;
+                    let _ = ack.send(true);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if worker.has_exited() {
-                        let _ = worker.restart();
+                Ok(ServiceEvent::LeaseReleased) => {
+                    if let Err(error) = stop_receiver(&mut receiver) {
+                        log_service_error("stop headless receiver after GUI lease", &error);
+                    }
+                    network_leased = false;
+                    receiver = service_args.config_path.as_ref().and_then(start_receiver);
+                }
+                Ok(ServiceEvent::SessionChange) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if worker.needs_restart() {
+                        restart_worker(&mut worker);
+                    }
+                    if !network_leased && receiver.is_none() {
+                        receiver = service_args.config_path.as_ref().and_then(start_receiver);
                     }
                 }
             }
         }
 
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::StopPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 1,
+            wait_hint: Duration::from_secs(7),
+            process_id: None,
+        })?;
+        if let Err(error) = stop_receiver(&mut receiver) {
+            log_service_error("stop headless receiver with service", &error);
+        }
         worker.stop();
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
@@ -157,19 +334,118 @@ mod windows_helper {
 
     enum ServiceEvent {
         Stop,
-        SessionChange(SessionChangeReason),
+        SessionChange,
+        Takeover(mpsc::Sender<bool>),
+        LeaseReleased,
     }
 
-    fn should_restart_worker(reason: SessionChangeReason) -> bool {
-        matches!(
-            reason,
-            SessionChangeReason::ConsoleConnect
-                | SessionChangeReason::RemoteConnect
-                | SessionChangeReason::SessionLogon
-                | SessionChangeReason::SessionLogoff
-                | SessionChangeReason::SessionCreate
-                | SessionChangeReason::SessionTerminate
-        )
+    fn restart_worker(worker: &mut WorkerProcess) {
+        if let Err(error) = worker.restart() {
+            log_service_error("start session input worker", &error);
+        }
+    }
+
+    fn start_receiver(config_path: &PathBuf) -> Option<HeadlessClientHandle> {
+        match headless_client::start(config_path.clone()) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                log_service_error("start headless receiver", &error);
+                None
+            }
+        }
+    }
+
+    fn stop_receiver(receiver: &mut Option<HeadlessClientHandle>) -> Result<(), String> {
+        if let Some(mut handle) = receiver.take() {
+            handle.stop_and_wait()?;
+        }
+        Ok(())
+    }
+
+    fn run_control_pipe(event_tx: mpsc::Sender<ServiceEvent>, owner_sid: String) {
+        loop {
+            let pipe = match create_control_pipe(&owner_sid) {
+                Ok(pipe) => pipe,
+                Err(error) => {
+                    log_service_error("create service control pipe", &error);
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+            let pipe = HandleGuard(pipe);
+            if !connect_pipe(pipe.0) {
+                continue;
+            }
+
+            let mut request = [0_u8; 1];
+            if !matches!(read_exact_pipe(pipe.0, &mut request), Ok(true)) || request[0] != 1 {
+                unsafe {
+                    let _ = DisconnectNamedPipe(pipe.0);
+                }
+                continue;
+            }
+
+            let (ack_tx, ack_rx) = mpsc::channel();
+            if event_tx.send(ServiceEvent::Takeover(ack_tx)).is_err() {
+                return;
+            }
+            if !matches!(ack_rx.recv(), Ok(true)) {
+                unsafe {
+                    let _ = DisconnectNamedPipe(pipe.0);
+                }
+                continue;
+            }
+
+            let acknowledged = write_control_ack(pipe.0);
+            if acknowledged {
+                let mut held = [0_u8; 1];
+                let _ = read_exact_pipe(pipe.0, &mut held);
+            }
+            unsafe {
+                let _ = DisconnectNamedPipe(pipe.0);
+            }
+            drop(pipe);
+
+            if event_tx.send(ServiceEvent::LeaseReleased).is_err() {
+                return;
+            }
+        }
+    }
+
+    fn create_control_pipe(owner_sid: &str) -> Result<HANDLE, String> {
+        let pipe_name_w = wide_null(SERVICE_CONTROL_PIPE);
+        let security = PipeSecurity::for_owner_sid(owner_sid)?;
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                pipe_name_w.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                1,
+                1,
+                0,
+                &security.attributes,
+            )
+        };
+        if pipe == INVALID_HANDLE_VALUE {
+            return Err(last_error("CreateNamedPipeW(service control)"));
+        }
+        Ok(pipe)
+    }
+
+    fn write_control_ack(pipe: HANDLE) -> bool {
+        let ack = [1_u8];
+        let mut written = 0_u32;
+        unsafe {
+            WriteFile(
+                pipe,
+                ack.as_ptr(),
+                ack.len() as u32,
+                &mut written,
+                ptr::null_mut(),
+            ) != 0
+                && written == ack.len() as u32
+        }
     }
 
     #[derive(Default)]
@@ -179,6 +455,19 @@ mod windows_helper {
     }
 
     impl WorkerProcess {
+        /// True when the worker died, or the physical console moved to a
+        /// different session while the worker stayed behind. An RDP attach or
+        /// detach swaps the console to a LogonUI session (and back on unlock)
+        /// without a session-change reason that names the console (issue #21),
+        /// so the 2s service tick polls for drift instead of trusting reasons.
+        fn needs_restart(&mut self) -> bool {
+            if self.has_exited() {
+                return true;
+            }
+            let console_session = unsafe { WTSGetActiveConsoleSessionId() };
+            console_session != INVALID_SESSION_ID && console_session != self.session_id
+        }
+
         fn restart(&mut self) -> Result<(), String> {
             self.stop();
             let session_id = unsafe { WTSGetActiveConsoleSessionId() };
@@ -259,43 +548,75 @@ mod windows_helper {
 
             let exe =
                 env::current_exe().map_err(|error| format!("resolve helper exe path: {error}"))?;
-            let command = format!("\"{}\" --worker", exe.display());
-            let mut command_w = wide_null(&command);
-            let mut desktop_w = wide_null("WinSta0\\Default");
             let current_dir = exe
                 .parent()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            let current_dir_w = wide_null(&current_dir.to_string_lossy());
 
-            let mut startup_info = STARTUPINFOW {
-                cb: mem::size_of::<STARTUPINFOW>() as u32,
-                lpDesktop: desktop_w.as_mut_ptr(),
-                ..Default::default()
-            };
-            let mut process_info = PROCESS_INFORMATION::default();
-            if CreateProcessAsUserW(
+            let default_error = match spawn_worker_on_desktop(
                 primary_token,
-                ptr::null(),
-                command_w.as_mut_ptr(),
-                ptr::null(),
-                ptr::null(),
-                0,
-                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                ptr::null(),
-                current_dir_w.as_ptr(),
-                &mut startup_info,
-                &mut process_info,
-            ) == 0
-            {
-                return Err(last_error("CreateProcessAsUserW"));
+                &exe,
+                &current_dir,
+                "WinSta0\\Default",
+            ) {
+                Ok(handle) => return Ok(handle),
+                Err(error) => {
+                    log_service_error("start session input worker on WinSta0\\Default", &error);
+                    error
+                }
+            };
+            match spawn_worker_on_desktop(primary_token, &exe, &current_dir, "WinSta0\\Winlogon") {
+                Ok(handle) => Ok(handle),
+                Err(error) => {
+                    log_service_error("start session input worker on WinSta0\\Winlogon", &error);
+                    Err(format!(
+                        "worker launch failed on Default ({default_error}) and Winlogon ({error})"
+                    ))
+                }
             }
-
-            if !process_info.hThread.is_null() {
-                let _ = CloseHandle(process_info.hThread);
-            }
-            Ok(process_info.hProcess)
         }
+    }
+
+    unsafe fn spawn_worker_on_desktop(
+        primary_token: HANDLE,
+        exe: &PathBuf,
+        current_dir: &PathBuf,
+        desktop: &str,
+    ) -> Result<HANDLE, String> {
+        let command = format!("\"{}\" --worker", exe.display());
+        let mut command_w = wide_null(&command);
+        let mut desktop_w = wide_null(desktop);
+        let current_dir_w = wide_null(&current_dir.to_string_lossy());
+        let mut startup_info = STARTUPINFOW {
+            cb: mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: desktop_w.as_mut_ptr(),
+            ..Default::default()
+        };
+        let mut process_info = PROCESS_INFORMATION::default();
+        if CreateProcessAsUserW(
+            primary_token,
+            ptr::null(),
+            command_w.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            ptr::null(),
+            current_dir_w.as_ptr(),
+            &mut startup_info,
+            &mut process_info,
+        ) == 0
+        {
+            let code = GetLastError();
+            return Err(format!(
+                "CreateProcessAsUserW({desktop}) failed with Windows error {code}"
+            ));
+        }
+
+        if !process_info.hThread.is_null() {
+            let _ = CloseHandle(process_info.hThread);
+        }
+        Ok(process_info.hProcess)
     }
 
     fn run_worker() -> Result<(), String> {
@@ -384,6 +705,9 @@ mod windows_helper {
                 .map(String::as_str)
                 .map_err(String::as_str),
         );
+        if !super::worker_can_inject(desktop_result.is_ok(), command) {
+            return;
+        }
 
         match command {
             InputCommand::ReleaseAll => {
@@ -396,17 +720,27 @@ mod windows_helper {
     }
 
     fn write_worker_desktop_status(session_id: u32, desktop_result: Result<&str, &str>) {
-        let path = input_helper_status_path(session_id);
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
+        static LAST_STATUS: std::sync::Mutex<Option<(std::time::Instant, String, String)>> =
+            std::sync::Mutex::new(None);
         let (desktop, error) = match desktop_result {
             Ok(name) => (name, ""),
             Err(error) => ("", error),
         };
+        let Ok(mut previous) = LAST_STATUS.lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if !super::worker_status_due(previous.as_ref(), now, desktop, error) {
+            return;
+        }
+        let path = input_helper_status_path(session_id);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let body = format!("{}\n{}\n{}\n", now_ms(), desktop, error);
-        let _ = fs::write(path, body);
+        if fs::write(path, body).is_ok() {
+            *previous = Some((now, desktop.into(), error.into()));
+        }
     }
 
     fn now_ms() -> u64 {
@@ -416,6 +750,26 @@ mod windows_helper {
             .unwrap_or(0)
     }
 
+    fn log_service_error(context: &str, error: &str) {
+        let base = env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        let directory = base.join("MyKVM");
+        if fs::create_dir_all(&directory).is_err() {
+            return;
+        }
+        let path = directory.join("service.log");
+        if fs::metadata(&path)
+            .map(|metadata| metadata.len() > 1024 * 1024)
+            .unwrap_or(false)
+        {
+            let _ = fs::write(&path, []);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{} {context}: {error}", now_ms());
+        }
+    }
+
     fn create_input_pipe(session_id: u32) -> Result<HANDLE, String> {
         let pipe_name = input_pipe_name(session_id);
         let pipe_name_w = wide_null(&pipe_name);
@@ -423,7 +777,7 @@ mod windows_helper {
         let pipe = unsafe {
             CreateNamedPipeW(
                 pipe_name_w.as_ptr(),
-                PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 PIPE_BUFFER_SIZE,
@@ -490,6 +844,18 @@ mod windows_helper {
         fn for_session(session_id: u32) -> Result<Self, String> {
             let user_sid = session_user_sid(session_id).unwrap_or_else(|| "IU".into());
             let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})");
+            Self::from_sddl(&sddl)
+        }
+
+        fn for_owner_sid(owner_sid: &str) -> Result<Self, String> {
+            if owner_sid.is_empty() {
+                return Err("service owner SID is empty".into());
+            }
+            let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{owner_sid})");
+            Self::from_sddl(&sddl)
+        }
+
+        fn from_sddl(sddl: &str) -> Result<Self, String> {
             let sddl_w = wide_null(&sddl);
             let mut security_descriptor = ptr::null_mut();
             let ok = unsafe {
@@ -604,5 +970,53 @@ mod windows_helper {
             len += 1;
         }
         String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_service_config_and_owner_sid() {
+            let args = [
+                SERVICE_CONFIG_PATH_ARG,
+                r"C:\Users\client\AppData\Roaming\com.xzhpl.mykvm\layout.json",
+                SERVICE_OWNER_SID_ARG,
+                "S-1-5-21-1-2-3-1001",
+            ]
+            .map(OsString::from)
+            .into_iter();
+
+            let parsed = ServiceArgs::parse(args).expect("parse service arguments");
+            assert_eq!(
+                parsed.config_path,
+                Some(PathBuf::from(
+                    r"C:\Users\client\AppData\Roaming\com.xzhpl.mykvm\layout.json"
+                ))
+            );
+            assert_eq!(parsed.owner_sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));
+        }
+
+        #[test]
+        fn accepts_legacy_worker_only_service_arguments() {
+            let parsed =
+                ServiceArgs::parse(std::iter::empty()).expect("parse legacy service arguments");
+            assert!(parsed.config_path.is_none());
+            assert!(parsed.owner_sid.is_none());
+        }
+
+        #[test]
+        fn rejects_partial_headless_service_arguments() {
+            let args = [
+                SERVICE_CONFIG_PATH_ARG,
+                r"C:\Users\client\AppData\Roaming\com.xzhpl.mykvm\layout.json",
+            ]
+            .map(OsString::from)
+            .into_iter();
+            assert_eq!(
+                ServiceArgs::parse(args).unwrap_err(),
+                format!("missing {SERVICE_OWNER_SID_ARG}")
+            );
+        }
     }
 }

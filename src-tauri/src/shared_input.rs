@@ -9,6 +9,9 @@ pub const FORWARD_BUTTON_MASK: u64 = 1 << 4;
 pub const INPUT_PIPE_PREFIX: &str = r"\\.\pipe\mykvm-input-s";
 pub const INPUT_SERVICE_NAME: &str = "MyKVMInputService";
 pub const INPUT_SERVICE_DISPLAY_NAME: &str = "MyKVM Lock Screen Input Service";
+pub const SERVICE_CONTROL_PIPE: &str = r"\\.\pipe\mykvm-service-control";
+pub const SERVICE_CONFIG_PATH_ARG: &str = "--config-path";
+pub const SERVICE_OWNER_SID_ARG: &str = "--owner-sid";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -33,6 +36,12 @@ pub enum MouseButton {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum InputCommand {
+    // Receiver-only on macOS; the wire event remains a legacy MouseMove.
+    #[cfg(target_os = "macos")]
+    ParkCursor {
+        x: i32,
+        y: i32,
+    },
     MouseMove {
         x: i32,
         y: i32,

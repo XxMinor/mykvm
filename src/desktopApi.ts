@@ -33,6 +33,10 @@ export interface FileTransferSummary {
 // renders the layout editor; the real runtime lives in the Tauri backend.
 const STUB_DETAIL = 'Available only in the Tauri desktop runtime.'
 
+export async function setHotkeyRecording(recording: boolean, captured: string | null = null): Promise<void> {
+  if (isTauri()) await invoke('set_hotkey_recording', { recording, captured });
+}
+
 const BROWSER_RUNTIME: RuntimeStatus = {
   started: false,
   transport: { state: 'stubbed', detail: STUB_DETAIL },
@@ -83,10 +87,12 @@ const BROWSER_RUNTIME: RuntimeStatus = {
   },
 }
 
+let browserLayout = defaultLayout
+
 export async function loadAppState(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
     return {
-      layout: defaultLayout,
+      layout: browserLayout,
       runtime: BROWSER_RUNTIME,
     }
   }
@@ -96,6 +102,7 @@ export async function loadAppState(): Promise<AppStateSnapshot> {
 
 export async function saveLayout(layout: LayoutState): Promise<AppStateSnapshot> {
   if (!isTauri()) {
+    browserLayout = layout
     return {
       layout,
       runtime: BROWSER_RUNTIME,
@@ -185,6 +192,16 @@ export async function stopRuntime(): Promise<RuntimeStatus> {
   }
 
   return invoke<RuntimeStatus>('stop_runtime')
+}
+
+export async function pasteRemoteClipboard(): Promise<void> {
+  if (!isTauri()) return
+  await invoke('paste_remote_clipboard')
+}
+
+export async function cancelFileTransfer(transferId: string): Promise<boolean> {
+  if (!isTauri()) return false
+  return invoke<boolean>('cancel_file_transfer', { transferId })
 }
 
 export async function scanLanPeers(): Promise<DiscoveryStatus> {
@@ -297,6 +314,22 @@ export async function sendFilesToDevice(deviceId: string, paths: string[]): Prom
   return invoke<FileTransferSummary>('send_files_to_device', { deviceId, paths })
 }
 
+export async function requestClientUpdate(deviceId: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('request_client_update', { deviceId })
+}
+
+export async function fetchClientLog(deviceId: string): Promise<string> {
+  if (!isTauri()) {
+    return ''
+  }
+
+  return invoke<string>('fetch_client_log', { deviceId })
+}
+
 export async function relaunchApp(): Promise<void> {
   if (!isTauri()) {
     window.location.reload()
@@ -379,7 +412,8 @@ export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
   }
 
   const { check } = await import('@tauri-apps/plugin-updater')
-  const update = await check()
+  // A stalled manifest fetch left the check spinning (PR #22).
+  const update = await check({ timeout: 20_000 })
 
   if (!update) {
     return { available: false }
@@ -410,17 +444,28 @@ export async function installAppUpdate(): Promise<void> {
     import('@tauri-apps/plugin-updater'),
     import('@tauri-apps/plugin-process'),
   ])
-  const update = await check()
+  // A stalled manifest fetch left the check spinning (PR #22).
+  const update = await check({ timeout: 20_000 })
 
   if (!update) {
     return
   }
 
   await setAppUpgrading(true).catch(() => {})
+  let handedOff = false
   try {
-    await update.downloadAndInstall()
+    await update.download()
+    // On Windows install() ends this process without the exit hooks: close
+    // the network first so the controller reconnects at once (to the input
+    // service while the installer runs) instead of timing out.
+    await invoke('prepare_update_install').catch(() => {})
+    handedOff = true
+    await update.install()
   } catch (error) {
     await setAppUpgrading(false).catch(() => {})
+    if (handedOff) {
+      await startRuntime().catch(() => {})
+    }
     throw error
   }
   await relaunch()
