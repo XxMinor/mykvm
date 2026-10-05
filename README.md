@@ -1,8 +1,10 @@
 # MyKVM
 
-**One keyboard, one mouse, one clipboard — shared across your Mac, Windows, and Linux machines on the same LAN.**
+**One keyboard, one mouse, one clipboard — shared across your Mac and Windows machines on the same LAN.**
 
 Move your cursor off the edge of one screen and it lands on the next machine. Your keyboard follows, and the clipboard (text and images) syncs automatically. No KVM hardware, no cables.
+
+Linux builds are available, but Linux keyboard/mouse capture and injection are not implemented yet ([#11](https://github.com/XxMinor/mykvm/issues/11), [#31](https://github.com/XxMinor/mykvm/issues/31)).
 
 [![Download](https://img.shields.io/github/v/release/XxMinor/mykvm?label=Download&style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
 [![Stars](https://img.shields.io/github/stars/XxMinor/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/stargazers)

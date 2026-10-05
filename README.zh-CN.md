@@ -1,8 +1,10 @@
 # MyKVM
 
-**一套键盘、一只鼠标、一份剪贴板 —— 在同一局域网内的 Mac、Windows、Linux 之间共享。**
+**一套键盘、一只鼠标、一份剪贴板 —— 在同一局域网内的 Mac 和 Windows 之间共享。**
 
 把光标移出一台屏幕的边缘，它就落到下一台机器上；键盘随之切换，剪贴板（文本和图片）自动同步。不需要 KVM 硬件，也不用插线。
+
+Linux 提供安装包，但 Linux 键鼠采集和注入尚未实现（[#11](https://github.com/XxMinor/mykvm/issues/11)、[#31](https://github.com/XxMinor/mykvm/issues/31)）。
 
 [![下载](https://img.shields.io/github/v/release/XxMinor/mykvm?label=%E4%B8%8B%E8%BD%BD&style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
 [![Stars](https://img.shields.io/github/stars/XxMinor/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/stargazers)

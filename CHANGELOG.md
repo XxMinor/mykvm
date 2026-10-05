@@ -26,6 +26,11 @@ release will reuse them).
 
 ### Fixed
 
+- Screen-switch shortcuts restore the cursor position used before leaving each device and screen. Only a first visit without a remembered position lands at the center; hidden client parking does not overwrite the remembered position.
+- MyKVM shortcuts release logical keys on both devices while tracking physically held modifiers separately. Holding Alt for repeated screen switches remains possible; releasing Alt stops plain arrow keys from switching screens.
+- macOS: leaving a controlled Mac requests cursor hiding until the next movement. Re-entry, local mouse movement, and stopping sharing restore it; ordered cursor messages prevent delayed parking from overriding re-entry.
+- macOS: remote wheel events use independent input state and explicit discrete scrolling flags. Rate-limited scroll logs help distinguish repeated remote events from continued scrolling inside an application.
+- Windows: startup requests administrator privileges through the normal UAC prompt, so elevated desktop programs do not require a separate trip to Settings.
 - Settings and Devices pages drop redundant page introductions; concise help is available beside labels. Clipboard sync has a single switch and old on-demand settings migrate to automatic sync without changing the switch state.
 - Windows: keyboard capture uses a separate message thread and a fresh worker after screenshot capture or a remote-screen handoff. Snipaste Ctrl+F1 temporarily returns both inputs to Windows for capture, then restores the original client. Remote cursor hiding uses a dedicated non-activating owner window.
 - The separate screen-protection UI and local-lock shortcut are removed. Existing quick start/stop shortcuts are preserved and legacy protection settings are disabled during migration.
@@ -72,6 +77,16 @@ release will reuse them).
 
 - macOS: opening MyKVM while it is already running (a second .app copy, `open -n`, or launching from a mounted DMG) now brings the running window to the front instead of starting a second process that fights the first over the network ports.
 - Windows: keyboard and mouse from the controller now keep working while a Remote Desktop session owns the machine and after it disconnects, so you can unlock the physical screen remotely instead of walking over to it (#21). The lock-screen input service now follows the physical console session when Remote Desktop swaps it, and the app reaches the service across that swap.
+
+### Known limitations
+
+- Linux keyboard/mouse capture and injection are not implemented yet (#11, #31). Linux packages do not provide input sharing.
+- Native cross-screen file dragging remains experimental. Folder transfer and file clipboard sharing require both peers to be updated.
+- The reported intermittent continuous scrolling still needs reproduction with the new event logs; the wheel-state changes have not yet been confirmed to resolve every case.
+
+## v0.9.12
+
+### Fixed
 
 - Keyboard, mouse, and clipboard could fail to connect between machines — the QUIC handshake rejected the peer with `invalid peer certificate: BadSignature`. The transport now pins the device's advertised certificate directly instead of running brittle chain validation over a self-signed certificate, which fixes cross-platform (macOS ↔ Windows) handshakes.
 

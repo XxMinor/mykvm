@@ -265,6 +265,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Test frontend
+        run: npm test
+
+      - name: Test Tauri backend and input helper
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --locked
+
       - name: Validate updater signing key
         shell: bash
         env:
