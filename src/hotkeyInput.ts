@@ -33,6 +33,7 @@ export function hotkeyFromKeyboardEvent(
   metaKeyLabel: MetaKeyLabel = "meta",
 ): string | null {
   if (event.key === "Backspace" || event.key === "Delete") {
+    if (event.ctrlKey || event.altKey || event.shiftKey || event.metaKey) return null;
     return "disabled";
   }
 

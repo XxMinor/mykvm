@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - bate
 
 env:
   CARGO_HTTP_MULTIPLEXING: "false"
@@ -13,7 +14,11 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +29,7 @@ jobs:
           cache: npm
 
       - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -44,5 +50,11 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Test frontend
+        run: npm test
+
       - name: Check Tauri backend
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+        run: cargo check --manifest-path src-tauri/Cargo.toml --workspace --all-targets --locked
+
+      - name: Test Tauri backend and input helper
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --locked

@@ -17,6 +17,46 @@ pub(crate) struct ClipboardImage {
 pub(crate) enum ClipboardContent {
     Text(String),
     Image(ClipboardImage),
+    Rich(crate::rich_clipboard::RichText),
+}
+
+pub(crate) enum ClipboardSnapshot {
+    Content(ClipboardContent),
+    Files(Vec<String>),
+}
+
+impl ClipboardSnapshot {
+    pub(crate) fn signature(&self) -> String {
+        match self {
+            Self::Content(content) => content.signature(),
+            Self::Files(paths) => files_signature(paths),
+        }
+    }
+
+    pub(crate) fn send_key(&self, version: Option<u64>) -> String {
+        let signature = self.signature();
+        match self {
+            // Copying the same folder again must resend changed children,
+            // without walking or hashing that folder on every clipboard poll.
+            Self::Files(_) => format!("{signature}:copy:{version:?}"),
+            Self::Content(_) => signature,
+        }
+    }
+}
+
+pub(crate) fn files_signature(paths: &[String]) -> String {
+    // Encode boundaries so ["ab", "c"] and ["a", "bc"] are distinct.
+    let encoded = serde_json::to_vec(paths).unwrap_or_default();
+    format!("files:{:016x}", clipboard_signature_hash(&encoded))
+}
+
+pub(crate) fn read_snapshot() -> Option<ClipboardSnapshot> {
+    let paths = crate::rich_clipboard::read_files();
+    if !paths.is_empty() {
+        Some(ClipboardSnapshot::Files(paths))
+    } else {
+        read_content().map(ClipboardSnapshot::Content)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,10 +75,21 @@ fn clipboard_signature_hash(bytes: &[u8]) -> u64 {
 impl ClipboardContent {
     pub(crate) fn is_oversized(&self) -> bool {
         match self {
+            ClipboardContent::Rich(rich) => rich.text.len() > CLIPBOARD_MAX_TEXT_BYTES
+                || rich.html.as_ref().is_some_and(|s| s.len() > crate::rich_clipboard::MAX_FORMAT_BYTES)
+                || rich.rtf.as_ref().is_some_and(|s| s.len() > crate::rich_clipboard::MAX_FORMAT_BYTES),
             ClipboardContent::Text(text) => text.len() > CLIPBOARD_MAX_TEXT_BYTES,
             ClipboardContent::Image(image) => {
                 // base64 inflates ~4/3; compare against the decoded RGBA budget.
-                image.rgba_base64.len() / 4 * 3 > CLIPBOARD_MAX_IMAGE_BYTES
+                let padding = image
+                    .rgba_base64
+                    .bytes()
+                    .rev()
+                    .take(2)
+                    .take_while(|byte| *byte == b'=')
+                    .count();
+                (image.rgba_base64.len() / 4 * 3).saturating_sub(padding)
+                    > CLIPBOARD_MAX_IMAGE_BYTES
             }
         }
     }
@@ -47,6 +98,9 @@ impl ClipboardContent {
     /// suppress echoing content we just received from a peer.
     pub(crate) fn signature(&self) -> String {
         match self {
+            ClipboardContent::Rich(rich) => format!("rich:{:x}:{:x}:{:x}", clipboard_signature_hash(rich.text.as_bytes()),
+                clipboard_signature_hash(rich.html.as_deref().unwrap_or("").as_bytes()),
+                clipboard_signature_hash(rich.rtf.as_deref().unwrap_or(&[]))),
             ClipboardContent::Text(text) => format!("text:{text}"),
             ClipboardContent::Image(image) => {
                 format!(
@@ -70,7 +124,14 @@ pub(crate) fn write_text(text: &str) -> Result<(), String> {
 }
 
 pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
+    // arboard's macOS image write is not wrapped in an autorelease pool. Synced
+    // clipboards are written on long-lived QUIC worker threads, which have no
+    // pool, so each received image's NSImage/TIFF temporaries (the whole image)
+    // were never freed: a few dozen screenshots reached ~2 GB (discussion #32).
+    #[cfg(target_os = "macos")]
+    let _pool = crate::input::macos_appkit::autorelease_pool();
     match content {
+        ClipboardContent::Rich(rich) => crate::rich_clipboard::write(rich),
         ClipboardContent::Text(text) => write_text(text),
         ClipboardContent::Image(image) => write_image(image),
     }
@@ -80,7 +141,30 @@ pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
 /// when the platform can identify a current image format, wait for an image
 /// read instead of falling back to stale text from a previous clipboard format.
 pub(crate) fn read_content() -> Option<ClipboardContent> {
+    // Same reason as `write_content`; arboard pools its image read but not
+    // `Clipboard::new()`, and this runs on the pool-less clipboard thread.
+    #[cfg(target_os = "macos")]
+    let _pool = crate::input::macos_appkit::autorelease_pool();
+    if !crate::rich_clipboard::read_files().is_empty() { return None; }
+    if let Some(rich) = crate::rich_clipboard::read() { return Some(ClipboardContent::Rich(rich)); }
     read_content_for_hint(content_hint(), read_text_content, read_image_content)
+}
+
+pub(crate) fn change_count() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::input::macos_appkit::clipboard_change_count()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let sequence =
+            unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        (sequence != 0).then_some(u64::from(sequence))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 fn read_content_for_hint<F, G>(
@@ -131,6 +215,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_clipboard_recopies_resend_without_changing_the_echo_signature() {
+        let files = ClipboardSnapshot::Files(vec!["/folder".into(), "/中文.txt".into()]);
+        assert_ne!(files.send_key(Some(1)), files.send_key(Some(2)));
+        assert_eq!(files.signature(), files_signature(&["/folder".into(), "/中文.txt".into()]));
+        assert_ne!(files_signature(&["ab".into(), "c".into()]), files_signature(&["a".into(), "bc".into()]));
+        let text = ClipboardSnapshot::Content(ClipboardContent::Text("same text".into()));
+        assert_eq!(text.send_key(Some(1)), text.send_key(Some(2)));
+    }
+
+    #[test]
+    fn image_budget_accounts_for_base64_padding() {
+        let encoded_len = CLIPBOARD_MAX_IMAGE_BYTES.div_ceil(3) * 4;
+        let mut image = ClipboardImage {
+            width: 8192,
+            height: 1024,
+            rgba_base64: "A".repeat(encoded_len - 1) + "=",
+        };
+        assert!(!ClipboardContent::Image(image.clone()).is_oversized());
+        image.rgba_base64.replace_range(encoded_len - 1.., "A");
+        assert!(ClipboardContent::Image(image).is_oversized());
+    }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
@@ -228,7 +335,11 @@ fn write_image(image: &ClipboardImage) -> Result<(), String> {
         .map_err(|error| format!("failed to decode clipboard image: {error}"))?;
     let width = image.width as usize;
     let height = image.height as usize;
-    if width == 0 || height == 0 || bytes.len() != width.saturating_mul(height).saturating_mul(4) {
+    if width == 0
+        || height == 0
+        || bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES
+        || bytes.len() != width.saturating_mul(height).saturating_mul(4)
+    {
         return Err("clipboard image has invalid dimensions".into());
     }
 

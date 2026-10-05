@@ -2346,6 +2346,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2353,7 +2354,10 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
+ "windows",
+ "windows-core 0.61.2",
  "windows-service",
  "windows-sys 0.61.2",
 ]

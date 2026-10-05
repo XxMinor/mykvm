@@ -23,15 +23,44 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 mod clipboard;
+#[cfg(any(target_os = "windows", test))]
+mod shortcut_keys;
+mod rich_clipboard;
+mod clipboard_exchange;
+mod folder_transfer;
+mod transfer_jobs;
+#[cfg(any(target_os = "windows", test))]
+mod drag_buffer;
+#[cfg(target_os = "windows")]
+pub mod headless_client;
 mod input;
+mod input_guard;
+#[cfg(any(target_os = "windows", test))]
+mod native_drag;
 mod performance;
 mod quic_transport;
 pub mod shared_input;
 #[cfg(target_os = "windows")]
+pub mod windows_drag;
+mod windows_drag_overlay;
+#[cfg(target_os = "windows")]
+pub mod windows_drop_catcher;
+#[cfg(target_os = "windows")]
 pub mod windows_input;
+#[cfg(any(target_os = "windows", test))]
+mod windows_keyboard_monitor;
+#[cfg(any(target_os = "windows", test))]
+mod windows_mouse_motion;
+#[cfg(target_os = "windows")]
+mod windows_keyboard_capture;
+#[cfg(target_os = "windows")]
+mod windows_cursor_guard;
+#[cfg(any(target_os = "windows", test))]
+mod local_capture_session;
 
 use clipboard::{ClipboardContent, ClipboardImage};
 use performance::PerformanceSample;
+use input_guard::{InputProtection, SharedGuard};
 
 const DISCOVERY_PORT: u16 = 47833;
 const TRANSPORT_PORT_MIN: u16 = 1024;
@@ -60,9 +89,29 @@ const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
-const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
-const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
+// A peer that stays down doubles the wait each time, up to a minute.
+const CLIPBOARD_RETRY_MAX_MS: u64 = 60_000;
+// Progressive 50, 100, ... 450 ms (~2.25 s in all) outlasts another process
+// holding the clipboard open (PR #22).
+const CLIPBOARD_WRITE_ATTEMPTS: usize = 10;
+const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
+const DRAG_TREE_PROTOCOL: &str = "mykvm.drag-tree.v1";
+const CLIPBOARD_FILES_PROTOCOL: &str = "mykvm.clipboard-files.v1";
+const CLIPBOARD_PULL_PROTOCOL: &str = "mykvm.clipboard-pull.v1";
+const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
+const LOG_REQUEST_PROTOCOL: &str = "mykvm.log-request.v1";
+// A paired controller asks a client to update itself (it runs its own updater,
+// so the update is still verified against this app's updater key).
+const REMOTE_UPDATE_PROTOCOL: &str = "mykvm.remote-update.v1";
+// Lock sync: the controller locked its screen and asks its clients to lock too.
+const LOCK_SCREEN_PROTOCOL: &str = "mykvm.lock-screen.v1";
+// A paired peer asks for this device's recent log; the reply is the tail of the
+// device's newest log file, streamed back over the file-transfer path.
+const CLIENT_LOG_TAIL_BYTES: u64 = 512 * 1024;
+/// Prefix of a drag-control send error: the peer never opened a drag session.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const DRAG_CONTROL_FAILED: &str = "拖放控制失败";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
@@ -72,6 +121,10 @@ const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
 const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
 const HELPER_PATH_ARG: &str = "--helper-path";
 const RUNTIME_STATE_EVENT: &str = "runtime-state-changed";
+const FILE_TRANSFER_PROGRESS_EVENT: &str = "file-transfer-progress";
+// Progress is emitted at most this often per file while sending (plus always on
+// completion) so a multi-GB transfer doesn't flood the webview with events.
+const FILE_TRANSFER_PROGRESS_INTERVAL_MS: u64 = 100;
 
 #[cfg(target_os = "windows")]
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\MyKVM_SingleInstance";
@@ -87,6 +140,15 @@ static WINDOWS_FIREWALL_ENSURED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 static SINGLE_INSTANCE_MUTEX: OnceLock<Mutex<Option<SingleInstanceGuard>>> = OnceLock::new();
+
+// Matches the `identifier` in tauri.conf.json.
+#[cfg(target_os = "macos")]
+const MACOS_BUNDLE_ID: &str = "com.xzhpl.mykvm";
+
+// Holds the flock'd lock file for the process lifetime; the kernel releases
+// the lock when the process exits, however it exits.
+#[cfg(target_os = "macos")]
+static MACOS_INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 struct SingleInstanceGuard {
@@ -155,6 +217,12 @@ struct Device {
     #[serde(default = "default_device_source")]
     source: String,
     screens: Vec<Screen>,
+    /// Pointer and scroll speed this controller applies when driving the
+    /// device (a per-device multiplier; 1 = as the local mouse moves).
+    #[serde(default = "default_input_speed")]
+    pointer_speed: f64,
+    #[serde(default = "default_input_speed")]
+    scroll_speed: f64,
 }
 
 /// Per-direction hotkeys for jumping between adjacent screens without moving
@@ -215,8 +283,17 @@ struct LayoutState {
     paired_controllers: Vec<PairedController>,
     #[serde(default = "default_clipboard_sync")]
     clipboard_sync: bool,
+    #[serde(default)]
+    clipboard_on_demand: bool,
+    #[serde(default = "default_clipboard_paste_hotkey")]
+    clipboard_paste_hotkey: String,
     #[serde(default = "default_file_transfer_enabled")]
     file_transfer_enabled: bool,
+    /// Controller: locking this machine locks its online clients too.
+    #[serde(default)]
+    lock_sync: bool,
+    #[serde(default)]
+    input_protection: InputProtection,
     #[serde(default = "default_language")]
     language: String,
     #[serde(default = "default_theme_mode")]
@@ -354,6 +431,7 @@ struct RuntimeStatus {
     pairing: PairingStatus,
     privilege: PrivilegeStatus,
     input_service: InputServiceStatus,
+    input_protection: input_guard::GuardStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,6 +522,8 @@ struct TransferFile {
     path: PathBuf,
     name: String,
     total_bytes: u64,
+    directory: bool,
+    bundle: Option<Arc<folder_transfer::FolderBundle>>,
 }
 
 #[derive(Debug)]
@@ -454,8 +534,15 @@ struct IncomingFileTransfer {
     total_bytes: u64,
     received_bytes: u64,
     next_chunk_index: u64,
+    directory_bundle: bool,
+    clipboard_transfer: bool,
+    touched_ms: u64,
     temp_path: PathBuf,
     final_path: PathBuf,
+    // ShareMouse-style drag: on finish, hand the completed file to the drag
+    // placer (which drops it into the folder under the cursor on release)
+    // instead of leaving it at final_path.
+    staged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +551,56 @@ struct FileTransferSummary {
     target_name: String,
     file_count: usize,
     byte_count: u64,
+}
+
+// One progress update for the sending-side toast. `file_index` is 1-based.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTransferProgress {
+    transfer_id: String,
+    file_name: String,
+    target_name: String,
+    sent_bytes: u64,
+    total_bytes: u64,
+    file_index: usize,
+    file_count: usize,
+    done: bool,
+    error: Option<String>,
+}
+
+// Carries what a per-file send needs to emit progress. Optional throughout the
+// send path so tests and any UI-less caller simply pass `None`.
+struct FileTransferProgressReporter<'a> {
+    app: &'a AppHandle,
+    target_name: &'a str,
+    file_index: usize,
+    file_count: usize,
+}
+
+impl FileTransferProgressReporter<'_> {
+    fn emit(
+        &self,
+        transfer_id: &str,
+        file: &TransferFile,
+        sent_bytes: u64,
+        done: bool,
+        error: Option<String>,
+    ) {
+        let _ = self.app.emit(
+            FILE_TRANSFER_PROGRESS_EVENT,
+            FileTransferProgress {
+                transfer_id: transfer_id.into(),
+                file_name: file.name.clone(),
+                target_name: self.target_name.into(),
+                sent_bytes,
+                total_bytes: file.total_bytes,
+                file_index: self.file_index,
+                file_count: self.file_count,
+                done,
+                error,
+            },
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -482,12 +619,30 @@ struct FileTransferPacket {
     offset: u64,
     #[serde(default)]
     data: Vec<u8>,
+    // Edge drag-drop: land the file on the receiver's Desktop instead of the
+    // transfers folder. Named-field msgpack, so old peers just ignore it (and
+    // an old sender leaves it false here).
+    #[serde(default)]
+    drop_to_desktop: bool,
+    // ShareMouse-style drag: the receiver stages the file and, when the drag is
+    // released over it, drops it into the folder under the cursor (else Desktop)
+    // instead of placing it immediately.
+    #[serde(default)]
+    drag_drop: bool,
+    // A device's log fetched by its peer: land it in the "MyKVM Remote Logs"
+    // folder instead of the transfers folder.
+    #[serde(default)]
+    client_log: bool,
+    #[serde(default)]
+    directory_bundle: bool,
+    #[serde(default)]
+    clipboard_transfer: bool,
 }
 
 struct AppRuntime {
     app_handle: AppHandle,
     layout: Arc<Mutex<LayoutState>>,
-    native_layout: Mutex<LayoutState>,
+    native_layout: Arc<Mutex<LayoutState>>,
     runtime: Mutex<RuntimeStatus>,
     peers: Arc<Mutex<Vec<LanPeer>>>,
     pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
@@ -509,23 +664,39 @@ struct AppRuntime {
     clipboard_receive_enabled: Arc<AtomicBool>,
     transport_packets: Arc<AtomicU64>,
     input_events: Arc<AtomicU64>,
+    input_guard: SharedGuard,
     clipboard_packets: Arc<AtomicU64>,
     runtime_toggle_shortcut: Mutex<Option<String>>,
+    clipboard_paste_shortcut: Mutex<Option<String>>,
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
+    #[cfg(target_os = "windows")]
+    input_service_network_lease: Mutex<Option<std::fs::File>>,
 }
 
 impl AppRuntime {
-    fn new(app_handle: AppHandle, config_path: PathBuf, detected_layout: LayoutState) -> Self {
+    fn new(app_handle: AppHandle, config_path: PathBuf, mut detected_layout: LayoutState) -> Self {
         let layout = load_layout_from_disk(&config_path)
             .map(|saved_layout| normalize_saved_layout(saved_layout, detected_layout.clone()))
             .unwrap_or_else(|| detected_layout.clone());
+        align_native_screen_ids(&mut detected_layout, &layout);
+        let input_guard = SharedGuard::default();
+        let notify_app = app_handle.clone();
+        input_guard::set_notifier(&input_guard, Arc::new(move || {
+            let handle = notify_app.clone();
+            let _ = notify_app.run_on_main_thread(move || {
+                let _ = sync_screen_switch_shortcuts(&handle);
+                if let Some(state) = handle.try_state::<AppRuntime>() {
+                    notify_runtime_state_changed(&handle, &state.runtime_status());
+                }
+            });
+        }));
         Self {
             app_handle,
             layout: Arc::new(Mutex::new(layout)),
-            native_layout: Mutex::new(detected_layout.clone()),
+            native_layout: Arc::new(Mutex::new(detected_layout.clone())),
             runtime: Mutex::new(default_runtime(&detected_layout)),
             peers: Arc::new(Mutex::new(Vec::new())),
             pairing_challenge: Arc::new(Mutex::new(None)),
@@ -547,12 +718,16 @@ impl AppRuntime {
             clipboard_receive_enabled: Arc::new(AtomicBool::new(false)),
             transport_packets: Arc::new(AtomicU64::new(0)),
             input_events: Arc::new(AtomicU64::new(0)),
+            input_guard,
             clipboard_packets: Arc::new(AtomicU64::new(0)),
             runtime_toggle_shortcut: Mutex::new(None),
+            clipboard_paste_shortcut: Mutex::new(None),
             runtime_toggle_menu_item: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
             config_path,
+            #[cfg(target_os = "windows")]
+            input_service_network_lease: Mutex::new(None),
         }
     }
 
@@ -591,11 +766,27 @@ impl AppRuntime {
     }
 
     fn runtime_status_for_layout(&self, layout: &LayoutState) -> RuntimeStatus {
-        let mut runtime = self.runtime.lock().unwrap().clone();
+        // Status reads are polled by the UI; a panic elsewhere that poisoned
+        // the lock must not turn every poll into another panic.
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         runtime.discovery = self.discovery_status_for_layout(layout);
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
+        if runtime.started && layout.machine_role == "server" {
+            let protection = input_guard::snapshot(&self.input_guard);
+            if !protection.capture_available {
+                runtime.capture = NativeStageStatus { state: "error".into(), detail: "输入捕获未就绪，请检查系统权限或重新启动共享。".into() };
+            } else if protection.reason.is_some() {
+                runtime.capture = NativeStageStatus { state: "paused".into(),
+                    detail: format!("输入保护已暂停跨屏：{:?}", protection.reason) };
+            }
+        }
+        runtime.input_protection = input_guard::snapshot(&self.input_guard);
 
         runtime
     }
@@ -613,7 +804,12 @@ impl AppRuntime {
         local_peer.input_ready =
             advertised_input_ready(layout, self.input_receive_enabled.load(Ordering::Relaxed));
         let peers = active_peers(&self.peers, &local_peer.id);
-        let state = if self.discovery_stop.lock().unwrap().is_some() {
+        let running = self
+            .discovery_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        let state = if running {
             "ready"
         } else {
             "idle"
@@ -629,51 +825,7 @@ impl AppRuntime {
     }
 
     fn pairing_status_for_layout(&self, layout: &LayoutState) -> PairingStatus {
-        if layout.machine_role != "client" {
-            return idle_pairing_status();
-        }
-
-        if !layout.paired_controllers.is_empty() {
-            return PairingStatus {
-                state: "paired".into(),
-                code: String::new(),
-                requester_name: String::new(),
-                requester_ip: String::new(),
-                expires_at_ms: 0,
-                detail: "客户端已配对，只对白名单服务端响应。".into(),
-            };
-        }
-
-        let now = Instant::now();
-        if let Ok(mut challenge) = self.pairing_challenge.lock() {
-            if challenge
-                .as_ref()
-                .map(|challenge| challenge.expires_at <= now)
-                .unwrap_or(false)
-            {
-                *challenge = None;
-            }
-
-            if let Some(challenge) = challenge.as_ref() {
-                return PairingStatus {
-                    state: "requested".into(),
-                    code: challenge.code.clone(),
-                    requester_name: challenge.requester_name.clone(),
-                    requester_ip: challenge.requester_ip.clone(),
-                    expires_at_ms: challenge.expires_at_ms,
-                    detail: "服务端正在请求配对，请在服务端输入此验证码。".into(),
-                };
-            }
-        }
-
-        PairingStatus {
-            state: "available".into(),
-            code: String::new(),
-            requester_name: String::new(),
-            requester_ip: String::new(),
-            expires_at_ms: 0,
-            detail: "客户端等待服务端发起配对。".into(),
-        }
+        pairing_status(layout, &self.pairing_challenge)
     }
 
     fn quic_transport_handle(&self) -> Option<quic_transport::TransportHandle> {
@@ -694,7 +846,7 @@ impl AppRuntime {
         let layout_for_input = Arc::clone(&self.layout);
         let layout_for_clipboard = Arc::clone(&self.layout);
         let layout_for_pairing = Arc::clone(&self.layout);
-        let native_layout_for_input = self.native_layout();
+        let native_layout_for_input = Arc::clone(&self.native_layout);
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
@@ -754,6 +906,31 @@ impl AppRuntime {
             };
             let current_peer = local_peer_from_layout(&layout);
 
+            if handle_drag_control_packet(&payload, &layout, &current_peer.id) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+
+            if handle_peer_request_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &app_handle_for_file_transfer,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+
+            if let Some(accepted) = handle_clipboard_files_commit(
+                &payload, &layout, &current_peer.id, &clipboard_seen_text, &clipboard_echo_until,
+            ) {
+                if accepted {
+                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                    clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                }
+                return accepted;
+            }
+
             if handle_file_transfer_packet(
                 &payload,
                 &layout,
@@ -799,6 +976,9 @@ impl AppRuntime {
     }
 
     fn start_discovery(&self) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        let _ = self.acquire_input_service_network_lease()?;
+
         let mut discovery_stop = self
             .discovery_stop
             .lock()
@@ -979,7 +1159,19 @@ impl AppRuntime {
                             if peer_visible_to_layout(&current_layout, &incoming.peer) {
                                 merge_peer(&peers, incoming.peer.clone());
                                 sync_layout_peer_presence(&layout_state, &peers);
-                                warm_quic_peer(&quic_transport, &incoming.peer);
+                                let fixed = current_layout.devices.iter().find(|device| {
+                                    device.source == "manual"
+                                        && device_matches_peer(
+                                            device,
+                                            &incoming.peer,
+                                            &current_layout.cluster_id,
+                                        )
+                                });
+                                if fixed
+                                    .is_none_or(|device| same_host(&device.host, &incoming.peer.ip))
+                                {
+                                    warm_quic_peer(&quic_transport, &incoming.peer);
+                                }
                             }
 
                             if matches!(incoming.kind.as_str(), "announce" | "probe") {
@@ -1017,10 +1209,72 @@ impl AppRuntime {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
+    fn acquire_input_service_network_lease(&self) -> Result<bool, String> {
+        let mut lease = self
+            .input_service_network_lease
+            .lock()
+            .map_err(|_| "input service network lease lock poisoned".to_string())?;
+        if lease
+            .as_ref()
+            .is_some_and(windows_input_service_network_lease_alive)
+        {
+            return Ok(true);
+        }
+        *lease = None;
+
+        if let Some(file) = acquire_windows_input_service_network_lease()? {
+            *lease = Some(file);
+            return Ok(true);
+        }
+
+        let service = query_windows_input_service_status()?;
+        let owns_network = windows_input_service_owns_network_ports()?;
+        if service.installed && !service.running {
+            // Revive a stopped lock-screen service even when it predates the
+            // network takeover: without it the lock screen gets no input (#27).
+            match start_windows_input_service() {
+                Ok(()) => {
+                    if let Some(file) = acquire_windows_input_service_network_lease()? {
+                        *lease = Some(file);
+                        return Ok(true);
+                    }
+                }
+                Err(error) if owns_network => return Err(error),
+                // An older install may only be startable by an administrator;
+                // that must not block discovery.
+                Err(error) => {
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        log::warn!("could not start the stopped input service: {error}");
+                    }
+                }
+            }
+        }
+        if owns_network {
+            return Err(
+                "MyKVM input service is running but its network takeover pipe is unavailable."
+                    .into(),
+            );
+        }
+        Ok(false)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn release_input_service_network_lease(&self) -> Result<(), String> {
+        self.input_service_network_lease
+            .lock()
+            .map_err(|_| "input service network lease lock poisoned".to_string())?
+            .take();
+        Ok(())
+    }
+
     fn start_input(&self, layout: LayoutState) -> (NativeStageStatus, NativeStageStatus) {
         sync_layout_peer_presence(&self.layout, &self.peers);
-        self.input_receive_enabled
-            .store(layout.input_mode == "receive", Ordering::Relaxed);
+        self.input_receive_enabled.store(
+            layout.input_mode == "receive" && input::NATIVE_INPUT_SUPPORTED,
+            Ordering::Relaxed,
+        );
         let native_layout = self.native_layout();
         let Ok(mut input_stop) = self.input_stop.lock() else {
             return (
@@ -1050,6 +1304,7 @@ impl AppRuntime {
         };
 
         let stop = Arc::new(AtomicBool::new(false));
+        input_guard::set_capture_available(&self.input_guard, true);
         let statuses = input::start_input_runtime(
             layout,
             Arc::clone(&self.layout),
@@ -1062,8 +1317,20 @@ impl AppRuntime {
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
             Arc::clone(&self.screen_switch_request),
+            Arc::clone(&self.input_guard),
         );
         *input_stop = Some(stop);
+        #[cfg(target_os = "macos")]
+        input::set_macos_app_nap_suppressed(
+            statuses.0.state == "ready" || statuses.1.state == "ready",
+        );
+        // These were only shown in the window, so a startup failure left no
+        // trace in the log once the window was closed.
+        for (stage, status) in [("capture", &statuses.0), ("inject", &statuses.1)] {
+            if status.state == "error" {
+                log::warn!("input {stage} unavailable: {}", status.detail);
+            }
+        }
         statuses
     }
 
@@ -1092,6 +1359,8 @@ impl AppRuntime {
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let transport_packets = Arc::clone(&self.transport_packets);
         let clipboard_packets = Arc::clone(&self.clipboard_packets);
+        let clipboard_layout = Arc::clone(&self.layout);
+        let clipboard_app = self.app_handle.clone();
         let Some(quic_transport) = self.quic_transport_handle() else {
             return NativeStageStatus {
                 state: "error".into(),
@@ -1109,6 +1378,8 @@ impl AppRuntime {
                 transport_packets,
                 clipboard_packets,
                 thread_stop,
+                clipboard_layout,
+                clipboard_app,
             );
         });
 
@@ -1166,7 +1437,22 @@ impl AppRuntime {
         }
     }
 
+    /// This process is about to end (quit, or an update about to install).
+    /// Release remote control, then close QUIC so the peer gets a
+    /// CONNECTION_CLOSE and reconnects at once — on a Windows client to the
+    /// input service, which takes over the same ports and identity when this
+    /// process is gone — instead of sending into a dead connection until its
+    /// 10 s idle timeout.
+    fn hand_off_network(&self) {
+        self.stop_input();
+        self.stop_clipboard();
+        self.stop_discovery();
+    }
+
     fn stop_input(&self) {
+        input::prepare_input_stop();
+        #[cfg(target_os = "macos")]
+        input::set_macos_app_nap_suppressed(false);
         self.input_receive_enabled.store(false, Ordering::Relaxed);
         if let Ok(mut stop) = self.input_stop.lock() {
             if let Some(signal) = stop.take() {
@@ -1178,6 +1464,7 @@ impl AppRuntime {
         // Drop any modifier flags we were holding for injection so a lost
         // key-up cannot leave Shift/Ctrl/Cmd stuck for the next session.
         input::reset_injected_modifiers();
+        input_guard::update_status(&self.input_guard, None, &Default::default());
     }
 
     fn stop_clipboard(&self) {
@@ -1237,7 +1524,11 @@ fn save_layout(
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
         let previous_layout = stored_layout.clone();
-        let saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
+        let mut saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
+        saved_layout.input_protection = InputProtection::default();
+        saved_layout.clipboard_on_demand = false;
+        saved_layout.clipboard_paste_hotkey = default_clipboard_paste_hotkey();
+        validate_shared_hotkeys(&saved_layout)?;
         write_layout_to_disk(&state.config_path, &saved_layout)?;
         *stored_layout = saved_layout.clone();
         (previous_layout, saved_layout)
@@ -1262,6 +1553,7 @@ fn save_layout(
     }
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
+    sync_clipboard_paste_shortcut(&state.app_handle)?;
     Ok(state.snapshot())
 }
 
@@ -1419,6 +1711,7 @@ fn start_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
         pairing: state.pairing_status_for_layout(&layout),
         privilege: current_privilege_status(),
         input_service: current_input_service_status(),
+        input_protection: Default::default(),
     };
 
     Ok(runtime.clone())
@@ -1489,7 +1782,12 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
                 "stopped"
             }
         ),
-        format!("local: {} / {}", local_peer.name, local_peer.ip),
+        format!(
+            "local: {} / {} (all IPv4: {})",
+            local_peer.name,
+            local_peer.ip,
+            local_ip_list().unwrap_or_default()
+        ),
         format!(
             "ports: discovery UDP {}, QUIC {}",
             runtime.discovery.port, local_peer.quic_port
@@ -1529,7 +1827,10 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
 
     Ok(DiagnosticInfo {
         report: lines.join("\n"),
-        app_version: env!("CARGO_PKG_VERSION").into(),
+        app_version: APP_VERSION
+            .get()
+            .cloned()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
         platform: current_platform().into(),
         role: layout.machine_role,
         runtime_started: runtime.started,
@@ -1688,6 +1989,7 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
     }
 
     if let Some(previous) = current.take() {
+        input::set_global_toggle_registered(false);
         if let Err(error) = app.global_shortcut().unregister(previous.as_str()) {
             log::warn!("failed to unregister quick start/stop shortcut {previous}: {error}");
         }
@@ -1700,17 +2002,29 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
                 format!("failed to register quick start/stop shortcut {next}: {error}")
             })?;
         *current = Some(next);
+        input::set_global_toggle_registered(true);
     }
 
     Ok(())
 }
 
 fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<String>, String> {
-    if layout.machine_role != "server" {
+    if layout.machine_role != "server" || input::hotkey_recording() || input::owns_native_shortcuts() {
         return Ok(None);
     }
 
     canonical_runtime_toggle_shortcut(&layout.edge_switch_hotkey)
+}
+
+fn validate_shared_hotkeys(layout: &LayoutState) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for value in [&layout.clipboard_paste_hotkey, &layout.edge_switch_hotkey,
+        &layout.screen_switch_hotkeys.left, &layout.screen_switch_hotkeys.right, &layout.screen_switch_hotkeys.up, &layout.screen_switch_hotkeys.down] {
+        if let Some(shortcut) = canonical_runtime_toggle_shortcut(value)? {
+            if !seen.insert(shortcut) { return Err("启停、粘贴和切屏快捷键不能重复。".into()); }
+        }
+    }
+    Ok(())
 }
 
 /// Register/unregister the four direction hotkeys so they stay in sync with the
@@ -1721,7 +2035,9 @@ fn sync_screen_switch_shortcuts(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     };
     let layout = state.layout_snapshot();
-    let next = screen_switch_shortcuts_for_layout(&layout);
+    let next = if input::hotkey_recording() || input::owns_native_shortcuts() || input_guard::is_paused(&state.input_guard) || layout.input_protection.local_only {
+        empty_screen_switch_hotkeys()
+    } else { screen_switch_shortcuts_for_layout(&layout) };
 
     let mut current = state
         .screen_switch_shortcuts
@@ -1795,7 +2111,14 @@ fn route_global_shortcut(
     let Some(state) = app.try_state::<AppRuntime>() else {
         return Ok(());
     };
-    if state.layout_snapshot().machine_role != "server" {
+    if state.layout_snapshot().machine_role != "server" || input::hotkey_recording() || input::owns_native_shortcuts() {
+        return Ok(());
+    }
+
+    let paste = state.clipboard_paste_shortcut.lock().map_err(|_| "clipboard shortcut is poisoned".to_string())?.clone();
+    if paste.as_ref().and_then(|s| s.parse::<tauri_plugin_global_shortcut::Shortcut>().ok()).as_ref() == Some(shortcut) {
+        if !input::prepare_system_shortcut(paste.as_deref().unwrap_or("disabled"), true) { return Ok(()); }
+        paste_remote_clipboard(state)?;
         return Ok(());
     }
 
@@ -1807,6 +2130,7 @@ fn route_global_shortcut(
     if let Some(toggle_str) = toggle.as_ref() {
         if let Ok(toggle_shortcut) = toggle_str.parse::<tauri_plugin_global_shortcut::Shortcut>() {
             if shortcut == &toggle_shortcut {
+                if !input::prepare_system_shortcut(toggle_str, false) { return Ok(()); }
                 drop(toggle);
                 toggle_runtime_from_app(app)?;
                 return Ok(());
@@ -1815,6 +2139,9 @@ fn route_global_shortcut(
     }
     drop(toggle);
 
+    if input_guard::is_paused(&state.input_guard) || state.layout_snapshot().input_protection.local_only {
+        return Ok(());
+    }
     // Direction switch hotkeys.
     let directions = state
         .screen_switch_shortcuts
@@ -1840,6 +2167,8 @@ fn route_global_shortcut(
     drop(directions);
 
     if let Some(direction) = direction {
+        if !state.runtime.lock().map(|runtime| runtime.started).unwrap_or(false)
+            || !input::prepare_system_shortcut("disabled", true) { return Ok(()); }
         if let Ok(mut request) = state.screen_switch_request.lock() {
             // Only the latest request wins; a rapid double-tap overwrites.
             *request = Some(direction);
@@ -1985,21 +2314,37 @@ fn read_input_service_status(state: tauri::State<'_, AppRuntime>) -> InputServic
 
 #[tauri::command]
 fn install_input_service(
+    app: AppHandle,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<InputServiceStatus, String> {
     #[cfg(target_os = "windows")]
     {
+        let previous_service_pid = windows_input_service_process_id()?;
         let helper_path = resolve_input_helper_path()?;
+        let owner_sid = current_windows_user_sid()?;
         let status = if is_windows_process_elevated().unwrap_or(false) {
-            install_windows_input_service(&helper_path)?;
-            start_windows_input_service()?;
-            current_input_service_status()
+            state.release_input_service_network_lease()?;
+            let result: Result<InputServiceStatus, String> = (|| {
+                install_windows_input_service(&helper_path, &state.config_path, &owner_sid)?;
+                start_windows_input_service()?;
+                let _ = state.acquire_input_service_network_lease()?;
+                Ok(current_input_service_status())
+            })();
+            if result.is_err() {
+                let _ = state.acquire_input_service_network_lease();
+            }
+            result?
         } else {
             launch_current_process_as_admin(&[
                 INSTALL_INPUT_SERVICE_ARG.into(),
                 HELPER_PATH_ARG.into(),
                 helper_path.to_string_lossy().into_owned(),
+                shared_input::SERVICE_CONFIG_PATH_ARG.into(),
+                state.config_path.to_string_lossy().into_owned(),
+                shared_input::SERVICE_OWNER_SID_ARG.into(),
+                owner_sid,
             ])?;
+            wait_for_input_service_network_lease_after_restart(app, previous_service_pid);
             InputServiceStatus {
                 detail: "Administrator approval requested to install the input service.".into(),
                 ..current_input_service_status()
@@ -2011,7 +2356,7 @@ fn install_input_service(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = state;
+        let _ = (app, state);
         Err("Windows input service is only available on Windows.".into())
     }
 }
@@ -2023,7 +2368,12 @@ fn uninstall_input_service(
     #[cfg(target_os = "windows")]
     {
         let status = if is_windows_process_elevated().unwrap_or(false) {
-            uninstall_windows_input_service()?;
+            state.release_input_service_network_lease()?;
+            let result = uninstall_windows_input_service();
+            if let Err(error) = result {
+                let _ = state.acquire_input_service_network_lease();
+                return Err(error);
+            }
             current_input_service_status()
         } else {
             launch_current_process_as_admin(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
@@ -2049,6 +2399,33 @@ fn update_runtime_input_service_status(state: &AppRuntime, status: &InputService
     }
 }
 
+#[cfg(target_os = "windows")]
+fn wait_for_input_service_network_lease_after_restart(
+    app: AppHandle,
+    previous_service_pid: Option<u32>,
+) {
+    thread::spawn(move || {
+        for _ in 0..240 {
+            let current_service_pid = windows_input_service_process_id().ok().flatten();
+            if current_service_pid.is_none() || current_service_pid == previous_service_pid {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let state = app.state::<AppRuntime>();
+            match state.acquire_input_service_network_lease() {
+                Ok(true) => {
+                    let status = current_input_service_status();
+                    update_runtime_input_service_status(state.inner(), &status);
+                    let runtime = state.runtime_status();
+                    notify_runtime_state_changed(&app, &runtime);
+                    return;
+                }
+                Ok(false) | Err(_) => thread::sleep(Duration::from_millis(250)),
+            }
+        }
+    });
+}
+
 #[tauri::command]
 fn send_secure_attention(
     device_id: String,
@@ -2070,8 +2447,15 @@ fn send_files_to_device(
     paths: Vec<String>,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<FileTransferSummary, String> {
-    let state = state.inner();
-    let device_id = device_id.as_str();
+    send_files_to_device_inner(state.inner(), &device_id, &paths, DropMode::TransfersFolder)
+}
+
+fn send_files_to_device_inner(
+    state: &AppRuntime,
+    device_id: &str,
+    paths: &[String],
+    drop_mode: DropMode,
+) -> Result<FileTransferSummary, String> {
     if paths.is_empty() {
         return Err("请选择要传输的文件。".into());
     }
@@ -2089,12 +2473,28 @@ fn send_files_to_device(
 
     let peers = active_peer_snapshot(&state.peers);
     let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
-    let files = collect_transfer_files(&paths)?;
+    let files = collect_transfer_files(paths)?;
+    let total_files = files.len();
     let mut file_count = 0_usize;
     let mut byte_count = 0_u64;
 
-    for file in files {
-        let packet_count = send_transfer_file(&quic_transport, &local_peer.id, &target, &file)?;
+    for (index, file) in files.iter().enumerate() {
+        let reporter = FileTransferProgressReporter {
+            app: &state.app_handle,
+            target_name: &target.name,
+            file_index: index + 1,
+            file_count: total_files,
+        };
+        let packet_count = send_transfer_file(
+            &quic_transport,
+            &local_peer.id,
+            &target,
+            file,
+            &new_transfer_id("file"),
+            drop_mode,
+            Some(&reporter),
+            None,
+        )?;
         state
             .transport_packets
             .fetch_add(packet_count, Ordering::Relaxed);
@@ -2107,6 +2507,203 @@ fn send_files_to_device(
         file_count,
         byte_count,
     })
+}
+
+/// Ask an online peer (a client, or the paired controller) for its recent log.
+/// The log arrives asynchronously in the "MyKVM Remote Logs" folder (which this
+/// opens); returns its path.
+/// Lock sync (controller side): when this machine locks, ask its online
+/// clients to lock as well. Polled, since neither platform hands a lock to a
+/// tray app without a window to receive it.
+fn spawn_lock_sync_watcher(app: AppHandle) {
+    let _ = thread::Builder::new()
+        .name("mykvm-lock-sync".into())
+        .spawn(move || {
+            let mut was_locked = local_screen_locked();
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let locked = local_screen_locked();
+                if locked && !was_locked {
+                    if let Some(state) = app.try_state::<AppRuntime>() {
+                        lock_online_clients(state.inner());
+                    }
+                }
+                was_locked = locked;
+            }
+        });
+}
+
+fn lock_online_clients(state: &AppRuntime) {
+    let layout = state.layout_snapshot();
+    if layout.machine_role != "server" || !layout.lock_sync {
+        return;
+    }
+    for device in layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local" && device.online)
+    {
+        match send_peer_request(state, &device.id, LOCK_SCREEN_PROTOCOL) {
+            Ok(()) => log::info!("lock sync: locked {}", device.name),
+            Err(error) => log::warn!("lock sync: could not lock {}: {error}", device.name),
+        }
+    }
+}
+
+/// Whether this machine's session is locked. Windows: the session's lock flag
+/// (not the input desktop, which a UAC prompt switches too).
+#[cfg(target_os = "windows")]
+fn local_screen_locked() -> bool {
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW,
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK,
+    };
+    unsafe {
+        let mut buffer: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let mut bytes = 0_u32;
+        if WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            WTS_CURRENT_SESSION,
+            WTSSessionInfoEx,
+            &mut buffer,
+            &mut bytes,
+        ) == 0
+            || buffer.is_null()
+        {
+            return false;
+        }
+        let info = &*(buffer as *const WTSINFOEXW);
+        let locked = info.Level == 1
+            && info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32;
+        WTSFreeMemory(buffer as *mut std::ffi::c_void);
+        locked
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn local_screen_locked() -> bool {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+    }
+    let raw = unsafe { CGSessionCopyCurrentDictionary() };
+    if raw.is_null() {
+        return false;
+    }
+    let session: CFDictionary<CFString, CFType> = unsafe { TCFType::wrap_under_create_rule(raw) };
+    session
+        .find(CFString::from_static_string("CGSSessionScreenIsLocked"))
+        .and_then(|value| value.downcast::<CFBoolean>())
+        .map(bool::from)
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn local_screen_locked() -> bool {
+    false
+}
+
+/// Lock this machine's screen (lock sync, client side).
+#[cfg(target_os = "windows")]
+fn lock_local_screen() {
+    if unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() } == 0 {
+        log::warn!("lock sync: LockWorkStation failed");
+    }
+}
+
+/// The login framework's SACLockScreenImmediate is what the menu bar's Lock
+/// Screen calls; if it is ever gone, press its shortcut (Ctrl+Cmd+Q) instead.
+#[cfg(target_os = "macos")]
+fn lock_local_screen() {
+    use std::os::raw::{c_char, c_int, c_void};
+    extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    const RTLD_LAZY: c_int = 1;
+    unsafe {
+        let framework = dlopen(
+            b"/System/Library/PrivateFrameworks/login.framework/Versions/Current/login\0".as_ptr()
+                as *const c_char,
+            RTLD_LAZY,
+        );
+        if !framework.is_null() {
+            let lock = dlsym(framework, b"SACLockScreenImmediate\0".as_ptr() as *const c_char);
+            if !lock.is_null() {
+                let lock: extern "C" fn() -> c_int = std::mem::transmute(lock);
+                lock();
+                return;
+            }
+        }
+    }
+    input::post_lock_screen_shortcut();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn lock_local_screen() {}
+
+/// Send a paired peer a request (`protocol`) over the stream channel.
+fn send_peer_request(state: &AppRuntime, device_id: &str, protocol: &str) -> Result<(), String> {
+    state.start_discovery()?;
+    let layout = state.layout_snapshot();
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready; start the runtime first.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
+
+    let packet = PeerRequestPacket {
+        protocol: protocol.into(),
+            paste_token: String::new(),        origin_id: local_peer.id.clone(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+    };
+    let payload = encode_wire_packet(&packet)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    quic_transport.send_stream_expect_ack(peer, payload)
+}
+
+/// Ask an online peer (a client, or the paired controller) for its recent log.
+/// The log arrives asynchronously in the "MyKVM Remote Logs" folder (which this
+/// opens); returns its path.
+#[tauri::command]
+fn fetch_client_log(
+    device_id: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<String, String> {
+    let state = state.inner();
+    if !state.layout_snapshot().file_transfer_enabled {
+        return Err("文件传输未开启，无法拉取日志。".into());
+    }
+    send_peer_request(state, &device_id, LOG_REQUEST_PROTOCOL)
+        .map_err(|error| format!("拉取日志失败: {error}"))?;
+
+    let dir = client_log_dir(&state.app_handle)?;
+    let _ = fs::create_dir_all(&dir);
+    let _ = open_external_path(&dir);
+    Ok(dir.to_string_lossy().into_owned())
+}
+
+/// Ask a client to update itself; it installs the release its own updater
+/// finds and restarts, while the controller keeps control through the hand-off.
+#[tauri::command]
+fn request_client_update(
+    device_id: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    send_peer_request(state.inner(), &device_id, REMOTE_UPDATE_PROTOCOL)
+        .map_err(|error| format!("请求客户端更新失败: {error}"))
 }
 
 #[tauri::command]
@@ -2197,6 +2794,13 @@ fn read_performance_sample(state: tauri::State<'_, AppRuntime>) -> PerformanceSa
         state.input_events.load(Ordering::Relaxed),
         state.clipboard_packets.load(Ordering::Relaxed),
     )
+}
+
+/// The update is downloaded and installs next. On Windows the updater ends
+/// this process itself, without the exit hooks, so hand the network over now.
+#[tauri::command]
+fn prepare_update_install(state: tauri::State<'_, AppRuntime>) {
+    state.hand_off_network();
 }
 
 #[tauri::command]
@@ -2377,9 +2981,57 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
             .disable()
             .map_err(|error| format!("failed to disable launch at startup: {error}"))?;
     }
-    manager
+    let enabled = manager
         .is_enabled()
-        .map_err(|error| format!("failed to read launch-at-startup state: {error}"))
+        .map_err(|error| format!("failed to read launch-at-startup state: {error}"))?;
+    #[cfg(target_os = "macos")]
+    macos_set_relaunch_on_login(!enabled);
+    Ok(enabled)
+}
+
+/// macOS "Reopen windows when logging back in" relaunches a running app at
+/// login. With launch at startup on, our LaunchAgent starts it as well, and
+/// the two race for the instance lock: the restored copy won (window shown,
+/// not silent) and the autostart copy bounced off it. While the LaunchAgent
+/// owns login launches, opt out of the restore relaunch as AppKit recommends
+/// for launchd-launched apps.
+#[cfg(target_os = "macos")]
+fn macos_set_relaunch_on_login(relaunch: bool) {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    // The two AppKit calls nest like a counter; keep at most one disable.
+    static DISABLED: AtomicBool = AtomicBool::new(false);
+    if DISABLED.swap(!relaunch, Ordering::Relaxed) == !relaunch {
+        return;
+    }
+    let selector: &[u8] = if relaunch {
+        b"enableRelaunchOnLogin\0"
+    } else {
+        b"disableRelaunchOnLogin\0"
+    };
+    unsafe {
+        let app_class = objc_getClass(b"NSApplication\0".as_ptr() as *const c_char);
+        if app_class.is_null() {
+            return;
+        }
+        let msg: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let ns_app = msg(
+            app_class,
+            sel_registerName(b"sharedApplication\0".as_ptr() as *const c_char),
+        );
+        if !ns_app.is_null() {
+            msg(ns_app, sel_registerName(selector.as_ptr() as *const c_char));
+        }
+    }
 }
 
 #[tauri::command]
@@ -2423,15 +3075,19 @@ pub fn handle_process_control_args() -> bool {
             let helper_path = arg_value(&args, HELPER_PATH_ARG)
                 .map(PathBuf::from)
                 .or_else(|| resolve_input_helper_path().ok());
-            match helper_path {
-                Some(path) => {
-                    if let Err(error) = install_windows_input_service(&path)
-                        .and_then(|_| start_windows_input_service())
+            let config_path =
+                arg_value(&args, shared_input::SERVICE_CONFIG_PATH_ARG).map(PathBuf::from);
+            let owner_sid = arg_value(&args, shared_input::SERVICE_OWNER_SID_ARG);
+            match (helper_path, config_path, owner_sid) {
+                (Some(path), Some(config_path), Some(owner_sid)) => {
+                    if let Err(error) =
+                        install_windows_input_service(&path, &config_path, &owner_sid)
+                            .and_then(|_| start_windows_input_service())
                     {
                         eprintln!("{error}");
                     }
                 }
-                None => eprintln!("failed to resolve mykvm-input-helper path"),
+                _ => eprintln!("missing input service path, config path, or owner SID"),
             }
             return true;
         }
@@ -2456,13 +3112,16 @@ fn arg_value(args: &[String], key: &str) -> Option<String> {
 pub fn acquire_single_instance() -> bool {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_ALREADY_EXISTS},
-        System::Threading::CreateMutexW,
+        System::Threading::{CreateMutexExW, SYNCHRONIZATION_SYNCHRONIZE},
     };
 
     let mutex_name = wide_null(SINGLE_INSTANCE_MUTEX_NAME);
-    let mutex = unsafe { CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr()) };
+    // We only need a lifetime handle and existence check, not mutex ownership.
+    // Minimal access also lets a normal process detect an elevated instance.
+    let mutex = unsafe { CreateMutexExW(std::ptr::null_mut(), mutex_name.as_ptr(), 0, SYNCHRONIZATION_SYNCHRONIZE) };
     if mutex.is_null() {
-        return true;
+        log::error!("cannot acquire the single-instance lock (error {}); refusing a competing input runtime", unsafe { windows_sys::Win32::Foundation::GetLastError() });
+        return false;
     }
 
     let already_exists =
@@ -2481,7 +3140,44 @@ pub fn acquire_single_instance() -> bool {
     true
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub fn acquire_single_instance() -> bool {
+    // Launch Services only dedupes Finder/Dock launches of the same bundle:
+    // `open -n`, a second .app copy (e.g. one still on a mounted DMG), or a
+    // bare binary all start another process, and two instances then fight
+    // over the discovery/QUIC ports and the config dir.
+    let Some(home) = std::env::var_os("HOME") else {
+        return true;
+    };
+    let lock_dir = std::path::Path::new(&home)
+        .join("Library/Application Support")
+        .join(MACOS_BUNDLE_ID);
+    if std::fs::create_dir_all(&lock_dir).is_err() {
+        return true;
+    }
+    // Truncating a file another process holds a flock on is harmless: the
+    // lock lives on the open file description, not the contents.
+    let Ok(file) = std::fs::File::create(lock_dir.join("instance.lock")) else {
+        // Never brick startup over lock-file plumbing.
+        return true;
+    };
+
+    // An updater relaunch briefly overlaps the old and new processes, so retry
+    // before concluding that a live instance owns the lock.
+    for _ in 0..20 {
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = MACOS_INSTANCE_LOCK.set(file);
+                return true;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(100)),
+            Err(std::fs::TryLockError::Error(_)) => return true,
+        }
+    }
+    false
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn acquire_single_instance() -> bool {
     true
 }
@@ -2513,7 +3209,18 @@ pub fn activate_existing_instance() -> bool {
         return signal_named_instance_event(ACTIVATE_INSTANCE_EVENT_NAME);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Launch Services delivers this to the running instance as a Reopen
+        // event, which the app already answers by showing the main window.
+        return std::process::Command::new("open")
+            .args(["-b", MACOS_BUNDLE_ID])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         false
     }
@@ -2629,7 +3336,7 @@ fn should_allow_app_exit_request(code: Option<i32>, explicit_quit: bool) -> bool
     code == Some(tauri::RESTART_EXIT_CODE) || explicit_quit
 }
 
-fn launched_from_autostart() -> bool {
+pub fn launched_from_autostart() -> bool {
     args_contain_autostart(env::args())
 }
 
@@ -2785,9 +3492,70 @@ fn setup_macos_window_visibility_watcher(app: &tauri::App) {
     });
 }
 
+// Poll for display reconfiguration (lid open/close, monitor plug/unplug) and
+// refresh the announced screen list. macOS enumerates displays via NSScreen,
+// which must run on the main thread, so the change is applied there.
+#[cfg(target_os = "macos")]
+fn setup_macos_display_watcher(app: &tauri::App) {
+    let app_handle = app.handle().clone();
+    thread::spawn(move || {
+        // Empty so the first stable reading re-checks what startup detected.
+        let mut applied = Vec::new();
+        let mut pending = None;
+        loop {
+            thread::sleep(Duration::from_millis(1500));
+            let now = macos_display_fingerprint();
+            if now == applied {
+                pending = None;
+                continue;
+            }
+            // Wake and lid changes arrive as bursts (4 flips in 5 s were seen
+            // on wake); act once the set has held still for a tick.
+            if pending.as_ref() != Some(&now) {
+                pending = Some(now);
+                continue;
+            }
+            applied = now;
+            pending = None;
+            let handle = app_handle.clone();
+            let _ = app_handle.run_on_main_thread(move || {
+                refresh_local_screens(&handle);
+            });
+        }
+    });
+}
+
+/// CoreGraphics display ids and bounds: thread-safe and cheap, unlike the
+/// NSScreen enumeration behind `detect_local_screens`, which needs the main
+/// thread. Bounds catch resolution and arrangement changes as well.
+#[cfg(target_os = "macos")]
+fn macos_display_fingerprint() -> Vec<(u32, i64, i64, i64, i64)> {
+    use core_graphics::display::CGDisplay;
+
+    let mut displays: Vec<_> = CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let bounds = CGDisplay::new(id).bounds();
+            (
+                id,
+                bounds.origin.x as i64,
+                bounds.origin.y as i64,
+                bounds.size.width as i64,
+                bounds.size.height as i64,
+            )
+        })
+        .collect();
+    displays.sort_unstable();
+    displays
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // The capture thread owns the keyboard raw-input sink used for hook
+        // health. Tao's unused DeviceEvents must not compete for registration.
+        .device_event_filter(tauri::DeviceEventFilter::Always)
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -2816,10 +3584,20 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            let _ = APP_VERSION.set(app.config().version.clone().unwrap_or_else(|| app.package_info().version.to_string()));
+            spawn_lock_sync_watcher(app.handle().clone());
             let silent_launch = launched_from_autostart();
+            #[cfg(target_os = "macos")]
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                macos_set_relaunch_on_login(!app.autolaunch().is_enabled().unwrap_or(false));
+            }
             if let Err(error) = app
                 .handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())
+                .plugin(tauri_plugin_updater::Builder::new().default_version_comparator(|current, release| {
+                    let installed = APP_VERSION.get().and_then(|version| version.parse().ok()).unwrap_or(current);
+                    release.version > installed
+                }).build())
             {
                 eprintln!("failed to initialize updater plugin: {error}");
             }
@@ -2852,6 +3630,26 @@ pub fn run() {
                 detected_layout,
             );
             app.manage(runtime);
+            let toggle_app = app.handle().clone();
+            input::set_runtime_toggle_sender(Box::new(move || {
+                let app = toggle_app.clone();
+                let _ = toggle_app.run_on_main_thread(move || {
+                    if let Err(error) = toggle_runtime_from_app(&app) { log::warn!("captured quick start/stop failed: {error}"); }
+                });
+            }));
+            let pending_files = Arc::downgrade(&app.state::<AppRuntime>().file_transfers);
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(30));
+                let Some(files) = pending_files.upgrade() else { break; };
+                if let Ok(mut transfers) = files.lock() {
+                    let now = now_ms();
+                    transfers.retain(|_, transfer| {
+                        if now.saturating_sub(transfer.touched_ms) <= 5 * 60 * 1000 { return true; }
+                        let _ = fs::remove_file(&transfer.temp_path);
+                        false
+                    });
+                };
+            });
 
             // Eagerly start discovery + input BEFORE the WebView2/frontend is
             // ready. The old flow waited for the frontend to call
@@ -2883,6 +3681,7 @@ pub fn run() {
                         pairing,
                         privilege,
                         input_service,
+                        input_protection: Default::default(),
                     };
                 }
             }
@@ -2891,6 +3690,8 @@ pub fn run() {
             setup_macos_cursor_hider(app);
             #[cfg(target_os = "macos")]
             setup_macos_window_visibility_watcher(app);
+            #[cfg(target_os = "macos")]
+            setup_macos_display_watcher(app);
             setup_tray(app)?;
             if let Err(error) = sync_runtime_toggle_shortcut(app.handle()) {
                 log::warn!("failed to register quick start/stop shortcut: {error}");
@@ -2900,7 +3701,155 @@ pub fn run() {
             }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
+            let _ = sync_clipboard_paste_shortcut(app.handle());
+            let clipboard_app = app.handle().clone();
+            input::set_clipboard_paste_sender(Box::new(move |target| {
+                let app = clipboard_app.clone();
+                thread::spawn(move || { if let Err(error) = request_clipboard_paste(app.state::<AppRuntime>().inner(), target, true) {
+                    let _ = app.emit("clipboard-paste-error", error);
+                }});
+            }));
             setup_single_instance_events(app.handle().clone());
+
+            // Edge drag-drop (ShareMouse-style): the capture tap hands us drag
+            // events as a local file drag crosses onto a controlled machine. A
+            // Windows target gets a native OLE drag (icon + drop into any folder
+            // or app); other targets transfer the files to land at the drop.
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                // One worker, so control messages reach the peer in order: with a
+                // thread per event a cancel could overtake its start, leaving the
+                // Windows drag session open with a synthetic button held down.
+                // File bytes stream on their own threads, so a drop is not held
+                // back behind a large file.
+                let (edge_drag_tx, edge_drag_rx) = std::sync::mpsc::channel::<input::EdgeDragEvent>();
+                input::set_edge_drag_sender(Box::new(move |event| {
+                    let _ = edge_drag_tx.send(event);
+                }));
+                thread::spawn(move || {
+                    let to_paths = |files: Vec<std::path::PathBuf>| -> Vec<String> {
+                        files
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect()
+                    };
+                    let deliver_to_desktop = |device_id: String, paths: Vec<String>, what: &'static str| {
+                        let handle = handle.clone();
+                        thread::spawn(move || {
+                            let state = handle.state::<AppRuntime>();
+                            match send_files_to_device_inner(
+                                state.inner(),
+                                &device_id,
+                                &paths,
+                                DropMode::Desktop,
+                            ) {
+                                Ok(summary) => log::info!(
+                                    "{what}: delivered {} file(s) ({}) to {}'s Desktop",
+                                    summary.file_count,
+                                    format_bytes(summary.byte_count),
+                                    summary.target_name
+                                ),
+                                Err(error) => log::warn!("{what} failed: {error}"),
+                            }
+                        });
+                    };
+                    // A drag whose native start the peer refused (e.g. a client too
+                    // old for drag control) is delivered as a plain transfer when the
+                    // button is released over it, instead of being lost (#33).
+                    let mut refused: Option<(String, Vec<String>)> = None;
+                    for event in edge_drag_rx {
+                        let state = handle.state::<AppRuntime>();
+                        let state = state.inner();
+                        match event {
+                            input::EdgeDragEvent::StartOle { device_id, files } => {
+                                let paths = to_paths(files);
+                                match send_ole_drag_start(state, &device_id, &paths) {
+                                    Ok(stream) => {
+                                        let handle = handle.clone();
+                                        thread::spawn(move || {
+                                            let state = handle.state::<AppRuntime>();
+                                            match stream_ole_drag_files(state.inner(), stream) {
+                                                Ok(count) => log::info!(
+                                                    "native drag streamed {count} file(s) to {device_id}"
+                                                ),
+                                                Err(error) => {
+                                                    log::warn!("native drag stream failed: {error}")
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(error) => {
+                                        log::warn!("native drag start failed: {error}");
+                                        if error.starts_with(DRAG_CONTROL_FAILED) {
+                                            if state.layout_snapshot().machine_role == "client" { deliver_to_desktop(device_id, paths, "refused controller drag"); }
+                                            else { refused = Some((device_id, paths)); }
+                                        }
+                                    }
+                                }
+                            }
+                            input::EdgeDragEvent::DropOle { device_id } => {
+                                if let Some((device_id, paths)) =
+                                    refused.take_if(|(id, _)| *id == device_id)
+                                {
+                                    deliver_to_desktop(device_id, paths, "refused native drag");
+                                    continue;
+                                }
+                                match send_ole_drag_signal(state, &device_id, "drop") {
+                                    Ok(()) => log::info!("native drag drop sent to {device_id}"),
+                                    Err(error) => log::warn!("native drag drop failed: {error}"),
+                                }
+                            }
+                            input::EdgeDragEvent::CancelOle { device_id } => {
+                                // The peer never opened a session for a refused start.
+                                if refused.take_if(|(id, _)| *id == device_id).is_some() {
+                                    continue;
+                                }
+                                if let Err(error) = send_ole_drag_signal(state, &device_id, "cancel")
+                                {
+                                    log::warn!("native drag cancel failed: {error}");
+                                }
+                            }
+                            input::EdgeDragEvent::Transfer { device_id, files } => {
+                                deliver_to_desktop(device_id, to_paths(files), "edge drag-drop");
+                            }
+                        }
+                    }
+                });
+            }
+
+            // The other direction: this Windows machine is the controller and
+            // the user drags files onto a controlled machine. The edge catcher
+            // grabs the OLE drop and we transfer the files to land on the
+            // controlled machine's Desktop.
+            #[cfg(target_os = "windows")]
+            {
+                let handle = app.handle().clone();
+                windows_drop_catcher::init(Box::new(move |device_id, files| {
+                    let handle = handle.clone();
+                    thread::spawn(move || {
+                        let paths: Vec<String> = files
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect();
+                        let state = handle.state::<AppRuntime>();
+                        match send_files_to_device_inner(
+                            state.inner(),
+                            &device_id,
+                            &paths,
+                            DropMode::DragDrop,
+                        ) {
+                            Ok(summary) => log::info!(
+                                "edge drop delivered {} file(s) ({}) to {}",
+                                summary.file_count,
+                                format_bytes(summary.byte_count),
+                                summary.target_name
+                            ),
+                            Err(error) => log::warn!("edge drop transfer failed: {error}"),
+                        }
+                    });
+                }));
+            }
             if silent_launch {
                 hide_main_window_handle(app.handle())?;
             } else {
@@ -2914,18 +3863,22 @@ pub fn run() {
             read_diagnostic_info,
             open_log_directory,
             save_layout,
+            cancel_file_transfer,
+            paste_remote_clipboard,
             start_runtime,
             stop_runtime,
             read_clipboard_text,
             write_clipboard_text,
             read_performance_sample,
             set_app_upgrading,
+            prepare_update_install,
             scan_lan_peers,
             probe_lan_peer,
             request_lan_pairing,
             confirm_lan_pairing,
             dismiss_pairing_request,
             reset_pairing,
+            set_hotkey_recording,
             set_autostart,
             is_autostart_enabled,
             restart_as_admin,
@@ -2934,6 +3887,8 @@ pub fn run() {
             uninstall_input_service,
             send_secure_attention,
             send_files_to_device,
+            fetch_client_log,
+            request_client_update,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -2950,6 +3905,11 @@ pub fn run() {
                 if !should_allow_app_exit(app, code) {
                     api.prevent_exit();
                     let _ = hide_main_window_handle(app);
+                }
+            }
+            tauri::RunEvent::Exit => {
+                if let Some(state) = app.try_state::<AppRuntime>() {
+                    state.hand_off_network();
                 }
             }
             #[cfg(target_os = "macos")]
@@ -3103,6 +4063,15 @@ fn set_main_window_visible(app: &AppHandle, visible: bool) {
     if let Some(state) = app.try_state::<AppRuntime>() {
         state.main_window_visible.store(visible, Ordering::Relaxed);
     }
+    // With no window on screen (closed, or minimized — the visibility watcher
+    // catches the native yellow button / Cmd+M) MyKVM lives in the tray: drop
+    // out of the Dock and Cmd+Tab, and come back as a regular app when shown.
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(if visible {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    });
 }
 
 fn set_main_window_focused(app: &AppHandle, focused: bool) {
@@ -3200,6 +4169,7 @@ fn default_runtime(layout: &LayoutState) -> RuntimeStatus {
         },
         privilege: current_privilege_status(),
         input_service: current_input_service_status(),
+        input_protection: Default::default(),
         discovery: DiscoveryStatus {
             state: "idle".into(),
             detail: "LAN discovery is stopped. Start runtime or scan the LAN to find peers.".into(),
@@ -3283,9 +4253,8 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
         System::{
             RemoteDesktop::WTSGetActiveConsoleSessionId,
             Services::{
-                OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
-                SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
-                SERVICE_STATUS_PROCESS,
+                OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
+                SERVICE_RUNNING,
             },
         },
     };
@@ -3315,7 +4284,7 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
         }
         let _service = ServiceHandleGuard(service);
 
-        let service_status = query_service_status_process(service)?;
+        let service_status = query_windows_service_status_process(service)?;
         let running = service_status.dwCurrentState == SERVICE_RUNNING;
         let pipe_available = running && input::windows_input_pipe_available();
         let active_session = WTSGetActiveConsoleSessionId();
@@ -3340,35 +4309,218 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
             detail: detail.into(),
         });
     }
+}
 
-    unsafe fn query_service_status_process(
-        service: windows_sys::Win32::System::Services::SC_HANDLE,
-    ) -> Result<SERVICE_STATUS_PROCESS, String> {
-        let mut status = SERVICE_STATUS_PROCESS::default();
-        let mut needed = 0_u32;
-        let ok = QueryServiceStatusEx(
-            service,
-            SC_STATUS_PROCESS_INFO,
-            &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
-            std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
-            &mut needed,
-        ) != 0;
-        if ok {
-            Ok(status)
-        } else {
-            Err(windows_last_error("QueryServiceStatusEx"))
+#[cfg(target_os = "windows")]
+unsafe fn query_windows_service_status_process(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+) -> Result<windows_sys::Win32::System::Services::SERVICE_STATUS_PROCESS, String> {
+    use windows_sys::Win32::System::Services::{
+        QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+    };
+
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0_u32;
+    if QueryServiceStatusEx(
+        service,
+        SC_STATUS_PROCESS_INFO,
+        &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
+        std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+        &mut needed,
+    ) == 0
+    {
+        return Err(windows_last_error("QueryServiceStatusEx"));
+    }
+    Ok(status)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_service_process_id() -> Result<Option<u32>, String> {
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE},
+        System::Services::{
+            OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
+        },
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW(process id)"));
         }
+        let _scm = ServiceHandleGuard(scm);
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let code = GetLastError();
+            if code == ERROR_SERVICE_DOES_NOT_EXIST || code == ERROR_SERVICE_MARKED_FOR_DELETE {
+                return Ok(None);
+            }
+            return Err(windows_last_error("OpenServiceW(process id)"));
+        }
+        let _service = ServiceHandleGuard(service);
+        let status = query_windows_service_status_process(service)?;
+        Ok((status.dwProcessId != 0).then_some(status.dwProcessId))
     }
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
+fn acquire_windows_input_service_network_lease() -> Result<Option<std::fs::File>, String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::{
+            GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GENERIC_READ,
+            GENERIC_WRITE, INVALID_HANDLE_VALUE,
+        },
+        Storage::FileSystem::{
+            CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+        },
+        System::Pipes::WaitNamedPipeW,
+    };
+
+    let pipe_name = wide_null(shared_input::SERVICE_CONTROL_PIPE);
+    if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), 2_000) } == 0 {
+        let error = unsafe { GetLastError() };
+        if matches!(
+            error,
+            ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY | ERROR_SEM_TIMEOUT
+        ) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "WaitNamedPipeW(MyKVM service control) failed with Windows error {error}"
+        ));
+    }
+
+    let handle = unsafe {
+        CreateFileW(
+            pipe_name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(windows_last_error("CreateFileW(MyKVM service control)"));
+    }
+
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let raw = file.as_raw_handle();
+    let request = [1_u8];
+    let mut written = 0_u32;
+    if unsafe {
+        WriteFile(
+            raw,
+            request.as_ptr(),
+            request.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    } == 0
+        || written != request.len() as u32
+    {
+        return Err(windows_last_error("write MyKVM service takeover request"));
+    }
+
+    let mut ack = [0_u8; 1];
+    let mut read = 0_u32;
+    if unsafe {
+        ReadFile(
+            raw,
+            ack.as_mut_ptr(),
+            ack.len() as u32,
+            &mut read,
+            std::ptr::null_mut(),
+        )
+    } == 0
+        || read != 1
+        || ack[0] != 1
+    {
+        return Err("MyKVM input service did not acknowledge network takeover.".into());
+    }
+
+    Ok(Some(file))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_service_network_lease_alive(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    unsafe {
+        PeekNamedPipe(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_service_owns_network_ports() -> Result<bool, String> {
+    use windows_sys::Win32::System::Services::{
+        OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QUERY_SERVICE_CONFIGW,
+        SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG,
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW(query config)"));
+        }
+        let _scm = ServiceHandleGuard(scm);
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_CONFIG);
+        if service.is_null() {
+            return Ok(false);
+        }
+        let _service = ServiceHandleGuard(service);
+
+        let mut needed = 0_u32;
+        let _ = QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            return Err(windows_last_error("QueryServiceConfigW(size)"));
+        }
+        let words =
+            (needed as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut buffer = vec![0_usize; words];
+        let config = buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW;
+        if QueryServiceConfigW(service, config, needed, &mut needed) == 0 {
+            return Err(windows_last_error("QueryServiceConfigW"));
+        }
+        let path = (*config).lpBinaryPathName;
+        if path.is_null() {
+            return Ok(false);
+        }
+        let len = (0..)
+            .find(|index| *path.add(*index) == 0)
+            .unwrap_or_default();
+        let command = String::from_utf16_lossy(std::slice::from_raw_parts(path, len));
+        Ok(command.contains(shared_input::SERVICE_CONFIG_PATH_ARG))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_input_service(
+    helper_path: &PathBuf,
+    config_path: &PathBuf,
+    owner_sid: &str,
+) -> Result<(), String> {
     use windows_sys::Win32::{
         Foundation::{GetLastError, ERROR_SERVICE_EXISTS},
         System::Services::{
-            ChangeServiceConfigW, CreateServiceW, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+            ChangeServiceConfig2W, ChangeServiceConfigW, CreateServiceW, OpenSCManagerW,
+            OpenServiceW, SC_ACTION, SC_ACTION_RESTART, SC_MANAGER_CONNECT,
             SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-            SERVICE_ERROR_NORMAL, SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+            SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_FAILURE_ACTIONS_FLAG,
+            SERVICE_WIN32_OWN_PROCESS,
         },
     };
 
@@ -3378,6 +4530,9 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
             helper_path.display()
         ));
     }
+
+    stop_windows_input_service_and_wait()?;
+    let protected_helper_path = install_protected_input_helper(helper_path)?;
 
     unsafe {
         let scm = OpenSCManagerW(
@@ -3393,8 +4548,12 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
         let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
         let display_name = wide_null(shared_input::INPUT_SERVICE_DISPLAY_NAME);
         let binary = wide_null(&format!(
-            "{} --service",
-            quote_windows_arg_str(&helper_path.to_string_lossy())
+            "{} --service {} {} {} {}",
+            quote_windows_arg_str(&protected_helper_path.to_string_lossy()),
+            shared_input::SERVICE_CONFIG_PATH_ARG,
+            quote_windows_arg_str(&config_path.to_string_lossy()),
+            shared_input::SERVICE_OWNER_SID_ARG,
+            quote_windows_arg_str(owner_sid),
         ));
         let mut service = CreateServiceW(
             scm,
@@ -3442,21 +4601,384 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
 
         let _service = ServiceHandleGuard(service);
 
-        // Let the logged-in (Authenticated) user stop/start this LocalSystem
-        // service, so the per-user (non-elevated) updater can restart it during
-        // upgrades without a UAC prompt — important for an unattended client.
-        // SYSTEM and Administrators keep full control; AU only gains
-        // start/stop/query. Best-effort: failure just leaves the default DACL.
+        let mut actions = [1000, 5000, 10_000].map(|delay| SC_ACTION {
+            Type: SC_ACTION_RESTART,
+            Delay: delay,
+        });
+        let recovery = SERVICE_FAILURE_ACTIONSW {
+            dwResetPeriod: 86400,
+            cActions: actions.len() as u32,
+            lpsaActions: actions.as_mut_ptr(),
+            ..Default::default()
+        };
+        let failure_flags = SERVICE_FAILURE_ACTIONS_FLAG {
+            fFailureActionsOnNonCrashFailures: 1,
+        };
+        if ChangeServiceConfig2W(
+            service,
+            SERVICE_CONFIG_FAILURE_ACTIONS,
+            (&recovery as *const SERVICE_FAILURE_ACTIONSW).cast(),
+        ) == 0
+            || ChangeServiceConfig2W(
+                service,
+                SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                (&failure_flags as *const SERVICE_FAILURE_ACTIONS_FLAG).cast(),
+            ) == 0
+        {
+            return Err(windows_last_error("configure input service recovery"));
+        }
+
+        // Authenticated users may only inspect service state/config. The owner
+        // may start, stop, and remove it, but cannot reconfigure it or its DACL.
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let sddl = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLORC;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)";
-        let _ = std::process::Command::new("sc.exe")
-            .args(["sdset", shared_input::INPUT_SERVICE_NAME, sddl])
+        let sddl = format!(
+            "D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCRPWPLOSDRC;;;{owner_sid})(A;;CCLC;;;AU)"
+        );
+        let result = std::process::Command::new("sc.exe")
+            .args(["sdset", shared_input::INPUT_SERVICE_NAME, &sddl])
             .creation_flags(CREATE_NO_WINDOW)
-            .output();
+            .output()
+            .map_err(|error| format!("failed to secure input service permissions: {error}"))?;
+        if !result.status.success() {
+            let detail = String::from_utf8_lossy(if result.stderr.is_empty() {
+                &result.stdout
+            } else {
+                &result.stderr
+            });
+            return Err(format!(
+                "failed to secure input service permissions: {}",
+                detail.trim()
+            ));
+        }
 
-        Ok(())
+        ensure_windows_input_service_firewall_rule(&protected_helper_path)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn protected_input_helper_path() -> Result<PathBuf, String> {
+    use windows::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG},
+    };
+
+    unsafe {
+        let raw = SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KNOWN_FOLDER_FLAG(0), None)
+            .map_err(|error| format!("failed to locate Program Files: {error}"))?;
+        let program_files = raw
+            .to_string()
+            .map_err(|error| format!("invalid Program Files path: {error}"));
+        CoTaskMemFree(Some(raw.as_ptr().cast()));
+        Ok(PathBuf::from(program_files?)
+            .join("MyKVM")
+            .join("mykvm-input-helper.exe"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_protected_input_helper(source: &PathBuf) -> Result<PathBuf, String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let target = protected_input_helper_path()?;
+    let directory = target
+        .parent()
+        .ok_or_else(|| "protected input helper path has no parent directory".to_string())?;
+    fs::create_dir_all(directory).map_err(|error| {
+        format!(
+            "failed to create protected input helper directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    secure_protected_input_helper_path(directory)?;
+
+    let staging = target.with_extension("exe.installing");
+    let _ = fs::remove_file(&staging);
+    let mut staging_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(|error| {
+            format!(
+                "failed to create protected input helper staging file {}: {error}",
+                staging.display()
+            )
+        })?;
+    secure_protected_input_helper_path(&staging)?;
+    let mut source_file = fs::File::open(source)
+        .map_err(|error| format!("failed to open input helper {}: {error}", source.display()))?;
+    std::io::copy(&mut source_file, &mut staging_file).map_err(|error| {
+        format!(
+            "failed to copy input helper to {}: {error}",
+            staging.display()
+        )
+    })?;
+    staging_file.sync_all().map_err(|error| {
+        format!(
+            "failed to flush protected input helper {}: {error}",
+            staging.display()
+        )
+    })?;
+    drop(staging_file);
+
+    let staging_wide = wide_null(&staging.to_string_lossy());
+    let target_wide = wide_null(&target.to_string_lossy());
+    if unsafe {
+        MoveFileExW(
+            staging_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        let error = windows_last_error("MoveFileExW(protected input helper)");
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    if let Err(error) = secure_protected_input_helper_path(&target) {
+        let _ = fs::remove_file(&target);
+        return Err(error);
+    }
+
+    Ok(target)
+}
+
+#[cfg(target_os = "windows")]
+fn secure_protected_input_helper_path(path: &std::path::Path) -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, HLOCAL},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        },
+    };
+
+    let descriptor = wide_null("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+    let mut security_descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor.as_ptr(),
+            SDDL_REVISION_1,
+            &mut security_descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(windows_last_error(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW(protected helper)",
+        ));
+    }
+
+    let path = wide_null(&path.to_string_lossy());
+    let secured = unsafe {
+        SetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            security_descriptor,
+        )
+    } != 0;
+    let error = (!secured)
+        .then(|| windows_last_error("SetFileSecurityW(protected input helper)"));
+    unsafe {
+        let _ = LocalFree(security_descriptor as HLOCAL);
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn remove_protected_input_helper() {
+    let Ok(target) = protected_input_helper_path() else {
+        return;
+    };
+    let _ = fs::remove_file(&target);
+    let _ = fs::remove_file(target.with_extension("exe.installing"));
+    if let Some(directory) = target.parent() {
+        let _ = fs::remove_dir(directory);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_input_service_and_wait() -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::{
+            GetLastError, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST,
+            ERROR_SERVICE_NOT_ACTIVE,
+        },
+        System::Services::{
+            ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+            SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
+            SERVICE_STOPPED, SERVICE_STOP_PENDING,
+        },
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW(stop)"));
+        }
+        let _scm = ServiceHandleGuard(scm);
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(
+            scm,
+            service_name.as_ptr(),
+            SERVICE_STOP | SERVICE_QUERY_STATUS,
+        );
+        if service.is_null() {
+            if GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Ok(());
+            }
+            return Err(windows_last_error("OpenServiceW(stop)"));
+        }
+        let _service = ServiceHandleGuard(service);
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        loop {
+            let mut status = SERVICE_STATUS::default();
+            if QueryServiceStatus(service, &mut status) == 0 {
+                return Err(windows_last_error("QueryServiceStatus(stop)"));
+            }
+            if status.dwCurrentState == SERVICE_STOPPED {
+                return Ok(());
+            }
+
+            if status.dwCurrentState != SERVICE_STOP_PENDING {
+                let mut stop_status = SERVICE_STATUS::default();
+                if ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status) == 0 {
+                    let code = GetLastError();
+                    if code == ERROR_SERVICE_NOT_ACTIVE {
+                        return Ok(());
+                    }
+                    if code != ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
+                        return Err(windows_last_error("ControlService(stop)"));
+                    }
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for MyKVM input service to stop".into());
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_user_sid() -> Result<String, String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, LocalFree, HLOCAL},
+        Security::{
+            Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+            TOKEN_USER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(windows_last_error("OpenProcessToken(current user SID)"));
+        }
+
+        let mut needed = 0_u32;
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return Err(windows_last_error(
+                "GetTokenInformation(current user SID size)",
+            ));
+        }
+        let mut buffer = vec![0_u8; needed as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr() as *mut _,
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            let _ = CloseHandle(token);
+            return Err(windows_last_error("GetTokenInformation(current user SID)"));
+        }
+        let _ = CloseHandle(token);
+
+        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut sid = std::ptr::null_mut();
+        if ConvertSidToStringSidW(token_user.User.Sid, &mut sid) == 0 {
+            return Err(windows_last_error("ConvertSidToStringSidW"));
+        }
+        let len = (0..)
+            .find(|index| *sid.add(*index) == 0)
+            .unwrap_or_default();
+        let value = String::from_utf16_lossy(std::slice::from_raw_parts(sid, len));
+        let _ = LocalFree(sid as HLOCAL);
+        Ok(value)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_input_service_firewall_rule(helper_path: &PathBuf) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const RULE_NAME: &str = "MyKVM Headless Input (UDP-In)";
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={RULE_NAME}"),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let result = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={RULE_NAME}"),
+            "dir=in",
+            "action=allow",
+            &format!("program={}", helper_path.display()),
+            "protocol=UDP",
+            "profile=any",
+            "enable=yes",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("failed to configure helper firewall rule: {error}"))?;
+    if !result.status.success() {
+        return Err(format!(
+            "failed to configure helper firewall rule: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn remove_windows_input_service_firewall_rule() {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            "name=MyKVM Headless Input (UDP-In)",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 #[cfg(target_os = "windows")]
@@ -3500,11 +5022,11 @@ fn uninstall_windows_input_service() -> Result<(), String> {
     use windows_sys::Win32::{
         Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST},
         Storage::FileSystem::DELETE,
-        System::Services::{
-            ControlService, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
-            SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
-        },
+        System::Services::{DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT},
     };
+
+    remove_windows_input_service_firewall_rule();
+    stop_windows_input_service_and_wait()?;
 
     unsafe {
         let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
@@ -3513,28 +5035,24 @@ fn uninstall_windows_input_service() -> Result<(), String> {
         }
         let _scm = ServiceHandleGuard(scm);
         let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
-        let service = OpenServiceW(
-            scm,
-            service_name.as_ptr(),
-            SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE,
-        );
+        let service = OpenServiceW(scm, service_name.as_ptr(), DELETE);
         if service.is_null() {
             let code = GetLastError();
             if code == ERROR_SERVICE_DOES_NOT_EXIST {
+                remove_protected_input_helper();
                 return Ok(());
             }
             return Err(windows_last_error("OpenServiceW(uninstall)"));
         }
         let _service = ServiceHandleGuard(service);
 
-        let mut stop_status = SERVICE_STATUS::default();
-        let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status);
-
         if DeleteService(service) == 0 {
             return Err(windows_last_error("DeleteService"));
         }
-        return Ok(());
     }
+
+    remove_protected_input_helper();
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -3693,6 +5211,21 @@ fn restart_current_process_as_admin() -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
+pub fn relaunch_as_admin_if_needed() -> Result<bool, String> {
+    if is_windows_process_elevated()? {
+        return Ok(false);
+    }
+
+    // The startup copy has acquired the instance lock but has not started any
+    // runtime yet. Release it so the elevated copy can take over immediately.
+    // Forward --mykvm-autostart so login launches still stay in the tray.
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    release_single_instance();
+    launch_current_process_as_admin(&args)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "windows")]
 fn launch_current_process_as_admin(args: &[String]) -> Result<(), String> {
     use windows_sys::Win32::{UI::Shell::ShellExecuteW, UI::WindowsAndMessaging::SW_SHOWNORMAL};
 
@@ -3797,7 +5330,11 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         pair_secret: default_pair_secret(),
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
+        clipboard_on_demand: false,
+        clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: default_file_transfer_enabled(),
+        lock_sync: false,
+        input_protection: Default::default(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -3809,6 +5346,8 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         devices: vec![Device {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
             id: device_id,
             name: local_device_name(),
             platform: current_platform().into(),
@@ -3840,7 +5379,11 @@ fn detect_fallback_layout() -> LayoutState {
         pair_secret: default_pair_secret(),
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
+        clipboard_on_demand: false,
+        clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: default_file_transfer_enabled(),
+        lock_sync: false,
+        input_protection: Default::default(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -3904,6 +5447,202 @@ fn detect_local_screens(app: &AppHandle, device_id: &str) -> Vec<Screen> {
         .collect()
 }
 
+/// Re-detect this machine's displays and update the local device's screens in
+/// the runtime layout, carrying over the user's saved on-canvas positions.
+/// Called when the display configuration changes (e.g. a MacBook lid closes)
+/// so the announce loop advertises the current screens instead of the stale
+/// list captured at startup.
+#[cfg(target_os = "macos")]
+fn refresh_local_screens(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return;
+    };
+    let state = state.inner();
+
+    let local_id = {
+        let Ok(layout) = state.layout.lock() else {
+            return;
+        };
+        match layout.devices.iter().find(|device| device.role == "local") {
+            Some(local) => local.id.clone(),
+            None => return,
+        }
+    };
+
+    let detected = detect_local_screens(app, &local_id);
+
+    let updated = {
+        let Ok(mut layout) = state.layout.lock() else {
+            return;
+        };
+        let Ok(mut native) = state.native_layout.lock() else {
+            return;
+        };
+        let Ok(mut memory) = screen_layout_memory().lock() else {
+            return;
+        };
+        let changed = apply_detected_local_screens(&mut layout, &mut native, detected, &mut memory);
+        drop(memory);
+        drop(native);
+        if !changed {
+            None
+        } else {
+            if let Err(error) = write_layout_to_disk(&state.config_path, &layout) {
+                log::warn!("failed to save refreshed display layout: {error}");
+            }
+            Some(layout.clone())
+        }
+    };
+
+    if let Some(snapshot) = updated {
+        if let Some(local) = snapshot.devices.iter().find(|d| d.role == "local") {
+            let desc: Vec<String> = local
+                .screens
+                .iter()
+                .map(|s| format!("{}[{}x{}]@({},{})", s.id, s.width, s.height, s.x, s.y))
+                .collect();
+            log::info!(
+                "local displays changed: now advertising {} screen(s): {}",
+                local.screens.len(),
+                desc.join(", ")
+            );
+        }
+        // Capture also caches native cursor geometry. Rebuild it on a real
+        // display change; the live QUIC receiver reads the same native layout.
+        // Off the main thread: the restart sleeps and waits for the event tap.
+        let app = app.clone();
+        thread::spawn(move || {
+            if let Err(error) = restart_runtime_if_running(app.state::<AppRuntime>().inner()) {
+                log::warn!("failed to refresh input after display change: {error}");
+            }
+        });
+    }
+}
+
+// Keep disconnected displays for the next lid-open/reconnect event.
+#[cfg(target_os = "macos")]
+fn screen_layout_memory() -> &'static Mutex<Vec<Screen>> {
+    static MEMORY: Mutex<Vec<Screen>> = Mutex::new(Vec::new());
+    &MEMORY
+}
+
+/// Match names and dimensions before volatile enumeration ids.
+// ponytail: identical names and dimensions retain enumeration order; use OS display UUIDs if those monitors must be distinguished across reboots.
+fn restore_local_screen_layout(
+    detected: Vec<Screen>,
+    current: &[Screen],
+    memory: &mut Vec<Screen>,
+) -> Vec<Screen> {
+    // NSScreen can temporarily be empty during sleep or display reconfiguration.
+    // Never persist its 1x1 fallback over the last usable arrangement.
+    if !local_screens_available(&detected) {
+        return current.to_vec();
+    }
+    for screen in current.iter().filter(|s| s.width > 1 && s.height > 1) {
+        if let Some(saved) = memory.iter_mut().find(|s| s.id == screen.id) {
+            *saved = screen.clone();
+        } else {
+            memory.push(screen.clone());
+        }
+    }
+    let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<Screen> = Vec::with_capacity(detected.len());
+    for mut screen in detected {
+        let saved = memory
+            .iter()
+            .filter(|s| !used_ids.contains(&s.id))
+            .filter(|s| {
+                s.name == screen.name
+                    || (s.width, s.height) == (screen.width, screen.height)
+                    || s.id == screen.id
+            })
+            .min_by_key(|s| {
+                (
+                    s.name != screen.name,
+                    (s.width, s.height) != (screen.width, screen.height),
+                    s.id != screen.id,
+                )
+            });
+        if let Some(saved) = saved {
+            screen.id = saved.id.clone();
+            screen.x = saved.x;
+            screen.y = saved.y;
+        }
+        while used_ids.contains(&screen.id) {
+            screen.id = format!("{}-b", screen.id);
+        }
+        used_ids.insert(screen.id.clone());
+        merged.push(screen);
+    }
+    merged
+}
+
+fn local_screens_available(screens: &[Screen]) -> bool {
+    screens
+        .iter()
+        .any(|screen| screen.width > 1 && screen.height > 1)
+}
+
+fn align_native_screen_ids(native: &mut LayoutState, arranged: &LayoutState) {
+    let Some(local) = native.devices.iter_mut().find(|d| d.role == "local") else {
+        return;
+    };
+    if !local_screens_available(&local.screens) {
+        return;
+    }
+    let Some(arranged) = arranged.devices.iter().find(|d| d.role == "local") else {
+        return;
+    };
+    for (screen, arranged) in local.screens.iter_mut().zip(&arranged.screens) {
+        screen.id = arranged.id.clone();
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn apply_detected_local_screens(
+    layout: &mut LayoutState,
+    native: &mut LayoutState,
+    detected: Vec<Screen>,
+    memory: &mut Vec<Screen>,
+) -> bool {
+    if !local_screens_available(&detected) {
+        return false;
+    }
+    let Some(local) = layout.devices.iter_mut().find(|d| d.role == "local") else {
+        return false;
+    };
+    let Some(native_local) = native.devices.iter_mut().find(|d| d.role == "local") else {
+        return false;
+    };
+    let merged = restore_local_screen_layout(detected.clone(), &local.screens, memory);
+    let mut native_screens = detected;
+    for (screen, arranged) in native_screens.iter_mut().zip(&merged) {
+        screen.id = arranged.id.clone();
+    }
+    if local.screens == merged && native_local.screens == native_screens {
+        return false;
+    }
+    local.screens = merged;
+    native_local.screens = native_screens;
+    let fallback = local
+        .screens
+        .iter()
+        .find(|s| s.is_primary)
+        .or_else(|| local.screens.first())
+        .map(|s| s.id.clone());
+    if !layout
+        .devices
+        .iter()
+        .flat_map(|d| &d.screens)
+        .any(|s| s.id == layout.selected_screen_id)
+    {
+        if let Some(id) = fallback {
+            layout.selected_screen_id = id;
+        }
+    }
+    true
+}
+
 fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutState) -> LayoutState {
     if is_old_demo_layout(&saved_layout) || saved_layout.devices.is_empty() {
         return detected_layout;
@@ -3953,7 +5692,11 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         pair_secret: normalize_pair_secret(&saved_layout.pair_secret),
         paired_controllers: normalize_paired_controllers(saved_layout.paired_controllers),
         clipboard_sync: saved_layout.clipboard_sync,
+        clipboard_on_demand: false,
+        clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: saved_layout.file_transfer_enabled,
+        lock_sync: saved_layout.lock_sync,
+        input_protection: InputProtection::default(),
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
         performance_monitor: saved_layout.performance_monitor,
@@ -3973,22 +5716,11 @@ fn merge_detected_local_device(saved_layout: &LayoutState, mut detected_device: 
         .iter()
         .find(|device| device.id == detected_device.id)
     {
-        detected_device.screens = detected_device
-            .screens
-            .into_iter()
-            .map(|screen| {
-                saved_device
-                    .screens
-                    .iter()
-                    .find(|saved_screen| saved_screen.id == screen.id)
-                    .map(|saved_screen| Screen {
-                        x: saved_screen.x,
-                        y: saved_screen.y,
-                        ..screen.clone()
-                    })
-                    .unwrap_or(screen)
-            })
-            .collect();
+        detected_device.screens = restore_local_screen_layout(
+            detected_device.screens,
+            &saved_device.screens,
+            &mut Vec::new(),
+        );
     }
 
     detected_device
@@ -4072,12 +5804,27 @@ fn read_hostname() -> Option<String> {
 }
 
 fn local_host_label() -> String {
-    match (hostname(), local_ip_address()) {
-        (Some(name), Some(ip)) => format!("{name} / {ip}"),
+    match (hostname(), local_ip_list()) {
+        (Some(name), Some(ips)) => format!("{name} / {ips}"),
         (Some(name), None) => name,
-        (None, Some(ip)) => ip,
+        (None, Some(ips)) => ips,
         (None, None) => "localhost".into(),
     }
+}
+
+/// The default-route address first, then every other usable IPv4, so a
+/// direct-cable or Thunderbolt-bridge address is visible for manual pairing
+/// instead of only the Wi-Fi one (#33).
+fn local_ip_list() -> Option<String> {
+    let primary = local_ip_address();
+    let mut ips: Vec<String> = primary.iter().cloned().collect();
+    ips.extend(
+        local_ipv4_addresses()
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .filter(|ip| Some(ip) != primary.as_ref()),
+    );
+    (!ips.is_empty()).then(|| ips.join(", "))
 }
 
 fn local_ip_address() -> Option<String> {
@@ -4102,10 +5849,54 @@ fn local_ip_address() -> Option<String> {
 }
 
 fn probe_local_ip_address() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let address = socket.local_addr().ok()?;
-    Some(address.ip().to_string())
+    // Prefer the interface that routes to the internet, but reject a loopback /
+    // otherwise-unusable result: right after wake the network stack can hand
+    // back 127.0.0.1, and announcing that address makes peers unable to connect
+    // (the "worked yesterday, dead this morning" symptom). Fall back to any real
+    // LAN interface address so we never advertise loopback.
+    //
+    // A proxy in TUN mode owns the default route; its tunnel address is not the
+    // LAN, and since the device id is host + this address, the id flipped every
+    // time the proxy toggled. Skip a point-to-point tunnel and pick the LAN.
+    if let Some(ip) = default_route_ipv4_address() {
+        if usable_discovery_ipv4(ip) && !point_to_point_ipv4(ip) {
+            return Some(ip.to_string());
+        }
+    }
+    preferred_lan_ipv4(&local_ipv4_addresses()).map(|ip| ip.to_string())
+}
+
+/// The likeliest physical-LAN address: host-side virtual adapters (VirtualBox,
+/// VMware, Hyper-V/WSL) usually end in .1, then home > corporate > container
+/// ranges.
+// ponytail: heuristic, only used while a tunnel holds the default route; read
+// the OS routing table's non-tunnel default route if this ever picks wrong.
+fn preferred_lan_ipv4(addresses: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+    addresses.iter().copied().min_by_key(|ip| {
+        let octets = ip.octets();
+        let class = match octets {
+            [192, 168, ..] => 0,
+            [10, ..] => 1,
+            [172, b, ..] if (16..32).contains(&b) => 2,
+            _ => 3,
+        };
+        (octets[3] == 1, class)
+    })
+}
+
+/// The default route's interface is a /30-or-narrower point-to-point link: a
+/// TUN adapter (sing-box style), never a LAN.
+fn point_to_point_ipv4(ip: Ipv4Addr) -> bool {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces.iter().any(|interface| match &interface.addr {
+                if_addrs::IfAddr::V4(address) => {
+                    address.ip == ip && u32::from(address.netmask).count_ones() >= 30
+                }
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
@@ -4148,11 +5939,19 @@ fn default_route_ipv4_address() -> Option<Ipv4Addr> {
 }
 
 fn usable_discovery_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, ..] = address.octets();
     !address.is_loopback()
         && !address.is_unspecified()
         && !address.is_multicast()
         && !address.is_broadcast()
         && !address.is_link_local()
+        // 198.18.0.0/15 (RFC 2544 benchmarking) is the TUN range of Clash,
+        // Mihomo and Surge — never a LAN a peer could reach.
+        && !(a == 198 && b & 0xfe == 18)
+}
+
+fn default_input_speed() -> f64 {
+    1.0
 }
 
 fn default_device_source() -> String {
@@ -4222,6 +6021,278 @@ fn default_modifier_map() -> ModifierMap {
         meta: default_modifier_meta(),
     }
 }
+
+fn sync_clipboard_paste_shortcut(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else { return Ok(()); };
+    let layout = state.layout_snapshot();
+    let next = if !input::hotkey_recording() && !input::owns_native_shortcuts() && layout.machine_role == "server" && layout.clipboard_sync {
+        canonical_runtime_toggle_shortcut(&layout.clipboard_paste_hotkey)?
+    } else { None };
+    let mut current = state.clipboard_paste_shortcut.lock().map_err(|_| "clipboard shortcut is poisoned".to_string())?;
+    if *current == next { return Ok(()); }
+    if let Some(previous) = current.take() { let _ = app.global_shortcut().unregister(previous.as_str()); }
+    if let Some(next) = next { app.global_shortcut().register(next.as_str()).map_err(|e| e.to_string())?; *current = Some(next); }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardFilesCommit {
+    protocol: String, origin_id: String, origin_transport_public_key: String, target_id: String,
+    cluster_id: String, pair_secret: String, ids: Vec<String>, paste: bool, paste_token: String,
+}
+
+#[tauri::command]
+fn set_hotkey_recording(
+    app: AppHandle,
+    recording: bool,
+    captured: Option<String>,
+) -> Result<(), String> {
+    let was_recording = input::hotkey_recording();
+    if !recording && (was_recording || captured.is_some()) {
+        input::finish_shortcut_recording(captured.as_deref());
+    }
+    input::set_hotkey_recording(recording);
+    sync_runtime_toggle_shortcut(&app)?;
+    sync_screen_switch_shortcuts(&app)?;
+    sync_clipboard_paste_shortcut(&app)?;
+    if recording { input::begin_shortcut_recording(); }
+    Ok(())
+}
+
+fn paste_permitted(layout: &LayoutState, paste: bool, token: &str, source_key: &str) -> bool {
+    paste && (layout.machine_role == "client" || clipboard_exchange::consume_paste(token, source_key))
+}
+
+const CLIPBOARD_FILES_SUPERSEDED: &str = "文件剪贴板已改变或同步已关闭。";
+
+fn ensure_file_transfer_current(keep_going: Option<&dyn Fn() -> bool>) -> Result<(), String> {
+    if keep_going.is_some_and(|check| !check()) {
+        Err(CLIPBOARD_FILES_SUPERSEDED.into())
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_clipboard_files(
+    transport: &quic_transport::TransportHandle,
+    local_id: &str,
+    target: &FileTransferTarget,
+    paths: &[String],
+    paste: bool,
+    token: String,
+    app: Option<&AppHandle>,
+    keep_going: Option<&dyn Fn() -> bool>,
+) -> Result<u64, String> {
+    if paths.len() > 64 {
+        return Err("一次最多可粘贴 64 个文件或文件夹。".into());
+    }
+    ensure_file_transfer_current(keep_going)?;
+    let probe = file_transfer_packet(
+        "clipboard-probe",
+        "",
+        local_id,
+        target,
+        "",
+        0,
+        0,
+        0,
+        Vec::new(),
+        DropMode::Clipboard,
+        false,
+    );
+    send_file_transfer_packet(transport, target, probe)?;
+    let mut ids = Vec::new();
+    let mut packet_count = 1;
+    for (index, path) in paths.iter().enumerate() {
+        ensure_file_transfer_current(keep_going)?;
+        // Prepare one entry at a time rather than spooling every selected folder.
+        let files = collect_transfer_files(std::slice::from_ref(path))?;
+        for file in files {
+            let id = new_transfer_id("clipboard");
+            let reporter = app.map(|app| FileTransferProgressReporter {
+                app,
+                target_name: &target.name,
+                file_index: index + 1,
+                file_count: paths.len(),
+            });
+            packet_count += send_transfer_file(
+                transport,
+                local_id,
+                target,
+                &file,
+                &id,
+                DropMode::Clipboard,
+                reporter.as_ref(),
+                keep_going,
+            )?;
+            ids.push(id);
+        }
+    }
+    // A large file may finish after another copy or after the switch is disabled.
+    // Leave the new clipboard alone instead of committing that old selection.
+    ensure_file_transfer_current(keep_going)?;
+    let commit = ClipboardFilesCommit {
+        protocol: CLIPBOARD_FILES_PROTOCOL.into(),
+        origin_id: local_id.into(),
+        origin_transport_public_key: transport.public_key().into(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        ids,
+        paste,
+        paste_token: token,
+    };
+    transport.send_stream_expect_ack(
+        transport.peer(
+            target.addr.clone(),
+            target.transport_public_key.clone(),
+            target.protocol_version,
+        ),
+        encode_wire_packet(&commit)?,
+    )?;
+    Ok(packet_count + 1)
+}
+
+fn send_current_clipboard(state: &AppRuntime, target: &FileTransferTarget, paste: bool, token: String) -> Result<(), String> {
+    let layout = state.layout_snapshot();
+    if !layout.clipboard_sync { return Err("剪贴板同步未开启。".into()); }
+    let transport = state.quic_transport_handle().ok_or("传输尚未就绪。")?;
+    let mut local = local_peer_from_layout(&layout); apply_transport_to_peer(&mut local, &transport);
+    let peer = transport.peer(target.addr.clone(), target.transport_public_key.clone(), target.protocol_version);
+    let paths = rich_clipboard::read_files();
+    if !paths.is_empty() {
+        if !layout.file_transfer_enabled { return Err("文件传输未开启。".into()); }
+        return send_clipboard_files(&transport, &local.id, target, &paths, paste, token,
+            Some(&state.app_handle), None).map(|_| ());
+    }
+    let content = clipboard::read_content().ok_or("剪贴板中没有可传输的内容。")?;
+    if content.is_oversized() { return Err("剪贴板内容超过大小上限。".into()); }
+    let mut packet = clipboard_packet_from_content(content, local.id, transport.public_key().into(), target.device_id.clone(),
+        target.cluster_id.clone(), target.pair_secret.clone(), next_clipboard_sequence());
+    packet.paste = paste; packet.paste_token = token;
+    transport.send_stream_expect_ack(peer, encode_wire_packet(&packet)?)
+}
+
+fn request_clipboard_paste(state: &AppRuntime, target: input::ClipboardTarget, remote: bool) -> Result<(), String> {
+    let destination = FileTransferTarget { device_id: target.device_id, name: String::new(), addr: target.addr,
+        transport_public_key: target.transport_public_key, protocol_version: target.protocol_version,
+        cluster_id: target.cluster_id, pair_secret: target.pair_secret };
+    if remote { return send_current_clipboard(state, &destination, true, String::new()); }
+    let layout = state.layout_snapshot();
+    let transport = state.quic_transport_handle().ok_or("传输尚未就绪。")?;
+    let local = local_peer_from_layout(&layout);
+    let token = clipboard_exchange::expect_paste(&destination.transport_public_key);
+    let packet = PeerRequestPacket { protocol: CLIPBOARD_PULL_PROTOCOL.into(), paste_token: token,
+        origin_id: local.id, target_id: destination.device_id, cluster_id: destination.cluster_id, pair_secret: destination.pair_secret };
+    transport.send_stream_expect_ack(transport.peer(destination.addr, destination.transport_public_key, destination.protocol_version), encode_wire_packet(&packet)?)
+}
+
+#[tauri::command]
+fn paste_remote_clipboard(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    let target = input::current_clipboard_target(&state.clipboard_target).ok_or("请先切换到目标电脑一次。")?;
+    let remote = state.remote_input_active.load(Ordering::Relaxed);
+    let app = state.app_handle.clone();
+    thread::spawn(move || { if let Err(error) = request_clipboard_paste(app.state::<AppRuntime>().inner(), target, remote) {
+        let _ = app.emit("clipboard-paste-error", error);
+    }});
+    Ok(())
+}
+
+fn handle_clipboard_files_commit(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_id: &str,
+    clipboard_seen: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+) -> Option<bool> {
+    let accepted = handle_clipboard_files_commit_with_writer(
+        payload,
+        layout,
+        local_id,
+        clipboard_seen,
+        clipboard_echo_until,
+        |paths| {
+            retry_clipboard_write(
+                CLIPBOARD_WRITE_ATTEMPTS,
+                Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
+                || rich_clipboard::write_files(paths),
+            )
+        },
+    );
+    if accepted == Some(true) {
+        let packet = decode_wire_packet::<ClipboardFilesCommit>(payload)?;
+        if paste_permitted(
+            layout,
+            packet.paste,
+            &packet.paste_token,
+            &packet.origin_transport_public_key,
+        ) {
+            input::paste_received_clipboard();
+        }
+    }
+    accepted
+}
+
+fn handle_clipboard_files_commit_with_writer<F>(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_id: &str,
+    clipboard_seen: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+    mut write_files: F,
+) -> Option<bool>
+where
+    F: FnMut(&[String]) -> Result<(), String>,
+{
+    let packet = decode_wire_packet::<ClipboardFilesCommit>(payload)?;
+    if packet.protocol != CLIPBOARD_FILES_PROTOCOL {
+        return None;
+    }
+    if !layout.clipboard_sync || !layout.file_transfer_enabled {
+        return Some(false);
+    }
+    if packet.paste
+        && layout.machine_role != "client"
+        && !clipboard_exchange::paste_expected(
+            &packet.paste_token,
+            &packet.origin_transport_public_key,
+        )
+    {
+        return Some(false);
+    }
+    let auth = clipboard_packet_from_content(
+        ClipboardContent::Text(String::new()),
+        packet.origin_id.clone(),
+        packet.origin_transport_public_key.clone(),
+        packet.target_id.clone(),
+        packet.cluster_id,
+        packet.pair_secret,
+        0,
+    );
+    if !clipboard_packet_authorized(layout, &auth)
+        || !clipboard_packet_targets_local(layout, &auth, local_id)
+    {
+        return Some(false);
+    }
+    let Some(paths) = clipboard_exchange::take_files(&packet.origin_id, &packet.ids) else {
+        return Some(false);
+    };
+    // Serialize the native write and its echo marker with the polling thread.
+    let Ok(mut seen) = clipboard_seen.lock() else {
+        return Some(false);
+    };
+    if let Err(error) = write_files(&paths) {
+        log::warn!("file clipboard receive write failed: {error}");
+        return Some(false);
+    }
+    *seen = Some(clipboard::files_signature(&paths));
+    arm_clipboard_echo_guard(clipboard_echo_until);
+    Some(true)
+}
+
+fn default_clipboard_paste_hotkey() -> String { "disabled".into() }
 
 fn default_edge_switch_hotkey() -> String {
     "alt+shift+k".into()
@@ -4410,6 +6481,10 @@ fn clipboard_ready_status() -> NativeStageStatus {
 #[serde(rename_all = "camelCase")]
 struct ClipboardPacket {
     protocol: String,
+    #[serde(default)]
+    paste: bool,
+    #[serde(default)]
+    paste_token: String,
     origin_id: String,
     // The sender's QUIC transport public key. Defaulted so packets from older
     // peers (which never sent it) still decode as an empty string. Authorization
@@ -4450,6 +6525,15 @@ struct ClipboardFormat {
     image: Option<ClipboardImage>,
 }
 
+fn next_clipboard_sequence() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let previous = SEQUENCE.load(Ordering::Relaxed);
+        let next = now_ms().max(previous.saturating_add(1));
+        if SEQUENCE.compare_exchange(previous, next, Ordering::Relaxed, Ordering::Relaxed).is_ok() { return next; }
+    }
+}
+
 fn clipboard_packet_from_content(
     content: ClipboardContent,
     origin_id: String,
@@ -4460,45 +6544,27 @@ fn clipboard_packet_from_content(
     sequence: u64,
 ) -> ClipboardPacket {
     let signature = content.signature();
-    match content {
-        ClipboardContent::Text(text) => ClipboardPacket {
-            protocol: CLIPBOARD_PROTOCOL.into(),
-            origin_id,
-            origin_transport_public_key,
-            target_id,
-            cluster_id,
-            pair_secret,
-            signature,
-            formats: vec![ClipboardFormat {
-                kind: "plainText".into(),
-                text: text.clone(),
-                image: None,
-            }],
-            text,
-            image: None,
-            sequence,
-        },
-        ClipboardContent::Image(image) => ClipboardPacket {
-            protocol: CLIPBOARD_PROTOCOL.into(),
-            origin_id,
-            origin_transport_public_key,
-            target_id,
-            cluster_id,
-            pair_secret,
-            signature,
-            formats: vec![ClipboardFormat {
-                kind: "imageRgba".into(),
-                text: String::new(),
-                image: Some(image.clone()),
-            }],
-            text: String::new(),
-            image: Some(image),
-            sequence,
-        },
-    }
+    let (text, formats) = match content {
+        ClipboardContent::Text(text) => (text.clone(), vec![ClipboardFormat { kind: "plainText".into(), text, image: None }]),
+        ClipboardContent::Image(image) => (String::new(), vec![ClipboardFormat { kind: "imageRgba".into(), text: String::new(), image: Some(image) }]),
+        ClipboardContent::Rich(rich) => {
+            let mut formats = Vec::new();
+            if let Some(html) = rich.html { formats.push(ClipboardFormat { kind: "htmlFragment".into(), text: html, image: None }); }
+            if let Some(rtf) = rich.rtf { formats.push(ClipboardFormat { kind: "rtfBytes".into(), text: { use base64::Engine as _; base64::engine::general_purpose::STANDARD.encode(rtf) }, image: None }); }
+            formats.push(ClipboardFormat { kind: "plainText".into(), text: rich.text.clone(), image: None });
+            (rich.text, formats)
+        }
+    };
+    ClipboardPacket { protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(), origin_id, origin_transport_public_key,
+        target_id, cluster_id, pair_secret, signature, formats, text, image: None, sequence }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn clipboard_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(5);
+    Duration::from_millis((CLIPBOARD_RETRY_INTERVAL_MS << doublings).min(CLIPBOARD_RETRY_MAX_MS))
+}
+
 fn run_clipboard_sync(
     quic_transport: quic_transport::TransportHandle,
     local_peer_id: String,
@@ -4508,13 +6574,42 @@ fn run_clipboard_sync(
     transport_packets: Arc<AtomicU64>,
     clipboard_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    layout_state: Arc<Mutex<LayoutState>>,
+    app: AppHandle,
 ) {
     let mut last_sent: Option<(String, String, String)> = None;
-    let mut last_failed: Option<(String, String, String, Instant)> = None;
+    // (device, addr, signature, failed_at, consecutive failures)
+    let mut last_failed: Option<(String, String, String, Instant, u32)> = None;
+    let mut last_read: Option<(u64, String, String)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
-    let mut sequence = now_ms();
+    let mut last_file_sync_enabled = false;
 
     while !stop.load(Ordering::Relaxed) {
+        let Some((sync, on_demand, file_transfer_enabled)) =
+            layout_state.lock().ok().map(|layout| {
+                (
+                    layout.clipboard_sync,
+                    layout.clipboard_on_demand,
+                    layout.file_transfer_enabled,
+                )
+            })
+        else {
+            break;
+        };
+        if !sync {
+            break;
+        }
+        if on_demand {
+            thread::sleep(Duration::from_millis(150));
+            continue;
+        }
+        if file_transfer_enabled != last_file_sync_enabled {
+            last_read = None;
+            last_sent = None;
+            last_failed = None;
+            last_file_sync_enabled = file_transfer_enabled;
+        }
+
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
             thread::sleep(Duration::from_millis(120));
             last_poll = Instant::now() - Duration::from_secs(1);
@@ -4527,10 +6622,25 @@ fn run_clipboard_sync(
         }
         last_poll = Instant::now();
 
-        let Some(content) = clipboard::read_content() else {
+        let version = clipboard::change_count();
+        let retry_due = last_failed
+            .as_ref()
+            .is_some_and(|(_, _, _, failed_at, failures)| {
+                failed_at.elapsed() >= clipboard_retry_delay(*failures)
+            });
+        if clipboard_poll_unchanged(version, &last_read, &target, retry_due) {
+            continue;
+        }
+        let Some(content) = clipboard::read_snapshot() else {
             continue;
         };
+        // Only cache a stable read. A copy racing the read must be polled again.
+        last_read = version
+            .filter(|version| Some(*version) == clipboard::change_count())
+            .map(|version| (version, target.device_id.clone(), target.addr.clone()));
         let signature = content.signature();
+        let send_key = content.send_key(version);
+        let is_files = matches!(&content, clipboard::ClipboardSnapshot::Files(_));
 
         // If this is the content we just wrote after receiving a peer packet,
         // suppress it. A different signature during the grace window is treated
@@ -4541,6 +6651,7 @@ fn run_clipboard_sync(
                 .map(|seen| seen.as_deref() == Some(signature.as_str()))
                 .unwrap_or(false);
             if is_known_echo {
+                last_failed = None;
                 continue;
             }
             if let Ok(mut seen) = clipboard_seen_text.lock() {
@@ -4548,26 +6659,30 @@ fn run_clipboard_sync(
             }
         }
 
-        if content.is_oversized() {
+        if matches!(&content, clipboard::ClipboardSnapshot::Content(content) if content.is_oversized())
+            || (is_files && !file_transfer_enabled)
+        {
+            last_failed = None;
             continue;
         }
 
         if last_sent
             .as_ref()
             .map(|(device_id, addr, previous)| {
-                device_id == &target.device_id && addr == &target.addr && previous == &signature
+                device_id == &target.device_id && addr == &target.addr && previous == &send_key
             })
             .unwrap_or(false)
         {
+            last_failed = None;
             continue;
         }
         if last_failed
             .as_ref()
-            .map(|(device_id, addr, previous, failed_at)| {
+            .map(|(device_id, addr, previous, failed_at, failures)| {
                 device_id == &target.device_id
                     && addr == &target.addr
-                    && previous == &signature
-                    && failed_at.elapsed() < Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
+                    && previous == &send_key
+                    && failed_at.elapsed() < clipboard_retry_delay(*failures)
             })
             .unwrap_or(false)
         {
@@ -4587,46 +6702,158 @@ fn run_clipboard_sync(
             .unwrap_or(true);
 
         if !should_send {
-            last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
+            last_failed = None;
+            last_sent = Some((target.device_id.clone(), target.addr.clone(), send_key));
             continue;
         }
 
-        sequence = sequence.saturating_add(1);
-        let packet = clipboard_packet_from_content(
-            content,
-            local_peer_id.clone(),
-            quic_transport.public_key().to_string(),
-            target.device_id.clone(),
-            target.cluster_id.clone(),
-            target.pair_secret.clone(),
-            sequence,
-        );
-
-        if let Ok(payload) = encode_wire_packet(&packet) {
-            let peer = quic_transport.peer(
-                target.addr.clone(),
-                target.transport_public_key.clone(),
-                target.protocol_version,
-            );
-            let send_result = quic_transport.send_stream_expect_ack(peer, payload);
-            if send_result.is_ok() {
-                transport_packets.fetch_add(1, Ordering::Relaxed);
-                clipboard_packets.fetch_add(1, Ordering::Relaxed);
+        let send_result = match content {
+            clipboard::ClipboardSnapshot::Files(paths) => {
+                let Some(layout) = layout_state.lock().ok().map(|layout| layout.clone()) else {
+                    break;
+                };
+                let name = layout
+                    .devices
+                    .iter()
+                    .find(|device| device.id == target.device_id)
+                    .map(|device| device.name.clone())
+                    .or_else(|| {
+                        layout
+                            .paired_controllers
+                            .iter()
+                            .find(|peer| peer.id == target.device_id)
+                            .map(|peer| peer.name.clone())
+                    })
+                    .unwrap_or_else(|| target.device_id.clone());
+                let destination = FileTransferTarget {
+                    device_id: target.device_id.clone(),
+                    name,
+                    addr: target.addr.clone(),
+                    transport_public_key: target.transport_public_key.clone(),
+                    protocol_version: target.protocol_version,
+                    cluster_id: target.cluster_id.clone(),
+                    pair_secret: target.pair_secret.clone(),
+                };
+                let keep_going = || {
+                    file_clipboard_sync_current(
+                        &layout_state,
+                        &stop,
+                        version,
+                        clipboard::change_count(),
+                    )
+                };
+                send_clipboard_files(
+                    &quic_transport,
+                    &local_peer_id,
+                    &destination,
+                    &paths,
+                    false,
+                    String::new(),
+                    Some(&app),
+                    Some(&keep_going),
+                )
+            }
+            clipboard::ClipboardSnapshot::Content(content) => {
+                let packet = clipboard_packet_from_content(
+                    content,
+                    local_peer_id.clone(),
+                    quic_transport.public_key().into(),
+                    target.device_id.clone(),
+                    target.cluster_id.clone(),
+                    target.pair_secret.clone(),
+                    next_clipboard_sequence(),
+                );
+                encode_wire_packet(&packet).and_then(|payload| {
+                    let peer = quic_transport.peer(
+                        target.addr.clone(),
+                        target.transport_public_key.clone(),
+                        target.protocol_version,
+                    );
+                    quic_transport
+                        .send_stream_expect_ack(peer, payload)
+                        .map(|_| 1)
+                })
+            }
+        };
+        // Retries of this same content (the peer is still down).
+        let failures = last_failed
+            .as_ref()
+            .filter(|(device_id, addr, previous, _, _)| {
+                device_id == &target.device_id && addr == &target.addr && previous == &send_key
+            })
+            .map_or(0, |(_, _, _, _, failures)| *failures);
+        if let Ok(packet_count) = send_result {
+            transport_packets.fetch_add(packet_count, Ordering::Relaxed);
+            clipboard_packets.fetch_add(1, Ordering::Relaxed);
+            if failures > 0 {
+                log::info!("clipboard send recovered after {failures} failed attempt(s)");
+            }
+            last_failed = None;
+            last_sent = Some((target.device_id, target.addr, send_key));
+        } else {
+            let error = send_result.err().unwrap_or_default();
+            if error == CLIPBOARD_FILES_SUPERSEDED || error == "传输已取消。" {
                 last_failed = None;
-                last_sent = Some((target.device_id, target.addr, signature));
+                last_sent = Some((target.device_id, target.addr, send_key));
+                continue;
+            }
+            // One warning per content; a peer that stays down filled the
+            // log every 2 s (1.7k lines in an afternoon, rotating out
+            // everything useful).
+            if failures == 0 {
+                log::warn!("clipboard send failed: {error}");
             } else {
-                if let Err(error) = send_result {
-                    log::warn!("clipboard send failed: {error}");
-                }
+                log::debug!("clipboard send failed again ({failures}): {error}");
+            }
+            if error.contains(quic_transport::STREAM_REJECTED) {
+                // The receiver refused it (clipboard sync off, unpaired, too
+                // old) and will refuse the same content again; wait for the
+                // next copy instead of resending every retry interval.
+                last_failed = None;
+                last_sent = Some((target.device_id, target.addr, send_key));
+            } else {
                 last_failed = Some((
                     target.device_id.clone(),
                     target.addr.clone(),
-                    signature,
+                    send_key,
                     Instant::now(),
+                    failures.saturating_add(1),
                 ));
             }
         }
     }
+}
+
+fn file_clipboard_sync_current(
+    layout: &Arc<Mutex<LayoutState>>,
+    stop: &AtomicBool,
+    expected_version: Option<u64>,
+    current_version: Option<u64>,
+) -> bool {
+    !stop.load(Ordering::Relaxed)
+        && expected_version == current_version
+        && layout
+            .lock()
+            .map(|layout| layout.clipboard_sync && layout.file_transfer_enabled)
+            .unwrap_or(false)
+}
+
+fn clipboard_poll_unchanged(
+    version: Option<u64>,
+    previous: &Option<(u64, String, String)>,
+    target: &input::ClipboardTarget,
+    retry_due: bool,
+) -> bool {
+    !retry_due
+        && version.is_some_and(|version| {
+            previous
+                .as_ref()
+                .is_some_and(|(last_version, device_id, addr)| {
+                    version == *last_version
+                        && device_id == &target.device_id
+                        && addr == &target.addr
+                })
+        })
 }
 
 /// True while we are inside the post-write grace window (see
@@ -4666,15 +6893,26 @@ fn retry_clipboard_content_write<F>(
 where
     F: FnMut(&ClipboardContent) -> Result<(), String>,
 {
+    retry_clipboard_write(attempts, retry_delay, || write_content(content))
+}
+
+fn retry_clipboard_write<F>(
+    attempts: usize,
+    retry_delay: Duration,
+    mut write: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
     let attempts = attempts.max(1);
     let mut last_error = None;
     for attempt in 0..attempts {
-        match write_content(content) {
+        match write() {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
         if attempt + 1 < attempts && !retry_delay.is_zero() {
-            thread::sleep(retry_delay);
+            thread::sleep(retry_delay * (attempt as u32 + 1));
         }
     }
 
@@ -4689,7 +6927,7 @@ fn handle_clipboard_packet(
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> bool {
-    handle_clipboard_packet_with_writer(
+    let accepted = handle_clipboard_packet_with_writer(
         payload,
         layout,
         local_peer_id,
@@ -4697,7 +6935,19 @@ fn handle_clipboard_packet(
         clipboard_echo_until,
         clipboard_last_sequences,
         write_clipboard_content_with_retry,
-    )
+    );
+    if accepted {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Intent { #[serde(default)] paste: bool, #[serde(default)] paste_token: String,
+            #[serde(default)] origin_transport_public_key: String, origin_id: String }
+        if let Some(intent) = decode_wire_packet::<Intent>(payload) {
+            if intent.origin_id != local_peer_id && paste_permitted(layout, intent.paste, &intent.paste_token, &intent.origin_transport_public_key) {
+                input::paste_received_clipboard();
+            }
+        }
+    }
+    accepted
 }
 
 fn handle_clipboard_packet_with_writer<F>(
@@ -4719,6 +6969,10 @@ where
     if packet.protocol != CLIPBOARD_PROTOCOL {
         return false;
     }
+
+    if layout.clipboard_on_demand && !packet.paste { return false; }
+    if packet.paste && layout.machine_role != "client"
+        && !clipboard_exchange::paste_expected(&packet.paste_token, &packet.origin_transport_public_key) { return false; }
 
     if !clipboard_packet_authorized(layout, &packet) {
         return false;
@@ -4827,6 +7081,14 @@ fn clipboard_packet_targets_local(
 }
 
 fn clipboard_content_from_packet(packet: ClipboardPacket) -> Option<ClipboardContent> {
+    let html = packet.formats.iter().find(|f| f.kind == "htmlFragment").map(|f| f.text.clone());
+    let rtf = packet.formats.iter().find(|f| f.kind == "rtfBytes").and_then(|f| {
+        use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(&f.text).ok()
+    });
+    if html.is_some() || rtf.is_some() {
+        let text = packet.formats.iter().find(|f| f.kind == "plainText").map(|f| f.text.clone()).unwrap_or_else(|| packet.text.clone());
+        return Some(ClipboardContent::Rich(rich_clipboard::RichText { text, html, rtf }));
+    }
     if let Some(content) = packet
         .formats
         .into_iter()
@@ -4889,34 +7151,11 @@ fn file_transfer_target_for_device(
         return Err("当前设备尚未完成配对，无法传输文件。".into());
     }
 
-    if let Some(device) = layout
-        .devices
-        .iter()
-        .find(|device| device.id == device_id && device.role != "local")
-    {
-        if !device.online || !device.input_ready {
-            return Err(format!("{} 当前不在线，无法传输文件。", device.name));
-        }
-        if device.protocol_version != quic_transport::PROTOCOL_VERSION
-            || device.transport_public_key.trim().is_empty()
-        {
-            return Err(format!("{} 版本过旧，请先升级 MyKVM。", device.name));
-        }
-        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
-        let host = file_transfer_host(&device.host)
-            .ok_or_else(|| format!("{} 缺少可用地址。", device.name))?;
-
-        return Ok(FileTransferTarget {
-            device_id: device.id.clone(),
-            name: device.name.clone(),
-            addr: format!("{host}:{quic_port}"),
-            transport_public_key: device.transport_public_key.clone(),
-            protocol_version: device.protocol_version,
-            cluster_id: layout.cluster_id.clone(),
-            pair_secret: layout.pair_secret.clone(),
-        });
-    }
-
+    // A client's only target is its controller: look there first. A device
+    // entry with the same id can be left over from when this machine was the
+    // server; it says "not input-ready" (a controller does not take input),
+    // and answering from it failed every transfer — the drag hand-off and the
+    // log — with "offline".
     if layout.machine_role == "client" {
         if let Some(controller) = layout
             .paired_controllers
@@ -4947,7 +7186,10 @@ fn file_transfer_target_for_device(
             };
 
             return Ok(FileTransferTarget {
-                device_id: controller.id.clone(),
+                // The controller's id as it announces itself now, not as stored
+                // at pairing: it is host + IP, so it moves with the IP (a TUN
+                // proxy flipped it), and the receiver matches target_id exactly.
+                device_id: peer.id.clone(),
                 name: controller.name.clone(),
                 addr: format!("{}:{}", host, peer.quic_port),
                 transport_public_key: peer.transport_public_key.clone(),
@@ -4956,6 +7198,34 @@ fn file_transfer_target_for_device(
                 pair_secret: layout.pair_secret.clone(),
             });
         }
+    }
+
+    if let Some(device) = layout
+        .devices
+        .iter()
+        .find(|device| device.id == device_id && device.role != "local")
+    {
+        if !device.online || !device.input_ready {
+            return Err(format!("{} 当前不在线，无法传输文件。", device.name));
+        }
+        if device.protocol_version != quic_transport::PROTOCOL_VERSION
+            || device.transport_public_key.trim().is_empty()
+        {
+            return Err(format!("{} 版本过旧，请先升级 MyKVM。", device.name));
+        }
+        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
+        let host = file_transfer_host(&device.host)
+            .ok_or_else(|| format!("{} 缺少可用地址。", device.name))?;
+
+        return Ok(FileTransferTarget {
+            device_id: device.id.clone(),
+            name: device.name.clone(),
+            addr: format!("{host}:{quic_port}"),
+            transport_public_key: device.transport_public_key.clone(),
+            protocol_version: device.protocol_version,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+        });
     }
 
     Err("没有找到可传输的目标设备。".into())
@@ -4980,6 +7250,12 @@ fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String>
         let path = PathBuf::from(path_value);
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("无法读取文件 {}: {error}", path.display()))?;
+        if metadata.is_dir() {
+            let bundle = Arc::new(folder_transfer::bundle(&path)?);
+            files.push(TransferFile { path: bundle.path().to_path_buf(), name: transfer_file_name(&path)?,
+                total_bytes: bundle.size().map_err(|e| e.to_string())?, directory: false, bundle: Some(bundle) });
+            continue;
+        }
         if !metadata.is_file() {
             return Err(format!("暂不支持传输文件夹或特殊文件：{}", path.display()));
         }
@@ -4995,14 +7271,35 @@ fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String>
             path,
             name,
             total_bytes: metadata.len(),
+            directory: false,
+            bundle: None,
         });
     }
 
     if files.is_empty() {
         Err("请选择要传输的文件。".into())
     } else {
-        Ok(files)
+    Ok(files)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_native_drag_files(paths: &[String]) -> Result<Vec<TransferFile>, String> {
+    let mut files = Vec::new();
+    for raw in paths {
+        let root = Path::new(raw);
+        let name = transfer_file_name(root)?;
+        if root.is_dir() {
+            for (relative, directory, size) in folder_transfer::walk(root)? {
+                let virtual_name = Path::new(&name).join(&relative).to_string_lossy().replace('\\', "/");
+                if virtual_name.encode_utf16().count() >= 260 { return Err(format!("{DRAG_CONTROL_FAILED}: 文件夹路径过长，请使用普通文件传输。")); }
+                files.push(TransferFile { path: root.join(relative), name: virtual_name, total_bytes: size, directory, bundle: None });
+            }
+        } else { files.extend(collect_transfer_files(&[raw.clone()])?); }
+        if files.len() > folder_transfer::MAX_ENTRIES { return Err("拖放条目过多。".into()); }
+    }
+    if files.is_empty() { return Err("请选择要传输的文件。".into()); }
+    Ok(files)
 }
 
 fn transfer_file_name(path: &Path) -> Result<String, String> {
@@ -5022,21 +7319,58 @@ fn transfer_file_name(path: &Path) -> Result<String, String> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_transfer_file(
     quic_transport: &quic_transport::TransportHandle,
     origin_id: &str,
     target: &FileTransferTarget,
     file: &TransferFile,
+    transfer_id: &str,
+    drop_mode: DropMode,
+    reporter: Option<&FileTransferProgressReporter>,
+    keep_going: Option<&dyn Fn() -> bool>,
 ) -> Result<u64, String> {
-    let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
-    let mut packet_count = 0_u64;
+    ensure_file_transfer_current(keep_going)?;
+    if file.directory {
+        return Ok(0);
+    }
+    if file.bundle.is_some() {
+        let probe = file_transfer_packet(
+            "directory-probe",
+            "",
+            origin_id,
+            target,
+            &file.name,
+            0,
+            0,
+            0,
+            Vec::new(),
+            drop_mode,
+            true,
+        );
+        send_file_transfer_packet(quic_transport, target, probe)
+            .map_err(|_| "对端版本不支持文件夹，请先更新两端 MyKVM。".to_string())?;
+    }
+    if let Some(reporter) = reporter {
+        reporter.emit(transfer_id, file, 0, false, None);
+    }
 
-    send_file_transfer_packet(
+    let job = transfer_jobs::TransferJob::new(transfer_id);
+    let outcome = send_transfer_file_bytes(
         quic_transport,
+        origin_id,
         target,
-        file_transfer_packet(
-            "start",
-            &transfer_id,
+        file,
+        drop_mode,
+        transfer_id,
+        reporter,
+        &job,
+        keep_going,
+    );
+    if outcome.is_err() {
+        let abort = file_transfer_packet(
+            "abort",
+            transfer_id,
             origin_id,
             target,
             &file.name,
@@ -5044,6 +7378,56 @@ fn send_transfer_file(
             0,
             0,
             Vec::new(),
+            drop_mode,
+            file.bundle.is_some(),
+        );
+        let _ = send_file_transfer_packet(quic_transport, target, abort);
+    }
+
+    if let Some(reporter) = reporter {
+        match &outcome {
+            Ok(_) => reporter.emit(transfer_id, file, file.total_bytes, true, None),
+            Err(error) => reporter.emit(transfer_id, file, 0, true, Some(error.clone())),
+        }
+    }
+
+    outcome
+}
+
+fn new_transfer_id(prefix: &str) -> String {
+    format!("{prefix}-{}-{}", now_ms(), random_hex(8))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_transfer_file_bytes(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: &str,
+    target: &FileTransferTarget,
+    file: &TransferFile,
+    drop_mode: DropMode,
+    transfer_id: &str,
+    reporter: Option<&FileTransferProgressReporter>,
+    job: &transfer_jobs::TransferJob,
+    keep_going: Option<&dyn Fn() -> bool>,
+) -> Result<u64, String> {
+    ensure_file_transfer_current(keep_going)?;
+    let mut packet_count = 0_u64;
+
+    send_file_transfer_packet(
+        quic_transport,
+        target,
+        file_transfer_packet(
+            "start",
+            transfer_id,
+            origin_id,
+            target,
+            &file.name,
+            file.total_bytes,
+            0,
+            0,
+            Vec::new(),
+            drop_mode,
+            file.bundle.is_some(),
         ),
     )?;
     packet_count += 1;
@@ -5053,7 +7437,12 @@ fn send_transfer_file(
     let mut buffer = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
     let mut offset = 0_u64;
     let mut chunk_index = 0_u64;
+    let mut last_progress = Instant::now();
     loop {
+        if job.cancelled() {
+            return Err("传输已取消。".into());
+        }
+        ensure_file_transfer_current(keep_going)?;
         let read = file_handle
             .read(&mut buffer)
             .map_err(|error| format!("读取文件 {} 失败: {error}", file.path.display()))?;
@@ -5066,7 +7455,7 @@ fn send_transfer_file(
             target,
             file_transfer_packet(
                 "chunk",
-                &transfer_id,
+                transfer_id,
                 origin_id,
                 target,
                 &file.name,
@@ -5074,19 +7463,29 @@ fn send_transfer_file(
                 chunk_index,
                 offset,
                 data,
+                drop_mode,
+                file.bundle.is_some(),
             ),
         )?;
         packet_count += 1;
         offset = offset.saturating_add(read as u64);
         chunk_index = chunk_index.saturating_add(1);
+        if let Some(reporter) = reporter {
+            if last_progress.elapsed() >= Duration::from_millis(FILE_TRANSFER_PROGRESS_INTERVAL_MS)
+            {
+                reporter.emit(transfer_id, file, offset, false, None);
+                last_progress = Instant::now();
+            }
+        }
     }
 
+    ensure_file_transfer_current(keep_going)?;
     send_file_transfer_packet(
         quic_transport,
         target,
         file_transfer_packet(
             "finish",
-            &transfer_id,
+            transfer_id,
             origin_id,
             target,
             &file.name,
@@ -5094,11 +7493,81 @@ fn send_transfer_file(
             chunk_index,
             offset,
             Vec::new(),
+            drop_mode,
+            file.bundle.is_some(),
         ),
     )?;
     packet_count += 1;
 
     Ok(packet_count)
+}
+
+#[tauri::command]
+fn cancel_file_transfer(transfer_id: String) -> bool { transfer_jobs::cancel(&transfer_id) }
+
+fn abort_incoming_file_transfer(packet: FileTransferPacket, transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>) -> bool {
+    let Ok(mut transfers) = transfers.lock() else { return false; };
+    let Some(transfer) = transfers.get(&packet.transfer_id) else { return true; };
+    if transfer.origin_id != packet.origin_id || transfer.target_id != packet.target_id { return false; }
+    if let Some(transfer) = transfers.remove(&packet.transfer_id) { let _ = fs::remove_file(transfer.temp_path); }
+    true
+}
+
+fn finalize_received_transfer(temp: &Path, final_path: &mut PathBuf, directory: bool) -> std::io::Result<()> {
+    let parent = final_path.parent().ok_or_else(|| std::io::Error::other("missing destination directory"))?.to_path_buf();
+    let name = final_path.file_name().ok_or_else(|| std::io::Error::other("missing file name"))?.to_string_lossy().into_owned();
+    loop {
+        if directory {
+            match fs::create_dir(&*final_path) {
+                Ok(()) => {
+                    if let Err(error) = folder_transfer::extract(temp, final_path) {
+                        let _ = fs::remove_dir_all(&*final_path);
+                        return Err(std::io::Error::other(error));
+                    }
+                    fs::remove_file(temp)?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        } else {
+            match fs::hard_link(temp, &*final_path) {
+                Ok(()) => { fs::remove_file(temp)?; return Ok(()); }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    *final_path = unique_transfer_destination(&parent, &name);
+                    continue;
+                }
+                Err(_) => {}
+            }
+            match fs::OpenOptions::new().write(true).create_new(true).open(&*final_path) {
+                Ok(mut output) => {
+                    let copy = fs::File::open(temp).and_then(|mut input| std::io::copy(&mut input, &mut output));
+                    drop(output);
+                    if let Err(error) = copy { let _ = fs::remove_file(&*final_path); return Err(error); }
+                    fs::remove_file(temp)?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        *final_path = unique_transfer_destination(&parent, &name);
+    }
+}
+
+// Where a transfer should land on the receiver.
+#[derive(Clone, Copy, PartialEq)]
+enum DropMode {
+    /// The MyKVM Transfers folder (the manual "send files" button).
+    TransfersFolder,
+    /// Straight onto the Desktop (edge drag-drop onto a non-Windows machine).
+    Desktop,
+    /// ShareMouse-style: stage, then drop into the folder under the cursor when
+    /// the drag is released (else Desktop).
+    DragDrop,
+    /// A device's log fetched on request; lands in the "MyKVM Remote Logs" folder.
+    ClientLog,
+    Clipboard,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5112,9 +7581,11 @@ fn file_transfer_packet(
     chunk_index: u64,
     offset: u64,
     data: Vec<u8>,
+    drop_mode: DropMode,
+    directory_bundle: bool,
 ) -> FileTransferPacket {
     FileTransferPacket {
-        protocol: FILE_TRANSFER_PROTOCOL.into(),
+        protocol: if drop_mode == DropMode::Clipboard { CLIPBOARD_FILES_PROTOCOL } else { FILE_TRANSFER_PROTOCOL }.into(),
         kind: kind.into(),
         transfer_id: transfer_id.into(),
         origin_id: origin_id.into(),
@@ -5126,6 +7597,11 @@ fn file_transfer_packet(
         chunk_index,
         offset,
         data,
+        drop_to_desktop: drop_mode == DropMode::Desktop,
+        drag_drop: drop_mode == DropMode::DragDrop,
+        client_log: drop_mode == DropMode::ClientLog,
+        directory_bundle,
+        clipboard_transfer: drop_mode == DropMode::Clipboard,
     }
 }
 
@@ -5145,6 +7621,470 @@ fn send_file_transfer_packet(
         .map_err(|error| format!("文件传输失败: {error}"))
 }
 
+// Control channel for ShareMouse-style native drag-drop onto a Windows client.
+// The file bytes still travel as ordinary FileTransferPackets (matched to the
+// drag by transfer_id); these messages open/close the client's OLE session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DragControlPacket {
+    protocol: String,
+    kind: String, // "start" | "drop" | "cancel"
+    origin_id: String,
+    target_id: String,
+    cluster_id: String,
+    pair_secret: String,
+    #[serde(default)]
+    files: Vec<DragControlFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DragControlFile {
+    transfer_id: String,
+    name: String,
+    size: u64,
+    #[serde(default)]
+    directory: bool,
+}
+
+/// Windows target: what a sent drag start still has to stream (edge drag-drop
+/// path, macOS controller only): each file under the transfer
+/// id announced in the start, so the peer feeds it to its drag session.
+#[cfg(target_os = "macos")]
+struct OleDragStream {
+    quic_transport: quic_transport::TransportHandle,
+    origin_id: String,
+    target: FileTransferTarget,
+    files: Vec<(String, TransferFile)>,
+}
+
+/// Announce a native drag to `device_id` (acknowledged before returning), so
+/// that a drop or cancel sent afterwards can never overtake it.
+#[cfg(target_os = "macos")]
+fn send_ole_drag_start(
+    state: &AppRuntime,
+    device_id: &str,
+    paths: &[String],
+) -> Result<OleDragStream, String> {
+    state.start_discovery()?;
+    let layout = state.layout_snapshot();
+    if !layout.file_transfer_enabled {
+        return Err("文件传输未开启。".into());
+    }
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready; start the runtime first.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
+    let files = collect_native_drag_files(paths)?;
+    let tree = files.iter().any(|file| file.directory);
+
+    // Pre-assign a transfer id per file so the client can match the streamed
+    // bytes to the drag session it is about to open.
+    let with_ids: Vec<(String, TransferFile)> = files
+        .into_iter()
+        .map(|file| (new_transfer_id("drag"), file))
+        .collect();
+
+    let manifest = with_ids
+        .iter()
+        .map(|(id, file)| DragControlFile {
+            transfer_id: id.clone(),
+            name: file.name.clone(),
+            size: file.total_bytes,
+            directory: file.directory,
+        })
+        .collect();
+    let start = DragControlPacket {
+        protocol: if tree { DRAG_TREE_PROTOCOL } else { DRAG_CONTROL_PROTOCOL }.into(),
+        kind: "start".into(),
+        origin_id: local_peer.id.clone(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        files: manifest,
+    };
+    let payload = encode_wire_packet(&start)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    quic_transport
+        .send_stream_expect_ack(peer, payload)
+        .map_err(|error| format!("{DRAG_CONTROL_FAILED}: {error}"))?;
+
+    Ok(OleDragStream {
+        quic_transport,
+        origin_id: local_peer.id,
+        target,
+        files: with_ids,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn stream_ole_drag_files(state: &AppRuntime, stream: OleDragStream) -> Result<usize, String> {
+    let OleDragStream {
+        quic_transport,
+        origin_id,
+        target,
+        files: with_ids,
+    } = stream;
+    let total = with_ids.len();
+    for (index, (transfer_id, file)) in with_ids.iter().enumerate() {
+        let reporter = FileTransferProgressReporter {
+            app: &state.app_handle,
+            target_name: &target.name,
+            file_index: index + 1,
+            file_count: total,
+        };
+        let packet_count = send_transfer_file(
+            &quic_transport,
+            &origin_id,
+            &target,
+            file,
+            transfer_id,
+            DropMode::TransfersFolder,
+            Some(&reporter),
+            None,
+        )?;
+        state
+            .transport_packets
+            .fetch_add(packet_count, Ordering::Relaxed);
+    }
+    Ok(total)
+}
+
+/// Windows target: signal drop or cancel for an in-flight OLE drag session.
+#[cfg(target_os = "macos")]
+fn send_ole_drag_signal(state: &AppRuntime, device_id: &str, kind: &str) -> Result<(), String> {
+    let layout = state.layout_snapshot();
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
+    let packet = DragControlPacket {
+        protocol: DRAG_CONTROL_PROTOCOL.into(),
+        kind: kind.into(),
+        origin_id: local_peer.id.clone(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        files: Vec::new(),
+    };
+    let payload = encode_wire_packet(&packet)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    quic_transport
+        .send_stream_expect_ack(peer, payload)
+        .map_err(|error| format!("{DRAG_CONTROL_FAILED}: {error}"))
+}
+
+/// Controller (either platform): ask the controlled machine to hand its
+/// in-flight file drag back to us. Sent when the cursor crosses back to the
+/// controller mid-drag. Fire-and-forget on a thread so the input hot path never
+/// blocks on the round-trip.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) fn send_drag_pull(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: String,
+    target_device_id: String,
+    target_addr: String,
+    target_pubkey: String,
+    target_version: u16,
+    cluster_id: String,
+    pair_secret: String,
+) {
+    if target_pubkey.trim().is_empty()
+        || target_addr.trim().is_empty()
+        || cluster_id.trim().is_empty()
+        || pair_secret.trim().is_empty()
+    {
+        return;
+    }
+    let quic_transport = quic_transport.clone();
+    thread::spawn(move || {
+        let label = target_device_id.clone();
+        let packet = DragControlPacket {
+            protocol: DRAG_CONTROL_PROTOCOL.into(),
+            kind: "pull".into(),
+            origin_id,
+            target_id: target_device_id,
+            cluster_id,
+            pair_secret,
+            files: Vec::new(),
+        };
+        let Ok(payload) = encode_wire_packet(&packet) else {
+            return;
+        };
+        let peer = quic_transport.peer(target_addr, target_pubkey, target_version);
+        match quic_transport.send_stream_expect_ack(peer, payload) {
+            Ok(_) => log::info!("drag pull sent to {label}"),
+            Err(error) => log::warn!("drag pull send failed: {error}"),
+        }
+    });
+}
+
+/// Client side: apply an incoming drag-control message. Returns true if the
+/// payload was a drag-control packet addressed to us (whether or not this
+/// platform can act on it).
+fn handle_drag_control_packet(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+) -> bool {
+    let Some(packet) = decode_wire_packet::<DragControlPacket>(payload) else {
+        return false;
+    };
+    if packet.protocol != DRAG_CONTROL_PROTOCOL && packet.protocol != DRAG_TREE_PROTOCOL {
+        return false;
+    }
+    if !layout.file_transfer_enabled {
+        return false;
+    }
+    // Reuse the file-transfer trust checks: same cluster, same pair secret, and
+    // (on a client) an origin we are paired to.
+    if layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || packet.pair_secret != layout.pair_secret
+    {
+        return false;
+    }
+    if layout.machine_role == "client"
+        && !layout.paired_controllers.is_empty()
+        && !layout
+            .paired_controllers
+            .iter()
+            .any(|controller| controller.id == packet.origin_id)
+    {
+        return false;
+    }
+    if packet.target_id != local_peer_id || packet.origin_id == local_peer_id {
+        return false;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        match packet.kind.as_str() {
+            "start" => {
+                let files = packet
+                    .files
+                    .into_iter()
+                    .map(|file| windows_drag::DragFileMeta {
+                        transfer_id: file.transfer_id,
+                        name: file.name,
+                        size: file.size,
+                        directory: file.directory,
+                    })
+                    .collect();
+                let mode = native_drag::NativeDragMode::for_role(&layout.machine_role);
+                if windows_drag::start_drag_session(files, mode) {
+                    log::info!("native drag session started from {}", packet.origin_id);
+                } else { return false; }
+            }
+            "drop" => windows_drag::signal_drop(),
+            "cancel" => windows_drag::cancel_session(),
+            // The controller crossed back to itself mid-drag and wants the file
+            // drag we are holding; the catcher reads it and transfers it up.
+            "pull" => windows_drop_catcher::handoff_to_controller(&packet.origin_id),
+            _ => {}
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // A Windows controller crossed back to itself mid-drag and asked us to
+        // hand our local file drag over as a native OLE drag on its side.
+        if packet.kind == "pull" {
+            crate::input::receiver_handoff_drag(packet.origin_id.clone());
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // Only Windows runs OLE drag sessions and only macOS hands one off;
+        // elsewhere the controller uses the transfer fallback.
+        let _ = packet;
+    }
+    true
+}
+
+/// ShareMouse-style drag placement (macOS receiver). Files transferred during a
+/// Windows→Mac drag are staged here; when the drag is released the input layer
+/// reports the folder under the cursor and the staged files move into it.
+#[cfg(target_os = "macos")]
+mod drag_place {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    struct State {
+        active: bool,
+        staged: Vec<PathBuf>,
+        target: Option<PathBuf>,
+        target_at: Option<Instant>,
+    }
+
+    fn state() -> &'static Mutex<State> {
+        static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+        STATE.get_or_init(|| {
+            Mutex::new(State {
+                active: false,
+                staged: Vec::new(),
+                target: None,
+                target_at: None,
+            })
+        })
+    }
+
+    fn fresh(at: Option<Instant>) -> bool {
+        at.map(|t| t.elapsed() < Duration::from_secs(3)).unwrap_or(false)
+    }
+
+    fn desktop_dir() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(|home| Path::new(&home).join("Desktop"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// A Windows→Mac drag started delivering files. `file_name` seeds the drag
+    /// overlay icon with that file type.
+    pub fn begin(file_name: &str) {
+        let first = {
+            let Ok(mut state) = state().lock() else {
+                return;
+            };
+            let first = !state.active;
+            if first {
+                state.staged.clear();
+                state.target = None;
+                state.target_at = None;
+            }
+            state.active = true;
+            first
+        };
+        if first {
+            let extension = Path::new(file_name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_string());
+            crate::input::drag_overlay_show(extension);
+        }
+    }
+
+    /// A file finished transferring into the staging dir.
+    pub fn stage(path: PathBuf) {
+        let ready_target = {
+            let Ok(mut state) = state().lock() else {
+                return;
+            };
+            match state.target.clone() {
+                // Released already: drop it straight in.
+                Some(target) if fresh(state.target_at) => Some(target),
+                _ => {
+                    state.staged.push(path.clone());
+                    None
+                }
+            }
+        };
+        if let Some(target) = ready_target {
+            place(&path, &target);
+        }
+    }
+
+    /// The drag was released over the Mac; `folder` is the folder under the
+    /// cursor (None = Desktop). Places everything staged so far.
+    pub fn release(folder: Option<PathBuf>) {
+        let target = folder.unwrap_or_else(desktop_dir);
+        let staged = {
+            let Ok(mut state) = state().lock() else {
+                return;
+            };
+            state.target = Some(target.clone());
+            state.target_at = Some(Instant::now());
+            state.active = false;
+            std::mem::take(&mut state.staged)
+        };
+        crate::input::drag_overlay_hide();
+        log::info!("drag drop released over {}", target.display());
+        for path in staged {
+            place(&path, &target);
+        }
+    }
+
+    /// Whether a pulled drag is genuinely still in the user's hand, i.e. it can
+    /// be relayed onward to another machine. Stricter than `is_active`, whose
+    /// grace window stays true for seconds AFTER a release so late-arriving
+    /// files still get placed — crossing within that window must not be
+    /// mistaken for a relay.
+    pub fn is_relaying() -> bool {
+        state().lock().map(|state| state.active).unwrap_or(false)
+    }
+
+    /// Client→client relay: take the files that finished streaming in and end
+    /// the local placement — they belong to the next machine now.
+    ///
+    /// ponytail: files still in flight when the drag is released on the far
+    /// machine are left in the staging dir and cleared by the next `begin`.
+    /// Carrying them over would mean tracking the inbound transfer's file count,
+    /// which the drag-control packet does not carry for this direction.
+    pub fn take_staged_for_relay() -> Vec<PathBuf> {
+        let staged = {
+            let Ok(mut state) = state().lock() else {
+                return Vec::new();
+            };
+            state.active = false;
+            state.target = None;
+            state.target_at = None;
+            std::mem::take(&mut state.staged)
+        };
+        crate::input::drag_overlay_hide();
+        staged
+    }
+
+    /// Whether a drag is in flight (so the release hook bothers to resolve the
+    /// folder under the cursor). Cheap — checked on every injected button-up.
+    pub fn is_active() -> bool {
+        state()
+            .lock()
+            .map(|state| state.active || fresh(state.target_at))
+            .unwrap_or(false)
+    }
+
+    fn place(staged: &Path, folder: &Path) {
+        let Some(name) = staged.file_name() else {
+            return;
+        };
+        let _ = fs::create_dir_all(folder);
+        let mut dest = folder.join(name);
+        let mut index = 1;
+        while dest.exists() {
+            let stem = staged.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+            dest = folder.join(match staged.extension().and_then(|e| e.to_str()) {
+                Some(ext) => format!("{stem} ({index}).{ext}"),
+                None => format!("{stem} ({index})"),
+            });
+            index += 1;
+        }
+        let moved = if staged.is_dir() {
+            crate::folder_transfer::copy_directory(staged, &dest).and_then(|_| fs::remove_dir_all(staged))
+        } else { super::finalize_received_transfer(staged, &mut dest, false) };
+        match moved {
+            Ok(()) => log::info!("drag drop placed {} -> {}", name.to_string_lossy(), dest.display()),
+            Err(error) => log::warn!("drag drop placement failed: {error}"),
+        }
+    }
+}
+
 fn handle_file_transfer_packet(
     payload: &[u8],
     layout: &LayoutState,
@@ -5159,7 +8099,28 @@ fn handle_file_transfer_packet(
         log::warn!("file transfer receive failed: could not resolve receive directory");
         return false;
     };
-    handle_decoded_file_transfer_packet(packet, layout, local_peer_id, transfers, &receive_root)
+    // Where the file finalizes:
+    //  - drag_drop → a hidden staging dir; the real placement (into the folder
+    //    under the cursor, or Desktop) happens when the drag is released.
+    //  - drop_to_desktop → straight onto the Desktop.
+    //  - otherwise → the transfers folder (None here).
+    let drop_root = if packet.client_log {
+        client_log_dir(app).ok()
+    } else if packet.drag_drop {
+        Some(receive_root.join(".mykvm-drag-staging"))
+    } else if packet.drop_to_desktop {
+        app.path().desktop_dir().ok()
+    } else {
+        None
+    };
+    handle_decoded_file_transfer_packet(
+        packet,
+        layout,
+        local_peer_id,
+        transfers,
+        &receive_root,
+        drop_root.as_deref(),
+    )
 }
 
 fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -5173,6 +8134,258 @@ fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to resolve file transfer receive directory: {error}"))
 }
 
+/// Where logs fetched from other devices land.
+fn client_log_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(downloads) = app.path().download_dir() {
+        return Ok(downloads.join("MyKVM Remote Logs"));
+    }
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join("MyKVM Remote Logs"))
+        .map_err(|error| format!("failed to resolve client log directory: {error}"))
+}
+
+/// Read at most the last `max_bytes` bytes of `path`.
+fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > max_bytes {
+        file.seek(SeekFrom::Start(len - max_bytes))?;
+    }
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    Ok(tail)
+}
+
+/// Copy the tail of this machine's newest log file into a temp file named after
+/// this device, ready to stream back to whoever asked. Returns the temp path.
+fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log dir: {error}"))?;
+    // The plugin keeps the live log plus rotated copies; the newest by mtime is
+    // the one currently being written.
+    let newest = fs::read_dir(&log_dir)
+        .map_err(|error| format!("failed to read log dir: {error}"))?
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+        })
+        .max_by_key(|entry| {
+            entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })
+        .map(|entry| entry.path())
+        .ok_or_else(|| "no log file found".to_string())?;
+
+    let tail = tail_of_file(&newest, CLIENT_LOG_TAIL_BYTES)
+        .map_err(|error| format!("failed to read log: {error}"))?;
+    let header = format!("MyKVM diagnostics: pid={} version={} elevated={} {}\n", std::process::id(),
+        app.config().version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
+        current_privilege_status().is_elevated, input::diagnostic_summary());
+    let tail = [header.as_bytes(), tail.as_slice()].concat();
+
+    let safe_name = device_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let file_name = format!("{}-{}.log", safe_name.trim_matches('-'), now_ms());
+    let temp_path = std::env::temp_dir().join(file_name);
+    fs::write(&temp_path, &tail).map_err(|error| format!("failed to stage log: {error}"))?;
+    Ok(temp_path)
+}
+
+// Control channel: a paired peer asks this device for something — its recent
+// log (sent back as an ordinary file transfer tagged `client_log`) or, from
+// its controller, to update itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerRequestPacket {
+    protocol: String,
+    #[serde(default)]
+    paste_token: String,
+    origin_id: String,
+    target_id: String,
+    cluster_id: String,
+    pair_secret: String,
+}
+
+/// What a paired peer may ask of this device.
+#[derive(Debug, PartialEq)]
+enum PeerRequest {
+    Log,
+    Update,
+    Lock,
+    Clipboard,
+}
+
+/// Whether `packet` may ask this device for anything, and what (`None` =
+/// refuse). File-transfer trust (same cluster and pair secret) plus: a client
+/// answers only a controller it is paired with — an unpaired client that kept
+/// its old secret answers no one — only a client can be asked to update, and a
+/// log needs file transfer, since it travels back as one.
+fn authorize_peer_request(
+    packet: &PeerRequestPacket,
+    layout: &LayoutState,
+    local_peer_id: &str,
+) -> Option<PeerRequest> {
+    let request = match packet.protocol.as_str() {
+        LOG_REQUEST_PROTOCOL if layout.file_transfer_enabled => PeerRequest::Log,
+        CLIPBOARD_PULL_PROTOCOL if layout.clipboard_sync => PeerRequest::Clipboard,
+        REMOTE_UPDATE_PROTOCOL if layout.machine_role == "client" => PeerRequest::Update,
+        LOCK_SCREEN_PROTOCOL if layout.machine_role == "client" => PeerRequest::Lock,
+        _ => return None,
+    };
+    if layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || packet.pair_secret != layout.pair_secret
+    {
+        return None;
+    }
+    if layout.machine_role == "client"
+        && !layout
+            .paired_controllers
+            .iter()
+            .any(|controller| controller.id == packet.origin_id)
+    {
+        return None;
+    }
+    if packet.target_id != local_peer_id || packet.origin_id == local_peer_id {
+        return None;
+    }
+    Some(request)
+}
+
+/// Device side of a peer request: authorize, then do the work off the stream
+/// handler (it must not block on a round-trip). Returns true if the packet was
+/// a peer request.
+fn handle_peer_request_packet(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    app: &AppHandle,
+) -> bool {
+    let Some(packet) = decode_wire_packet::<PeerRequestPacket>(payload) else {
+        return false;
+    };
+    if !matches!(
+        packet.protocol.as_str(),
+        LOG_REQUEST_PROTOCOL | REMOTE_UPDATE_PROTOCOL | LOCK_SCREEN_PROTOCOL | CLIPBOARD_PULL_PROTOCOL
+    ) {
+        return false;
+    }
+    match authorize_peer_request(&packet, layout, local_peer_id) {
+        None => return packet.protocol != CLIPBOARD_PULL_PROTOCOL,
+        Some(PeerRequest::Update) => {
+            log::info!("update requested by controller {}", packet.origin_id);
+            run_requested_update(app.clone());
+            return true;
+        }
+        Some(PeerRequest::Lock) => {
+            log::info!("lock sync: controller {} locked its screen", packet.origin_id);
+            lock_local_screen();
+            return true;
+        }
+        Some(PeerRequest::Clipboard) => {
+            let origin = packet.origin_id;
+            let token = packet.paste_token;
+            let app = app.clone();
+            thread::spawn(move || {
+                let state = app.state::<AppRuntime>();
+                let layout = state.layout_snapshot();
+                let peers = active_peer_snapshot(&state.peers);
+                let result = file_transfer_target_for_device(&layout, &peers, &origin)
+                    .and_then(|target| send_current_clipboard(state.inner(), &target, true, token));
+                if let Err(error) = result { log::warn!("requested clipboard send failed: {error}"); }
+            });
+            return true;
+        }
+        Some(PeerRequest::Log) => {}
+    }
+
+    let device_name = local_peer_from_layout(layout).name;
+    let app = app.clone();
+    let origin_id = packet.origin_id;
+    thread::spawn(move || {
+        let temp_path = match write_own_log_tail(&app, &device_name) {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!("log request: could not stage log: {error}");
+                return;
+            }
+        };
+        let state = app.state::<AppRuntime>();
+        let path = temp_path.to_string_lossy().into_owned();
+        match send_files_to_device_inner(state.inner(), &origin_id, &[path], DropMode::ClientLog) {
+            Ok(summary) => log::info!(
+                "log request: sent {} to {}",
+                format_bytes(summary.byte_count),
+                summary.target_name
+            ),
+            Err(error) => log::warn!("log request: send failed: {error}"),
+        }
+        let _ = fs::remove_file(&temp_path);
+    });
+    true
+}
+
+/// Check, download and install the release this app's own updater finds (so
+/// it is verified against our updater key), handing the network over first.
+/// On Windows `install` ends this process and the installer restarts it.
+fn run_requested_update(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        use tauri_plugin_updater::UpdaterExt;
+        let state = app.state::<AppRuntime>();
+        let update = match app
+            .updater_builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|error| error.to_string())
+        {
+            Ok(updater) => updater.check().await.map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        let update = match update {
+            Ok(Some(update)) => update,
+            Ok(None) => {
+                log::info!("requested update: already on the latest release");
+                return;
+            }
+            Err(error) => {
+                log::warn!("requested update: check failed: {error}");
+                return;
+            }
+        };
+        log::info!("requested update: installing {}", update.version);
+        state.upgrading.store(true, Ordering::Relaxed);
+        let bytes = match update.download(|_, _| {}, || {}).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!("requested update: download failed: {error}");
+                state.upgrading.store(false, Ordering::Relaxed);
+                return;
+            }
+        };
+        state.hand_off_network();
+        if let Err(error) = update.install(bytes) {
+            log::warn!("requested update: install failed: {error}");
+            state.upgrading.store(false, Ordering::Relaxed);
+            let _ = start_runtime_inner(state.inner());
+            return;
+        }
+        app.restart();
+    });
+}
+
 #[cfg(test)]
 fn handle_file_transfer_packet_with_root(
     payload: &[u8],
@@ -5184,7 +8397,7 @@ fn handle_file_transfer_packet_with_root(
     let Some(packet) = decode_wire_packet::<FileTransferPacket>(payload) else {
         return false;
     };
-    handle_decoded_file_transfer_packet(packet, layout, local_peer_id, transfers, receive_root)
+    handle_decoded_file_transfer_packet(packet, layout, local_peer_id, transfers, receive_root, None)
 }
 
 fn handle_decoded_file_transfer_packet(
@@ -5193,8 +8406,9 @@ fn handle_decoded_file_transfer_packet(
     local_peer_id: &str,
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
+    drop_root: Option<&Path>,
 ) -> bool {
-    if packet.protocol != FILE_TRANSFER_PROTOCOL {
+    if packet.protocol != FILE_TRANSFER_PROTOCOL && packet.protocol != CLIPBOARD_FILES_PROTOCOL {
         return false;
     }
     if !layout.file_transfer_enabled {
@@ -5209,11 +8423,27 @@ fn handle_decoded_file_transfer_packet(
     if packet.origin_id == local_peer_id {
         return true;
     }
+    if packet.protocol == CLIPBOARD_FILES_PROTOCOL && !layout.clipboard_sync { return false; }
+    if packet.kind == "directory-probe" || packet.kind == "clipboard-probe" { return true; }
+
+    // A file that belongs to an active native drag session feeds that session's
+    // in-memory stream (read by the OLE drop target) instead of landing on disk.
+    #[cfg(target_os = "windows")]
+    if windows_drag::session_wants(&packet.transfer_id) {
+        return match packet.kind.as_str() {
+            "start" => true,
+            "chunk" => windows_drag::feed_chunk(&packet.transfer_id, &packet.data),
+            "finish" => windows_drag::finish_file(&packet.transfer_id),
+            "abort" => windows_drag::abort_file(&packet.transfer_id),
+            _ => false,
+        };
+    }
 
     match packet.kind.as_str() {
-        "start" => start_incoming_file_transfer(packet, transfers, receive_root),
+        "start" => start_incoming_file_transfer(packet, transfers, receive_root, drop_root),
         "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
         "finish" => finish_incoming_file_transfer(packet, transfers),
+        "abort" => abort_incoming_file_transfer(packet, transfers),
         _ => false,
     }
 }
@@ -5222,6 +8452,7 @@ fn start_incoming_file_transfer(
     packet: FileTransferPacket,
     transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     receive_root: &Path,
+    drop_root: Option<&Path>,
 ) -> bool {
     if packet.transfer_id.trim().is_empty()
         || packet.origin_id.trim().is_empty()
@@ -5243,7 +8474,14 @@ fn start_incoming_file_transfer(
         return false;
     }
 
-    let final_path = unique_transfer_destination(receive_root, &file_name);
+    // The finalize root overrides the transfers folder (Desktop, or the hidden
+    // drag-staging dir). The .part staging file always stays in the transfers
+    // folder so it never flashes at the final location.
+    let final_root = drop_root.unwrap_or(receive_root);
+    if drop_root.is_some() {
+        let _ = fs::create_dir_all(final_root);
+    }
+    let final_path = unique_transfer_destination(final_root, &file_name);
     let temp_path = receive_root.join(format!(
         ".mykvm-{}-{}.part",
         sanitize_transfer_id(&packet.transfer_id),
@@ -5251,6 +8489,7 @@ fn start_incoming_file_transfer(
     ));
 
     if let Ok(mut transfers) = transfers.lock() {
+        if transfers.len() >= 32 || transfers.values().filter(|transfer| transfer.origin_id == packet.origin_id).count() >= 8 { return false; }
         if let Some(previous) = transfers.remove(&packet.transfer_id) {
             let _ = fs::remove_file(previous.temp_path);
         }
@@ -5262,6 +8501,12 @@ fn start_incoming_file_transfer(
         return false;
     }
 
+    // A ShareMouse-style drag: hold the file for release-time placement.
+    #[cfg(target_os = "macos")]
+    if packet.drag_drop {
+        drag_place::begin(&packet.file_name);
+    }
+
     let transfer = IncomingFileTransfer {
         origin_id: packet.origin_id.clone(),
         target_id: packet.target_id.clone(),
@@ -5269,8 +8514,12 @@ fn start_incoming_file_transfer(
         total_bytes: packet.total_bytes,
         received_bytes: 0,
         next_chunk_index: 0,
+        directory_bundle: packet.directory_bundle,
+        clipboard_transfer: packet.clipboard_transfer,
+        touched_ms: now_ms(),
         temp_path,
         final_path,
+        staged: packet.drag_drop,
     };
 
     transfers
@@ -5299,6 +8548,8 @@ fn append_incoming_file_transfer_chunk(
         || packet.target_id != transfer.target_id
         || packet.file_name != transfer.file_name
         || packet.total_bytes != transfer.total_bytes
+        || packet.directory_bundle != transfer.directory_bundle
+        || packet.clipboard_transfer != transfer.clipboard_transfer
         || packet.chunk_index != transfer.next_chunk_index
         || packet.offset != transfer.received_bytes
         || transfer
@@ -5322,6 +8573,7 @@ fn append_incoming_file_transfer_chunk(
         .received_bytes
         .saturating_add(packet.data.len() as u64);
     transfer.next_chunk_index = transfer.next_chunk_index.saturating_add(1);
+    transfer.touched_ms = now_ms();
     true
 }
 
@@ -5332,7 +8584,7 @@ fn finish_incoming_file_transfer(
     if !packet.data.is_empty() {
         return false;
     }
-    let (temp_path, final_path, file_name, total_bytes) = {
+    let (temp_path, mut final_path, file_name, total_bytes, staged, directory_bundle) = {
         let Ok(transfers) = transfers.lock() else {
             return false;
         };
@@ -5343,6 +8595,8 @@ fn finish_incoming_file_transfer(
             || packet.target_id != transfer.target_id
             || packet.file_name != transfer.file_name
             || packet.total_bytes != transfer.total_bytes
+            || packet.directory_bundle != transfer.directory_bundle
+            || packet.clipboard_transfer != transfer.clipboard_transfer
             || packet.offset != transfer.received_bytes
             || packet.chunk_index != transfer.next_chunk_index
             || transfer.received_bytes != transfer.total_bytes
@@ -5354,14 +8608,29 @@ fn finish_incoming_file_transfer(
             transfer.final_path.clone(),
             transfer.file_name.clone(),
             transfer.total_bytes,
+            transfer.staged,
+            transfer.directory_bundle,
         )
     };
 
-    match fs::rename(&temp_path, &final_path) {
+    // The staging dir and the final dir can sit on different volumes (e.g. a
+    // redirected Desktop), where rename fails — fall back to copy + delete.
+    let finalize = finalize_received_transfer(&temp_path, &mut final_path, directory_bundle);
+    match finalize {
         Ok(()) => {
+            if packet.clipboard_transfer { clipboard_exchange::remember_file(&packet.origin_id, &packet.transfer_id, final_path.clone()); }
             if let Ok(mut transfers) = transfers.lock() {
                 transfers.remove(&packet.transfer_id);
             }
+            // ShareMouse-style drag: the file is complete in the staging dir;
+            // hand it to the placer, which drops it into the folder under the
+            // cursor when the drag is released (or right away if already).
+            #[cfg(target_os = "macos")]
+            if staged {
+                drag_place::stage(final_path.clone());
+                return true;
+            }
+            let _ = staged;
             log::info!(
                 "received file transfer {} bytes={} path={}",
                 file_name,
@@ -5544,20 +8813,12 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
         }
     }
 
-    refresh_paired_controller_keys(layout, peers);
+    refresh_paired_controller_addresses(layout, peers);
 }
 
-/// Keeps each paired controller's transport_public_key (and id/host/ip) in sync
-/// with the peer it was paired with. A peer's QUIC transport identity is
-/// regenerated whenever its self-signed cert/key file is missing — app updates,
-/// reinstalls, or the file being cleared all rotate the advertised
-/// transport_public_key while the pairing credentials (cluster_id/pair_secret)
-/// stay the same. Without this sync the controller's stored key goes stale, the
-/// input path rejects every packet with "controller not in paired-controllers
-/// list", and the user is forced to re-pair even though the pairing is still
-/// valid. The security premise is unchanged: input packets still have to match
-/// cluster_id/pair_secret, which only the two paired endpoints know.
-fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
+/// Discovery may refresh an address, but cannot replace a paired certificate.
+/// A replacement identity must pass the existing pairing-code flow.
+fn refresh_paired_controller_addresses(layout: &mut LayoutState, peers: &[LanPeer]) {
     if layout.paired_controllers.is_empty() {
         return;
     }
@@ -5565,19 +8826,10 @@ fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
     for controller in &mut layout.paired_controllers {
         let Some(peer) = peers
             .iter()
-            .find(|peer| paired_controller_can_repair_with_peer(controller, peer))
+            .find(|peer| paired_controller_identity_matches_peer(controller, peer))
         else {
             continue;
         };
-
-        let new_key = peer.transport_public_key.trim();
-        if !new_key.is_empty() && controller.transport_public_key != new_key {
-            log::info!(
-                "paired controller {} rotated transport key; updating stored key",
-                controller.id
-            );
-            controller.transport_public_key = new_key.to_string();
-        }
 
         let new_id = peer_device_id(peer);
         if !new_id.is_empty() && controller.id != new_id {
@@ -5597,10 +8849,10 @@ fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
 }
 
 fn device_matches_peer(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
-    device.id == peer_device_id(peer)
-        || (!device.transport_public_key.trim().is_empty()
-            && device.transport_public_key == peer.transport_public_key)
-        || same_cluster_host(device, peer, layout_cluster_id)
+    if !device.transport_public_key.trim().is_empty() {
+        return device.transport_public_key == peer.transport_public_key;
+    }
+    device.id == peer_device_id(peer) || same_cluster_host(device, peer, layout_cluster_id)
 }
 
 fn same_cluster_host(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
@@ -5661,11 +8913,13 @@ fn sanitize_id(value: &str) -> String {
 fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.online = true;
     device.input_ready = peer.input_ready;
-    device.host = if peer.ip.trim().is_empty() {
-        peer.host.clone()
-    } else {
-        peer.ip.clone()
-    };
+    if device.source != "manual" {
+        device.host = if peer.ip.trim().is_empty() {
+            peer.host.clone()
+        } else {
+            peer.ip.clone()
+        };
+    }
     device.transport_port = peer.transport_port;
     device.quic_port = normalize_quic_port(peer.transport_port, peer.quic_port);
     device.transport_public_key = peer.transport_public_key.clone();
@@ -5827,10 +9081,18 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         screens: local_device
             .map(|device| device.screens.iter().map(screen_to_peer_screen).collect())
             .unwrap_or_default(),
-        app_version: env!("CARGO_PKG_VERSION").into(),
+        app_version: APP_VERSION
+            .get()
+            .cloned()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
         last_seen_ms: now_ms(),
     }
 }
+
+/// The version peers see (and a controller compares to offer an update): the
+/// app's own version, which a build's config can set without touching
+/// Cargo.toml. Set once at startup.
+static APP_VERSION: OnceLock<String> = OnceLock::new();
 
 fn apply_transport_to_peer(peer: &mut LanPeer, transport: &quic_transport::TransportHandle) {
     peer.quic_port = transport.port();
@@ -6340,10 +9602,11 @@ fn is_paired_controller(layout: &LayoutState, peer: &LanPeer) -> bool {
 }
 
 fn paired_controller_identity_matches_peer(controller: &PairedController, peer: &LanPeer) -> bool {
+    if !controller.transport_public_key.trim().is_empty() {
+        return controller.transport_public_key == peer.transport_public_key;
+    }
     (!peer.id.trim().is_empty() && controller.id == peer.id)
         || controller.id == peer_device_id(peer)
-        || (!peer.transport_public_key.trim().is_empty()
-            && controller.transport_public_key == peer.transport_public_key)
 }
 
 fn paired_controller_can_repair_with_peer(controller: &PairedController, peer: &LanPeer) -> bool {
@@ -6417,6 +9680,61 @@ fn handle_pairing_stream_packet(
             log::warn!("pairing confirmation rejected: {error}");
             false
         }
+    }
+}
+
+/// What the client's pairing panel shows. A live challenge wins over "paired":
+/// `begin_pairing_challenge` lets a known controller re-pair (rotated key, or
+/// the two machines swapped roles), and answering "paired" with an empty code
+/// popped the window up with no code to type on the server.
+fn pairing_status(
+    layout: &LayoutState,
+    pairing_challenge: &Mutex<Option<PairingChallenge>>,
+) -> PairingStatus {
+    if layout.machine_role != "client" {
+        return idle_pairing_status();
+    }
+
+    let now = Instant::now();
+    if let Ok(mut challenge) = pairing_challenge.lock() {
+        if challenge
+            .as_ref()
+            .map(|challenge| challenge.expires_at <= now)
+            .unwrap_or(false)
+        {
+            *challenge = None;
+        }
+
+        if let Some(challenge) = challenge.as_ref() {
+            return PairingStatus {
+                state: "requested".into(),
+                code: challenge.code.clone(),
+                requester_name: challenge.requester_name.clone(),
+                requester_ip: challenge.requester_ip.clone(),
+                expires_at_ms: challenge.expires_at_ms,
+                detail: "服务端正在请求配对，请在服务端输入此验证码。".into(),
+            };
+        }
+    }
+
+    if !layout.paired_controllers.is_empty() {
+        return PairingStatus {
+            state: "paired".into(),
+            code: String::new(),
+            requester_name: String::new(),
+            requester_ip: String::new(),
+            expires_at_ms: 0,
+            detail: "客户端已配对，只对白名单服务端响应。".into(),
+        };
+    }
+
+    PairingStatus {
+        state: "available".into(),
+        code: String::new(),
+        requester_name: String::new(),
+        requester_ip: String::new(),
+        expires_at_ms: 0,
+        detail: "客户端等待服务端发起配对。".into(),
     }
 }
 
@@ -6861,10 +10179,242 @@ mod tests {
         }
     }
 
+    /// A drag pulled off one controlled machine can be relayed onward to
+    /// another only while it is still in the user's hand. `is_active` stays
+    /// true for seconds after the release so files still in flight get placed,
+    /// and reading THAT as "a relay is in progress" made the next crossing
+    /// forward a drag that had already been dropped here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drag_place_relay_closes_before_the_placement_grace_window() {
+        drag_place::begin("photo.png");
+        assert!(drag_place::is_relaying());
+        assert!(drag_place::is_active());
+
+        drag_place::release(None);
+        assert!(
+            drag_place::is_active(),
+            "late files must still find their target"
+        );
+        assert!(
+            !drag_place::is_relaying(),
+            "a released drag must not be forwarded to the next machine"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unavailable_local_displays_preserve_layout_across_restart() {
+        let mut saved = test_layout();
+        let mut arranged = test_screen("local-device");
+        arranged.id = "local-display-1".into();
+        arranged.width = 2560;
+        arranged.height = 1440;
+        arranged.x = 7500;
+        arranged.y = -3960;
+        saved.devices[0].screens = vec![arranged.clone()];
+        saved.selected_screen_id = arranged.id.clone();
+
+        let mut unavailable = arranged.clone();
+        unavailable.name = "Display unavailable".into();
+        unavailable.width = 1;
+        unavailable.height = 1;
+        unavailable.x = 0;
+        unavailable.y = 0;
+
+        for detected in [Vec::new(), vec![unavailable]] {
+            let sleeping = restore_local_screen_layout(
+                detected.clone(),
+                &saved.devices[0].screens,
+                &mut Vec::new(),
+            );
+            assert_eq!(sleeping, saved.devices[0].screens);
+
+            // Restart with no monitors available and no in-process memory.
+            let mut disk = saved.clone();
+            disk.devices[0].screens = sleeping;
+            let disk = serde_json::from_slice(&serde_json::to_vec(&disk).unwrap()).unwrap();
+            let mut native = test_layout();
+            native.devices[0].screens = detected;
+            let restarted = normalize_saved_layout(disk, native);
+            assert_eq!(restarted.devices[0].screens, saved.devices[0].screens);
+            assert_eq!(restarted.devices[1], saved.devices[1]);
+
+            let mut awake = arranged.clone();
+            awake.x = 0;
+            awake.y = 0;
+            let restored = restore_local_screen_layout(
+                vec![awake],
+                &restarted.devices[0].screens,
+                &mut Vec::new(),
+            );
+            assert_eq!(restored, saved.devices[0].screens);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_local_screen_layout_survives_lid_close_and_reopen() {
+        let mk = |id: &str, w: i32, h: i32, x: i32, y: i32| Screen {
+            id: id.into(),
+            device_id: "local-device".into(),
+            name: format!("Monitor {w}x{h}"),
+            x,
+            y,
+            width: w,
+            height: h,
+            scale: 1.0,
+            is_primary: w == 2560,
+        };
+        let mut memory = Vec::new();
+
+        // External on top, built-in arranged below (the user's real layout).
+        let arranged = vec![
+            mk("local-display-1", 2560, 1440, 0, 0),
+            mk("local-display-2", 1512, 982, 518, 1440),
+        ];
+
+        // Lid closes: only the external is detected — built-in drops out.
+        let closed = restore_local_screen_layout(
+            vec![mk("local-display-1", 2560, 1440, 0, 0)],
+            &arranged,
+            &mut memory,
+        );
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].id, "local-display-1");
+
+        // Lid re-opens with the enumeration SHUFFLED (built-in now index 0, so
+        // its index-based id collides with the external's). Each physical display
+        // must still be restored to its own id and its user-arranged position.
+        let reopened = restore_local_screen_layout(
+            vec![
+                mk("local-display-1", 1512, 982, 99, 99), // built-in, default (wrong) pos
+                mk("local-display-2", 2560, 1440, 99, 99), // external, default (wrong) pos
+            ],
+            &closed,
+            &mut memory,
+        );
+        let built_in = reopened
+            .iter()
+            .find(|s| (s.width, s.height) == (1512, 982))
+            .unwrap();
+        let external = reopened
+            .iter()
+            .find(|s| (s.width, s.height) == (2560, 1440))
+            .unwrap();
+        assert_eq!(built_in.id, "local-display-2");
+        assert_eq!((built_in.x, built_in.y), (518, 1440), "built-in restored below");
+        assert_eq!(external.id, "local-display-1");
+        assert_eq!((external.x, external.y), (0, 0), "external restored to origin");
+    }
+
+    #[test]
+    fn display_refresh_updates_native_coordinates_and_preserves_arrangement() {
+        let mut layout = test_layout();
+        let mut first = test_screen("local-device");
+        first.id = "local-display-1".into();
+        first.name = "Display A".into();
+        let mut second = first.clone();
+        second.id = "local-display-2".into();
+        second.name = "Display B".into();
+        second.x = first.width;
+        second.is_primary = false;
+        layout.devices[0].screens = vec![first.clone(), second.clone()];
+        let mut native = layout.clone();
+        for screen in &mut layout.devices[0].screens {
+            screen.x += 7500;
+            screen.y = -3960;
+        }
+        layout.selected_screen_id = layout.devices[1].screens[0].id.clone();
+        let selected = layout.selected_screen_id.clone();
+
+        second.id = "local-display-1".into();
+        second.x = 0;
+        second.y = 1080;
+        second.scale = 1.5;
+        first.id = "local-display-2".into();
+        let detected = vec![second, first];
+        let mut memory = Vec::new();
+        assert!(apply_detected_local_screens(
+            &mut layout,
+            &mut native,
+            detected.clone(),
+            &mut memory
+        ));
+        let arranged = &layout.devices[0].screens[0];
+        assert_eq!(arranged.id, "local-display-2");
+        assert_eq!((arranged.x, arranged.y), (9420, -3960));
+        let physical = &native.devices[0].screens[0];
+        assert_eq!(physical.id, arranged.id);
+        assert_eq!((physical.x, physical.y, physical.scale), (0, 1080, 1.5));
+        assert_eq!(layout.selected_screen_id, selected);
+        assert!(!apply_detected_local_screens(
+            &mut layout,
+            &mut native,
+            detected.clone(),
+            &mut memory
+        ));
+        assert!(!apply_detected_local_screens(
+            &mut layout,
+            &mut native,
+            Vec::new(),
+            &mut memory
+        ));
+
+        // Reboot with the OS enumerating the same two displays in reverse order.
+        let mut detected_layout = test_layout();
+        detected_layout.devices[0].screens = detected;
+        let restored = normalize_saved_layout(layout.clone(), detected_layout.clone());
+        align_native_screen_ids(&mut detected_layout, &restored);
+        assert_eq!(restored.devices[0].screens, layout.devices[0].screens);
+        assert_eq!(
+            detected_layout.devices[0].screens,
+            native.devices[0].screens
+        );
+
+        // Identical display models must not exchange their positions on every poll.
+        for screen in &mut layout.devices[0].screens {
+            screen.name = "Same model".into();
+        }
+        for screen in &mut native.devices[0].screens {
+            screen.name = "Same model".into();
+        }
+        let unchanged = native.devices[0].screens.clone();
+        assert!(!apply_detected_local_screens(
+            &mut layout,
+            &mut native,
+            unchanged,
+            &mut Vec::new()
+        ));
+    }
+
+    #[test]
+    fn legacy_extra_controls_are_disabled_without_changing_existing_switches() {
+        let mut saved = test_layout();
+        saved.edge_switch_hotkey = "ctrl+alt+k".into();
+        saved.clipboard_sync = false;
+        saved.clipboard_on_demand = true;
+        saved.clipboard_paste_hotkey = "alt+shift+v".into();
+        saved.input_protection = InputProtection {
+            local_only: true, protect_fullscreen: true,
+            blocked_applications: vec!["snipaste.exe".into()], lock_hotkey: "alt+shift+l".into(),
+        };
+        let restored = normalize_saved_layout(saved, test_layout());
+        assert_eq!(restored.edge_switch_hotkey, "ctrl+alt+k");
+        assert!(!restored.clipboard_sync);
+        assert!(!restored.clipboard_on_demand);
+        assert_eq!(restored.clipboard_paste_hotkey, "disabled");
+        assert_eq!(restored.input_protection, InputProtection::default());
+    }
+
     fn test_layout() -> LayoutState {
         LayoutState {
+            lock_sync: false,
+            input_protection: Default::default(),
             devices: vec![
                 Device {
+                    pointer_speed: 1.0,
+                    scroll_speed: 1.0,
                     id: "local-device".into(),
                     name: "Local".into(),
                     platform: "macos".into(),
@@ -6883,6 +10433,8 @@ mod tests {
                     screens: vec![test_screen("local-device")],
                 },
                 Device {
+                    pointer_speed: 1.0,
+                    scroll_speed: 1.0,
                     id: "peer-client-10-0-0-2".into(),
                     name: "Client".into(),
                     platform: "windows".into(),
@@ -6909,6 +10461,8 @@ mod tests {
             pair_secret: "secret-test".into(),
             paired_controllers: Vec::new(),
             clipboard_sync: false,
+            clipboard_on_demand: false,
+            clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
             file_transfer_enabled: true,
             language: "cn".into(),
             theme_mode: "system".into(),
@@ -7034,6 +10588,25 @@ mod tests {
     }
 
     #[test]
+    fn manually_selected_peer_address_survives_discovery_and_file_transfer() {
+        let mut layout = test_layout();
+        layout.devices[1].source = "manual".into();
+        layout.devices[1].host = "169.254.10.2".into();
+        let peer = test_peer();
+        apply_peer_presence(&mut layout, &[peer.clone()]);
+        assert_eq!(layout.devices[1].host, "169.254.10.2");
+        assert!(layout.devices[1].online);
+        assert_eq!(layout.devices[1].quic_port, peer.quic_port);
+        let target =
+            file_transfer_target_for_device(&layout, &[peer], &layout.devices[1].id).unwrap();
+        assert_eq!(target.addr, "169.254.10.2:52001");
+        let restored: LayoutState =
+            serde_json::from_slice(&serde_json::to_vec(&layout).unwrap()).unwrap();
+        assert_eq!(restored.devices[1].source, "manual");
+        assert_eq!(restored.devices[1].host, "169.254.10.2");
+    }
+
+    #[test]
     fn peer_presence_updates_live_address_and_port() {
         let mut layout = test_layout();
         let peer = test_peer();
@@ -7047,17 +10620,51 @@ mod tests {
     }
 
     #[test]
-    fn peer_presence_matches_same_cluster_host_after_identity_rotation() {
+    fn discovery_cannot_replace_paired_device_certificates() {
+        let mut layout = test_layout();
+        let peer = test_peer();
+        layout.paired_controllers = vec![PairedController {
+            id: peer.id.clone(),
+            name: peer.name.clone(),
+            host: peer.host.clone(),
+            ip: peer.ip.clone(),
+            transport_public_key: peer.transport_public_key.clone(),
+            protocol_version: peer.protocol_version,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let trusted = layout.paired_controllers[0].clone();
+        let mut impostor = peer.clone();
+        impostor.transport_public_key = "untrusted-replacement".into();
+        apply_peer_presence(&mut layout, &[impostor]);
+        assert!(!layout.devices[1].online);
+        assert_eq!(layout.devices[1].transport_public_key, "peer-public-key");
+        assert_eq!(layout.paired_controllers[0], trusted);
+
+        let mut moved = peer;
+        moved.id = "changed-peer-id".into();
+        moved.ip = "10.0.0.99".into();
+        apply_peer_presence(&mut layout, &[moved]);
+        assert!(layout.devices[1].online);
+        assert_eq!(layout.devices[1].host, "10.0.0.99");
+        assert_eq!(layout.paired_controllers[0].ip, "10.0.0.99");
+        assert_eq!(
+            layout.paired_controllers[0].transport_public_key,
+            trusted.transport_public_key
+        );
+    }
+
+    #[test]
+    fn peer_presence_keeps_trusted_key_when_peer_id_changes() {
         let mut layout = test_layout();
         let mut peer = test_peer();
         peer.id = "rotated-client-id".into();
-        peer.transport_public_key = "rotated-client-key".into();
 
         apply_peer_presence(&mut layout, &[peer]);
 
         assert!(layout.devices[1].online);
         assert!(layout.devices[1].input_ready);
-        assert_eq!(layout.devices[1].transport_public_key, "rotated-client-key");
+        assert_eq!(layout.devices[1].transport_public_key, "peer-public-key");
     }
 
     #[test]
@@ -7182,6 +10789,14 @@ mod tests {
             stored.as_ref().expect("challenge").requester_id,
             requester.id
         );
+        let code = stored.as_ref().expect("challenge").code.clone();
+        drop(stored);
+
+        // The already-paired client must show this code, not "paired": the
+        // window popped up with nothing to type on the server.
+        let status = pairing_status(&layout, &challenge);
+        assert_eq!(status.state, "requested");
+        assert_eq!(status.code, code);
     }
 
     #[test]
@@ -7479,6 +11094,7 @@ mod tests {
         }];
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(),
             origin_id: "attacker".into(),
             origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
@@ -7520,6 +11136,7 @@ mod tests {
         }];
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(),
             // id no longer matches the recorded controller (IP moved),
             origin_id: "server-10-0-0-77".into(),
             origin_transport_public_key: "server-key".into(),
@@ -7565,13 +11182,299 @@ mod tests {
     }
 
     #[test]
+    fn file_clipboard_stops_when_copy_changes_or_either_switch_is_disabled() {
+        let mut enabled = test_layout();
+        enabled.clipboard_sync = true;
+        let layout = Arc::new(Mutex::new(enabled));
+        let stop = AtomicBool::new(false);
+        assert!(file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(7)
+        ));
+        assert!(!file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(8)
+        ));
+        layout.lock().unwrap().file_transfer_enabled = false;
+        assert!(!file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(7)
+        ));
+        layout.lock().unwrap().file_transfer_enabled = true;
+        layout.lock().unwrap().clipboard_sync = false;
+        assert!(!file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(7)
+        ));
+        layout.lock().unwrap().clipboard_sync = true;
+        stop.store(true, Ordering::Relaxed);
+        assert!(!file_clipboard_sync_current(
+            &layout,
+            &stop,
+            Some(7),
+            Some(7)
+        ));
+    }
+
+    #[test]
+    fn file_clipboard_commit_respects_switches_and_pairing() {
+        let mut layout = test_layout();
+        layout.clipboard_sync = true;
+        let id = new_transfer_id("test-clipboard-receipt");
+        let origin = layout.devices[1].id.clone();
+        clipboard_exchange::remember_file(&origin, &id, PathBuf::from("/received.txt"));
+        let mut packet = ClipboardFilesCommit {
+            protocol: CLIPBOARD_FILES_PROTOCOL.into(),
+            origin_id: origin,
+            origin_transport_public_key: layout.devices[1].transport_public_key.clone(),
+            target_id: "local-device".into(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            ids: vec![id],
+            paste: false,
+            paste_token: String::new(),
+        };
+        let seen = Arc::new(Mutex::new(None));
+        let echo = Arc::new(Mutex::new(None));
+        for disabled in ["clipboard", "files", "identity"] {
+            let mut blocked = layout.clone();
+            match disabled {
+                "clipboard" => blocked.clipboard_sync = false,
+                "files" => blocked.file_transfer_enabled = false,
+                _ => packet.pair_secret = "unpaired-secret".into(),
+            }
+            let result = handle_clipboard_files_commit_with_writer(
+                &encode_wire_packet(&packet).unwrap(),
+                &blocked,
+                "local-device",
+                &seen,
+                &echo,
+                |_| panic!("a rejected file clipboard must not be written"),
+            );
+            assert_eq!(result, Some(false));
+        }
+        packet.pair_secret = layout.pair_secret.clone();
+        assert_eq!(
+            handle_clipboard_files_commit_with_writer(
+                &encode_wire_packet(&packet).unwrap(),
+                &layout,
+                "local-device",
+                &seen,
+                &echo,
+                |paths| {
+                    assert_eq!(paths, ["/received.txt"]);
+                    Ok(())
+                },
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some(clipboard::files_signature(&["/received.txt".into()]).as_str())
+        );
+        assert!(clipboard_echo_active(&echo));
+    }
+
+    #[test]
+    fn file_clipboard_streams_files_and_folders_then_commits_without_a_paste() {
+        let free_port = || UdpSocket::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let sandbox = tempfile::tempdir().unwrap();
+        let source = sandbox.path().join("source");
+        let destination = sandbox.path().join("received");
+        fs::create_dir_all(source.join("中文文件夹/empty")).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("note.txt"), b"hello file").unwrap();
+        fs::write(source.join("中文文件夹/nested.txt"), b"hello folder").unwrap();
+        let sender = quic_transport::start(
+            free_port(),
+            sandbox.path().join("sender-id"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        )
+        .unwrap();
+        let mut layout = test_layout();
+        layout.clipboard_sync = true;
+        layout.devices[1].transport_public_key = sender.public_key().into();
+        let origin = layout.devices[1].id.clone();
+        let seen = Arc::new(Mutex::new(None));
+        let echo = Arc::new(Mutex::new(None));
+        let written = Arc::new(Mutex::new(Vec::<String>::new()));
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let keep_running = Arc::new(AtomicBool::new(true));
+        let stop_on_chunk = Arc::new(AtomicBool::new(false));
+        let (
+            receive_layout,
+            receive_root,
+            receive_seen,
+            receive_echo,
+            receive_written,
+            receive_transfers,
+            receive_running,
+            receive_stop,
+        ) = (
+            layout.clone(),
+            destination.clone(),
+            Arc::clone(&seen),
+            Arc::clone(&echo),
+            Arc::clone(&written),
+            Arc::clone(&transfers),
+            Arc::clone(&keep_running),
+            Arc::clone(&stop_on_chunk),
+        );
+        let receiver = quic_transport::start(
+            free_port(),
+            sandbox.path().join("receiver-id"),
+            Arc::new(|_, _| {}),
+            Arc::new(move |payload, _| {
+                if let Some(commit) = decode_wire_packet::<ClipboardFilesCommit>(&payload) {
+                    assert!(
+                        !commit.paste,
+                        "automatic sync must wait for the user's normal paste"
+                    );
+                }
+                if let Some(accepted) = handle_clipboard_files_commit_with_writer(
+                    &payload,
+                    &receive_layout,
+                    "local-device",
+                    &receive_seen,
+                    &receive_echo,
+                    |paths| {
+                        *receive_written.lock().unwrap() = paths.to_vec();
+                        Ok(())
+                    },
+                ) {
+                    return accepted;
+                }
+                if receive_stop.load(Ordering::Relaxed)
+                    && decode_wire_packet::<FileTransferPacket>(&payload)
+                        .is_some_and(|p| p.kind == "chunk")
+                {
+                    receive_running.store(false, Ordering::Relaxed);
+                }
+                handle_file_transfer_packet_with_root(
+                    &payload,
+                    &receive_layout,
+                    "local-device",
+                    &receive_transfers,
+                    &receive_root,
+                )
+            }),
+        )
+        .unwrap();
+        let target = FileTransferTarget {
+            device_id: "local-device".into(),
+            name: "Test receiver".into(),
+            addr: format!("127.0.0.1:{}", receiver.port()),
+            transport_public_key: receiver.public_key().into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id,
+            pair_secret: layout.pair_secret,
+        };
+        let paths = [source.join("note.txt"), source.join("中文文件夹")]
+            .map(|p| p.to_string_lossy().into_owned());
+        let guard = || keep_running.load(Ordering::Relaxed);
+        send_clipboard_files(
+            &sender,
+            &origin,
+            &target,
+            &paths,
+            false,
+            String::new(),
+            None,
+            Some(&guard),
+        )
+        .unwrap();
+        let received = written.lock().unwrap().clone();
+        assert_eq!(received.len(), 2);
+        assert_eq!(fs::read(&received[0]).unwrap(), b"hello file");
+        assert_eq!(
+            fs::read(Path::new(&received[1]).join("nested.txt")).unwrap(),
+            b"hello folder"
+        );
+        assert!(Path::new(&received[1]).join("empty").is_dir());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(clipboard::files_signature(&received))
+        );
+        assert!(clipboard_echo_active(&echo));
+
+        // A later copy cancels the old upload before it can replace the clipboard.
+        stop_on_chunk.store(true, Ordering::Relaxed);
+        let error = send_clipboard_files(
+            &sender,
+            &origin,
+            &target,
+            &paths,
+            false,
+            String::new(),
+            None,
+            Some(&guard),
+        )
+        .unwrap_err();
+        assert_eq!(error, CLIPBOARD_FILES_SUPERSEDED);
+        assert_eq!(*written.lock().unwrap(), received);
+        assert!(
+            transfers.lock().unwrap().is_empty(),
+            "cancelled partial uploads must be removed"
+        );
+        sender.stop_and_wait().unwrap();
+        receiver.stop_and_wait().unwrap();
+    }
+
+    #[test]
+    fn clipboard_poll_skips_unchanged_content_but_keeps_retries_and_peer_changes() {
+        let mut target = input::ClipboardTarget {
+            device_id: "client".into(),
+            addr: "192.0.2.1:47834".into(),
+            transport_public_key: "key".into(),
+            protocol_version: 1,
+            cluster_id: "cluster".into(),
+            pair_secret: "secret".into(),
+            expires_at: None,
+        };
+        let previous = Some((7, target.device_id.clone(), target.addr.clone()));
+        assert!(clipboard_poll_unchanged(Some(7), &previous, &target, false));
+        assert!(!clipboard_poll_unchanged(
+            Some(8),
+            &previous,
+            &target,
+            false
+        ));
+        assert!(!clipboard_poll_unchanged(Some(7), &previous, &target, true));
+        assert!(!clipboard_poll_unchanged(None, &previous, &target, false));
+        target.device_id = "other-client".into();
+        assert!(!clipboard_poll_unchanged(
+            Some(7),
+            &previous,
+            &target,
+            false
+        ));
+        target.device_id = "client".into();
+        target.addr = "192.0.2.2:47834".into();
+        assert!(!clipboard_poll_unchanged(
+            Some(7),
+            &previous,
+            &target,
+            false
+        ));
+    }
+
+    #[test]
     fn clipboard_image_packet_fits_transport_stream_budget() {
-        let raw_rgba_bytes = 800 * 600 * 4;
+        let raw_rgba_bytes = 3840 * 2160 * 4;
         let encoded_len = raw_rgba_bytes / 3 * 4;
         let packet = clipboard_packet_from_content(
             ClipboardContent::Image(ClipboardImage {
-                width: 800,
-                height: 600,
+                width: 3840,
+                height: 2160,
                 rgba_base64: "A".repeat(encoded_len),
             }),
             "local-device".into(),
@@ -7635,6 +11538,7 @@ mod tests {
         let layout = test_layout();
         let packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(),
             origin_id: "peer-client-10-0-0-2".into(),
             origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
@@ -7725,6 +11629,7 @@ mod tests {
         let layout = test_layout();
         let packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
+            paste: false, paste_token: String::new(),
             origin_id: "peer-client-10-0-0-2".into(),
             origin_transport_public_key: String::new(),
             target_id: String::new(),
@@ -7889,6 +11794,19 @@ mod tests {
 
         assert_eq!(target.addr, "10.0.0.1:52001");
         assert_eq!(target.transport_public_key, "server-public-key");
+
+        // The two machines swapped roles: this client still lists the
+        // controller as a device from its server days, online but not
+        // input-ready. The transfer must still go to the controller.
+        let mut stale = layout.devices[1].clone();
+        stale.id = "peer-server-10-0-0-1".into();
+        stale.role = "client".into();
+        stale.online = true;
+        stale.input_ready = false;
+        layout.devices.push(stale);
+        let target =
+            file_transfer_target_for_device(&layout, &peers, "peer-server-10-0-0-1").unwrap();
+        assert_eq!(target.addr, "10.0.0.1:52001");
     }
 
     #[test]
@@ -7918,6 +11836,42 @@ mod tests {
             "hello world"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edge_drop_transfer_finalizes_on_desktop_root_with_part_file_staged_elsewhere() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-staging");
+        let desktop = temp_test_dir("file-transfer-desktop");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet("start", "transfer-3", "note.txt", 5, 0, 0, b""),
+            test_file_transfer_packet("chunk", "transfer-3", "note.txt", 5, 0, 0, b"hello"),
+            test_file_transfer_packet("finish", "transfer-3", "note.txt", 5, 1, 5, b""),
+        ] {
+            let mut packet = packet;
+            packet.drop_to_desktop = true;
+            assert!(handle_decoded_file_transfer_packet(
+                packet,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+                Some(&desktop)
+            ));
+        }
+
+        assert_eq!(
+            fs::read_to_string(desktop.join("note.txt")).expect("file lands on the desktop root"),
+            "hello"
+        );
+        assert!(
+            !root.join("note.txt").exists(),
+            "final file must not appear in the staging root"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(desktop);
     }
 
     #[test]
@@ -7958,6 +11912,46 @@ mod tests {
         assert!(sanitize_transfer_file_name("  ").is_none());
     }
 
+    #[test]
+    fn directory_packets_restore_the_tree_and_empty_folders() {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("empty")).unwrap();
+        fs::create_dir_all(source.path().join("nested")).unwrap();
+        fs::write(source.path().join("nested/example.txt"), "hello").unwrap();
+        let bundle = folder_transfer::bundle(source.path()).unwrap();
+        let bytes = fs::read(bundle.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut layout = test_layout();
+        layout.file_transfer_enabled = true;
+        layout.cluster_id = "cluster-test".into();
+        layout.pair_secret = "secret-test".into();
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        for (kind, index, offset, data) in [
+            ("start", 0, 0, &[][..]), ("chunk", 0, 0, bytes.as_slice()),
+            ("finish", 1, bytes.len() as u64, &[][..]),
+        ] {
+            let mut packet = test_file_transfer_packet(kind, "directory-test", "photos", bytes.len() as u64, index, offset, data);
+            packet.directory_bundle = true;
+            assert!(handle_decoded_file_transfer_packet(packet, &layout, "local-device", &transfers, root.path(), None));
+        }
+        assert!(root.path().join("photos/empty").is_dir());
+        assert_eq!(fs::read_to_string(root.path().join("photos/nested/example.txt")).unwrap(), "hello");
+        assert!(transfers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn finalizing_a_transfer_never_overwrites_an_existing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let temp = root.path().join("incoming.part");
+        let mut destination = root.path().join("existing.txt");
+        fs::write(&destination, "original").unwrap();
+        fs::write(&temp, "new").unwrap();
+        finalize_received_transfer(&temp, &mut destination, false).unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("existing.txt")).unwrap(), "original");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "new");
+        assert!(!temp.exists());
+    }
+
     fn temp_test_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("{name}-{}", random_hex(4)));
         fs::create_dir_all(&path).expect("temp test dir");
@@ -7986,7 +11980,157 @@ mod tests {
             chunk_index,
             offset,
             data: data.to_vec(),
+            drop_to_desktop: false,
+            drag_drop: false,
+            client_log: false,
+            directory_bundle: false,
+            clipboard_transfer: false,
         }
+    }
+
+    fn peer_request(protocol: &str, origin: &str) -> PeerRequestPacket {
+        PeerRequestPacket {
+            protocol: protocol.into(),
+            paste_token: String::new(),            origin_id: origin.into(),
+            target_id: "local-device".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+        }
+    }
+
+    fn paired_client_layout() -> LayoutState {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.cluster_id = "cluster-test".into();
+        layout.pair_secret = "secret-test".into();
+        layout.file_transfer_enabled = true;
+        layout.paired_controllers = vec![PairedController {
+            id: "controller".into(),
+            name: "Controller".into(),
+            host: "controller.local".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: 0,
+        }];
+        layout
+    }
+
+    #[test]
+    fn only_the_paired_controller_can_update_a_client() {
+        let layout = paired_client_layout();
+        let update = |packet: &PeerRequestPacket, layout: &LayoutState| {
+            authorize_peer_request(packet, layout, "local-device")
+        };
+        assert_eq!(
+            update(&peer_request(REMOTE_UPDATE_PROTOCOL, "controller"), &layout),
+            Some(PeerRequest::Update)
+        );
+        assert_eq!(
+            update(&peer_request(LOG_REQUEST_PROTOCOL, "controller"), &layout),
+            Some(PeerRequest::Log)
+        );
+        // Another device that knows the secret is not the paired controller.
+        assert_eq!(update(&peer_request(REMOTE_UPDATE_PROTOCOL, "other"), &layout), None);
+        // A wrong secret, or a request meant for another device.
+        let mut wrong_secret = peer_request(REMOTE_UPDATE_PROTOCOL, "controller");
+        wrong_secret.pair_secret = "guess".into();
+        assert_eq!(update(&wrong_secret, &layout), None);
+        let mut elsewhere = peer_request(REMOTE_UPDATE_PROTOCOL, "controller");
+        elsewhere.target_id = "someone-else".into();
+        assert_eq!(update(&elsewhere, &layout), None);
+        // Unpaired (paired list cleared, secret kept): answers no one.
+        let mut unpaired = layout.clone();
+        unpaired.paired_controllers.clear();
+        assert_eq!(update(&peer_request(REMOTE_UPDATE_PROTOCOL, "controller"), &unpaired), None);
+        // Lock sync: the paired controller may lock a client, nobody else may.
+        assert_eq!(
+            update(&peer_request(LOCK_SCREEN_PROTOCOL, "controller"), &layout),
+            Some(PeerRequest::Lock)
+        );
+        assert_eq!(update(&peer_request(LOCK_SCREEN_PROTOCOL, "other"), &layout), None);
+        // A server is never updated or locked by a peer; no log without file
+        // transfer.
+        let mut server = layout.clone();
+        server.machine_role = "server".into();
+        assert_eq!(update(&peer_request(REMOTE_UPDATE_PROTOCOL, "controller"), &server), None);
+        assert_eq!(update(&peer_request(LOCK_SCREEN_PROTOCOL, "controller"), &server), None);
+        let mut no_transfer = layout.clone();
+        no_transfer.file_transfer_enabled = false;
+        assert_eq!(update(&peer_request(LOG_REQUEST_PROTOCOL, "controller"), &no_transfer), None);
+    }
+
+    #[test]
+    fn clipboard_retry_backs_off_to_a_minute() {
+        assert_eq!(clipboard_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(clipboard_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(clipboard_retry_delay(5), Duration::from_secs(32));
+        assert_eq!(clipboard_retry_delay(6), Duration::from_secs(60));
+        assert_eq!(clipboard_retry_delay(40), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn rich_clipboard_formats_round_trip_and_keep_a_plain_text_fallback() {
+        let packet = clipboard_packet_from_content(ClipboardContent::Rich(rich_clipboard::RichText {
+            text: "中文".into(), html: Some("<b>中文</b>".into()), rtf: Some(b"{\\rtf1 sample}".to_vec()),
+        }), "peer".into(), "key".into(), "local-device".into(), "cluster-test".into(), "secret-test".into(), 1);
+        let bytes = encode_wire_packet(&packet).unwrap();
+        let decoded = decode_wire_packet::<ClipboardPacket>(&bytes).unwrap();
+        assert_eq!(decoded.text, "中文");
+        let content = clipboard_content_from_packet(decoded).unwrap();
+        let ClipboardContent::Rich(rich) = content else { panic!("rich formats lost"); };
+        assert_eq!(rich.html.as_deref(), Some("<b>中文</b>"));
+        assert_eq!(rich.rtf.as_deref(), Some(&b"{\\rtf1 sample}"[..]));
+        let mut legacy = decode_wire_packet::<ClipboardPacket>(&bytes).unwrap();
+        legacy.formats.retain(|format| format.kind == "plainText");
+        assert!(matches!(clipboard_content_from_packet(legacy), Some(ClipboardContent::Text(text)) if text == "中文"));
+    }
+
+    #[test]
+    fn on_demand_clipboard_does_not_overwrite_local_content_without_a_requested_paste() {
+        let mut layout = test_layout();
+        layout.cluster_id = "cluster-test".into(); layout.pair_secret = "secret-test".into();
+        layout.clipboard_on_demand = true;
+        let mut packet = clipboard_packet_from_content(ClipboardContent::Text("remote".into()), "peer".into(), "key".into(),
+            "local-device".into(), layout.cluster_id.clone(), layout.pair_secret.clone(), 1);
+        let seen = Arc::new(Mutex::new(None)); let echo = Arc::new(Mutex::new(None)); let sequences = Arc::new(Mutex::new(HashMap::new()));
+        let mut writes = 0;
+        assert!(!handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        packet.paste = true;
+        assert!(!handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        assert_eq!(writes, 0);
+        packet.paste_token = clipboard_exchange::expect_paste("key");
+        assert!(handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        assert_eq!(writes, 1);
+    }
+
+    #[test]
+    fn lan_ip_choice_skips_proxy_tunnels_and_host_side_adapters() {
+        // Clash/Mihomo/Surge TUN range is never a LAN.
+        assert!(!usable_discovery_ipv4(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(!usable_discovery_ipv4(Ipv4Addr::new(198, 19, 255, 254)));
+        assert!(usable_discovery_ipv4(Ipv4Addr::new(198, 20, 0, 1)));
+        // sing-box tunnel, VirtualBox host-only, the real Wi-Fi address.
+        let addresses = [
+            Ipv4Addr::new(172, 19, 0, 1),
+            Ipv4Addr::new(192, 168, 56, 1),
+            Ipv4Addr::new(192, 168, 66, 106),
+        ];
+        assert_eq!(
+            preferred_lan_ipv4(&addresses),
+            Some(Ipv4Addr::new(192, 168, 66, 106))
+        );
+    }
+
+    #[test]
+    fn tail_of_file_returns_only_the_last_bytes() {
+        let path = std::env::temp_dir().join(format!("mykvm-tail-{}.log", random_hex(6)));
+        fs::write(&path, b"0123456789").expect("write");
+        assert_eq!(tail_of_file(&path, 4).expect("tail"), b"6789");
+        // Smaller than the cap: the whole file.
+        assert_eq!(tail_of_file(&path, 100).expect("tail"), b"0123456789");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
