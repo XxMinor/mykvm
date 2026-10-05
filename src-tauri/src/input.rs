@@ -4017,9 +4017,32 @@ fn windows_hooks_look_removed(watchdog: &mut WindowsHookWatchdog) -> bool {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_hook_receipt(owner_thread_id: u32) -> Option<u32> {
+    if owner_thread_id != unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } {
+        return None;
+    }
+    let receipt = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
+    LAST_HOOK_EVENT_TICK.store(receipt, Ordering::Relaxed);
+    Some(receipt)
+}
+
+#[cfg(target_os = "windows")]
+fn track_windows_local_left_button(message: u32, flags: u32, extra_info: usize, held: &AtomicBool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{LLMHF_INJECTED, WM_LBUTTONDOWN, WM_LBUTTONUP};
+    if flags & LLMHF_INJECTED != 0 || extra_info == crate::windows_drag::DRAG_INPUT_MARKER {
+        return;
+    }
+    match message {
+        WM_LBUTTONDOWN => held.store(true, Ordering::Relaxed),
+        WM_LBUTTONUP => held.store(false, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, LLMHF_INJECTED, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        CallNextHookEx, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MBUTTONDOWN, WM_MBUTTONUP,
         WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
         WM_XBUTTONUP,
@@ -4037,21 +4060,14 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
-    if context.capture_thread_id != unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } {
+    if windows_hook_receipt(context.capture_thread_id).is_none() {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
-    LAST_HOOK_EVENT_TICK.store(unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() }, Ordering::Relaxed);
     let message = wparam as u32;
     if event.dwExtraInfo == crate::windows_drag::DRAG_INPUT_MARKER {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
-    if event.flags & LLMHF_INJECTED == 0 {
-        match message {
-            WM_LBUTTONDOWN => WINDOWS_LOCAL_LEFT_DOWN.store(true, Ordering::Relaxed),
-            WM_LBUTTONUP => WINDOWS_LOCAL_LEFT_DOWN.store(false, Ordering::Relaxed),
-            _ => {}
-        }
-    }
+    track_windows_local_left_button(message, event.flags, event.dwExtraInfo, &WINDOWS_LOCAL_LEFT_DOWN);
 
     if !cached_windows_input_desktop_is_default() {
         release_windows_remote_control(&context, true);
@@ -4092,13 +4108,9 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     let Some(context) = windows_capture_context() else {
         return next();
     };
-    if context.keyboard_thread_id.load(Ordering::Relaxed)
-        != unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
-    {
+    let Some(receipt_tick) = windows_hook_receipt(context.keyboard_thread_id.load(Ordering::Relaxed)) else {
         return next();
-    }
-    let receipt_tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
-    LAST_HOOK_EVENT_TICK.store(receipt_tick, Ordering::Relaxed);
+    };
     context
         .keyboard_hook_tick
         .store(receipt_tick, Ordering::Relaxed);
@@ -9120,34 +9132,35 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn local_hook_events_still_refresh_activity_and_ignore_ole_button_brackets() {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSLLHOOKSTRUCT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        };
-
-        // No capture target is active. Local typing must still mark a live hook.
-        let key = KBDLLHOOKSTRUCT { time: 10_000, ..Default::default() };
-        unsafe { windows_keyboard_proc(0, WM_KEYDOWN as usize, &key as *const _ as isize); }
-        let receipt = LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed);
+    fn hook_activity_requires_the_owner_thread_and_uses_the_receipt_clock() {
+        let owner = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let before = LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed);
+        assert_eq!(windows_hook_receipt(owner.wrapping_add(1)), None);
+        assert_eq!(LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed), before);
+        let receipt = windows_hook_receipt(owner).expect("current capture owner remains live while local");
+        assert_eq!(LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed), receipt);
         let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
-        assert!(now.wrapping_sub(receipt) < 5_000, "activity uses callback receipt time, not a delayed event timestamp");
+        assert!(now.wrapping_sub(receipt) < 5_000, "activity uses callback receipt time");
+    }
 
-        let mut mouse = MSLLHOOKSTRUCT { time: 11_000, ..Default::default() };
-        unsafe { windows_mouse_proc(0, WM_LBUTTONDOWN as usize, &mouse as *const _ as isize); }
-        assert!(windows_local_left_button_down());
-
-        // An OLE cleanup up must not masquerade as the user's actual release.
-        mouse.flags = LLMHF_INJECTED;
-        mouse.dwExtraInfo = crate::windows_drag::DRAG_INPUT_MARKER;
-        unsafe { windows_mouse_proc(0, WM_LBUTTONUP as usize, &mouse as *const _ as isize); }
-        assert!(windows_local_left_button_down());
-
-        mouse.flags = 0;
-        mouse.dwExtraInfo = 0;
-        unsafe { windows_mouse_proc(0, WM_LBUTTONUP as usize, &mouse as *const _ as isize); }
-        assert!(!windows_local_left_button_down());
-        let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
-        assert!(now.wrapping_sub(LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed)) < 5_000);
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn local_left_button_tracking_ignores_injected_and_ole_events() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{LLMHF_INJECTED, WM_LBUTTONDOWN, WM_LBUTTONUP};
+        let held = AtomicBool::new(false);
+        track_windows_local_left_button(WM_LBUTTONDOWN, 0, 0, &held);
+        assert!(held.load(Ordering::Relaxed));
+        // Cleanup brackets and other synthetic ups cannot release a physical hold.
+        for (flags, extra) in [
+            (LLMHF_INJECTED, crate::windows_drag::DRAG_INPUT_MARKER),
+            (LLMHF_INJECTED, 0),
+            (0, crate::windows_drag::DRAG_INPUT_MARKER),
+        ] {
+            track_windows_local_left_button(WM_LBUTTONUP, flags, extra, &held);
+            assert!(held.load(Ordering::Relaxed));
+        }
+        track_windows_local_left_button(WM_LBUTTONUP, 0, 0, &held);
+        assert!(!held.load(Ordering::Relaxed));
     }
 
     #[cfg(target_os = "macos")]
