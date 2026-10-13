@@ -3329,9 +3329,9 @@ function App() {
 
       {editingDevice ? <DeviceSettingsModal key={editingDevice.id} device={editingDevice} language={language}
         onClose={() => setEditingDevice(null)}
-        onSave={(pointerSpeed, scrollSpeed) => saveModalLayout(current => {
+        onSave={(pointerSpeed, scrollSpeed, invertScroll) => saveModalLayout(current => {
           if (!current.devices.some(device => device.id === editingDevice.id)) throw new Error(language === "cn" ? "设备已移除。" : "Device no longer available.");
-          return { ...current, devices: current.devices.map(device => device.id === editingDevice.id ? { ...device, pointerSpeed, scrollSpeed } : device) };
+          return { ...current, devices: current.devices.map(device => device.id === editingDevice.id ? { ...device, pointerSpeed, scrollSpeed, invertScroll } : device) };
         })}
         onRepair={() => { setEditingDevice(null); void handleRepairDevice(editingDevice); }}
         onRemove={() => { handleRemoveDevice(editingDevice.id); setEditingDevice(null); }}

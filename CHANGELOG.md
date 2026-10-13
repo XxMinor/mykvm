@@ -10,6 +10,7 @@ release will reuse them).
 
 ### Added
 
+- Per-device reverse scrolling: Devices → Device settings → Reverse scroll direction changes both scroll axes for that remote device, independently of macOS natural scrolling or MOS (discussion #29).
 - Device settings use a modal form. Pointer and scroll speeds are saved together; pairing and removal actions are grouped inside the form.
 - Folder transfers preserve nested directories and empty folders. Windows native drags include directory descriptors; ordinary transfers unpack into the receiving folder. New folder and file-clipboard protocols require both peers to be updated.
 - Rich clipboard sharing includes HTML and RTF with a plain-text fallback.

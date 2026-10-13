@@ -10,18 +10,19 @@ export function DeviceSettingsModal({ device, language, onClose, onSave, onRepai
   device: Device
   language: 'cn' | 'en'
   onClose: () => void
-  onSave: (pointerSpeed: number, scrollSpeed: number) => Promise<void>
+  onSave: (pointerSpeed: number, scrollSpeed: number, invertScroll: boolean) => Promise<void>
   onRepair: () => void
   onRemove: () => void
 }) {
   const cn = language === 'cn'
   const [pointerSpeed, setPointerSpeed] = useState(device.pointerSpeed ?? 1)
   const [scrollSpeed, setScrollSpeed] = useState(device.scrollSpeed ?? 1)
+  const [invertScroll, setInvertScroll] = useState(device.invertScroll ?? false)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   async function save() {
     setPending(true); setError(null)
-    try { await onSave(pointerSpeed, scrollSpeed); onClose() }
+    try { await onSave(pointerSpeed, scrollSpeed, invertScroll); onClose() }
     catch (error) { setError(error instanceof Error ? error.message : String(error)) }
     finally { setPending(false) }
   }
@@ -36,6 +37,11 @@ export function DeviceSettingsModal({ device, language, onClose, onSave, onRepai
           <select value={scrollSpeed} disabled={pending} onChange={event => setScrollSpeed(Number(event.target.value))}>
             {SCROLL_SPEEDS.map(speed => <option key={speed} value={speed}>{speed}×{speed === 1 ? (cn ? '（默认）' : ' (default)') : ''}</option>)}
           </select></label>
+      </div>
+      <div>
+        <label className="modal-checkbox"><input type="checkbox" checked={invertScroll} disabled={pending} onChange={event => setInvertScroll(event.target.checked)} />
+          <span>{cn ? '反转滚动方向' : 'Reverse scroll direction'}</span></label>
+        <p className="modal-help">{cn ? '仅影响这台远端设备的滚动方向，可用于配合 macOS 自然滚动或 MOS。' : 'Changes scrolling only on this remote device, including when using macOS natural scrolling or MOS.'}</p>
       </div>
       <div className="modal-maintenance"><span>{cn ? '连接维护' : 'Connection maintenance'}</span>
         <div><button type="button" className="secondary-button compact-button" disabled={pending} onClick={onRepair}>{cn ? '重新配对' : 'Re-pair'}</button>

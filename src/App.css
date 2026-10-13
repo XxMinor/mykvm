@@ -2313,6 +2313,8 @@
 .modal-field { display: grid; gap: 10px; font-size: 14px; }
 .modal-field select { font: inherit; min-width: 0; width: 100%; height: 44px; padding: 0 12px; background: #242429; border: 1px solid #7775; border-radius: 8px; color: #f4f4f5; }
 .modal-field select:focus { outline: 2px solid #2786ff; outline-offset: 2px; }
+.modal-checkbox { display: flex; align-items: center; gap: 10px; font-size: 14px; margin-bottom: 8px; cursor: pointer; }
+.modal-checkbox input { width: 16px; height: 16px; margin: 0; accent-color: #2786ff; }
 .modal-help { font-size: 12px; color: #a1a1aa; line-height: 1.7; margin: 0; }
 .modal-maintenance { display: grid; gap: 12px; padding-top: 18px; border-top: 1px solid #7773; font-size: 13px; color: #a1a1aa; }
 .modal-maintenance > div { display: flex; gap: 10px; flex-wrap: wrap; }
