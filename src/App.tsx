@@ -1,4 +1,5 @@
 import { DeviceSettingsModal } from "./DeviceSettingsModal";
+import { formatUnknownError } from "./errors";
 import { HelpHeading, InfoTip } from "./InfoTip";
 import {
   type CSSProperties,
@@ -1335,9 +1336,7 @@ function App() {
     try {
       updateInputServiceStatus(await readInputServiceStatus());
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -1350,9 +1349,7 @@ function App() {
       updateInputServiceStatus(await installInputService());
       setInputServiceAction(null);
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -1365,9 +1362,7 @@ function App() {
       updateInputServiceStatus(await uninstallInputService());
       setInputServiceAction(null);
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -4051,22 +4046,6 @@ function updateStatusLabel(status: UpdateStatus, ui: AppText) {
       return ui.settings.updateFailed;
     default:
       return ui.settings.updateIdle;
-  }
-}
-
-function formatUnknownError(error: unknown, fallback: string) {
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
-
-  try {
-    const text = JSON.stringify(error);
-    return text && text !== "null" ? text : fallback;
-  } catch {
-    return fallback;
   }
 }
 
