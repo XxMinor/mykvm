@@ -61,6 +61,7 @@ release will reuse them).
 - macOS: when the controlled machine stops accepting input, clicks and keys now hand control back to the Mac instead of freezing the trackpad and mouse until MyKVM is force-quit. A file drag that an older client refuses is delivered to that machine's Desktop instead (#33).
 - The device list and diagnostics show every IPv4 address of this machine, so a direct-cable or Thunderbolt-bridge address is visible for manual pairing, not just the Wi-Fi one (#33).
 - Windows: MyKVM starts a stopped lock-screen input service from an older install, so clicks work on the lock screen again (#27).
+- Windows: refused clicks, keys, and scroll events retry through the input service even when Windows supplies no error code. This covers elevated prompts on the normal desktop, including UAC without dimming (#28).
 - macOS: launch at startup opens MyKVM once and silently, instead of racing macOS "Reopen windows when logging back in" and showing the window. Display changes on wake are applied once instead of several times, without blocking the app, and input-capture errors are now written to the log.
 - macOS: returning to the Mac after a long session with the window hidden no longer stalls while the hidden cursor is restored.
 - Mouse movement keeps a steady 125 Hz instead of dropping to about 62 Hz when input callbacks jitter.

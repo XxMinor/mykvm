@@ -2911,17 +2911,19 @@ fn dispatch_input_command(command: InputCommand) -> bool {
                 Err(error) => note_windows_helper_unavailable(&error),
             }
         }
-        // Windows refuses local injection (ERROR_ACCESS_DENIED) when the
+        // Windows can refuse local injection when the
         // foreground window outranks this process: the UAC consent prompt on
         // the normal desktop at "notify without dimming" (#28), Task Manager or
-        // an elevated app (#9). The SYSTEM helper can reach those, and a refused
-        // SendInput inserts nothing, so the retry cannot double an event.
-        if crate::windows_input::inject_command_without_tracking(&command)
-            == Err(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED)
-        {
-            if let Err(error) = windows_pipe_dispatcher().send(&command) {
-                note_windows_helper_unavailable(&error);
-            }
+        // an elevated app (#9). UIPI does not guarantee ERROR_ACCESS_DENIED;
+        // GetLastError can even be zero. Retry every refused single-event
+        // SendInput through the SYSTEM helper: zero inserted events means this
+        // cannot double a click or key.
+        if let Err(error) = inject_windows_command_with_fallback(
+            &command,
+            crate::windows_input::inject_command_without_tracking,
+            |command| windows_pipe_dispatcher().send(command),
+        ) {
+            note_windows_helper_unavailable(&error);
         }
         return true;
     }
@@ -2930,6 +2932,29 @@ fn dispatch_input_command(command: InputCommand) -> bool {
     {
         inject_input_command(command);
         true
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn inject_windows_command_with_fallback(
+    command: &InputCommand,
+    mut inject_local: impl FnMut(&InputCommand) -> Result<(), u32>,
+    mut send_helper: impl FnMut(&InputCommand) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut inject_one = |command: &InputCommand| {
+        match inject_local(command) {
+            Ok(()) => Ok(()),
+            Err(_) => send_helper(command),
+        }
+    };
+    match *command {
+        InputCommand::Scroll { delta_x, delta_y } if delta_x != 0 && delta_y != 0 => {
+            // A diagonal scroll uses two SendInput calls. Retry only the axis
+            // that failed so an already-inserted axis is never replayed.
+            inject_one(&InputCommand::Scroll { delta_x: 0, delta_y })?;
+            inject_one(&InputCommand::Scroll { delta_x, delta_y: 0 })
+        }
+        _ => inject_one(command),
     }
 }
 
@@ -8874,6 +8899,60 @@ fn inject_key(_key_code: u16, _down: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_windows_input_retries_without_a_specific_last_error() {
+        for command in [
+            InputCommand::Key { key_code: 0x41, down: true },
+            InputCommand::MouseButton { button: MouseButton::Left, down: true, x: 5, y: 10 },
+            InputCommand::Scroll { delta_x: 0, delta_y: 1 },
+        ] {
+            for error in [0, 5, 87] {
+                let mut forwarded = Vec::new();
+                assert!(inject_windows_command_with_fallback(
+                    &command,
+                    |_| Err(error),
+                    |command| { forwarded.push(command.clone()); Ok(()) },
+                ).is_ok());
+                assert_eq!(forwarded, vec![command.clone()]);
+            }
+        }
+    }
+
+    #[test]
+    fn successful_windows_input_stays_local_and_helper_errors_are_reported() {
+        let command = InputCommand::Key { key_code: 0x41, down: false };
+        assert!(inject_windows_command_with_fallback(
+            &command, |_| Ok(()), |_| panic!("successful input must not be replayed"),
+        ).is_ok());
+        assert_eq!(inject_windows_command_with_fallback(
+            &command, |_| Err(0), |_| Err("helper unavailable".into()),
+        ), Err("helper unavailable".into()));
+    }
+
+    #[test]
+    fn windows_scroll_fallback_does_not_repeat_an_already_injected_axis() {
+        let command = InputCommand::Scroll { delta_x: 2, delta_y: -3 };
+        let mut local = Vec::new();
+        let mut forwarded = Vec::new();
+        assert!(inject_windows_command_with_fallback(
+            &command,
+            |command| {
+                local.push(command.clone());
+                if matches!(command, InputCommand::Scroll { delta_x: 0, .. }) {
+                    Ok(())
+                } else {
+                    Err(0)
+                }
+            },
+            |command| { forwarded.push(command.clone()); Ok(()) },
+        ).is_ok());
+        assert_eq!(local, vec![
+            InputCommand::Scroll { delta_x: 0, delta_y: -3 },
+            InputCommand::Scroll { delta_x: 2, delta_y: 0 },
+        ]);
+        assert_eq!(forwarded, vec![InputCommand::Scroll { delta_x: 2, delta_y: 0 }]);
+    }
 
     #[test]
     fn scroll_speed_carries_the_fraction() {
