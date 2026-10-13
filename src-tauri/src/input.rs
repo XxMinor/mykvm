@@ -225,6 +225,7 @@ struct InputTarget {
     /// scroll_speed), captured like `modifier_map`.
     pointer_speed: f64,
     scroll_speed: f64,
+    invert_scroll: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1986,6 +1987,7 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
                         modifier_map: target_modifier_map(layout, &device.platform),
                         pointer_speed: sane_input_speed(device.pointer_speed),
                         scroll_speed: sane_input_speed(device.scroll_speed),
+                        invert_scroll: device.invert_scroll,
                     });
                 }
             }
@@ -4858,16 +4860,18 @@ fn sane_input_speed(speed: f64) -> f64 {
 /// thousandths so a slow speed still scrolls (0.5x: one step every other
 /// notch) instead of rounding every step to nothing.
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
-fn scaled_scroll(horizontal: bool, delta: i32, speed: f64) -> i32 {
+fn scaled_scroll(horizontal: bool, delta: i32, speed: f64, invert: bool) -> i32 {
     use std::sync::atomic::AtomicI64;
     static REMAINDER_MILLI: [AtomicI64; 2] = [AtomicI64::new(0), AtomicI64::new(0)];
-    if delta == 0 || (speed - 1.0).abs() < 1e-9 {
-        return delta;
-    }
-    let remainder = &REMAINDER_MILLI[usize::from(horizontal)];
-    let total = (f64::from(delta) * speed * 1000.0).round() as i64 + remainder.load(Ordering::Relaxed);
-    remainder.store(total % 1000, Ordering::Relaxed);
-    (total / 1000) as i32
+    let scaled = if delta == 0 || (speed - 1.0).abs() < 1e-9 {
+        delta
+    } else {
+        let remainder = &REMAINDER_MILLI[usize::from(horizontal)];
+        let total = (f64::from(delta) * speed * 1000.0).round() as i64 + remainder.load(Ordering::Relaxed);
+        remainder.store(total % 1000, Ordering::Relaxed);
+        (total / 1000) as i32
+    };
+    if invert { scaled.saturating_neg() } else { scaled }
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -4894,10 +4898,11 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
         return true;
     };
     let speed = active_target.target.scroll_speed;
+    let invert = active_target.target.invert_scroll;
     let (delta_x, delta_y) = if message == WM_MOUSEHWHEEL {
-        (scaled_scroll(true, delta, speed), 0)
+        (scaled_scroll(true, delta, speed, invert), 0)
     } else if message == WM_MOUSEWHEEL {
-        (0, scaled_scroll(false, delta, speed))
+        (0, scaled_scroll(false, delta, speed, invert))
     } else {
         return false;
     };
@@ -5144,11 +5149,13 @@ fn handle_macos_event(
                 false,
                 event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as i32,
                 speed,
+                active_target.target.invert_scroll,
             );
             let delta_x = scaled_scroll(
                 true,
                 event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32,
                 speed,
+                active_target.target.invert_scroll,
             );
             if delta_x == 0 && delta_y == 0 {
                 return CallbackResult::Drop;
@@ -8871,11 +8878,17 @@ mod tests {
     #[test]
     fn scroll_speed_carries_the_fraction() {
         // 1x is untouched; 2x doubles.
-        assert_eq!(scaled_scroll(false, 3, 1.0), 3);
-        assert_eq!(scaled_scroll(false, 1, 2.0), 2);
+        assert_eq!(scaled_scroll(false, 3, 1.0, false), 3);
+        assert_eq!(scaled_scroll(false, 1, 2.0, false), 2);
         // 0.5x: every other notch goes through, none is lost.
-        let slow: i32 = (0..4).map(|_| scaled_scroll(true, 1, 0.5)).sum();
+        let slow: i32 = (0..4).map(|_| scaled_scroll(true, 1, 0.5, false)).sum();
         assert_eq!(slow, 2);
+        // Reverse both axes after scaling, including fractional touchpad steps.
+        assert_eq!(scaled_scroll(false, 3, 1.0, true), -3);
+        assert_eq!(scaled_scroll(true, -2, 2.0, true), 4);
+        let reversed_slow: i32 = (0..4).map(|_| scaled_scroll(true, 1, 0.5, true)).sum();
+        assert_eq!(reversed_slow, -2);
+        assert_eq!(scaled_scroll(false, i32::MIN, 1.0, true), i32::MAX);
         // A broken saved speed falls back to a usable one.
         assert_eq!(sane_input_speed(f64::NAN), 1.0);
         assert_eq!(sane_input_speed(0.0), 0.25);
@@ -9411,6 +9424,7 @@ mod tests {
         InputTarget {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
+            invert_scroll: false,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -9450,6 +9464,7 @@ mod tests {
                 Device {
                     pointer_speed: 1.0,
                     scroll_speed: 1.0,
+                    invert_scroll: false,
                     id: "local-device".into(),
                     name: "Local".into(),
                     platform: "macos".into(),
@@ -9470,6 +9485,7 @@ mod tests {
                 Device {
                     pointer_speed: 1.0,
                     scroll_speed: 1.0,
+                    invert_scroll: false,
                     id: "peer-device".into(),
                     name: "Client".into(),
                     platform: "windows".into(),
@@ -9526,6 +9542,7 @@ mod tests {
         let device = Device {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
+            invert_scroll: false,
             id: "peer-device".into(),
             name: "Client".into(),
             platform: "windows".into(),
@@ -9555,6 +9572,7 @@ mod tests {
         let target = InputTarget {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
+            invert_scroll: false,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -9613,6 +9631,7 @@ mod tests {
         let target = InputTarget {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
+            invert_scroll: false,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -9664,6 +9683,7 @@ mod tests {
         let target = InputTarget {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
+            invert_scroll: false,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -10108,6 +10128,7 @@ mod tests {
             let target = InputTarget {
                 pointer_speed: 1.0,
                 scroll_speed: 1.0,
+                invert_scroll: false,
                 device_id: "peer-device".into(),
                 origin_device_id: "peer-local-192-168-66-92".into(),
                 cluster_id: "cluster-test".into(),
@@ -10950,6 +10971,7 @@ mod tests {
         let target = InputTarget {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
+            invert_scroll: false,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -10989,6 +11011,7 @@ mod tests {
         let target = InputTarget {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
+            invert_scroll: false,
             device_id: "peer-device".into(),
             origin_device_id: "peer-local-192-168-66-92".into(),
             cluster_id: "cluster-test".into(),
@@ -11193,6 +11216,16 @@ mod tests {
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].target_addr, "10.0.0.2:52001");
+    }
+
+    #[test]
+    fn input_targets_keep_the_selected_devices_scroll_direction() {
+        let mut layout = layout_for_target_tests();
+        assert!(!build_input_targets(&layout, &layout)[0].invert_scroll);
+        layout.devices[0].invert_scroll = true;
+        assert!(!build_input_targets(&layout, &layout)[0].invert_scroll);
+        layout.devices[1].invert_scroll = true;
+        assert!(build_input_targets(&layout, &layout)[0].invert_scroll);
     }
 
     #[test]

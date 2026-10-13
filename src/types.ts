@@ -62,6 +62,7 @@ export interface Device {
   /** Multipliers this controller applies when driving the device. */
   pointerSpeed?: number
   scrollSpeed?: number
+  invertScroll?: boolean
   role: 'local' | 'server' | 'client'
   source?: 'detected' | 'manual'
   screens: Screen[]

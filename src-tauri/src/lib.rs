@@ -223,6 +223,8 @@ struct Device {
     pointer_speed: f64,
     #[serde(default = "default_input_speed")]
     scroll_speed: f64,
+    #[serde(default)]
+    invert_scroll: bool,
 }
 
 /// Per-direction hotkeys for jumping between adjacent screens without moving
@@ -5383,6 +5385,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         devices: vec![Device {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
+            invert_scroll: false,
             id: device_id,
             name: local_device_name(),
             platform: current_platform().into(),
@@ -10200,6 +10203,21 @@ fn random_pairing_code() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_layout_defaults_scroll_direction_and_saved_inversion_survives_reload() {
+        let mut legacy = serde_json::to_value(test_layout()).unwrap();
+        for device in legacy["devices"].as_array_mut().unwrap() {
+            device.as_object_mut().unwrap().remove("invertScroll");
+        }
+        let mut layout: LayoutState = serde_json::from_value(legacy).unwrap();
+        assert!(layout.devices.iter().all(|device| !device.invert_scroll));
+        layout.devices[1].invert_scroll = true;
+        let saved = serde_json::to_string(&layout).unwrap();
+        let restored = normalize_saved_layout(serde_json::from_str(&saved).unwrap(), test_layout());
+        assert!(!restored.devices[0].invert_scroll);
+        assert!(restored.devices[1].invert_scroll);
+    }
+
     fn test_screen(device_id: &str) -> Screen {
         Screen {
             id: format!("{device_id}-display-1"),
@@ -10450,6 +10468,7 @@ mod tests {
                 Device {
                     pointer_speed: 1.0,
                     scroll_speed: 1.0,
+                    invert_scroll: false,
                     id: "local-device".into(),
                     name: "Local".into(),
                     platform: "macos".into(),
@@ -10470,6 +10489,7 @@ mod tests {
                 Device {
                     pointer_speed: 1.0,
                     scroll_speed: 1.0,
+                    invert_scroll: false,
                     id: "peer-client-10-0-0-2".into(),
                     name: "Client".into(),
                     platform: "windows".into(),
