@@ -1252,8 +1252,21 @@ impl AppRuntime {
             }
         }
         if owns_network {
+            // StartServiceW may return before the service creates its control
+            // pipe. WaitNamedPipeW returns immediately if it does not exist yet.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(file) = acquire_windows_input_service_network_lease()? {
+                    *lease = Some(file);
+                    return Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
             return Err(
-                "MyKVM input service is running but its network takeover pipe is unavailable."
+                "MyKVM input service did not make its network takeover pipe available within 5 seconds. Check C:\\ProgramData\\MyKVM\\service.log."
                     .into(),
             );
         }
@@ -2330,7 +2343,8 @@ fn install_input_service(
                 let _ = state.acquire_input_service_network_lease()?;
                 Ok(current_input_service_status())
             })();
-            if result.is_err() {
+            if let Err(error) = &result {
+                log::error!("input service installation/repair failed: {error}");
                 let _ = state.acquire_input_service_network_lease();
             }
             result?
@@ -2371,6 +2385,7 @@ fn uninstall_input_service(
             state.release_input_service_network_lease()?;
             let result = uninstall_windows_input_service();
             if let Err(error) = result {
+                log::error!("input service removal failed: {error}");
                 let _ = state.acquire_input_service_network_lease();
                 return Err(error);
             }
@@ -4404,6 +4419,10 @@ fn acquire_windows_input_service_network_lease() -> Result<Option<std::fs::File>
         )
     };
     if handle == INVALID_HANDLE_VALUE {
+        let error = unsafe { GetLastError() };
+        if matches!(error, ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY) {
+            return Ok(None);
+        }
         return Err(windows_last_error("CreateFileW(MyKVM service control)"));
     }
 
@@ -4678,8 +4697,11 @@ fn protected_input_helper_path() -> Result<PathBuf, String> {
 
 #[cfg(target_os = "windows")]
 fn install_protected_input_helper(source: &PathBuf) -> Result<PathBuf, String> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION},
+        Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        },
     };
 
     let target = protected_input_helper_path()?;
@@ -4725,17 +4747,30 @@ fn install_protected_input_helper(source: &PathBuf) -> Result<PathBuf, String> {
 
     let staging_wide = wide_null(&staging.to_string_lossy());
     let target_wide = wide_null(&target.to_string_lossy());
-    if unsafe {
-        MoveFileExW(
-            staging_wide.as_ptr(),
-            target_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        let error = windows_last_error("MoveFileExW(protected input helper)");
-        let _ = fs::remove_file(&staging);
-        return Err(error);
+    // SERVICE_STOPPED can arrive before the old process releases its image.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if unsafe {
+            MoveFileExW(
+                staging_wide.as_ptr(),
+                target_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            break;
+        }
+        let error = unsafe { GetLastError() };
+        if !matches!(error, ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+            || Instant::now() >= deadline
+        {
+            let _ = fs::remove_file(&staging);
+            return Err(format!(
+                "MoveFileExW(protected input helper {}) failed with Windows error {error}",
+                target.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
     }
     if let Err(error) = secure_protected_input_helper_path(&target) {
         let _ = fs::remove_file(&target);

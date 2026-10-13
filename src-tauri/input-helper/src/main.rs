@@ -114,7 +114,7 @@ mod windows_helper {
     use windows_sys::Win32::{
         Foundation::{
             CloseHandle, GetLastError, LocalFree, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL,
-            INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+            INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::{
             Authorization::{
@@ -488,6 +488,19 @@ mod windows_helper {
 
             unsafe {
                 let _ = TerminateProcess(self.handle, 0);
+                // TerminateProcess is asynchronous. The old worker must release
+                // its executable and input pipe before repair or a new worker.
+                match WaitForSingleObject(self.handle, 5_000) {
+                    WAIT_OBJECT_0 => {}
+                    WAIT_TIMEOUT => log_service_error(
+                        "stop session input worker",
+                        "timed out waiting for the worker process to exit",
+                    ),
+                    _ => log_service_error(
+                        "stop session input worker",
+                        &last_error("WaitForSingleObject(worker)"),
+                    ),
+                }
                 let _ = CloseHandle(self.handle);
             }
             self.handle = ptr::null_mut();
@@ -975,6 +988,50 @@ mod windows_helper {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn stopping_worker_waits_for_process_exit() {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+
+            let mut child = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows_helper::tests::worker_process_fixture",
+                    "--ignored",
+                ])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut handle = ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    DuplicateHandle(
+                        GetCurrentProcess(),
+                        child.as_raw_handle(),
+                        GetCurrentProcess(),
+                        &mut handle,
+                        0,
+                        0,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                },
+                0
+            );
+            let mut worker = WorkerProcess {
+                handle,
+                session_id: 1,
+            };
+            worker.stop();
+            assert!(child.try_wait().unwrap().is_some());
+            assert!(worker.handle.is_null());
+        }
+
+        #[test]
+        #[ignore = "subprocess fixture for stopping_worker_waits_for_process_exit"]
+        fn worker_process_fixture() {
+            thread::park();
+        }
 
         #[test]
         fn parses_service_config_and_owner_sid() {
