@@ -9964,6 +9964,7 @@ mod tests {
             file_transfer_enabled: true,
             language: "cn".into(),
             theme_mode: "system".into(),
+            update_channel: crate::updates::UpdateChannel::Stable,
             performance_monitor: false,
             transport_port_mode: "auto".into(),
             transport_port: 47833,

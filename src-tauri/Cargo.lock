@@ -2344,6 +2344,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rmp-serde",
+ "semver",
  "serde",
  "serde_json",
  "socket2",

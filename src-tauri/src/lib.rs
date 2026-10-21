@@ -38,6 +38,7 @@ mod input_guard;
 #[cfg(any(target_os = "windows", test))]
 mod native_drag;
 mod performance;
+mod updates;
 #[cfg(any(target_os = "windows", test))]
 mod windows_service_install;
 mod quic_transport;
@@ -73,7 +74,6 @@ const TRANSPORT_PORT_MAX: u16 = 65_535;
 // ports (e.g. 47833 and 47834) still reach each other.
 const DISCOVERY_PORT_SPAN: u16 = 8;
 const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
-const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 // UDP discovery is a heartbeat, not the transport itself. Keep peers through
 // short announce gaps so online clients do not flicker offline in the UI.
@@ -302,6 +302,8 @@ struct LayoutState {
     language: String,
     #[serde(default = "default_theme_mode")]
     theme_mode: String,
+    #[serde(default)]
+    update_channel: updates::UpdateChannel,
     #[serde(default = "default_performance_monitor")]
     performance_monitor: bool,
     #[serde(default = "default_transport_port_mode")]
@@ -3057,8 +3059,8 @@ fn open_repository_url() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_releases_url() -> Result<(), String> {
-    open_external_url(RELEASES_URL)
+fn open_releases_url(channel: Option<updates::UpdateChannel>) -> Result<(), String> {
+    open_external_url(&channel.unwrap_or_default().releases_url())
 }
 
 #[tauri::command]
@@ -3887,6 +3889,7 @@ pub fn run() {
             read_clipboard_text,
             write_clipboard_text,
             read_performance_sample,
+            updates::check_app_update,
             set_app_upgrading,
             prepare_update_install,
             scan_lan_peers,
@@ -5364,6 +5367,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         input_protection: Default::default(),
         language: default_language(),
         theme_mode: default_theme_mode(),
+        update_channel: Default::default(),
         performance_monitor: default_performance_monitor(),
         transport_port_mode: default_transport_port_mode(),
         transport_port,
@@ -5414,6 +5418,7 @@ fn detect_fallback_layout() -> LayoutState {
         input_protection: Default::default(),
         language: default_language(),
         theme_mode: default_theme_mode(),
+        update_channel: Default::default(),
         performance_monitor: default_performance_monitor(),
         transport_port_mode: default_transport_port_mode(),
         transport_port: default_transport_port(),
@@ -5727,6 +5732,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         input_protection: InputProtection::default(),
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
+        update_channel: saved_layout.update_channel,
         performance_monitor: saved_layout.performance_monitor,
         transport_port_mode: normalize_transport_port_mode(&saved_layout.transport_port_mode),
         transport_port,
@@ -8371,17 +8377,9 @@ fn handle_peer_request_packet(
 /// On Windows `install` ends this process and the installer restarts it.
 fn run_requested_update(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        use tauri_plugin_updater::UpdaterExt;
         let state = app.state::<AppRuntime>();
-        let update = match app
-            .updater_builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(|error| error.to_string())
-        {
-            Ok(updater) => updater.check().await.map_err(|error| error.to_string()),
-            Err(error) => Err(error),
-        };
+        let channel = state.layout_snapshot().update_channel;
+        let update = updates::available_release(&app, channel).await;
         let update = match update {
             Ok(Some(update)) => update,
             Ok(None) => {
@@ -10511,6 +10509,7 @@ mod tests {
             file_transfer_enabled: true,
             language: "cn".into(),
             theme_mode: "system".into(),
+            update_channel: updates::UpdateChannel::Stable,
             performance_monitor: false,
             transport_port_mode: "auto".into(),
             transport_port: 49152,

@@ -92,6 +92,7 @@ import type {
   Screen,
   ThemeMode,
   TransportPortMode,
+  UpdateChannel,
 } from "./types";
 
 const DEFAULT_BOARD_WIDTH = 1040;
@@ -247,6 +248,7 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [availableUpdate, setAvailableUpdate] =
     useState<AppUpdateInfo | null>(null);
+  const [latestReleaseVersion, setLatestReleaseVersion] = useState<string | null>(null);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<
     string | null
@@ -270,7 +272,7 @@ function App() {
   >({ left: null, right: null, up: null, down: null });
   const fileDragTargetIdRef = useRef<string | null>(null);
   const fileTransferFallbackTargetIdRef = useRef<string | null>(null);
-  const startupUpdateCheckStarted = useRef(false);
+  const updateCheckRequest = useRef(0);
   const snapshotRef = useRef<AppStateSnapshot | null>(null);
 
   useEffect(() => {
@@ -727,19 +729,14 @@ function App() {
   const machineRole = layout?.machineRole ?? "unset";
   const language = layout?.language ?? "cn";
   const themeMode = layout?.themeMode ?? "system";
+  const updateChannel = layout?.updateChannel ?? "stable";
   const resolvedTheme = resolveTheme(themeMode, systemTheme);
   const ui = TEXT[language];
   const hasLoadedSnapshot = Boolean(snapshot);
   const isAvailableUpdateDismissed =
     Boolean(availableUpdate) &&
     dismissedUpdateVersion === availableUpdate?.version;
-  // The latest released version: the newer one when an update is available,
-  // otherwise the current build once a check confirms we're up to date.
-  const latestVersionLabel = availableUpdate
-    ? availableUpdate.version
-    : updateStatus === "current"
-      ? APP_VERSION
-      : null;
+  const latestVersionLabel = latestReleaseVersion;
   const hasActionableUpdate =
     Boolean(availableUpdate) && !isAvailableUpdateDismissed;
   const visibleTabs = useMemo(
@@ -878,52 +875,43 @@ function App() {
     }
   }, [resolvedTheme, themeMode]);
 
-  useEffect(() => {
-    if (!hasLoadedSnapshot || !isTauri() || startupUpdateCheckStarted.current) {
-      return;
-    }
-
-    let active = true;
-    const timerId = window.setTimeout(() => {
-      if (!active || startupUpdateCheckStarted.current) {
+  const checkUpdateAutomatically = useEffectEvent(async (channel: UpdateChannel) => {
+    const request = ++updateCheckRequest.current;
+    setUpdateStatus("checking");
+    setUpdateMessage(null);
+    try {
+      const result = await checkForAppUpdate(channel);
+      if (request !== updateCheckRequest.current || snapshotRef.current?.layout.updateChannel !== channel) return;
+      setLatestReleaseVersion(result.latestVersion ?? null);
+      if (!result.available || !result.update) {
+        setAvailableUpdate(null);
+        setUpdateStatus("current");
         return;
       }
+      setAvailableUpdate(result.update);
+      if (dismissedUpdateVersion === result.update.version) {
+        setUpdateStatus("idle");
+        setUpdateMessage(ui.settings.updateDismissed);
+      } else {
+        setUpdateStatus("available");
+        setUpdateMessage(`${ui.settings.updateAvailable}: v${result.update.version}`);
+      }
+    } catch (error: unknown) {
+      if (request !== updateCheckRequest.current) return;
+      setUpdateStatus("error");
+      setUpdateMessage(formatUpdaterError(error, ui.errors.checkUpdate,
+        ui.errors.updateSignatureMismatch, ui.errors.updateManifestUnavailable));
+    }
+  });
 
-      startupUpdateCheckStarted.current = true;
-      checkForAppUpdate()
-        .then((result) => {
-          if (!active) {
-            return;
-          }
-
-          if (!result.available || !result.update) {
-            // Up to date: the updater returns nothing, so the current build is
-            // the latest release. Record that so "Latest version" can show it.
-            setAvailableUpdate(null);
-            setUpdateStatus("current");
-            return;
-          }
-
-          setAvailableUpdate(result.update);
-          if (dismissedUpdateVersion === result.update.version) {
-            setUpdateStatus("idle");
-            setUpdateMessage(ui.settings.updateDismissed);
-            return;
-          }
-
-          setUpdateStatus("available");
-          setUpdateMessage(`${ui.settings.updateAvailable}: v${result.update.version}`);
-        })
-        .catch(() => {
-          // Startup checks should not interrupt normal app startup.
-        });
-    }, 1200);
-
+  useEffect(() => {
+    if (!hasLoadedSnapshot || !isTauri()) return;
+    const timerId = window.setTimeout(() => void checkUpdateAutomatically(updateChannel), 1200);
     return () => {
-      active = false;
       window.clearTimeout(timerId);
+      updateCheckRequest.current++;
     };
-  }, [dismissedUpdateVersion, hasLoadedSnapshot, ui]);
+  }, [hasLoadedSnapshot, updateChannel]);
 
   useEffect(() => {
     if (!isPerformanceActive) {
@@ -1979,9 +1967,13 @@ function App() {
 
     setUpdateStatus("checking");
     setUpdateMessage(null);
+    const request = ++updateCheckRequest.current;
+    const channel = updateChannel;
 
     try {
-      const result = await checkForAppUpdate();
+      const result = await checkForAppUpdate(channel);
+      if (request !== updateCheckRequest.current || snapshotRef.current?.layout.updateChannel !== channel) return;
+      setLatestReleaseVersion(result.latestVersion ?? null);
 
       if (result.available && result.update) {
         localStorage.removeItem(UPDATE_DISMISSED_VERSION_KEY);
@@ -1996,6 +1988,7 @@ function App() {
       setUpdateStatus("current");
       setUpdateMessage(ui.settings.updateCurrent);
     } catch (error: unknown) {
+      if (request !== updateCheckRequest.current) return;
       setUpdateStatus("error");
       setUpdateMessage(
         formatUpdaterError(
@@ -2005,6 +1998,20 @@ function App() {
           ui.errors.updateManifestUnavailable,
         ),
       );
+    }
+  }
+
+  async function changeUpdateChannel(channel: UpdateChannel) {
+    if (channel === updateChannel || updateStatus === "installing") return;
+    updateCheckRequest.current++;
+    setAvailableUpdate(null);
+    setLatestReleaseVersion(null);
+    setUpdateStatus("idle");
+    setUpdateMessage(null);
+    try {
+      await saveModalLayout((current) => ({ ...current, updateChannel: channel }));
+    } catch (error: unknown) {
+      setErrorMessage(formatUnknownError(error, ui.errors.saveLayout));
     }
   }
 
@@ -2018,15 +2025,15 @@ function App() {
 
     try {
       if (isPortable) {
-        await openUpdateReleasePage();
+        await openUpdateReleasePage(updateChannel);
         setUpdateStatus("available");
         setUpdateMessage(ui.settings.portableUpdateCopy);
         return;
       }
 
-      await installAppUpdate();
+      if (!(await installAppUpdate(updateChannel))) await checkDesktopUpdate();
     } catch (error: unknown) {
-      await openUpdateReleasePage().catch(() => {
+      await openUpdateReleasePage(updateChannel).catch(() => {
         // The original update error is more useful than a secondary browser error.
       });
       const errorText = formatUpdaterError(
@@ -2052,7 +2059,7 @@ function App() {
   }
 
   function openUpdateDownloads() {
-    void openUpdateReleasePage();
+    void openUpdateReleasePage(updateChannel);
   }
 
   function renderErrorDialog(message: string) {
@@ -3124,6 +3131,20 @@ function App() {
                   <span className={`update-status-badge ${updateStatus}`}>
                     {updateStatusLabel(updateStatus, ui)}
                   </span>
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.updateChannel}</span>
+                  <div className="segmented-control" role="group" aria-label={ui.settings.updateChannel}>
+                    {(["stable", "beta"] as UpdateChannel[]).map((channel) => (
+                      <button key={channel} type="button"
+                        className={updateChannel === channel ? "active" : ""}
+                        aria-pressed={updateChannel === channel}
+                        disabled={isSaving || updateStatus === "installing"}
+                        onClick={() => void changeUpdateChannel(channel)}>
+                        {channel === "stable" ? ui.settings.stableChannel : ui.settings.betaChannel}
+                      </button>
+                    ))}
+                  </div>
                 </div>
                 <dl className="network-meta compact-meta">
                   <div>

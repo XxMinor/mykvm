@@ -10,6 +10,7 @@ release will reuse them).
 
 ### Added
 
+- App Updates offers Stable and Beta (bate) channels. The selected channel is saved and also applies to remote client update requests.
 - Per-device reverse scrolling: Devices → Device settings → Reverse scroll direction changes both scroll axes for that remote device, independently of macOS natural scrolling or MOS (discussion #29).
 - Device settings use a modal form. Pointer and scroll speeds are saved together; pairing and removal actions are grouped inside the form.
 - Folder transfers preserve nested directories and empty folders. Windows native drags include directory descriptors; ordinary transfers unpack into the receiving folder. New folder and file-clipboard protocols require both peers to be updated.
@@ -27,6 +28,7 @@ release will reuse them).
 
 ### Fixed
 
+- The latest-version label shows the selected channel's published version, including when the installed local test build is newer.
 - macOS: repeated remote scrolling reuses one private input-state table, preventing shared-memory growth during long sessions. Scroll events keep explicit discrete and momentum-free settings.
 - macOS: remote drags keep matching press/move/release events on macOS 27. Returning to the controller keeps the actual drag position until handoff, and stopping sharing releases held buttons. Ordered snapshots recover lost presses without replaying stale drag state.
 - macOS: a disabled input tap releases remote keys and buttons before recovery. Cursor suppression is checked before forwarding pending movement (#45).

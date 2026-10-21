@@ -8,6 +8,8 @@ export type ThemeMode = 'system' | 'dark' | 'light'
 
 export type TransportPortMode = 'auto' | 'fixed'
 
+export type UpdateChannel = 'stable' | 'beta'
+
 export type ModifierTarget = 'control' | 'alt' | 'meta' | 'same'
 
 export interface ModifierMap {
@@ -86,6 +88,7 @@ export interface LayoutState {
   inputProtection?: InputProtection
   language: AppLanguage
   themeMode: ThemeMode
+  updateChannel: UpdateChannel
   performanceMonitor: boolean
   transportPortMode: TransportPortMode
   transportPort: number
