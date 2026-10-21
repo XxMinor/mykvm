@@ -54,7 +54,9 @@ jobs:
           fetch-depth: 0
 
       - name: Test updater manifests and beta retention
-        run: node --test scripts/updater-release.test.mjs
+        run: |
+          node --test scripts/updater-release.test.mjs
+          node scripts/check-release-shell.mjs
 
       - name: Compute next version
         id: version
@@ -662,11 +664,11 @@ jobs:
           RELEASE_NOTES: ${{ needs.prepare.outputs.release_notes }}
         run: |
           set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          fs.writeFileSync('beta-notes.md', `Current build: v${process.env.VERSION}\nSource: https://github.com/${process.env.GITHUB_REPOSITORY}/commit/${process.env.GITHUB_SHA}\n\n${process.env.RELEASE_NOTES}`);
+          NODE
           if [[ "$CHANNEL" == "beta" ]]; then
-            node --input-type=module <<'NODE'
-            import fs from 'node:fs';
-            fs.writeFileSync('beta-notes.md', `Current build: v${process.env.VERSION}\nSource: https://github.com/${process.env.GITHUB_REPOSITORY}/commit/${process.env.GITHUB_SHA}\n\n${process.env.RELEASE_NOTES}`);
-            NODE
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/beta" \
               -f sha="$GITHUB_SHA" -F force=true
             gh release edit beta --draft=false --prerelease --latest=false \
