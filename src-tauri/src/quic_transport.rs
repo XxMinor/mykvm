@@ -1113,7 +1113,11 @@ mod tests {
         let receiver = start(
             free_port(),
             receiver_dir.path().to_path_buf(),
-            Arc::new(move |payload, _| { let _ = input_tx.send(payload); }),
+            Arc::new(move |payload, _| {
+                // A queued connection probe can arrive after another task
+                // establishes the peer. It is not an input event.
+                if !payload.is_empty() { let _ = input_tx.send(payload); }
+            }),
             Arc::new(|_, _| {
                 thread::sleep(Duration::from_millis(2300));
                 true
