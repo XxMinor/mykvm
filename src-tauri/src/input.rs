@@ -3162,6 +3162,11 @@ fn input_event_to_command(
 }
 
 fn inject_input_command(command: InputCommand) {
+    // CoreGraphics posting creates autoreleased CFData even though the event
+    // itself is released by Rust. Long-lived QUIC workers have no AppKit pool
+    // to drain those temporaries; keep them bounded to one native command.
+    #[cfg(target_os = "macos")]
+    let _pool = macos_appkit::autorelease_pool();
     #[cfg(target_os = "macos")]
     if matches!(command, InputCommand::MouseMove { .. }) {
         set_macos_client_cursor_hidden(false);

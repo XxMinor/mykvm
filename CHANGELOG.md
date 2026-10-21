@@ -28,6 +28,7 @@ release will reuse them).
 
 ### Fixed
 
+- macOS: received mouse, keyboard, and scroll input releases native temporary data after each command instead of retaining it on long-lived network workers.
 - The latest-version label shows the selected channel's published version, including when the installed local test build is newer.
 - macOS: repeated remote scrolling reuses one private input-state table, preventing shared-memory growth during long sessions. Scroll events keep explicit discrete and momentum-free settings.
 - macOS: remote drags keep matching press/move/release events on macOS 27. Returning to the controller keeps the actual drag position until handoff, and stopping sharing releases held buttons. Ordered snapshots recover lost presses without replaying stale drag state.
