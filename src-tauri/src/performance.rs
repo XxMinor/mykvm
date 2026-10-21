@@ -88,7 +88,7 @@ struct RUsageInfoV0 {
 }
 
 #[cfg(target_os = "macos")]
-fn read_macos_physical_footprint_mb() -> Result<f64, String> {
+pub(crate) fn read_macos_physical_footprint_mb() -> Result<f64, String> {
     use std::ffi::c_void;
 
     const RUSAGE_INFO_V0: i32 = 0;

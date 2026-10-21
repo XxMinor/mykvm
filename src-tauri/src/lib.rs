@@ -38,6 +38,8 @@ mod input_guard;
 #[cfg(any(target_os = "windows", test))]
 mod native_drag;
 mod performance;
+#[cfg(any(target_os = "windows", test))]
+mod windows_service_install;
 mod quic_transport;
 pub mod shared_input;
 #[cfg(target_os = "windows")]
@@ -1465,10 +1467,10 @@ impl AppRuntime {
     }
 
     fn stop_input(&self) {
+        self.input_receive_enabled.store(false, Ordering::Relaxed);
         input::prepare_input_stop();
         #[cfg(target_os = "macos")]
         input::set_macos_app_nap_suppressed(false);
-        self.input_receive_enabled.store(false, Ordering::Relaxed);
         if let Ok(mut stop) = self.input_stop.lock() {
             if let Some(signal) = stop.take() {
                 signal.store(true, Ordering::Relaxed);
@@ -2328,84 +2330,81 @@ fn read_input_service_status(state: tauri::State<'_, AppRuntime>) -> InputServic
 }
 
 #[tauri::command]
-fn install_input_service(
-    app: AppHandle,
-    state: tauri::State<'_, AppRuntime>,
-) -> Result<InputServiceStatus, String> {
+async fn install_input_service(app: AppHandle) -> Result<InputServiceStatus, String> {
     #[cfg(target_os = "windows")]
     {
-        let previous_service_pid = windows_input_service_process_id()?;
-        let helper_path = resolve_input_helper_path()?;
-        let owner_sid = current_windows_user_sid()?;
-        let status = if is_windows_process_elevated().unwrap_or(false) {
-            state.release_input_service_network_lease()?;
-            let result: Result<InputServiceStatus, String> = (|| {
-                install_windows_input_service(&helper_path, &state.config_path, &owner_sid)?;
-                start_windows_input_service()?;
-                let _ = state.acquire_input_service_network_lease()?;
-                Ok(current_input_service_status())
+        return tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppRuntime>();
+            let helper_path = resolve_input_helper_path()?;
+            let owner_sid = current_windows_user_sid()?;
+            let result = (|| -> Result<InputServiceStatus, String> {
+                if is_windows_process_elevated()? {
+                    state.release_input_service_network_lease()?;
+                    install_windows_input_service(&helper_path, &state.config_path, &owner_sid)?;
+                    start_windows_input_service()?;
+                } else {
+                    windows_service_install::run_elevated(&[
+                        INSTALL_INPUT_SERVICE_ARG.into(),
+                        HELPER_PATH_ARG.into(),
+                        helper_path.to_string_lossy().into_owned(),
+                        shared_input::SERVICE_CONFIG_PATH_ARG.into(),
+                        state.config_path.to_string_lossy().into_owned(),
+                        shared_input::SERVICE_OWNER_SID_ARG.into(),
+                        owner_sid,
+                    ])?;
+                }
+                let status = wait_for_input_service_ready(state.inner())?;
+                update_runtime_input_service_status(state.inner(), &status);
+                notify_runtime_state_changed(&app, &state.runtime_status());
+                Ok(status)
             })();
             if let Err(error) = &result {
                 log::error!("input service installation/repair failed: {error}");
                 let _ = state.acquire_input_service_network_lease();
             }
-            result?
-        } else {
-            launch_current_process_as_admin(&[
-                INSTALL_INPUT_SERVICE_ARG.into(),
-                HELPER_PATH_ARG.into(),
-                helper_path.to_string_lossy().into_owned(),
-                shared_input::SERVICE_CONFIG_PATH_ARG.into(),
-                state.config_path.to_string_lossy().into_owned(),
-                shared_input::SERVICE_OWNER_SID_ARG.into(),
-                owner_sid,
-            ])?;
-            wait_for_input_service_network_lease_after_restart(app, previous_service_pid);
-            InputServiceStatus {
-                detail: "Administrator approval requested to install the input service.".into(),
-                ..current_input_service_status()
-            }
-        };
-        update_runtime_input_service_status(state.inner(), &status);
-        Ok(status)
+            result
+        })
+        .await
+        .map_err(|error| format!("input service installer task failed: {error}"))?;
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, state);
+        let _ = app;
         Err("Windows input service is only available on Windows.".into())
     }
 }
 
 #[tauri::command]
-fn uninstall_input_service(
-    state: tauri::State<'_, AppRuntime>,
-) -> Result<InputServiceStatus, String> {
+async fn uninstall_input_service(app: AppHandle) -> Result<InputServiceStatus, String> {
     #[cfg(target_os = "windows")]
     {
-        let status = if is_windows_process_elevated().unwrap_or(false) {
-            state.release_input_service_network_lease()?;
-            let result = uninstall_windows_input_service();
-            if let Err(error) = result {
-                log::error!("input service removal failed: {error}");
-                let _ = state.acquire_input_service_network_lease();
-                return Err(error);
-            }
-            current_input_service_status()
-        } else {
-            launch_current_process_as_admin(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
-            InputServiceStatus {
-                detail: "Administrator approval requested to uninstall the input service.".into(),
-                ..current_input_service_status()
-            }
-        };
-        update_runtime_input_service_status(state.inner(), &status);
-        Ok(status)
+        return tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppRuntime>();
+            let status = if is_windows_process_elevated()? {
+                state.release_input_service_network_lease()?;
+                let result = uninstall_windows_input_service();
+                if let Err(error) = result {
+                    log::error!("input service removal failed: {error}");
+                    let _ = state.acquire_input_service_network_lease();
+                    return Err(error);
+                }
+                current_input_service_status()
+            } else {
+                windows_service_install::run_elevated(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
+                state.release_input_service_network_lease()?;
+                current_input_service_status()
+            };
+            update_runtime_input_service_status(state.inner(), &status);
+            Ok(status)
+        })
+        .await
+        .map_err(|error| format!("input service removal task failed: {error}"))?;
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = state;
+        let _ = app;
         Err("Windows input service is only available on Windows.".into())
     }
 }
@@ -2417,30 +2416,23 @@ fn update_runtime_input_service_status(state: &AppRuntime, status: &InputService
 }
 
 #[cfg(target_os = "windows")]
-fn wait_for_input_service_network_lease_after_restart(
-    app: AppHandle,
-    previous_service_pid: Option<u32>,
-) {
-    thread::spawn(move || {
-        for _ in 0..240 {
-            let current_service_pid = windows_input_service_process_id().ok().flatten();
-            if current_service_pid.is_none() || current_service_pid == previous_service_pid {
-                thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-            let state = app.state::<AppRuntime>();
-            match state.acquire_input_service_network_lease() {
-                Ok(true) => {
-                    let status = current_input_service_status();
-                    update_runtime_input_service_status(state.inner(), &status);
-                    let runtime = state.runtime_status();
-                    notify_runtime_state_changed(&app, &runtime);
-                    return;
+fn wait_for_input_service_ready(state: &AppRuntime) -> Result<InputServiceStatus, String> {
+    let mut last_error = String::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        match state.acquire_input_service_network_lease() {
+            Ok(_) => {
+                let status = current_input_service_status();
+                if status.installed && status.running && status.pipe_available {
+                    return Ok(status);
                 }
-                Ok(false) | Err(_) => thread::sleep(Duration::from_millis(250)),
+                last_error = status.detail;
             }
+            Err(error) => last_error = error,
         }
-    });
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!("Input service did not become ready after installation: {last_error}. Check C:\\ProgramData\\MyKVM\\service.log."))
 }
 
 #[tauri::command]
@@ -3097,21 +3089,29 @@ pub fn handle_process_control_args() -> bool {
             let owner_sid = arg_value(&args, shared_input::SERVICE_OWNER_SID_ARG);
             match (helper_path, config_path, owner_sid) {
                 (Some(path), Some(config_path), Some(owner_sid)) => {
-                    if let Err(error) =
+                    let result =
                         install_windows_input_service(&path, &config_path, &owner_sid)
-                            .and_then(|_| start_windows_input_service())
-                    {
+                            .and_then(|_| start_windows_input_service());
+                    windows_service_install::record_result(&result);
+                    if let Err(error) = result {
                         eprintln!("{error}");
+                        std::process::exit(1);
                     }
                 }
-                _ => eprintln!("missing input service path, config path, or owner SID"),
+                _ => {
+                    windows_service_install::record_result(&Err("missing input service path, config path, or owner SID".into()));
+                    std::process::exit(1);
+                }
             }
             return true;
         }
 
         if args.iter().any(|arg| arg == UNINSTALL_INPUT_SERVICE_ARG) {
-            if let Err(error) = uninstall_windows_input_service() {
+            let result = uninstall_windows_input_service();
+            windows_service_install::record_result(&result);
+            if let Err(error) = result {
                 eprintln!("{error}");
+                std::process::exit(1);
             }
             return true;
         }
@@ -4352,36 +4352,6 @@ unsafe fn query_windows_service_status_process(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_input_service_process_id() -> Result<Option<u32>, String> {
-    use windows_sys::Win32::{
-        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE},
-        System::Services::{
-            OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
-        },
-    };
-
-    unsafe {
-        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
-        if scm.is_null() {
-            return Err(windows_last_error("OpenSCManagerW(process id)"));
-        }
-        let _scm = ServiceHandleGuard(scm);
-        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
-        let service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_STATUS);
-        if service.is_null() {
-            let code = GetLastError();
-            if code == ERROR_SERVICE_DOES_NOT_EXIST || code == ERROR_SERVICE_MARKED_FOR_DELETE {
-                return Ok(None);
-            }
-            return Err(windows_last_error("OpenServiceW(process id)"));
-        }
-        let _service = ServiceHandleGuard(service);
-        let status = query_windows_service_status_process(service)?;
-        Ok((status.dwProcessId != 0).then_some(status.dwProcessId))
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn acquire_windows_input_service_network_lease() -> Result<Option<std::fs::File>, String> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows_sys::Win32::{
@@ -4545,12 +4515,7 @@ fn install_windows_input_service(
         },
     };
 
-    if !helper_path.is_file() {
-        return Err(format!(
-            "input helper binary does not exist: {}",
-            helper_path.display()
-        ));
-    }
+    windows_service_install::validate_helper_binary(helper_path)?;
 
     stop_windows_input_service_and_wait()?;
     let protected_helper_path = install_protected_input_helper(helper_path)?;
@@ -4784,6 +4749,11 @@ fn install_protected_input_helper(source: &PathBuf) -> Result<PathBuf, String> {
 
 #[cfg(target_os = "windows")]
 fn secure_protected_input_helper_path(path: &std::path::Path) -> Result<(), String> {
+    set_windows_path_security(path, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_path_security(path: &std::path::Path, sddl: &str) -> Result<(), String> {
     use windows_sys::Win32::{
         Foundation::{LocalFree, HLOCAL},
         Security::{
@@ -4794,7 +4764,7 @@ fn secure_protected_input_helper_path(path: &std::path::Path) -> Result<(), Stri
         },
     };
 
-    let descriptor = wide_null("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+    let descriptor = wide_null(sddl);
     let mut security_descriptor = std::ptr::null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -5109,12 +5079,16 @@ fn resolve_input_helper_path() -> Result<PathBuf, String> {
         exe_dir.join("resources").join("mykvm-input-helper.exe"),
     ];
 
-    candidates
-        .iter()
-        .find(|path| path.is_file())
-        .cloned()
-        .or_else(|| candidates.first().cloned())
-        .ok_or_else(|| "failed to build input helper path candidates".into())
+    let mut error =
+        "input helper binary is missing; reinstall MyKVM using the complete installer".to_string();
+    for path in candidates {
+        match windows_service_install::validate_helper_binary(&path) {
+            Ok(()) => return Ok(path),
+            Err(detail) if path.exists() => error = detail,
+            Err(_) => {}
+        }
+    }
+    Err(error)
 }
 
 #[cfg(target_os = "windows")]
@@ -5264,7 +5238,21 @@ pub fn relaunch_as_admin_if_needed() -> Result<bool, String> {
 
 #[cfg(target_os = "windows")]
 fn launch_current_process_as_admin(args: &[String]) -> Result<(), String> {
-    use windows_sys::Win32::{UI::Shell::ShellExecuteW, UI::WindowsAndMessaging::SW_SHOWNORMAL};
+    drop(launch_current_process_as_admin_with_handle(args)?);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn launch_current_process_as_admin_with_handle(
+    args: &[String],
+) -> Result<std::os::windows::io::OwnedHandle, String> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{
+        UI::Shell::{
+            ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        },
+        UI::WindowsAndMessaging::SW_SHOWNORMAL,
+    };
 
     let exe =
         env::current_exe().map_err(|error| format!("failed to locate current exe: {error}"))?;
@@ -5281,22 +5269,24 @@ fn launch_current_process_as_admin(args: &[String]) -> Result<(), String> {
     } else {
         params_w.as_ptr()
     };
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            file.as_ptr(),
-            params_ptr,
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: operation.as_ptr(),
+        lpFile: file.as_ptr(),
+        lpParameters: params_ptr,
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
     };
-
-    if (result as isize) <= 32 {
-        return Err("administrator restart was cancelled or blocked by Windows".into());
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err(windows_last_error(
+            "administrator restart was cancelled or blocked by Windows",
+        ));
     }
-
-    Ok(())
+    if info.hProcess.is_null() {
+        return Err("Windows did not return the administrator process handle".into());
+    }
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(info.hProcess.cast()) })
 }
 
 #[cfg(target_os = "windows")]

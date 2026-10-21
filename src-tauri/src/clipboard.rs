@@ -51,12 +51,53 @@ pub(crate) fn files_signature(paths: &[String]) -> String {
 }
 
 pub(crate) fn read_snapshot() -> Option<ClipboardSnapshot> {
+    #[cfg(target_os = "macos")]
+    let _pool = crate::input::macos_appkit::autorelease_pool();
     let paths = crate::rich_clipboard::read_files();
     if !paths.is_empty() {
-        Some(ClipboardSnapshot::Files(paths))
+        Some(snapshot_for_files(paths, read_image_content))
     } else {
         read_content().map(ClipboardSnapshot::Content)
     }
+}
+
+fn snapshot_for_files(
+    paths: Vec<String>,
+    read_image: impl FnOnce() -> Option<ClipboardContent>,
+) -> ClipboardSnapshot {
+    // Chat apps can expose a private-container file URL AND bitmap pixels.
+    // Use the current bitmap when macOS denies that URL; keep readable files
+    // as files and preserve the original error if no bitmap is available.
+    if paths.iter().any(|path| std::fs::File::open(path).is_err()) {
+        if let Some(content @ ClipboardContent::Image(_)) = read_image() {
+            return ClipboardSnapshot::Content(content);
+        }
+    }
+    ClipboardSnapshot::Files(paths)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn lock_windows_clipboard() -> std::sync::MutexGuard<'static, ()> {
+    static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ACCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_clipboard_error(message: &str) -> String {
+    use windows_sys::Win32::{
+        System::DataExchange::GetOpenClipboardWindow,
+        UI::WindowsAndMessaging::GetWindowThreadProcessId,
+    };
+    let mut process_id = 0;
+    let window = unsafe { GetOpenClipboardWindow() };
+    if !window.is_null() {
+        unsafe {
+            GetWindowThreadProcessId(window, &mut process_id);
+        }
+    }
+    format!("{message} (clipboard holder pid={process_id})")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +258,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unreadable_clipboard_file_uses_its_bitmap_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("private-image.png").to_string_lossy().into_owned()];
+        let snapshot = snapshot_for_files(paths.clone(), || Some(ClipboardContent::Image(ClipboardImage {
+            width: 1, height: 1, rgba_base64: "AAAAAA==".into(),
+        })));
+        assert!(matches!(snapshot, ClipboardSnapshot::Content(ClipboardContent::Image(_))));
+        assert!(matches!(snapshot_for_files(paths, || None), ClipboardSnapshot::Files(_)),
+            "an unavailable bitmap must not silently discard a file copy");
+    }
+
+    #[test]
+    fn readable_file_copies_keep_file_transfer_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        std::fs::write(&path, b"file data").unwrap();
+        let snapshot = snapshot_for_files(vec![path.to_string_lossy().into_owned()], || panic!("a readable file must not be converted to bitmap"));
+        assert!(matches!(snapshot, ClipboardSnapshot::Files(_)));
+    }
+
+    #[test]
     fn file_clipboard_recopies_resend_without_changing_the_echo_signature() {
         let files = ClipboardSnapshot::Files(vec!["/folder".into(), "/中文.txt".into()]);
         assert_ne!(files.send_key(Some(1)), files.send_key(Some(2)));
@@ -298,7 +360,10 @@ mod tests {
 fn read_image() -> Option<ClipboardImage> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-    let arboard_image = arboard::Clipboard::new().ok().and_then(|mut clipboard| {
+    let arboard_image = {
+        #[cfg(target_os = "windows")]
+        let _access = lock_windows_clipboard();
+        arboard::Clipboard::new().ok().and_then(|mut clipboard| {
         let image = clipboard.get_image().ok()?;
         if image.width == 0 || image.height == 0 || image.bytes.is_empty() {
             return None;
@@ -312,7 +377,8 @@ fn read_image() -> Option<ClipboardImage> {
             height: image.height as u32,
             rgba_base64: BASE64.encode(image.bytes.as_ref()),
         })
-    });
+        })
+    };
 
     arboard_image.or_else(|| {
         #[cfg(target_os = "windows")]
@@ -343,6 +409,8 @@ fn write_image(image: &ClipboardImage) -> Result<(), String> {
         return Err("clipboard image has invalid dimensions".into());
     }
 
+    #[cfg(target_os = "windows")]
+    let _access = lock_windows_clipboard();
     let mut clipboard =
         arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
     clipboard
@@ -388,6 +456,7 @@ fn content_hint() -> ClipboardContentHint {
 
 #[cfg(target_os = "windows")]
 fn read_windows_dib_image() -> Option<ClipboardImage> {
+    let _access = lock_windows_clipboard();
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard,
     };
@@ -456,6 +525,7 @@ fn decode_windows_dib_image(data: &[u8]) -> Option<ClipboardImage> {
 
 #[cfg(target_os = "windows")]
 fn read_system_text() -> Result<String, String> {
+    let _access = lock_windows_clipboard();
     let mut clipboard =
         arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
     clipboard
@@ -492,11 +562,12 @@ fn read_system_text() -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 fn write_system_text(text: &str) -> Result<(), String> {
+    let _access = lock_windows_clipboard();
     let mut clipboard =
         arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
     clipboard
         .set_text(text.to_string())
-        .map_err(|error| format!("failed to write clipboard text: {error}"))
+        .map_err(|error| windows_clipboard_error(&format!("failed to write clipboard text: {error}")))
 }
 
 #[cfg(not(target_os = "windows"))]

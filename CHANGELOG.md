@@ -27,6 +27,12 @@ release will reuse them).
 
 ### Fixed
 
+- macOS: repeated remote scrolling reuses one private input-state table, preventing shared-memory growth during long sessions. Scroll events keep explicit discrete and momentum-free settings.
+- macOS: remote drags keep matching press/move/release events on macOS 27. Returning to the controller keeps the actual drag position until handoff, and stopping sharing releases held buttons. Ordered snapshots recover lost presses without replaying stale drag state.
+- macOS: a disabled input tap releases remote keys and buttons before recovery. Cursor suppression is checked before forwarding pending movement (#45).
+- Clipboard acknowledgements allow Windows clipboard retries to finish; slow clipboard operations keep the keyboard/mouse connection intact. Windows clipboard access is serialized within MyKVM, and busy errors identify the holding process.
+- Windows: elevated service installation returns its actual failure to the UI, records a diagnostic result, validates the helper executable before installation, and reports readiness timeouts (#46).
+- Clipboard images from chat apps fall back to available bitmap data when their private temporary file cannot be read.
 - Windows: installing or repairing the unattended-control service waits for its startup pipe and for old workers to exit. A briefly locked helper executable is retried; failures show the backend's specific error instead of a generic runtime message (#27, #40).
 - Screen-switch shortcuts restore the cursor position used before leaving each device and screen. Only a first visit without a remembered position lands at the center; hidden client parking does not overwrite the remembered position.
 - MyKVM shortcuts release logical keys on both devices while tracking physically held modifiers separately. Holding Alt for repeated screen switches remains possible; releasing Alt stops plain arrow keys from switching screens.

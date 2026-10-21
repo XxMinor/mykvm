@@ -200,6 +200,7 @@ impl TransportHandle {
             ));
         }
 
+        let deadline = stream_send_timeout(payload.len()) + Duration::from_secs(1);
         let (result_tx, result_rx) = mpsc::channel();
         self.commands
             .send(TransportCommand::SendStream {
@@ -209,7 +210,7 @@ impl TransportHandle {
             })
             .map_err(|_| "QUIC transport is stopped".to_string())?;
         result_rx
-            .recv_timeout(Duration::from_secs(6))
+            .recv_timeout(deadline)
             .map_err(|_| "QUIC stream send timed out".to_string())?
     }
 
@@ -403,12 +404,15 @@ async fn run_transport(
                 tokio::spawn(async move {
                     // Cancel stalled writes too, not just the caller's wait for
                     // an answer, so timed-out transfers release their buffers.
+                    let deadline = stream_send_timeout(payload.len());
+                    let peer_addr = peer.addr.clone();
+                    let payload_bytes = payload.len();
                     let outcome = tokio::time::timeout(
-                        Duration::from_secs(5),
+                        deadline,
                         send_stream_task(&endpoint, &connections, &health, peer, payload),
                     ).await.unwrap_or_else(|_| Err("QUIC stream send timed out".into()));
                     if let Err(error) = &outcome {
-                        log::warn!("QUIC stream send failed: {error}");
+                        log::warn!("QUIC stream send failed peer={peer_addr} bytes={payload_bytes}: {error}");
                     }
                     let _ = result.send(outcome);
                     drop(permit);
@@ -761,7 +765,7 @@ fn spawn_stream_reader(
                     };
                     let on_stream = Arc::clone(&on_stream);
                     tokio::spawn(async move {
-                        let payload = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(MAX_STREAM_BYTES))
+                        let payload = tokio::time::timeout(stream_send_timeout(MAX_STREAM_BYTES), recv.read_to_end(MAX_STREAM_BYTES))
                             .await.map_err(|error| error.to_string())
                             .and_then(|result| result.map_err(|error| error.to_string()));
                         match payload {
@@ -931,9 +935,7 @@ async fn send_stream_on_connection(
     connection: quinn::Connection,
     payload: Vec<u8>,
 ) -> Result<(), String> {
-    // The ack also waits for the payload tail to land and for the receiver to
-    // apply it (image decode, pasteboard write): budget ~2 MB/s on top of 500 ms.
-    let ack_timeout = Duration::from_millis(500 + (payload.len() / 2048) as u64);
+    let ack_timeout = stream_ack_timeout(payload.len());
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -948,6 +950,18 @@ async fn send_stream_on_connection(
         Ok(Err(error)) => Err(format!("failed to read QUIC stream ack: {error}")),
         Err(_) => Err("QUIC stream ack timed out".into()),
     }
+}
+
+fn stream_ack_timeout(payload_bytes: usize) -> Duration {
+    // A Windows clipboard write retries for 2.25 seconds before it can reply.
+    // Allow those retries even for a tiny text packet. Image decoding and the
+    // payload tail get an additional budget of roughly 2 MB/s.
+    Duration::from_secs(3) + Duration::from_millis((payload_bytes / 2048) as u64)
+}
+
+fn stream_send_timeout(payload_bytes: usize) -> Duration {
+    // Include connection setup and writing, not only the receiver's reply.
+    stream_ack_timeout(payload_bytes) + Duration::from_secs(5)
 }
 
 fn verify_stream_ack(bytes: &[u8]) -> Result<(), String> {
@@ -1078,6 +1092,57 @@ mod tests {
     fn stream_ack_rejects_non_ok_payloads() {
         assert!(verify_stream_ack(b"ok").is_ok());
         assert!(verify_stream_ack(b"reject").is_err());
+    }
+
+    #[test]
+    fn stream_deadlines_cover_clipboard_retries_and_large_payloads() {
+        let clipboard_retry_time = Duration::from_millis(2250);
+        for bytes in [1, 256 * 1024, MAX_STREAM_BYTES] {
+            let ack = stream_ack_timeout(bytes);
+            assert!(ack > clipboard_retry_time);
+            assert!(stream_send_timeout(bytes) > ack + Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn delayed_clipboard_ack_does_not_fail_or_interrupt_input() {
+        let free_port = || std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let sender_dir = tempfile::tempdir().unwrap();
+        let (input_tx, input_rx) = mpsc::channel();
+        let receiver = start(
+            free_port(),
+            receiver_dir.path().to_path_buf(),
+            Arc::new(move |payload, _| { let _ = input_tx.send(payload); }),
+            Arc::new(|_, _| {
+                thread::sleep(Duration::from_millis(2300));
+                true
+            }),
+        ).unwrap();
+        let sender = start(
+            free_port(),
+            sender_dir.path().to_path_buf(),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        ).unwrap();
+        let peer = sender.peer(
+            format!("127.0.0.1:{}", receiver.port()),
+            receiver.public_key().into(),
+            PROTOCOL_VERSION,
+        );
+        let stream_sender = sender.clone();
+        let stream_peer = peer.clone();
+        let send = thread::spawn(move || stream_sender.send_stream_expect_ack(stream_peer, b"clipboard".to_vec()));
+        let ready_by = Instant::now() + Duration::from_secs(2);
+        while !sender.send_datagram(peer.clone(), b"drag-move".to_vec()).unwrap() {
+            assert!(Instant::now() < ready_by);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(input_rx.recv_timeout(Duration::from_millis(300)).unwrap(), b"drag-move");
+        let result = send.join().unwrap();
+        sender.stop_and_wait().unwrap();
+        receiver.stop_and_wait().unwrap();
+        assert!(result.is_ok(), "the receiver's clipboard retries must fit the ack budget: {result:?}");
     }
 
     #[test]
@@ -1262,6 +1327,33 @@ mod tests {
             "a rejected stream must not tear down the input connection"
         );
         assert_eq!(input.as_deref(), Some(&b"input"[..]));
+    }
+
+    #[test]
+    fn input_reconnects_after_peer_restart_without_pairing_again() {
+        let free_port = || std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let sender_dir = tempfile::tempdir().unwrap();
+        let receiver = start(free_port(), receiver_dir.path().to_path_buf(), Arc::new(|_, _| {}), Arc::new(|_, _| true)).unwrap();
+        let port = receiver.port();
+        let identity = receiver.public_key().to_string();
+        let sender = start(free_port(), sender_dir.path().to_path_buf(), Arc::new(|_, _| {}), Arc::new(|_, _| true)).unwrap();
+        let peer = sender.peer(format!("127.0.0.1:{port}"), identity.clone(), PROTOCOL_VERSION);
+        sender.send_stream_expect_ack(peer.clone(), b"initial".to_vec()).unwrap();
+        receiver.stop_and_wait().unwrap();
+        let (input_tx, input_rx) = mpsc::channel();
+        let receiver = start(port, receiver_dir.path().to_path_buf(), Arc::new(move |payload, _| { let _ = input_tx.send(payload); }), Arc::new(|_, _| true)).unwrap();
+        assert_eq!(receiver.public_key(), identity);
+        assert_eq!(receiver.port(), port);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let received = loop {
+            let _ = sender.send_datagram(peer.clone(), b"after-restart".to_vec());
+            if let Ok(payload) = input_rx.recv_timeout(Duration::from_millis(50)) { break Some(payload); }
+            if Instant::now() >= deadline { break None; }
+        };
+        sender.stop_and_wait().unwrap();
+        receiver.stop_and_wait().unwrap();
+        assert_eq!(received.as_deref(), Some(&b"after-restart"[..]), "a restarted peer must recover using its pinned identity");
     }
 
     #[test]

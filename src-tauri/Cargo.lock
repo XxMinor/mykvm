@@ -2336,6 +2336,7 @@ dependencies = [
  "base64 0.22.1",
  "core-foundation",
  "core-graphics",
+ "foreign-types",
  "if-addrs",
  "image",
  "log",

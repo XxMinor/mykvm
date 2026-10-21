@@ -421,6 +421,26 @@ struct HeldInputs {
     keys: Vec<u16>,
     #[serde(default)]
     buttons: u64,
+    /// Ordered snapshots can repair a lost press as well as a lost release.
+    /// Zero is the legacy, release-only form.
+    #[serde(default, skip_serializing_if = "held_sequence_is_zero")]
+    sequence: u64,
+}
+
+fn held_sequence_is_zero(sequence: &u64) -> bool {
+    *sequence == 0
+}
+
+fn accept_held_sequence(source: SocketAddr, sequence: u64) -> bool {
+    if sequence == 0 {
+        return true;
+    }
+    static SEQUENCES: OnceLock<Mutex<RemoteCursorSequences>> = OnceLock::new();
+    SEQUENCES
+        .get_or_init(|| Mutex::new(RemoteCursorSequences::default()))
+        .lock()
+        .map(|mut state| state.accept(source, sequence, Instant::now()))
+        .unwrap_or(false)
 }
 
 impl HeldInputs {
@@ -469,8 +489,9 @@ impl SenderHeld {
             }
             _ => {}
         }
-        self.due(now).then(|| {
+        (self.due(now) || matches!(event, InputEvent::MouseButton { .. })).then(|| {
             self.last_attached = Some(now);
+            self.held.sequence = next_cursor_sequence();
             self.held.clone()
         })
     }
@@ -479,12 +500,18 @@ impl SenderHeld {
         self.last_attached
             .is_none_or(|last| now.saturating_duration_since(last) >= HELD_REFRESH)
     }
+
+    fn release_buttons(&mut self) {
+        self.held.buttons = 0;
+        self.last_attached = None;
+    }
 }
 
 static SENDER_HELD: Mutex<SenderHeld> = Mutex::new(SenderHeld {
     held: HeldInputs {
         keys: Vec::new(),
         buttons: 0,
+        sequence: 0,
     },
     last_attached: None,
 });
@@ -525,6 +552,17 @@ impl ReceivedHeld {
                 .last_packet
                 .is_some_and(|last| now.saturating_duration_since(last) >= HELD_SILENCE)
     }
+
+    fn take_for_stop(&mut self, buttons: u64, x: i32, y: i32) -> Vec<InputCommand> {
+        let mut releases: Vec<_> = std::mem::take(&mut self.keys).into_iter()
+            .map(|key_code| InputCommand::Key { key_code, down: false }).collect();
+        releases.extend(ALL_MOUSE_BUTTONS.into_iter()
+            .filter(|button| buttons & mouse_button_mask(*button) != 0)
+            .map(|button| InputCommand::MouseButton { button, down: false, x, y }));
+        self.heartbeats = false;
+        self.last_packet = None;
+        releases
+    }
 }
 
 static RECEIVED_HELD: Mutex<ReceivedHeld> = Mutex::new(ReceivedHeld {
@@ -534,7 +572,24 @@ static RECEIVED_HELD: Mutex<ReceivedHeld> = Mutex::new(ReceivedHeld {
 });
 
 /// Release whatever this machine holds that `held` does not list.
-fn reconcile_received_held(held: &HeldInputs, sink: &dyn Fn(InputCommand) -> bool) {
+fn received_button_updates(buttons: u64, held: &HeldInputs, repair_presses: bool) -> Vec<(MouseButton, bool)> {
+    ALL_MOUSE_BUTTONS
+        .iter()
+        .filter_map(|&button| {
+            let bit = mouse_button_mask(button);
+            let down = held.buttons & bit != 0;
+            let was_down = buttons & bit != 0;
+            (down != was_down && (!down || (repair_presses && held.sequence != 0))).then_some((button, down))
+        })
+        .collect()
+}
+
+fn reconcile_received_held(
+    held: &HeldInputs,
+    position_before: i64,
+    sink: &dyn Fn(InputCommand) -> bool,
+    repair_presses: bool,
+) {
     let stale_keys = RECEIVED_HELD
         .lock()
         .map(|mut state| state.take_stale_keys(held))
@@ -545,17 +600,18 @@ fn reconcile_received_held(held: &HeldInputs, sink: &dyn Fn(InputCommand) -> boo
             down: false,
         });
     }
-    let stale_buttons = REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed) & !held.buttons;
-    for button in ALL_MOUSE_BUTTONS {
-        if stale_buttons & mouse_button_mask(button) != 0 {
-            let (x, y) = update_remote_mouse_button(button, false);
-            sink(InputCommand::MouseButton {
-                button,
-                down: false,
-                x,
-                y,
-            });
-        }
+    for (button, down) in
+        received_button_updates(REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed), held, repair_presses)
+    {
+        let current = update_remote_mouse_button(button, down);
+        // A lost press belongs at the previous point, before this move. Starting
+        // it at the new point can miss the Finder item the user grabbed.
+        let (x, y) = if down {
+            unpack_remote_position(position_before)
+        } else {
+            current
+        };
+        sink(InputCommand::MouseButton { button, down, x, y });
     }
 }
 
@@ -576,7 +632,7 @@ pub(crate) fn start_held_input_watchdog(sink: fn(InputCommand) -> bool) {
                     .unwrap_or(false);
                 if silent {
                     log::info!("controller went silent with input held; releasing it");
-                    reconcile_received_held(&HeldInputs::default(), &sink);
+                    reconcile_received_held(&HeldInputs::default(), REMOTE_MOUSE_POSITION.load(Ordering::Relaxed), &sink, false);
                 }
             });
     });
@@ -1351,25 +1407,36 @@ fn start_platform_capture(
                 )),
                 false,
             );
-            drain_switch_request_macos(&context);
             // macOS disables a tap whose callback ran too long or that idled out.
             // Without re-enabling it the mouse and keyboard silently freeze until
             // the app restarts, which is the classic "works, then sticks after a
             // while" failure. Re-arm it as soon as we notice.
             if context.tap_disabled.swap(false, Ordering::Relaxed) {
+                // The disabled tap already lets local hardware input through.
+                // End the remote hold before rearming; flushing a pending move
+                // or heartbeat here would operate both machines at once (#45).
+                if context.remote_active.load(Ordering::Relaxed) {
+                    return_to_local_macos(&context);
+                }
+                context.move_pending.store(false, Ordering::Relaxed);
+                if let Ok(mut request) = context.switch_request.lock() { *request = None; }
                 tap.enable();
                 for raw_tap in &raw_gesture_taps {
                     raw_tap.enable();
                 }
-                log::debug!("[diag] event tap re-enabled after being disabled");
+                log::warn!("macOS event tap recovered; remote input was released before restoring local control");
+                continue;
             }
+            drain_switch_request_macos(&context);
             // While controlling a remote, macOS can re-associate the physical
             // mouse with the local cursor (especially when backgrounded),
             // making the server pointer reappear and follow the mouse.
             // Re-pin it to the anchor and re-assert hide while active.
             let is_remote_active = context.remote_active.load(Ordering::Relaxed);
             if is_remote_active {
-                repin_macos_cursor_while_remote(&context);
+                if !repin_macos_cursor_while_remote(&context) {
+                    continue;
+                }
                 flush_pending_mouse_move(
                     &context.move_pending,
                     &context.last_mouse_move_sent,
@@ -2447,6 +2514,7 @@ pub(crate) fn handle_input_datagram_with_sink(
             return false;
         }
         let held = packet.held.take();
+        let mut held_is_current = false;
         let position_before = REMOTE_MOUSE_POSITION.load(Ordering::Relaxed);
         // Steady-state datagrams omit the pairing block (it rides ~once per
         // INPUT_FULL_CRED_REFRESH). A credentialled packet is authorized in
@@ -2471,6 +2539,14 @@ pub(crate) fn handle_input_datagram_with_sink(
             if !packet_targets_local(&layout, &packet.target_device_id, &local_peer_id) {
                 return true;
             }
+            if let Some(held) = &held {
+                held_is_current = accept_held_sequence(source, held.sequence);
+                if !held_is_current && matches!(packet.event, InputEvent::MouseButton { .. }) {
+                    // Do not apply an old down after a newer release or a
+                    // snapshot that already repaired that down.
+                    return true;
+                }
+            }
             if matches!(packet.event, InputEvent::MouseMove { .. }) {
                 if let Some(cursor) = packet.cursor {
                     // Reject a delayed park after re-entry, and a delayed move
@@ -2486,7 +2562,8 @@ pub(crate) fn handle_input_datagram_with_sink(
             let Ok(native_layout) = native_layout.lock() else {
                 return false;
             };
-            input_event_to_command(&layout, &native_layout, packet.event)
+            let parked = packet.cursor.is_some_and(|cursor| cursor.parked);
+            input_event_to_command(&layout, &native_layout, packet.event, parked)
         };
         let Some(command) = command else {
             return true;
@@ -2494,14 +2571,21 @@ pub(crate) fn handle_input_datagram_with_sink(
         if let InputCommand::Scroll { delta_x, delta_y } = &command {
             log_scroll_event(true, *delta_x, *delta_y);
         }
-        #[cfg(target_os = "macos")]
-        let command = match (command, packet.cursor) {
-            (InputCommand::MouseMove { x, y, .. }, Some(RemoteCursorState { parked: true, .. })) =>
-                InputCommand::ParkCursor { x, y },
-            (command, _) => command,
-        };
+        let mut command = command;
         if let Ok(mut state) = RECEIVED_HELD.lock() {
             state.track(&command, Instant::now());
+        }
+        if let Some(held) = held.as_ref().filter(|_| held_is_current) {
+            // Parking relinquishes input. A delayed park must not repair a
+            // press that a drag handoff has already released on this machine.
+            #[cfg(target_os = "macos")]
+            let repair_presses = !matches!(command, InputCommand::ParkCursor { .. });
+            #[cfg(not(target_os = "macos"))]
+            let repair_presses = true;
+            reconcile_received_held(held, position_before, sink, repair_presses);
+        }
+        if let InputCommand::MouseMove { drag_button, .. } = &mut command {
+            *drag_button = button_from_mask(REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed));
         }
         // An idle controller's heartbeat re-sends the current position; don't
         // inject a move that goes nowhere.
@@ -2513,9 +2597,6 @@ pub(crate) fn handle_input_datagram_with_sink(
             && !MACOS_CLIENT_CURSOR_HIDDEN.lock().map(|hidden| *hidden).unwrap_or(false);
         if !heartbeat_repeat && sink(command) {
             input_events.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(held) = held {
-            reconcile_received_held(&held, sink);
         }
         return true;
     }
@@ -3036,6 +3117,7 @@ fn input_event_to_command(
     layout: &LayoutState,
     native_layout: &LayoutState,
     event: InputEvent,
+    _parked: bool,
 ) -> Option<InputCommand> {
     match event {
         InputEvent::MouseMove { screen_id, x, y } => {
@@ -3055,6 +3137,12 @@ fn input_event_to_command(
                     native_screen.y,
                     native_screen.height,
                 );
+                #[cfg(target_os = "macos")]
+                if _parked {
+                    // Parking is only for cursor visibility. Preserve the last
+                    // real point so a pending drag handoff releases there.
+                    return Some(InputCommand::ParkCursor { x: absolute_x, y: absolute_y });
+                }
                 let drag_button = update_remote_mouse_position(absolute_x, absolute_y);
                 return Some(InputCommand::MouseMove {
                     x: absolute_x,
@@ -3083,9 +3171,13 @@ fn inject_input_command(command: InputCommand) {
         InputCommand::ParkCursor { x, y } => {
             // A posted MouseMoved can be processed AFTER the hide and undo it.
             // Warping produces no event, leaving the next real movement to show it.
-            let _ = core_graphics::display::CGDisplay::warp_mouse_cursor_position(
-                core_graphics::geometry::CGPoint::new(x as f64, y as f64),
-            );
+            // But warping during a live Finder drag bypasses its trajectory.
+            // The handoff/cancel must finish at the actual last drag point.
+            if REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed) == 0 {
+                let _ = core_graphics::display::CGDisplay::warp_mouse_cursor_position(
+                    core_graphics::geometry::CGPoint::new(x as f64, y as f64),
+                );
+            }
             set_macos_client_cursor_hidden(true);
         }
         InputCommand::MouseMove { x, y, drag_button } => inject_mouse_move(x, y, drag_button),
@@ -3451,6 +3543,10 @@ unsafe extern "C" fn macos_raw_gesture_event_callback(
         return event;
     }
 
+    if context.tap_disabled.load(Ordering::Relaxed) {
+        return event;
+    }
+
     if context.remote_active.load(Ordering::Relaxed) {
         // Media keys (volume, play, next...) go to the controlled machine.
         if event_type == MACOS_NSEVENT_TYPE_SYSTEM_DEFINED {
@@ -3678,6 +3774,12 @@ fn release_remote_buttons(
                 input_events,
             );
         }
+    }
+    // A cross-machine drag hands LEFT to the receiver instead of sending Up.
+    // Forget it after all release packets, otherwise a later peer's snapshot
+    // could recreate a button the user already released on this machine.
+    if let Ok(mut held) = SENDER_HELD.lock() {
+        held.release_buttons();
     }
 }
 
@@ -3969,7 +4071,26 @@ pub(crate) fn finish_shortcut_recording(captured: Option<&str>) {
 
 pub(crate) fn prepare_input_stop() {
     #[cfg(target_os = "macos")]
-    set_macos_client_cursor_hidden(false);
+    {
+        set_macos_client_cursor_hidden(false);
+        // Cancel a live Finder drag before releasing its button, rather than
+        // dropping the file at the last remote position during quit/restart.
+        if REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed) & LEFT_BUTTON_MASK != 0
+            && macos_appkit::change_count() != MACOS_RECEIVER_DRAG_COUNT_AT_DOWN.load(Ordering::Relaxed)
+        {
+            post_marked_escape_key();
+        }
+    }
+    // Release native input before reset_injected_modifiers clears the matching
+    // mouse-event numbers. Merely forgetting a held button can strand Finder's
+    // drag session, including for the Mac's own physical mouse afterwards.
+    let buttons = REMOTE_MOUSE_BUTTONS.swap(0, Ordering::Relaxed);
+    let (x, y) = unpack_remote_position(REMOTE_MOUSE_POSITION.load(Ordering::Relaxed));
+    let releases = RECEIVED_HELD.lock()
+        .map(|mut state| state.take_for_stop(buttons, x, y)).unwrap_or_default();
+    for command in releases {
+        dispatch_input_command(command);
+    }
     #[cfg(target_os = "windows")]
     if let Some(context) = windows_capture_context() { release_shortcut_inputs_windows(&context); }
 }
@@ -5089,6 +5210,10 @@ fn handle_macos_event(
         return CallbackResult::Keep;
     }
 
+    if context.tap_disabled.load(Ordering::Relaxed) {
+        return CallbackResult::Keep;
+    }
+
     // Events this process posted for LOCAL consumption (e.g. the Escape that
     // cancels a Finder drag once it crosses to the remote) — pass them through
     // untouched instead of re-capturing and forwarding them.
@@ -5152,7 +5277,7 @@ fn handle_macos_event(
             // Releasing the drag over the controlled machine: this is the drop.
             fire_pending_edge_drop(context);
             if context.local_left_held.swap(false, Ordering::Relaxed) {
-                post_marked_left_mouse_up();
+                post_marked_left_mouse_up(event);
             }
             send_macos_mouse_button(context, &active_target, MouseButton::Left, false)
         }
@@ -5313,7 +5438,10 @@ fn handle_macos_mouse_move(
             // First mouse event since crossing: it moved the still-attached
             // cursor, which draws the hide. Now detach and pin.
             if context.decouple_pending.swap(false, Ordering::Relaxed) {
-                set_macos_cursor_decoupled(true);
+                if !set_macos_cursor_decoupled(true) {
+                    context.tap_disabled.store(true, Ordering::Relaxed);
+                    return CallbackResult::Drop;
+                }
                 force_repin_macos_cursor_to_anchor(context);
             }
             if context
@@ -5387,8 +5515,12 @@ fn handle_macos_mouse_move(
             active_target.y = active_target
                 .y
                 .clamp(0.0, (active_target.current_screen.height - 1) as f64);
+            // Validate local cursor suppression before forwarding. If a repin
+            // is paced out, retain the accumulated remote position and send it
+            // once the anchor has been restored instead of moving both cursors.
+            let cursor_ready = repin_macos_cursor_if_drifted(context, location);
             let dragging = remote_button_is_down(&context.remote_button_mask);
-            let due = should_send_mouse_move(&context.last_mouse_move_sent, dragging);
+            let due = cursor_ready && should_send_mouse_move(&context.last_mouse_move_sent, dragging);
             context.move_pending.store(!due, Ordering::Relaxed);
             if due
                 && !send_remote_mouse_move(
@@ -5432,11 +5564,6 @@ fn handle_macos_mouse_move(
                     show_macos_cursor_if_needed(context);
                     return CallbackResult::Keep;
                 }
-            }
-            if repin_macos_cursor_if_drifted(context, location)
-                && !context.main_window_visible.load(Ordering::Relaxed)
-            {
-                reassert_macos_hidden_window_cursor(context, true);
             }
             // Re-pinning also runs from the capture run loop because mouse-move
             // callbacks can stop arriving once the pointer is over the client.
@@ -5608,7 +5735,7 @@ pub(crate) fn post_lock_screen_shortcut() {
 
 #[cfg(target_os = "macos")]
 fn post_marked_escape_key() {
-    use core_graphics::event::{CGEvent, CGEventTapLocation, EventField};
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, EventField};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
     const ESCAPE_KEYCODE: u16 = 53;
@@ -5617,6 +5744,7 @@ fn post_marked_escape_key() {
             return;
         };
         if let Ok(event) = CGEvent::new_keyboard_event(source, ESCAPE_KEYCODE, down) {
+            event.set_flags(CGEventFlags::empty());
             event.set_integer_value_field(
                 EventField::EVENT_SOURCE_USER_DATA,
                 MACOS_SELF_EVENT_MARKER,
@@ -5631,22 +5759,36 @@ fn post_marked_escape_key() {
 /// it here, so this Mac kept the button logically down: back on this screen
 /// the pointer was still dragging. Post a marked release where it is pinned.
 #[cfg(target_os = "macos")]
-fn post_marked_left_mouse_up() {
-    use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
-    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-
+fn post_marked_left_mouse_up(release: &core_graphics::event::CGEvent) {
     let Some(location) = macos_current_cursor_location() else {
         return;
     };
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
-        return;
-    };
-    if let Ok(event) =
-        CGEvent::new_mouse_event(source, CGEventType::LeftMouseUp, location, CGMouseButton::Left)
-    {
-        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
-        event.post(CGEventTapLocation::HID);
+    if let Ok(event) = macos_marked_left_release(release, location) {
+        event.post(core_graphics::event::CGEventTapLocation::HID);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_marked_left_release(
+    release: &core_graphics::event::CGEvent,
+    location: core_graphics::geometry::CGPoint,
+) -> Result<core_graphics::event::CGEvent, ()> {
+    use core_graphics::{
+        event::{CGEvent, CGEventType, CGMouseButton, EventField},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+    // Preserve the physical release's event number so it still matches
+    // the local press. A fresh zero-number Up may not finish that drag on macOS 27.
+    // Use a separate source: even CGEventCreateCopy shares source metadata, so
+    // marking a copy can also mark the captured hardware event's source.
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)?;
+    let event = CGEvent::new_mouse_event(source, CGEventType::LeftMouseUp, location, CGMouseButton::Left)?;
+    event.set_flags(release.get_flags());
+    for field in [EventField::MOUSE_EVENT_NUMBER, EventField::MOUSE_EVENT_CLICK_STATE] {
+        event.set_integer_value_field(field, release.get_integer_value_field(field));
+    }
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
+    Ok(event)
 }
 
 /// Called when a left-drag crosses onto a controlled machine: if a drag
@@ -5819,6 +5961,11 @@ static MACOS_RECEIVER_DRAG_COUNT_AT_DOWN: std::sync::atomic::AtomicI64 =
 /// racing this handoff).
 #[cfg(target_os = "macos")]
 pub fn receiver_handoff_drag(controller_device_id: String) {
+    // Claim the hold once. A delayed/repeated pull must neither reuse the old
+    // pasteboard nor leave LEFT set for the watchdog to release a second time.
+    if REMOTE_MOUSE_BUTTONS.fetch_and(!LEFT_BUTTON_MASK, Ordering::Relaxed) & LEFT_BUTTON_MASK == 0 {
+        return;
+    }
     let (x, y) = unpack_remote_position(REMOTE_MOUSE_POSITION.load(Ordering::Relaxed));
     let at_down = MACOS_RECEIVER_DRAG_COUNT_AT_DOWN.load(Ordering::Relaxed);
     let current = macos_appkit::change_count();
@@ -6755,26 +6902,27 @@ fn return_to_local_macos(context: &MacCaptureContext) {
 /// window is hidden. Do not repeatedly push hide/transparent cursor state here:
 /// those APIs are stack-based and must stay one enter paired with one return.
 #[cfg(target_os = "macos")]
-fn repin_macos_cursor_while_remote(context: &MacCaptureContext) {
+fn repin_macos_cursor_while_remote(context: &MacCaptureContext) -> bool {
     // Detaching before the first mouse event would strand the hide undrawn.
     if context.decouple_pending.load(Ordering::Relaxed) {
-        return;
+        // No physical move has arrived yet, but held-key heartbeats are still
+        // required when a hotkey entered the remote and the user only types.
+        return true;
     }
-    set_macos_cursor_decoupled(true);
-    if !context.main_window_visible.load(Ordering::Relaxed) {
-        let drifted = if let Some(location) = macos_current_cursor_location() {
-            repin_macos_cursor_if_drifted(context, location)
-        } else {
-            force_repin_macos_cursor_to_anchor(context);
-            true
-        };
-        reassert_macos_hidden_window_cursor(context, drifted);
-        return;
+    if !set_macos_cursor_decoupled(true) {
+        context.tap_disabled.store(true, Ordering::Relaxed);
+        return false;
     }
-
-    if let Some(location) = macos_current_cursor_location() {
-        repin_macos_cursor_if_drifted(context, location);
+    let ready = if let Some(location) = macos_current_cursor_location() {
+        repin_macos_cursor_if_drifted(context, location)
+    } else {
+        context.tap_disabled.store(true, Ordering::Relaxed);
+        false
+    };
+    if ready && !context.main_window_visible.load(Ordering::Relaxed) {
+        reassert_macos_hidden_window_cursor(context, false);
     }
+    ready
 }
 
 #[cfg(target_os = "macos")]
@@ -6939,16 +7087,14 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
 /// feels seamless. MUST be re-coupled on every exit path or the user's cursor
 /// stays frozen.
 #[cfg(target_os = "macos")]
-fn set_macos_cursor_decoupled(decoupled: bool) {
+fn set_macos_cursor_decoupled(decoupled: bool) -> bool {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
     }
 
     let connected = if decoupled { 0 } else { 1 };
-    unsafe {
-        let _ = CGAssociateMouseAndMouseCursorPosition(connected);
-    }
+    unsafe { CGAssociateMouseAndMouseCursorPosition(connected) == 0 }
 }
 
 /// macOS default: local hardware events stay suppressed for 0.25s after a warp.
@@ -7257,7 +7403,7 @@ fn repin_macos_cursor_if_drifted(
     let dx = location.x - x;
     let dy = location.y - y;
     if dx.abs() <= DRIFT_THRESHOLD_PX && dy.abs() <= DRIFT_THRESHOLD_PX {
-        return false;
+        return true;
     }
 
     if !macos_cursor_repin_due(context, Duration::from_millis(REPIN_INTERVAL_MS)) {
@@ -7267,8 +7413,17 @@ fn repin_macos_cursor_if_drifted(
     // When MyKVM is not frontmost, macOS can re-associate the cursor with the
     // physical mouse despite CGAssociateMouseAndMouseCursorPosition(false).
     // Re-pin only after actual drift and at a capped rate.
-    set_macos_cursor_decoupled(true);
-    move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
+    if !set_macos_cursor_decoupled(true) {
+        context.tap_disabled.store(true, Ordering::Relaxed);
+        return false;
+    }
+    if !move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y)) {
+        context.tap_disabled.store(true, Ordering::Relaxed);
+        return false;
+    }
+    if !context.main_window_visible.load(Ordering::Relaxed) {
+        reassert_macos_hidden_window_cursor(context, true);
+    }
     true
 }
 
@@ -7380,15 +7535,15 @@ fn mac_display_snapshots() -> Vec<MacDisplaySnapshot> {
 fn move_macos_cursor_without_event(
     context: &MacCaptureContext,
     point: core_graphics::geometry::CGPoint,
-) {
-    move_macos_cursor_without_event_on_displays(point, &context.display_snapshots);
+) -> bool {
+    move_macos_cursor_without_event_on_displays(point, &context.display_snapshots)
 }
 
 #[cfg(target_os = "macos")]
 fn move_macos_cursor_without_event_on_displays(
     point: core_graphics::geometry::CGPoint,
     displays: &[MacDisplaySnapshot],
-) {
+) -> bool {
     use core_graphics::display::CGDisplay;
 
     for display in displays {
@@ -7405,12 +7560,12 @@ fn move_macos_cursor_without_event_on_displays(
                 .move_cursor_to_point(local_point)
                 .is_ok()
             {
-                return;
+                return true;
             }
         }
     }
 
-    let _ = CGDisplay::warp_mouse_cursor_position(point);
+    CGDisplay::warp_mouse_cursor_position(point).is_ok()
 }
 
 /// Arms macOS to hide the pointer even when MyKVM is NOT the frontmost app.
@@ -7931,10 +8086,49 @@ fn mac_key_to_windows_vk_pairs() -> &'static [(u16, u16)] {
 
 #[cfg(target_os = "macos")]
 fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
+    use core_graphics::{display::CGDisplay, event::CGEventTapLocation, geometry::CGPoint};
+
+    let (delta, click_state, event_number, first_drag) = macos_click_tracker()
+        .lock()
+        .map(|mut tracker| {
+            let (delta, count, number) = tracker.movement(x, y, drag_button);
+            (delta, count, number, tracker.take_drag_start(x, y, drag_button))
+        })
+        .unwrap_or(((0, 0), i64::from(drag_button.is_some()), 0, false));
+    let Ok(event) = macos_mouse_move_event(
+        x,
+        y,
+        drag_button,
+        MAC_INJECT_FLAGS.load(Ordering::Relaxed),
+        delta,
+        click_state,
+        event_number,
+    ) else {
+        return;
+    };
+    // Warping ahead of every dragged event bypasses the OS drag trajectory.
+    // Let the Dragged event itself move the cursor while a button is held.
+    if drag_button.is_none() {
+        let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x as f64, y as f64));
+    }
+    if first_drag {
+        log_macos_drag_state("start", &event, x, y);
+    }
+    event.post(CGEventTapLocation::HID);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mouse_move_event(
+    x: i32,
+    y: i32,
+    drag_button: Option<MouseButton>,
+    flags: u64,
+    delta: (i64, i64),
+    click_state: i64,
+    event_number: i64,
+) -> Result<core_graphics::event::CGEvent, ()> {
     use core_graphics::{
-        display::CGDisplay,
-        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton},
-        event_source::{CGEventSource, CGEventSourceStateID},
+        event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, EventField},
         geometry::CGPoint,
     };
 
@@ -7951,14 +8145,68 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
         None => (CGEventType::MouseMoved, CGMouseButton::Left),
     };
 
-    // Posted mouse-move events do not always update the visible macOS cursor.
-    let _ = CGDisplay::warp_mouse_cursor_position(point);
+    // The entire gesture must use one remote-input state table. Hardware state
+    // can change independently of the Windows controller's held buttons.
+    let source = macos_injection_source()?;
+    let event = CGEvent::new_mouse_event(source, event_type, point, mouse_button)?;
+    event.set_flags(CGEventFlags::from_bits_truncate(flags));
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, delta.0);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, delta.1);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_state);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_NUMBER, event_number);
+    Ok(event)
+}
 
-    if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
-        if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
-            event.post(CGEventTapLocation::HID);
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacMouseEventNumbers {
+    last: i64,
+    held: [i64; 5],
+}
+
+#[cfg(target_os = "macos")]
+impl MacMouseEventNumbers {
+    fn index(button: MouseButton) -> usize {
+        match button {
+            MouseButton::Left => 0, MouseButton::Right => 1, MouseButton::Middle => 2,
+            MouseButton::Back => 3, MouseButton::Forward => 4,
         }
     }
+
+    fn button(&mut self, button: MouseButton, down: bool, system_count: i64) -> i64 {
+        let index = Self::index(button);
+        if down {
+            // macOS 27's Carbon/TIS event routing rejects zero/reused click
+            // numbers, including Finder drag initiation. Begin above the HID
+            // click counter, and retain this number through drag and release.
+            self.last = self.last.max(system_count).checked_add(1)
+                .filter(|number| *number <= i64::from(i32::MAX)).unwrap_or(1);
+            self.held[index] = self.last;
+            self.last
+        } else {
+            std::mem::take(&mut self.held[index])
+        }
+    }
+
+    fn dragging(&self, button: MouseButton) -> i64 { self.held[Self::index(button)] }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_mouse_click_count() -> i64 {
+    use core_graphics::event::CGEventType;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceCounterForEventType(state: i32, event_type: u32) -> u32;
+    }
+    [
+        CGEventType::LeftMouseDown,
+        CGEventType::RightMouseDown,
+        CGEventType::OtherMouseDown,
+    ]
+    .into_iter()
+    .map(|kind| i64::from(unsafe { CGEventSourceCounterForEventType(1, kind as u32) }))
+    .sum()
 }
 
 /// One pressed-button record for injected macOS click counting.
@@ -7970,6 +8218,7 @@ struct MacClickDown {
     y: i32,
     at: Instant,
     count: u8,
+    drag_logged: bool,
 }
 
 /// Click counting for injected macOS mouse buttons. macOS does NOT infer
@@ -7984,6 +8233,8 @@ struct MacClickDown {
 struct MacClickTracker {
     last_down: Option<MacClickDown>,
     pressed: [Option<MacClickDown>; 3],
+    last_position: Option<(i32, i32)>,
+    numbers: MacMouseEventNumbers,
 }
 
 #[cfg(target_os = "macos")]
@@ -7999,6 +8250,7 @@ impl MacClickTracker {
         now: Instant,
         double_click_interval: Duration,
     ) -> i64 {
+        self.last_position = Some((x, y));
         let index = match button {
             MouseButton::Left => 0,
             MouseButton::Right => 1,
@@ -8024,6 +8276,7 @@ impl MacClickTracker {
                 y,
                 at: now,
                 count,
+                drag_logged: false,
             };
             self.last_down = Some(click);
             self.pressed[index] = Some(click);
@@ -8041,6 +8294,27 @@ impl MacClickTracker {
             self.last_down = None;
             0
         }
+    }
+
+    fn movement(&mut self, x: i32, y: i32, button: Option<MouseButton>) -> ((i64, i64), i64, i64) {
+        let previous = self.last_position.replace((x, y)).unwrap_or((x, y));
+        let click_state = button.and_then(|button| self.pressed.iter().flatten()
+            .find(|click| click.button == button).map(|click| i64::from(click.count)))
+            .unwrap_or(i64::from(button.is_some()));
+        let event_number = button.map(|button| self.numbers.dragging(button)).unwrap_or(0);
+        ((i64::from(x) - i64::from(previous.0), i64::from(y) - i64::from(previous.1)), click_state, event_number)
+    }
+
+    fn take_drag_start(&mut self, x: i32, y: i32, button: Option<MouseButton>) -> bool {
+        if button != Some(MouseButton::Left) {
+            return false;
+        }
+        let Some(click) = self.pressed[0].as_mut() else { return false; };
+        if click.drag_logged || click_points_are_near(click.x, click.y, x, y, Self::MAX_DISTANCE_PX) {
+            return false;
+        }
+        click.drag_logged = true;
+        true
     }
 }
 
@@ -8089,20 +8363,26 @@ fn macos_double_click_interval() -> Duration {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_click_state(button: MouseButton, down: bool, x: i32, y: i32) -> i64 {
+fn macos_mouse_button_fields(button: MouseButton, down: bool, x: i32, y: i32) -> (i64, i64) {
+    let system_count = if down {
+        macos_system_mouse_click_count()
+    } else {
+        0
+    };
     macos_click_tracker()
         .lock()
         .map(|mut tracker| {
-            tracker.event_count(
+            let count = tracker.event_count(
                 button,
                 down,
                 x,
                 y,
                 Instant::now(),
                 macos_double_click_interval(),
-            )
+            );
+            (count, tracker.numbers.button(button, down, system_count))
         })
-        .unwrap_or(if down { 1 } else { 0 })
+        .unwrap_or((if down { 1 } else { 0 }, 0))
 }
 
 #[cfg(target_os = "macos")]
@@ -8417,12 +8697,7 @@ mod macos_drag_overlay {
 
 #[cfg(target_os = "macos")]
 fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
-    use core_graphics::{
-        display::CGDisplay,
-        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField},
-        event_source::{CGEventSource, CGEventSourceStateID},
-        geometry::CGPoint,
-    };
+    use core_graphics::event::CGEventTapLocation;
 
     // Snapshot the drag pasteboard's changeCount when a left press begins, so a
     // later "pull" from the controller can tell a fresh Finder drag (count
@@ -8443,9 +8718,34 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
         });
     }
 
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+    let (click_state, event_number) = macos_mouse_button_fields(button, down, x, y);
+    let Ok(event) = macos_mouse_button_event(
+        button, down, x, y, MAC_INJECT_FLAGS.load(Ordering::Relaxed), click_state, event_number,
+    ) else {
         return;
     };
+    if !down && button == MouseButton::Left && click_state == 0 && event_number != 0 {
+        log_macos_drag_state("release", &event, x, y);
+    }
+    event.post(CGEventTapLocation::HID);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mouse_button_event(
+    button: MouseButton,
+    down: bool,
+    x: i32,
+    y: i32,
+    flags: u64,
+    click_state: i64,
+    event_number: i64,
+) -> Result<core_graphics::event::CGEvent, ()> {
+    use core_graphics::{
+        event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, EventField},
+        geometry::CGPoint,
+    };
+
+    let source = macos_injection_source()?;
     // Side buttons are "other" mouse events distinguished only by their button
     // number (macOS: 2 = middle, 3 = back, 4 = forward); new_mouse_event has no
     // CGMouseButton for 3/4, so create an Other event and stamp the number.
@@ -8463,18 +8763,38 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     };
     let point = CGPoint::new(x as f64, y as f64);
 
-    let _ = CGDisplay::warp_mouse_cursor_position(point);
-
-    if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
-        if let Some(number) = button_number {
-            event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
-        }
-        event.set_integer_value_field(
-            EventField::MOUSE_EVENT_CLICK_STATE,
-            macos_click_state(button, down, x, y),
-        );
-        event.post(CGEventTapLocation::HID);
+    let event = CGEvent::new_mouse_event(source, event_type, point, mouse_button)?;
+    event.set_flags(CGEventFlags::from_bits_truncate(flags));
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
+    if let Some(number) = button_number {
+        event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
     }
+    event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_state);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_NUMBER, event_number);
+    Ok(event)
+}
+
+/// Only gesture start/release are logged, never every mouse move. Comparing the
+/// state-table buttons and drag pasteboard distinguishes an unrecognized hold
+/// from a Finder drag that started but failed to drop.
+#[cfg(target_os = "macos")]
+fn log_macos_drag_state(phase: &str, event: &core_graphics::event::CGEvent, x: i32, y: i32) {
+    use core_graphics::event::EventField;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
+    }
+    let source_id = event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID) as i32;
+    let hid = unsafe { CGEventSourceButtonState(1, 0) };
+    let session = unsafe { CGEventSourceButtonState(0, 0) };
+    let source = unsafe { CGEventSourceButtonState(source_id, 0) };
+    let board_down = MACOS_RECEIVER_DRAG_COUNT_AT_DOWN.load(Ordering::Relaxed);
+    let board_now = macos_appkit::change_count();
+    log::info!(
+        "[drag] macOS {phase} number={} at=({x},{y}) source={source_id} left(hid/session/source)={hid}/{session}/{source} remote={:#x} modifiers={:#x} pasteboard={board_down}->{board_now}",
+        event.get_integer_value_field(EventField::MOUSE_EVENT_NUMBER),
+        REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed), event.get_flags().bits(),
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -8485,16 +8805,57 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_scroll_event(delta_x: i32, delta_y: i32, flags: u64) -> Result<core_graphics::event::CGEvent, ()> {
-    use core_graphics::{
-        event::{CGEvent, CGEventFlags, EventField, ScrollEventUnit},
-        event_source::{CGEventSource, CGEventSourceStateID},
-    };
+fn macos_injection_source() -> Result<core_graphics::event_source::CGEventSource, ()> {
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use foreign_types::ForeignType;
 
-    if delta_x == 0 && delta_y == 0 { return Err(()); }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceCreate(state_id: i32) -> core_graphics::sys::CGEventSourceRef;
+        fn CGEventSourceGetSourceStateID(source: core_graphics::sys::CGEventSourceRef) -> i32;
+    }
+
+    // Each Private source creates a WindowServer state table backed by a
+    // shared-memory mapping. On macOS 27 these mappings survive CFRelease:
+    // 5,000 fresh sources retained ~79 MiB; one reused source stayed below
+    // 1 MiB. Keep exactly one table for the process, across QUIC workers.
+    // CGEventSource is not Send: share its documented native state-table ID,
+    // not the Rust object. Temporary sources are created and dropped on the
+    // calling thread. One master source intentionally has process lifetime,
+    // like a native static, so the ID remains valid when a worker exits.
+    static STATE_ID: Mutex<Option<i32>> = Mutex::new(None);
+    let id = {
+        let mut state = STATE_ID.lock().map_err(|_| ())?;
+        if state.is_none() {
+            let source = CGEventSource::new(CGEventSourceStateID::Private)?;
+            let id = unsafe { CGEventSourceGetSourceStateID(source.as_ptr()) };
+            std::mem::forget(source);
+            *state = Some(id);
+        }
+        state.ok_or(())?
+    };
+    let source = unsafe { CGEventSourceCreate(id) };
+    if source.is_null() {
+        Err(())
+    } else {
+        Ok(unsafe { CGEventSource::from_ptr(source) })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_scroll_event(
+    delta_x: i32,
+    delta_y: i32,
+    flags: u64,
+) -> Result<core_graphics::event::CGEvent, ()> {
+    use core_graphics::event::{CGEvent, CGEventFlags, EventField, ScrollEventUnit};
+
+    if delta_x == 0 && delta_y == 0 {
+        return Err(());
+    }
     // Remote wheel ticks must not inherit local hardware/trackpad scroll state.
     // Apple recommends private event state for remote-control applications.
-    let source = CGEventSource::new(CGEventSourceStateID::Private)?;
+    let source = macos_injection_source()?;
     let event = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)?;
     event.set_flags(CGEventFlags::from_bits_truncate(flags));
     event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
@@ -10266,6 +10627,33 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_scroll_workers_share_one_private_state_table() {
+        use core_graphics::event::EventField;
+        let source_id = || macos_scroll_event(0, 1, 0).unwrap()
+            .get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID);
+        let expected = source_id();
+        for worker in (0..4).map(|_| thread::spawn(source_id)).collect::<Vec<_>>() {
+            assert_eq!(worker.join().unwrap(), expected,
+                "each worker must reuse the same private state table");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "measures process memory; run alone with --ignored --test-threads=1"]
+    fn macos_scroll_memory_stays_bounded_over_100000_events() {
+        for _ in 0..32 { drop(macos_scroll_event(0, 1, 0).unwrap()); }
+        let before = crate::performance::read_macos_physical_footprint_mb().unwrap();
+        for index in 0..100_000 {
+            drop(macos_scroll_event(0, if index % 2 == 0 { 1 } else { -1 }, 0).unwrap());
+        }
+        let after = crate::performance::read_macos_physical_footprint_mb().unwrap();
+        eprintln!("100000 scroll events: footprint {before:.2} -> {after:.2} MiB (increase {:.2} MiB)", after - before);
+        assert!(after - before < 8.0, "a fresh private source per event retains roughly 1.5 GiB here");
+    }
+
+    #[test]
     fn cursor_park_requires_authorization_and_does_not_skip_an_idle_position() {
         let mut layout = layout_for_target_tests();
         layout.machine_role = "client".into();
@@ -10575,11 +10963,13 @@ mod tests {
             last_attached: None,
         };
         let key = |key_code, down| InputEvent::Key { key_code, down };
+        let without_sequence = |mut held: HeldInputs| { assert_ne!(held.sequence, 0); held.sequence = 0; held };
         assert_eq!(
-            state.track(&key(0x10, true), t0),
+            state.track(&key(0x10, true), t0).map(without_sequence),
             Some(HeldInputs {
                 keys: vec![0x10],
-                buttons: 0
+                buttons: 0,
+                sequence: 0,
             })
         );
         // Tracked but not attached again inside the refresh window.
@@ -10587,7 +10977,9 @@ mod tests {
             button: MouseButton::Left,
             down: true,
         };
-        assert_eq!(state.track(&left, t0 + Duration::from_millis(10)), None);
+        assert_eq!(state.track(&left, t0 + Duration::from_millis(10)).map(without_sequence), Some(HeldInputs {
+            keys: vec![0x10], buttons: LEFT_BUTTON_MASK, sequence: 0,
+        }), "button transitions must carry their own held snapshot");
         // Auto-repeat does not duplicate; a release clears even if unsent.
         state.track(&key(0x10, true), t0 + Duration::from_millis(20));
         state.track(&key(0x10, false), t0 + Duration::from_millis(30));
@@ -10597,10 +10989,11 @@ mod tests {
             y: 2,
         };
         assert_eq!(
-            state.track(&moved, t0 + HELD_REFRESH),
+            state.track(&moved, t0 + HELD_REFRESH + Duration::from_millis(10)).map(without_sequence),
             Some(HeldInputs {
                 keys: Vec::new(),
-                buttons: LEFT_BUTTON_MASK
+                buttons: LEFT_BUTTON_MASK,
+                sequence: 0,
             })
         );
     }
@@ -10627,6 +11020,7 @@ mod tests {
         let stale = state.take_stale_keys(&HeldInputs {
             keys: vec![0x10],
             buttons: 0,
+            sequence: 0,
         });
         assert_eq!(stale, vec![0x41]);
         assert_eq!(state.keys, vec![0x10]);
@@ -10650,6 +11044,7 @@ mod tests {
         let held = HeldInputs {
             keys: vec![0x10],
             buttons: LEFT_BUTTON_MASK,
+            sequence: 42,
         };
         let packet = |held| InputPacketRef {
             protocol: INPUT_PROTOCOL,
@@ -10672,6 +11067,150 @@ mod tests {
         // This version reads it, and reads an older sender's packet as None.
         assert_eq!(decode_input_packet(&with).expect("decode").held, Some(held));
         assert_eq!(decode_input_packet(&without).expect("decode").held, None);
+    }
+
+    #[test]
+    fn ordered_button_snapshots_repair_lost_down_and_up_without_duplicate_presses() {
+        let held = HeldInputs { buttons: LEFT_BUTTON_MASK, sequence: 2, ..HeldInputs::default() };
+        assert_eq!(received_button_updates(0, &held, true), vec![(MouseButton::Left, true)]);
+        assert!(received_button_updates(LEFT_BUTTON_MASK, &held, true).is_empty());
+        assert!(received_button_updates(0, &held, false).is_empty(), "a delayed park must not re-press a handed-off drag");
+        let released = HeldInputs { sequence: 3, ..HeldInputs::default() };
+        assert_eq!(received_button_updates(LEFT_BUTTON_MASK, &released, true), vec![(MouseButton::Left, false)]);
+        let legacy = HeldInputs { sequence: 0, ..held };
+        assert!(received_button_updates(0, &legacy, true).is_empty(), "legacy unordered snapshots remain release-only");
+    }
+
+    #[test]
+    fn a_delayed_held_snapshot_cannot_resurrect_a_released_drag() {
+        let source = "127.0.0.1:45123".parse().unwrap();
+        let mut sequences = RemoteCursorSequences::default();
+        let now = Instant::now();
+        assert!(sequences.accept(source, 100, now));
+        assert!(sequences.accept(source, 102, now));
+        assert!(!sequences.accept(source, 101, now));
+    }
+
+    #[test]
+    fn stopping_releases_native_buttons_and_keys_even_without_heartbeats() {
+        let mut state = ReceivedHeld {
+            keys: vec![0x10, 0x41], heartbeats: false, last_packet: Some(Instant::now()),
+        };
+        let releases = state.take_for_stop(LEFT_BUTTON_MASK | mouse_button_mask(MouseButton::Right), 400, 500);
+        assert_eq!(releases, vec![
+            InputCommand::Key { key_code: 0x10, down: false },
+            InputCommand::Key { key_code: 0x41, down: false },
+            InputCommand::MouseButton { button: MouseButton::Left, down: false, x: 400, y: 500 },
+            InputCommand::MouseButton { button: MouseButton::Right, down: false, x: 400, y: 500 },
+        ]);
+        assert!(!state.heartbeats);
+        assert!(state.last_packet.is_none());
+        assert!(state.take_for_stop(0, 400, 500).is_empty(), "a second stop must not duplicate the releases");
+    }
+
+    #[test]
+    fn a_handed_off_button_cannot_reappear_in_the_next_peers_snapshot() {
+        let now = Instant::now();
+        let mut state = SenderHeld { held: HeldInputs::default(), last_attached: None };
+        state.track(&InputEvent::MouseButton { button: MouseButton::Left, down: true }, now);
+        // The left-up happens locally after a drag handoff, so it never passes
+        // through track(). Finishing remote releases must still forget LEFT.
+        state.release_buttons();
+        let held = state.track(&InputEvent::MouseMove {
+            screen_id: "next-peer".into(), x: 10, y: 20,
+        }, now + Duration::from_millis(1)).expect("the next peer needs a fresh snapshot");
+        assert_eq!(held.buttons, 0);
+        assert_ne!(held.sequence, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cross_screen_local_release_preserves_the_physical_event_without_mutation() {
+        use core_graphics::{
+            event::{CGEvent, CGEventType, CGMouseButton, EventField},
+            event_source::{CGEventSource, CGEventSourceStateID}, geometry::CGPoint,
+        };
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap();
+        let release = CGEvent::new_mouse_event(source, CGEventType::LeftMouseUp, CGPoint::new(100.0, 200.0), CGMouseButton::Left).unwrap();
+        release.set_integer_value_field(EventField::MOUSE_EVENT_NUMBER, 321);
+        release.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+        release.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, 777);
+        let copy = macos_marked_left_release(&release, CGPoint::new(500.0, 600.0)).unwrap();
+        for field in [EventField::EVENT_SOURCE_STATE_ID, EventField::MOUSE_EVENT_NUMBER,
+            EventField::MOUSE_EVENT_BUTTON_NUMBER, EventField::MOUSE_EVENT_CLICK_STATE] {
+            assert_eq!(copy.get_integer_value_field(field), release.get_integer_value_field(field));
+        }
+        assert_eq!((copy.location().x, copy.location().y), (500.0, 600.0));
+        assert_eq!(copy.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA), MACOS_SELF_EVENT_MARKER);
+        assert_eq!((release.location().x, release.location().y), (100.0, 200.0));
+        assert_eq!(release.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA), 777);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_drag_motion_preserves_press_count_and_actual_deltas() {
+        use core_graphics::event::{CGEventFlags, CGEventType, EventField};
+        let mut tracker = MacClickTracker::default();
+        tracker.event_count(MouseButton::Left, true, 100, 200, Instant::now(), Duration::from_millis(500));
+        let down_number = tracker.numbers.button(MouseButton::Left, true, 100);
+        let (delta, count, event_number) = tracker.movement(125, 195, Some(MouseButton::Left));
+        assert_eq!(delta, (25, -5));
+        assert_eq!(count, 1);
+        let flags = CGEventFlags::CGEventFlagCommand;
+        assert_eq!(event_number, down_number);
+        let event = macos_mouse_move_event(125, 195, Some(MouseButton::Left), flags.bits(), delta, count, event_number).unwrap();
+        assert!(matches!(event.get_type(), CGEventType::LeftMouseDragged));
+        assert_eq!(event.get_flags(), flags);
+        assert_eq!(event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X), 25);
+        assert_eq!(event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y), -5);
+        assert_eq!(event.get_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE), 1);
+        assert_eq!(event.get_integer_value_field(EventField::MOUSE_EVENT_NUMBER), down_number);
+        assert_eq!(event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA), MACOS_SELF_EVENT_MARKER);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mouse_gesture_keeps_one_private_state_and_button_pressure() {
+        use core_graphics::event::EventField;
+        // Build, but never post, native events. Remote state must stay separate
+        // from hardware, and survive the short-lived source wrapper per event.
+        let down = macos_mouse_button_event(MouseButton::Left, true, 100, 200, 0, 1, 123).unwrap();
+        let drag = macos_mouse_move_event(150, 220, Some(MouseButton::Left), 0, (50, 20), 1, 123).unwrap();
+        let up = macos_mouse_button_event(MouseButton::Left, false, 150, 220, 0, 0, 123).unwrap();
+        let source_id = down.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID);
+        assert!(source_id > 1, "a persistent private state, not hardware/session state");
+        for event in [&down, &drag, &up] {
+            assert_eq!(event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID), source_id);
+            assert_eq!(event.get_integer_value_field(EventField::MOUSE_EVENT_NUMBER), 123);
+            assert_eq!(event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER), 0);
+        }
+        assert_eq!(down.get_double_value_field(EventField::MOUSE_EVENT_PRESSURE), 1.0);
+        assert_eq!(drag.get_double_value_field(EventField::MOUSE_EVENT_PRESSURE), 1.0);
+        assert_eq!(up.get_double_value_field(EventField::MOUSE_EVENT_PRESSURE), 0.0);
+
+        let mut tracker = MacClickTracker::default();
+        tracker.event_count(MouseButton::Left, true, 100, 200, Instant::now(), Duration::from_millis(500));
+        assert!(!tracker.take_drag_start(103, 202, Some(MouseButton::Left)));
+        assert!(tracker.take_drag_start(150, 220, Some(MouseButton::Left)));
+        assert!(!tracker.take_drag_start(160, 220, Some(MouseButton::Left)), "only one start log per hold");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mouse_numbers_match_each_press_drag_and_release_and_follow_hardware() {
+        let mut numbers = MacMouseEventNumbers::default();
+        let left = numbers.button(MouseButton::Left, true, 100);
+        assert_eq!(left, 101, "the first synthetic click must exceed the HID counter");
+        assert_eq!(numbers.dragging(MouseButton::Left), left);
+        let right = numbers.button(MouseButton::Right, true, 100);
+        assert!(right > left);
+        assert_eq!(numbers.dragging(MouseButton::Left), left);
+        assert_eq!(numbers.button(MouseButton::Left, false, 0), left);
+        assert_eq!(numbers.button(MouseButton::Right, false, 0), right);
+        assert_eq!(numbers.dragging(MouseButton::Left), 0);
+        let after_local_use = numbers.button(MouseButton::Left, true, 500);
+        assert_eq!(after_local_use, 501);
+        assert_eq!(numbers.button(MouseButton::Left, false, 0), after_local_use);
     }
 
     #[test]
@@ -10808,6 +11347,7 @@ mod tests {
                 x: 960,
                 y: 540,
             },
+            false,
         )
         .expect("mouse move should map to command");
 
