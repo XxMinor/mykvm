@@ -1263,6 +1263,22 @@ fn start_platform_capture(
 
     thread::spawn(move || {
         let display_snapshots = mac_display_snapshots();
+        // Prepare native cursor data and paired connections outside the event
+        // callback, so the first crossing does not pay image decode or dial.
+        if !crate::macos_cursor::prepare() {
+            log::warn!("macOS transparent cursor unavailable; using native cursor hide");
+        }
+        {
+            let mut warmed = std::collections::HashSet::new();
+            for target in &targets {
+                if warmed.insert((&target.target_addr, &target.transport_public_key)) {
+                    let peer = quic_transport.peer(target.target_addr.clone(),
+                        target.transport_public_key.clone(), quic_transport::PROTOCOL_VERSION);
+                    // Empty transport probes cannot decode as native input.
+                    let _ = quic_transport.send_datagram(peer, Vec::new());
+                }
+            }
+        }
         enable_macos_background_cursor_hide();
         let context = Arc::new(MacCaptureContext {
             quic_transport,
@@ -5586,18 +5602,11 @@ fn handle_macos_mouse_move(
         return CallbackResult::Keep;
     }
     if let Some(active_target) = crossing_target(&targets, location.x, location.y, dx, dy) {
+        let transition_started = Instant::now();
         let anchor = local_anchor_point(&active_target);
-        dismiss_macos_dock_ui_if_up();
-        // Hide BEFORE the anchor warp: when MyKVM is hidden/minimized it runs as a
-        // background process, and the WindowServer services a background process's
-        // cursor-warp and cursor-hide calls lazily. If we warp first the user sees
-        // the pointer flick to the screen edge and linger there until the delayed
-        // hide lands — the "cursor sticks at the edge, hides late" stutter, whose
-        // visible offset scales with flick speed. Hiding first means the pointer
-        // vanishes where it is, then jumps to the anchor invisibly, so no edge
-        // stick is ever visible regardless of scheduling latency.
-        log::debug!("[diag] cross INTO remote — hiding+decoupling now");
-        hide_and_pin_macos_cursor(context, active_target.target.edge, anchor);
+        // Keep local cursor state intact while a new connection is warming.
+        // Hotkey entry already follows this order; an edge must not hide and
+        // re-show the pointer on every unsuccessful warmup attempt.
         if !send_remote_mouse_move(
             &context.quic_transport,
             &active_target,
@@ -5607,12 +5616,14 @@ fn handle_macos_mouse_move(
             reset_mouse_move_timer(&context.last_mouse_move_sent);
             reset_remote_button_mask(&context.remote_button_mask);
             reset_cursor_repin_timer(context);
-            set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
-            set_macos_cursor_decoupled(false);
-            show_macos_cursor_if_needed(context);
             context.just_crossed.store(false, Ordering::Relaxed);
             return CallbackResult::Keep;
         }
+        dismiss_macos_dock_ui_if_up();
+        let hide_started = Instant::now();
+        // Hide before moving the local anchor, using the already decoded cursor.
+        hide_and_pin_macos_cursor(context, active_target.target.edge, anchor);
+        let cursor_setup_us = hide_started.elapsed().as_micros();
         reset_mouse_move_timer(&context.last_mouse_move_sent);
         reset_cursor_repin_timer(context);
         reset_remote_button_mask(&context.remote_button_mask);
@@ -5630,6 +5641,8 @@ fn handle_macos_mouse_move(
         }
         context.just_crossed.store(true, Ordering::Relaxed);
         context.local_left_held.store(left_drag, Ordering::Relaxed);
+        log::info!("macOS edge entry target={} cursor_setup_us={} transition_us={}",
+            active_target.target.device_id, cursor_setup_us, transition_started.elapsed().as_micros());
         if left_drag {
             // The crossing happened mid-left-drag: if a drag session started
             // during this button hold and it carries files, arm an edge drop.
@@ -7283,110 +7296,12 @@ fn set_macos_cursor_hidden_with_appkit(hidden: bool) {
 /// more robust than the global hide counter when MyKVM is not frontmost.
 #[cfg(target_os = "macos")]
 fn set_macos_cursor_transparent(transparent: bool) {
-    set_macos_cursor_transparent_inner(transparent, true);
+    if transparent { crate::macos_cursor::push(); } else { crate::macos_cursor::pop(); }
 }
 
 #[cfg(target_os = "macos")]
 fn set_macos_cursor_transparent_current() {
-    set_macos_cursor_transparent_inner(true, false);
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_cursor_transparent_inner(transparent: bool, push: bool) {
-    use std::ffi::c_void;
-    use std::os::raw::{c_char, c_double};
-
-    #[link(name = "objc")]
-    extern "C" {
-        fn objc_getClass(name: *const c_char) -> *mut c_void;
-        fn sel_registerName(name: *const c_char) -> *mut c_void;
-        fn objc_msgSend();
-    }
-
-    // A 16x16 fully-transparent RGBA bitmap. NSImage created from this paints
-    // nothing, so the cursor is visually absent without a hide/show call.
-    const SIZE: usize = 16;
-    static TRANSPARENT_BYTES: [u8; SIZE * SIZE * 4] = [0; SIZE * SIZE * 4];
-
-    unsafe {
-        let nscursor = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
-        let nsimage = objc_getClass(b"NSImage\0".as_ptr() as *const c_char);
-        let nsdata = objc_getClass(b"NSData\0".as_ptr() as *const c_char);
-        let nssize = objc_getClass(b"NSSize\0".as_ptr() as *const c_char);
-        if nscursor.is_null() || nsimage.is_null() || nsdata.is_null() || nssize.is_null() {
-            return;
-        }
-
-        if !transparent {
-            // Pop our transparent cursor to restore the previous cursor image.
-            let pop_sel = sel_registerName(b"pop\0".as_ptr() as *const c_char);
-            let pop: extern "C" fn(*mut c_void, *mut c_void) =
-                std::mem::transmute(objc_msgSend as *const ());
-            pop(nscursor, pop_sel);
-            return;
-        }
-
-        // NSData dataWithBytes:length:
-        let data_sel = sel_registerName(b"dataWithBytes:length:\0".as_ptr() as *const c_char);
-        let data_with: extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as *const ());
-        let data = data_with(
-            nsdata,
-            data_sel,
-            TRANSPARENT_BYTES.as_ptr(),
-            TRANSPARENT_BYTES.len(),
-        );
-        if data.is_null() {
-            return;
-        }
-
-        // NSImage initWithData:
-        let alloc_sel = sel_registerName(b"alloc\0".as_ptr() as *const c_char);
-        let init_sel = sel_registerName(b"initWithData:\0".as_ptr() as *const c_char);
-        let alloc: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as *const ());
-        let init: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as *const ());
-        let image_obj = alloc(nsimage, alloc_sel);
-        let image = init(image_obj, init_sel, data);
-        if image.is_null() {
-            return;
-        }
-
-        // NSSize { width, height } value type, laid out as two doubles.
-        let size_sel = sel_registerName(b"setSize:\0".as_ptr() as *const c_char);
-        let set_size: extern "C" fn(*mut c_void, *mut c_void, c_double, c_double) =
-            std::mem::transmute(objc_msgSend as *const ());
-        set_size(image, size_sel, SIZE as c_double, SIZE as c_double);
-
-        // NSCursor initWithImage:hotSpot: — hot spot at (0,0), anywhere is fine
-        // since the cursor is invisible. hotSpot is an NSPoint (two CGFloats),
-        // passed by value; on arm64 that lands in the float argument registers as
-        // two doubles after the object-pointer argument.
-        let cursor_init_sel =
-            sel_registerName(b"initWithImage:hotSpot:\0".as_ptr() as *const c_char);
-        let cursor_init: extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            c_double,
-            c_double,
-        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
-        let cursor_obj = alloc(nscursor, alloc_sel);
-        let cursor = cursor_init(cursor_obj, cursor_init_sel, image, 0.0, 0.0);
-        if cursor.is_null() {
-            return;
-        }
-
-        let apply_sel = if push {
-            sel_registerName(b"push\0".as_ptr() as *const c_char)
-        } else {
-            sel_registerName(b"set\0".as_ptr() as *const c_char)
-        };
-        let apply: extern "C" fn(*mut c_void, *mut c_void) =
-            std::mem::transmute(objc_msgSend as *const ());
-        apply(cursor, apply_sel);
-    }
+    crate::macos_cursor::set_current();
 }
 
 #[cfg(target_os = "macos")]

@@ -28,6 +28,8 @@ release will reuse them).
 
 ### Fixed
 
+- Windows: input-service actions have the same spacing below the local information grid as other settings controls and wrap on narrower windows.
+- macOS: screen entry uses a valid, cached transparent cursor; paired connections are prepared before crossing, and reconnecting peers keep the local cursor until input can be sent.
 - macOS: received mouse, keyboard, and scroll input releases native temporary data after each command instead of retaining it on long-lived network workers.
 - The latest-version label shows the selected channel's published version, including when the installed local test build is newer.
 - macOS: repeated remote scrolling reuses one private input-state table, preventing shared-memory growth during long sessions. Scroll events keep explicit discrete and momentum-free settings.

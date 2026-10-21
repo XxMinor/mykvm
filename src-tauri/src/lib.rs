@@ -41,6 +41,8 @@ mod performance;
 mod updates;
 #[cfg(any(target_os = "windows", test))]
 mod windows_service_install;
+#[cfg(target_os = "macos")]
+mod macos_cursor;
 mod quic_transport;
 pub mod shared_input;
 #[cfg(target_os = "windows")]

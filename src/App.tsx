@@ -3033,7 +3033,7 @@ function App() {
             </div>
 
             <div className="settings-column">
-              <section className="surface-card settings-card">
+              <section className="surface-card settings-card local-info-card">
                 <h2>{ui.settings.localInfo}</h2>
                 <dl className="network-meta compact-meta">
                   <div>
