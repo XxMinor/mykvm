@@ -25,6 +25,7 @@ export const defaultLayout: LayoutState = {
   fileTransferEnabled: true,
   language: 'cn',
   themeMode: 'system',
+  updateChannel: 'stable',
   performanceMonitor: false,
   transportPortMode: 'auto',
   transportPort: 47833,

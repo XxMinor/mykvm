@@ -1,4 +1,5 @@
 import { DeviceSettingsModal } from "./DeviceSettingsModal";
+import { formatUnknownError } from "./errors";
 import { HelpHeading, InfoTip } from "./InfoTip";
 import {
   type CSSProperties,
@@ -91,6 +92,7 @@ import type {
   Screen,
   ThemeMode,
   TransportPortMode,
+  UpdateChannel,
 } from "./types";
 
 const DEFAULT_BOARD_WIDTH = 1040;
@@ -205,7 +207,7 @@ function App() {
   const [fileTransferPendingTargetId, setFileTransferPendingTargetId] =
     useState<string | null>(null);
   const [fileDragTargetId, setFileDragTargetId] = useState<string | null>(null);
-  const [fileTransferMessage, setFileTransferMessage] = useState<string | null>(
+  const [fileTransferMessage, setFileTransferMessage] = useState<{ text: string } | null>(
     null,
   );
   const [fileTransfers, setFileTransfers] = useState<
@@ -246,6 +248,7 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [availableUpdate, setAvailableUpdate] =
     useState<AppUpdateInfo | null>(null);
+  const [latestReleaseVersion, setLatestReleaseVersion] = useState<string | null>(null);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<
     string | null
@@ -269,12 +272,18 @@ function App() {
   >({ left: null, right: null, up: null, down: null });
   const fileDragTargetIdRef = useRef<string | null>(null);
   const fileTransferFallbackTargetIdRef = useRef<string | null>(null);
-  const startupUpdateCheckStarted = useRef(false);
+  const updateCheckRequest = useRef(0);
   const snapshotRef = useRef<AppStateSnapshot | null>(null);
 
   useEffect(() => {
     snapshotRef.current = snapshot;
   }, [snapshot]);
+
+  useEffect(() => {
+    if (!fileTransferMessage) return;
+    const timeout = window.setTimeout(() => setFileTransferMessage(null), 5_000);
+    return () => window.clearTimeout(timeout);
+  }, [fileTransferMessage]);
 
   useEffect(() => {
     fileTransferFallbackTargetIdRef.current =
@@ -726,19 +735,14 @@ function App() {
   const machineRole = layout?.machineRole ?? "unset";
   const language = layout?.language ?? "cn";
   const themeMode = layout?.themeMode ?? "system";
+  const updateChannel = layout?.updateChannel ?? "stable";
   const resolvedTheme = resolveTheme(themeMode, systemTheme);
   const ui = TEXT[language];
   const hasLoadedSnapshot = Boolean(snapshot);
   const isAvailableUpdateDismissed =
     Boolean(availableUpdate) &&
     dismissedUpdateVersion === availableUpdate?.version;
-  // The latest released version: the newer one when an update is available,
-  // otherwise the current build once a check confirms we're up to date.
-  const latestVersionLabel = availableUpdate
-    ? availableUpdate.version
-    : updateStatus === "current"
-      ? APP_VERSION
-      : null;
+  const latestVersionLabel = latestReleaseVersion;
   const hasActionableUpdate =
     Boolean(availableUpdate) && !isAvailableUpdateDismissed;
   const visibleTabs = useMemo(
@@ -877,52 +881,43 @@ function App() {
     }
   }, [resolvedTheme, themeMode]);
 
-  useEffect(() => {
-    if (!hasLoadedSnapshot || !isTauri() || startupUpdateCheckStarted.current) {
-      return;
-    }
-
-    let active = true;
-    const timerId = window.setTimeout(() => {
-      if (!active || startupUpdateCheckStarted.current) {
+  const checkUpdateAutomatically = useEffectEvent(async (channel: UpdateChannel) => {
+    const request = ++updateCheckRequest.current;
+    setUpdateStatus("checking");
+    setUpdateMessage(null);
+    try {
+      const result = await checkForAppUpdate(channel);
+      if (request !== updateCheckRequest.current || snapshotRef.current?.layout.updateChannel !== channel) return;
+      setLatestReleaseVersion(result.latestVersion ?? null);
+      if (!result.available || !result.update) {
+        setAvailableUpdate(null);
+        setUpdateStatus("current");
         return;
       }
+      setAvailableUpdate(result.update);
+      if (dismissedUpdateVersion === result.update.version) {
+        setUpdateStatus("idle");
+        setUpdateMessage(ui.settings.updateDismissed);
+      } else {
+        setUpdateStatus("available");
+        setUpdateMessage(`${ui.settings.updateAvailable}: v${result.update.version}`);
+      }
+    } catch (error: unknown) {
+      if (request !== updateCheckRequest.current) return;
+      setUpdateStatus("error");
+      setUpdateMessage(formatUpdaterError(error, ui.errors.checkUpdate,
+        ui.errors.updateSignatureMismatch, ui.errors.updateManifestUnavailable));
+    }
+  });
 
-      startupUpdateCheckStarted.current = true;
-      checkForAppUpdate()
-        .then((result) => {
-          if (!active) {
-            return;
-          }
-
-          if (!result.available || !result.update) {
-            // Up to date: the updater returns nothing, so the current build is
-            // the latest release. Record that so "Latest version" can show it.
-            setAvailableUpdate(null);
-            setUpdateStatus("current");
-            return;
-          }
-
-          setAvailableUpdate(result.update);
-          if (dismissedUpdateVersion === result.update.version) {
-            setUpdateStatus("idle");
-            setUpdateMessage(ui.settings.updateDismissed);
-            return;
-          }
-
-          setUpdateStatus("available");
-          setUpdateMessage(`${ui.settings.updateAvailable}: v${result.update.version}`);
-        })
-        .catch(() => {
-          // Startup checks should not interrupt normal app startup.
-        });
-    }, 1200);
-
+  useEffect(() => {
+    if (!hasLoadedSnapshot || !isTauri()) return;
+    const timerId = window.setTimeout(() => void checkUpdateAutomatically(updateChannel), 1200);
     return () => {
-      active = false;
       window.clearTimeout(timerId);
+      updateCheckRequest.current++;
     };
-  }, [dismissedUpdateVersion, hasLoadedSnapshot, ui]);
+  }, [hasLoadedSnapshot, updateChannel]);
 
   useEffect(() => {
     if (!isPerformanceActive) {
@@ -1033,9 +1028,10 @@ function App() {
 
   async function handleRequestClientUpdate(deviceId: string) {
     setErrorMessage(null);
+    setFileTransferMessage(null);
     try {
       await requestClientUpdate(deviceId);
-      setFileTransferMessage(ui.settings.updateClientSent);
+      setFileTransferMessage({ text: ui.settings.updateClientSent });
     } catch (error: unknown) {
       setErrorMessage(
         error instanceof Error ? error.message : ui.errors.updateRuntime,
@@ -1118,7 +1114,7 @@ function App() {
 
       try {
         const summary = await sendFilesToDevice(targetDeviceId, transferPaths);
-        setFileTransferMessage(formatFileTransferSummary(summary, language));
+        setFileTransferMessage({ text: formatFileTransferSummary(summary, language) });
       } catch (error: unknown) {
         setErrorMessage(
           error instanceof Error ? error.message : ui.errors.fileTransfer,
@@ -1335,9 +1331,7 @@ function App() {
     try {
       updateInputServiceStatus(await readInputServiceStatus());
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -1350,9 +1344,7 @@ function App() {
       updateInputServiceStatus(await installInputService());
       setInputServiceAction(null);
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -1365,9 +1357,7 @@ function App() {
       updateInputServiceStatus(await uninstallInputService());
       setInputServiceAction(null);
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
-      );
+      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -1984,9 +1974,13 @@ function App() {
 
     setUpdateStatus("checking");
     setUpdateMessage(null);
+    const request = ++updateCheckRequest.current;
+    const channel = updateChannel;
 
     try {
-      const result = await checkForAppUpdate();
+      const result = await checkForAppUpdate(channel);
+      if (request !== updateCheckRequest.current || snapshotRef.current?.layout.updateChannel !== channel) return;
+      setLatestReleaseVersion(result.latestVersion ?? null);
 
       if (result.available && result.update) {
         localStorage.removeItem(UPDATE_DISMISSED_VERSION_KEY);
@@ -2001,6 +1995,7 @@ function App() {
       setUpdateStatus("current");
       setUpdateMessage(ui.settings.updateCurrent);
     } catch (error: unknown) {
+      if (request !== updateCheckRequest.current) return;
       setUpdateStatus("error");
       setUpdateMessage(
         formatUpdaterError(
@@ -2010,6 +2005,20 @@ function App() {
           ui.errors.updateManifestUnavailable,
         ),
       );
+    }
+  }
+
+  async function changeUpdateChannel(channel: UpdateChannel) {
+    if (channel === updateChannel || updateStatus === "installing") return;
+    updateCheckRequest.current++;
+    setAvailableUpdate(null);
+    setLatestReleaseVersion(null);
+    setUpdateStatus("idle");
+    setUpdateMessage(null);
+    try {
+      await saveModalLayout((current) => ({ ...current, updateChannel: channel }));
+    } catch (error: unknown) {
+      setErrorMessage(formatUnknownError(error, ui.errors.saveLayout));
     }
   }
 
@@ -2023,15 +2032,15 @@ function App() {
 
     try {
       if (isPortable) {
-        await openUpdateReleasePage();
+        await openUpdateReleasePage(updateChannel);
         setUpdateStatus("available");
         setUpdateMessage(ui.settings.portableUpdateCopy);
         return;
       }
 
-      await installAppUpdate();
+      if (!(await installAppUpdate(updateChannel))) await checkDesktopUpdate();
     } catch (error: unknown) {
-      await openUpdateReleasePage().catch(() => {
+      await openUpdateReleasePage(updateChannel).catch(() => {
         // The original update error is more useful than a secondary browser error.
       });
       const errorText = formatUpdaterError(
@@ -2057,7 +2066,7 @@ function App() {
   }
 
   function openUpdateDownloads() {
-    void openUpdateReleasePage();
+    void openUpdateReleasePage(updateChannel);
   }
 
   function renderErrorDialog(message: string) {
@@ -2101,6 +2110,15 @@ function App() {
     return (
       <div className="info-banner" role="status">
         <span>{message}</span>
+        <button
+          type="button"
+          className="info-banner-close"
+          onClick={() => setFileTransferMessage(null)}
+          aria-label={ui.errors.close}
+          title={ui.errors.close}
+        >
+          <WindowCloseIcon />
+        </button>
       </div>
     );
   }
@@ -2415,7 +2433,7 @@ function App() {
       </header>
 
       {errorMessage ? renderErrorDialog(errorMessage) : null}
-      {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
+      {fileTransferMessage ? renderInfoBanner(fileTransferMessage.text) : null}
       {renderFileTransferToasts()}
       {shownInputServiceAction
         ? renderInputServicePrompt(shownInputServiceAction)
@@ -3031,7 +3049,7 @@ function App() {
             </div>
 
             <div className="settings-column">
-              <section className="surface-card settings-card">
+              <section className="surface-card settings-card local-info-card">
                 <h2>{ui.settings.localInfo}</h2>
                 <dl className="network-meta compact-meta">
                   <div>
@@ -3129,6 +3147,20 @@ function App() {
                   <span className={`update-status-badge ${updateStatus}`}>
                     {updateStatusLabel(updateStatus, ui)}
                   </span>
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.updateChannel}</span>
+                  <div className="segmented-control" role="group" aria-label={ui.settings.updateChannel}>
+                    {(["stable", "beta"] as UpdateChannel[]).map((channel) => (
+                      <button key={channel} type="button"
+                        className={updateChannel === channel ? "active" : ""}
+                        aria-pressed={updateChannel === channel}
+                        disabled={isSaving || updateStatus === "installing"}
+                        onClick={() => void changeUpdateChannel(channel)}>
+                        {channel === "stable" ? ui.settings.stableChannel : ui.settings.betaChannel}
+                      </button>
+                    ))}
+                  </div>
                 </div>
                 <dl className="network-meta compact-meta">
                   <div>
@@ -3329,9 +3361,9 @@ function App() {
 
       {editingDevice ? <DeviceSettingsModal key={editingDevice.id} device={editingDevice} language={language}
         onClose={() => setEditingDevice(null)}
-        onSave={(pointerSpeed, scrollSpeed) => saveModalLayout(current => {
+        onSave={(pointerSpeed, scrollSpeed, invertScroll) => saveModalLayout(current => {
           if (!current.devices.some(device => device.id === editingDevice.id)) throw new Error(language === "cn" ? "设备已移除。" : "Device no longer available.");
-          return { ...current, devices: current.devices.map(device => device.id === editingDevice.id ? { ...device, pointerSpeed, scrollSpeed } : device) };
+          return { ...current, devices: current.devices.map(device => device.id === editingDevice.id ? { ...device, pointerSpeed, scrollSpeed, invertScroll } : device) };
         })}
         onRepair={() => { setEditingDevice(null); void handleRepairDevice(editingDevice); }}
         onRemove={() => { handleRemoveDevice(editingDevice.id); setEditingDevice(null); }}
@@ -4051,22 +4083,6 @@ function updateStatusLabel(status: UpdateStatus, ui: AppText) {
       return ui.settings.updateFailed;
     default:
       return ui.settings.updateIdle;
-  }
-}
-
-function formatUnknownError(error: unknown, fallback: string) {
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
-
-  try {
-    const text = JSON.stringify(error);
-    return text && text !== "null" ? text : fallback;
-  } catch {
-    return fallback;
   }
 }
 

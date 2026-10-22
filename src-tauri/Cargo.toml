@@ -30,6 +30,7 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
 serde_json = "1.0"
+semver = "1"
 tar = "=0.4.45"
 tempfile = "3"
 rmp-serde = "1"
@@ -53,6 +54,7 @@ tauri-plugin-global-shortcut = "2"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
+foreign-types = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.8.1"

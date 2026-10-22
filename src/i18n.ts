@@ -150,6 +150,9 @@ export const TEXT = {
       performanceCopy:
         "开启后在本页采样 CPU、内存和输入流量。",
       updates: "应用更新",
+      updateChannel: "更新通道",
+      stableChannel: "正式版",
+      betaChannel: "测试版（bate）",
       updatesCopy: "下载新版并在安装后重启。",
       updatesBrowserCopy: "浏览器预览模式不会检查桌面端更新。",
       portableUpdateCopy:
@@ -399,6 +402,9 @@ export const TEXT = {
       performanceCopy:
         "Sample CPU, memory, and input traffic while this page is open.",
       updates: "App Updates",
+      updateChannel: "Update channel",
+      stableChannel: "Stable",
+      betaChannel: "Beta (bate)",
       updatesCopy: "Download the latest version and restart after installation.",
       updatesBrowserCopy: "Browser preview mode does not check desktop updates.",
       portableUpdateCopy:

@@ -9,7 +9,7 @@ import type {
   PerformanceSample,
   RuntimeStatus,
 } from './runtime'
-import type { LayoutState } from './types'
+import type { LayoutState, UpdateChannel } from './types'
 
 export interface AppUpdateInfo {
   version: string
@@ -20,7 +20,20 @@ export interface AppUpdateInfo {
 
 export interface AppUpdateCheckResult {
   available: boolean
+  latestVersion?: string | null
   update?: AppUpdateInfo
+}
+
+interface UpdaterMetadata extends AppUpdateInfo {
+  rid: number
+  currentVersion: string
+  rawJson: Record<string, unknown>
+}
+
+interface NativeUpdateCheckResult {
+  available: boolean
+  latestVersion: string | null
+  update: UpdaterMetadata | null
 }
 
 export interface FileTransferSummary {
@@ -389,13 +402,13 @@ export async function openRepositoryUrl(): Promise<void> {
   await invoke('open_repository_url')
 }
 
-export async function openUpdateReleasePage(): Promise<void> {
+export async function openUpdateReleasePage(channel: UpdateChannel = 'stable'): Promise<void> {
   if (!isTauri()) {
-    window.open(RELEASES_URL, '_blank', 'noopener,noreferrer')
+    window.open(channel === 'beta' ? `${REPOSITORY_URL}/releases/tag/beta` : RELEASES_URL, '_blank', 'noopener,noreferrer')
     return
   }
 
-  await invoke('open_releases_url')
+  await invoke('open_releases_url', { channel })
 }
 
 export async function isPortableMode(): Promise<boolean> {
@@ -406,27 +419,23 @@ export async function isPortableMode(): Promise<boolean> {
   return invoke<boolean>('is_portable_mode')
 }
 
-export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
+export async function checkForAppUpdate(channel: UpdateChannel): Promise<AppUpdateCheckResult> {
   if (!isTauri()) {
     return { available: false }
   }
 
-  const { check } = await import('@tauri-apps/plugin-updater')
-  // A stalled manifest fetch left the check spinning (PR #22).
-  const update = await check({ timeout: 20_000 })
-
-  if (!update) {
-    return { available: false }
-  }
-
-  return {
-    available: true,
-    update: {
-      version: update.version,
-      currentVersion: update.currentVersion,
-      date: update.date,
-      body: update.body,
-    },
+  const result = await invoke<NativeUpdateCheckResult>('check_app_update', { channel })
+  if (!result.update) return { available: false, latestVersion: result.latestVersion }
+  const { Update } = await import('@tauri-apps/plugin-updater')
+  const update = new Update(result.update)
+  try {
+    return {
+      available: result.available,
+      latestVersion: result.latestVersion,
+      update: { version: update.version, currentVersion: update.currentVersion, date: update.date, body: update.body },
+    }
+  } finally {
+    await update.close()
   }
 }
 
@@ -435,21 +444,18 @@ export async function setAppUpgrading(enabled: boolean): Promise<void> {
   await invoke('set_app_upgrading', { enabled })
 }
 
-export async function installAppUpdate(): Promise<void> {
+export async function installAppUpdate(channel: UpdateChannel): Promise<boolean> {
   if (!isTauri()) {
-    return
+    return false
   }
 
-  const [{ check }, { relaunch }] = await Promise.all([
+  const [{ Update }, { relaunch }] = await Promise.all([
     import('@tauri-apps/plugin-updater'),
     import('@tauri-apps/plugin-process'),
   ])
-  // A stalled manifest fetch left the check spinning (PR #22).
-  const update = await check({ timeout: 20_000 })
-
-  if (!update) {
-    return
-  }
+  const result = await invoke<NativeUpdateCheckResult>('check_app_update', { channel })
+  if (!result.available || !result.update) return false
+  const update = new Update(result.update)
 
   await setAppUpgrading(true).catch(() => {})
   let handedOff = false
@@ -467,6 +473,9 @@ export async function installAppUpdate(): Promise<void> {
       await startRuntime().catch(() => {})
     }
     throw error
+  } finally {
+    await update.close().catch(() => {})
   }
   await relaunch()
+  return true
 }

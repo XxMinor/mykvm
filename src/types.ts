@@ -8,6 +8,8 @@ export type ThemeMode = 'system' | 'dark' | 'light'
 
 export type TransportPortMode = 'auto' | 'fixed'
 
+export type UpdateChannel = 'stable' | 'beta'
+
 export type ModifierTarget = 'control' | 'alt' | 'meta' | 'same'
 
 export interface ModifierMap {
@@ -62,6 +64,7 @@ export interface Device {
   /** Multipliers this controller applies when driving the device. */
   pointerSpeed?: number
   scrollSpeed?: number
+  invertScroll?: boolean
   role: 'local' | 'server' | 'client'
   source?: 'detected' | 'manual'
   screens: Screen[]
@@ -85,6 +88,7 @@ export interface LayoutState {
   inputProtection?: InputProtection
   language: AppLanguage
   themeMode: ThemeMode
+  updateChannel: UpdateChannel
   performanceMonitor: boolean
   transportPortMode: TransportPortMode
   transportPort: number

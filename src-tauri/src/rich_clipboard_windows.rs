@@ -41,14 +41,15 @@ fn owner() -> Result<Owner, String> {
     }
 }
 fn open_owned(owner: &Owner) -> Result<Open, String> {
+    let access = crate::clipboard::lock_windows_clipboard();
     if unsafe { OpenClipboard(owner.0) } == 0 {
-        Err("剪贴板被其它应用占用。".into())
+        Err(crate::clipboard::windows_clipboard_error("剪贴板被其它应用占用。"))
     } else {
-        Ok(Open)
+        Ok(Open { _access: access })
     }
 }
 
-struct Open;
+struct Open { _access: std::sync::MutexGuard<'static, ()> }
 impl Drop for Open {
     fn drop(&mut self) {
         unsafe {
@@ -57,10 +58,11 @@ impl Drop for Open {
     }
 }
 fn open() -> Result<Open, String> {
+    let access = crate::clipboard::lock_windows_clipboard();
     if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
-        Err("剪贴板被其它应用占用。".into())
+        Err(crate::clipboard::windows_clipboard_error("剪贴板被其它应用占用。"))
     } else {
-        Ok(Open)
+        Ok(Open { _access: access })
     }
 }
 fn format(name: &str) -> u32 {
@@ -125,10 +127,7 @@ pub(super) fn read() -> Option<RichText> {
         return None;
     }
     Some(RichText {
-        text: arboard::Clipboard::new()
-            .ok()?
-            .get_text()
-            .unwrap_or_default(),
+        text: crate::clipboard::read_text().unwrap_or_default(),
         html,
         rtf,
     })

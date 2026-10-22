@@ -34,10 +34,10 @@ fn note_injection_refused(kind: &str, error: u32) {
         *last = Instant::now();
     }
 
-    if error == ERROR_ACCESS_DENIED {
+    if error == ERROR_ACCESS_DENIED || error == 0 {
         log::warn!(
-            "injected {kind} refused by Windows (ERROR_ACCESS_DENIED): the foreground window \
-             runs at another integrity level (Task Manager, a UAC prompt, an elevated app). \
+            "injected {kind} refused by Windows (error {error}): the foreground window \
+             may run at a higher integrity level (Task Manager, a UAC prompt, an elevated app). \
              The app retries such input through the MyKVM input service; if that service \
              is not installed, install it in Settings or run MyKVM as administrator."
         );

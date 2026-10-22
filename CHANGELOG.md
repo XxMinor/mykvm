@@ -10,6 +10,8 @@ release will reuse them).
 
 ### Added
 
+- App Updates offers Stable and Beta (bate) channels. The selected channel is saved and also applies to remote client update requests.
+- Per-device reverse scrolling: Devices → Device settings → Reverse scroll direction changes both scroll axes for that remote device, independently of macOS natural scrolling or MOS (discussion #29).
 - Device settings use a modal form. Pointer and scroll speeds are saved together; pairing and removal actions are grouped inside the form.
 - Folder transfers preserve nested directories and empty folders. Windows native drags include directory descriptors; ordinary transfers unpack into the receiving folder. New folder and file-clipboard protocols require both peers to be updated.
 - Rich clipboard sharing includes HTML and RTF with a plain-text fallback.
@@ -26,6 +28,19 @@ release will reuse them).
 
 ### Fixed
 
+- Windows: cursor recentering counts as a live mouse-hook callback, preventing unnecessary hook reinstalls while controlling an idle remote screen.
+- Success banners such as remote client update requests close automatically after five seconds and include a Close button.
+- Windows: input-service actions have the same spacing below the local information grid as other settings controls and wrap on narrower windows.
+- macOS: screen entry uses a valid, cached transparent cursor; paired connections are prepared before crossing, and reconnecting peers keep the local cursor until input can be sent.
+- macOS: received mouse, keyboard, and scroll input releases native temporary data after each command instead of retaining it on long-lived network workers.
+- The latest-version label shows the selected channel's published version, including when the installed local test build is newer.
+- macOS: repeated remote scrolling reuses one private input-state table, preventing shared-memory growth during long sessions. Scroll events keep explicit discrete and momentum-free settings.
+- macOS: remote drags keep matching press/move/release events on macOS 27. Returning to the controller keeps the actual drag position until handoff, and stopping sharing releases held buttons. Ordered snapshots recover lost presses without replaying stale drag state.
+- macOS: a disabled input tap releases remote keys and buttons before recovery. Cursor suppression is checked before forwarding pending movement (#45).
+- Clipboard acknowledgements allow Windows clipboard retries to finish; slow clipboard operations keep the keyboard/mouse connection intact. Windows clipboard access is serialized within MyKVM, and busy errors identify the holding process.
+- Windows: elevated service installation returns its actual failure to the UI, records a diagnostic result, validates the helper executable before installation, and reports readiness timeouts (#46).
+- Clipboard images from chat apps fall back to available bitmap data when their private temporary file cannot be read.
+- Windows: installing or repairing the unattended-control service waits for its startup pipe and for old workers to exit. A briefly locked helper executable is retried; failures show the backend's specific error instead of a generic runtime message (#27, #40).
 - Screen-switch shortcuts restore the cursor position used before leaving each device and screen. Only a first visit without a remembered position lands at the center; hidden client parking does not overwrite the remembered position.
 - MyKVM shortcuts release logical keys on both devices while tracking physically held modifiers separately. Holding Alt for repeated screen switches remains possible; releasing Alt stops plain arrow keys from switching screens.
 - macOS: leaving a controlled Mac requests cursor hiding until the next movement. Re-entry, local mouse movement, and stopping sharing restore it; ordered cursor messages prevent delayed parking from overriding re-entry.
@@ -59,6 +74,7 @@ release will reuse them).
 - macOS: when the controlled machine stops accepting input, clicks and keys now hand control back to the Mac instead of freezing the trackpad and mouse until MyKVM is force-quit. A file drag that an older client refuses is delivered to that machine's Desktop instead (#33).
 - The device list and diagnostics show every IPv4 address of this machine, so a direct-cable or Thunderbolt-bridge address is visible for manual pairing, not just the Wi-Fi one (#33).
 - Windows: MyKVM starts a stopped lock-screen input service from an older install, so clicks work on the lock screen again (#27).
+- Windows: refused clicks, keys, and scroll events retry through the input service even when Windows supplies no error code. This covers elevated prompts on the normal desktop, including UAC without dimming (#28).
 - macOS: launch at startup opens MyKVM once and silently, instead of racing macOS "Reopen windows when logging back in" and showing the window. Display changes on wake are applied once instead of several times, without blocking the app, and input-capture errors are now written to the log.
 - macOS: returning to the Mac after a long session with the window hidden no longer stalls while the hidden cursor is restored.
 - Mouse movement keeps a steady 125 Hz instead of dropping to about 62 Hz when input callbacks jitter.

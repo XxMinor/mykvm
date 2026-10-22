@@ -1452,6 +1452,11 @@
   gap: 12px;
 }
 
+.local-info-card > .inline-actions {
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
 .role-switcher {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1717,6 +1722,9 @@
 }
 
 .info-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   margin: 0;
   padding: 10px 12px;
   border: 1px solid rgba(45, 212, 191, 0.28);
@@ -1726,6 +1734,34 @@
   font-size: 13px;
   font-weight: 700;
   overflow-wrap: anywhere;
+}
+
+.info-banner > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.info-banner-close {
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.info-banner-close:hover {
+  background: rgba(45, 212, 191, 0.16);
+}
+
+.info-banner-close:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }
 
 .error-dialog-backdrop {
@@ -2313,6 +2349,8 @@
 .modal-field { display: grid; gap: 10px; font-size: 14px; }
 .modal-field select { font: inherit; min-width: 0; width: 100%; height: 44px; padding: 0 12px; background: #242429; border: 1px solid #7775; border-radius: 8px; color: #f4f4f5; }
 .modal-field select:focus { outline: 2px solid #2786ff; outline-offset: 2px; }
+.modal-checkbox { display: flex; align-items: center; gap: 10px; font-size: 14px; margin-bottom: 8px; cursor: pointer; }
+.modal-checkbox input { width: 16px; height: 16px; margin: 0; accent-color: #2786ff; }
 .modal-help { font-size: 12px; color: #a1a1aa; line-height: 1.7; margin: 0; }
 .modal-maintenance { display: grid; gap: 12px; padding-top: 18px; border-top: 1px solid #7773; font-size: 13px; color: #a1a1aa; }
 .modal-maintenance > div { display: flex; gap: 10px; flex-wrap: wrap; }

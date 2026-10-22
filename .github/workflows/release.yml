@@ -29,7 +29,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.channel || (github.ref_name == 'bate' && 'beta' || 'stable') }}
   cancel-in-progress: false
 
 env:
@@ -52,6 +52,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Test updater manifests and beta retention
+        run: |
+          node --test scripts/updater-release.test.mjs
+          node scripts/check-release-shell.mjs
 
       - name: Compute next version
         id: version
@@ -135,6 +140,9 @@ jobs:
               patch=$((patch + 1))
             fi
             version="$major.$minor.$patch-beta.${GITHUB_RUN_NUMBER}"
+            if [[ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]]; then
+              version="$version.${GITHUB_RUN_ATTEMPT}"
+            fi
           fi
 
           tag="v$version"
@@ -192,7 +200,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create release tag
-        if: steps.version.outputs.should_release == 'true'
+        if: steps.version.outputs.should_release == 'true' && steps.version.outputs.channel == 'stable'
         shell: bash
         run: |
           set -euo pipefail
@@ -202,19 +210,15 @@ jobs:
           git push origin "${{ steps.version.outputs.tag }}"
 
       - name: Create draft release
-        if: steps.version.outputs.should_release == 'true'
+        if: steps.version.outputs.should_release == 'true' && steps.version.outputs.channel == 'stable'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
-          CHANNEL: ${{ steps.version.outputs.channel }}
           RELEASE_NOTES: ${{ steps.version.outputs.release_notes }}
         run: |
           set -euo pipefail
           args=("$TAG" --draft --title "MyKVM $TAG" --notes "$RELEASE_NOTES" --target "$GITHUB_SHA")
-          if [[ "$CHANNEL" == "beta" ]]; then
-            args+=(--prerelease)
-          fi
           gh release create "${args[@]}" --repo "$GITHUB_REPOSITORY"
 
   build:
@@ -491,6 +495,7 @@ jobs:
           rm -f "$P12" "$CERT_PEM"
 
       - name: Build and publish desktop bundles
+        id: bundle
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -505,11 +510,12 @@ jobs:
         with:
           tauriScript: npm run tauri
           args: ${{ matrix.args }}
-          tagName: ${{ needs.prepare.outputs.tag }}
-          releaseName: "MyKVM ${{ needs.prepare.outputs.tag }}"
+          tagName: ${{ needs.prepare.outputs.channel == 'stable' && needs.prepare.outputs.tag || '' }}
+          releaseName: ${{ needs.prepare.outputs.channel == 'stable' && format('MyKVM {0}', needs.prepare.outputs.tag) || '' }}
           releaseBody: ${{ needs.prepare.outputs.release_notes }}
-          # Keep the release a DRAFT until latest.json is attached (published by
-          # the assemble-latest-json job below). Otherwise the release becomes
+          # Keep stable releases a DRAFT until latest.json is attached. Beta
+          # builds only stage Actions artifacts and create no per-build release.
+          # Otherwise the release becomes
           # "latest" the moment the first platform bundle uploads, and the in-app
           # updater (releases/latest/download/latest.json) 404s for the rest of
           # the build. A failed build also never becomes "latest" this way.
@@ -562,6 +568,27 @@ jobs:
             echo "Self-signed (non-notarized) build: skipping spctl Gatekeeper checks."
           fi
 
+      - name: Stage beta packages
+        if: needs.prepare.outputs.channel == 'beta'
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.bundle.outputs.artifactPaths }}
+        run: |
+          node --input-type=module <<'NODE'
+          import path from 'node:path';
+          import { stageUpdaterAssets } from './scripts/assemble-updater-manifest.mjs';
+          stageUpdaterAssets(JSON.parse(process.env.ARTIFACT_PATHS), path.join(process.env.RUNNER_TEMP, 'mykvm-beta-assets'));
+          NODE
+
+      - name: Keep beta packages in Actions until every platform is ready
+        if: needs.prepare.outputs.channel == 'beta'
+        uses: actions/upload-artifact@v4
+        with:
+          name: beta-${{ matrix.name }}
+          path: ${{ runner.temp }}/mykvm-beta-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
   assemble-latest-json:
     name: Assemble updater manifest
     needs:
@@ -573,7 +600,10 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download release assets
+        if: needs.prepare.outputs.channel == 'stable'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
@@ -583,154 +613,83 @@ jobs:
           gh release download "$TAG" --dir dl --repo "$GITHUB_REPOSITORY" --clobber
           find dl -maxdepth 1 -type f -printf '%f\n' | sort
 
+      - name: Download staged beta packages
+        if: needs.prepare.outputs.channel == 'beta'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: beta-*
+          path: dl
+          merge-multiple: true
+
       - name: Generate latest.json
         env:
           REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
           RELEASE_NOTES: ${{ needs.prepare.outputs.release_notes }}
-        run: |
-          set -euo pipefail
-          node <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
+        run: node scripts/assemble-updater-manifest.mjs
 
-          const dir = 'dl';
-          let files = fs.readdirSync(dir);
-          const tag = process.env.TAG;
-          const version = process.env.VERSION;
-          const notes = process.env.RELEASE_NOTES || `Release ${tag}`;
-          const baseUrl = `https://github.com/${process.env.REPO}/releases/download/${tag}`;
-          const assetUrl = (name) => `${baseUrl}/${encodeURIComponent(name)}`;
-          const signatureFor = (name) => {
-            const sigName = `${name}.sig`;
-            return files.includes(sigName)
-              ? fs.readFileSync(path.join(dir, sigName), 'utf8').trim()
-              : null;
-          };
-          const platforms = {};
-
-          const addPlatform = (key, assetName) => {
-            const signature = signatureFor(assetName);
-            if (!signature) {
-              console.warn(`Skipping ${key}: missing signature for ${assetName}`);
-              return false;
-            }
-
-            platforms[key] = {
-              signature,
-              url: assetUrl(assetName),
-            };
-            return true;
-          };
-
-          const macAsset = files.find((name) => /\.app\.tar\.gz$/i.test(name));
-          if (!macAsset) {
-            throw new Error('No macOS updater .app.tar.gz asset found.');
-          }
-          const macAdded =
-            addPlatform('darwin-aarch64', macAsset) &&
-            addPlatform('darwin-x86_64', macAsset);
-          if (!macAdded) {
-            throw new Error(`Missing signature for macOS updater asset ${macAsset}.`);
-          }
-
-          const windowsAsset = files.find(
-            (name) =>
-              !name.endsWith('.sig') &&
-              name !== 'mykvm-windows-x64-setup.exe' &&
-              (/setup\.exe$/i.test(name) || /\.msi$/i.test(name)),
-          );
-          if (windowsAsset) {
-            const windowsUpdaterAsset = 'mykvm-windows-x64-setup.exe';
-            fs.copyFileSync(path.join(dir, windowsAsset), path.join(dir, windowsUpdaterAsset));
-            fs.copyFileSync(
-              path.join(dir, `${windowsAsset}.sig`),
-              path.join(dir, `${windowsUpdaterAsset}.sig`),
-            );
-            files = fs.readdirSync(dir);
-            addPlatform('windows-x86_64', windowsUpdaterAsset);
-          }
-
-          const linuxAsset = files.find(
-            (name) =>
-              !name.endsWith('.sig') &&
-              /\.AppImage$/i.test(name) &&
-              /(amd64|x86_64)/i.test(name),
-          );
-          if (linuxAsset) {
-            addPlatform('linux-x86_64', linuxAsset);
-          }
-          // tauri-plugin-updater looks up `{os}-{arch}-{installer}` before
-          // `{os}-{arch}`, so without these a .deb or .rpm install was offered
-          // the AppImage. Assets without a signature are skipped.
-          const debAsset = files.find((name) => /_amd64\.deb$/i.test(name));
-          if (debAsset) {
-            addPlatform('linux-x86_64-deb', debAsset);
-          }
-          const rpmAsset = files.find((name) => /\.x86_64\.rpm$/i.test(name));
-          if (rpmAsset) {
-            addPlatform('linux-x86_64-rpm', rpmAsset);
-          }
-
-          fs.writeFileSync(
-            'latest.json',
-            `${JSON.stringify(
-              {
-                version,
-                notes,
-                pub_date: new Date().toISOString(),
-                platforms,
-              },
-              null,
-              2,
-            )}\n`,
-          );
-
-          console.log(fs.readFileSync('latest.json', 'utf8'));
-          NODE
-
-      - name: Upload latest.json
+      - name: Upload updater assets and manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           set -euo pipefail
-          if [[ -f dl/mykvm-windows-x64-setup.exe ]]; then
-            gh release upload "$TAG" \
-              dl/mykvm-windows-x64-setup.exe \
-              dl/mykvm-windows-x64-setup.exe.sig \
-              --clobber \
-              --repo "$GITHUB_REPOSITORY"
-          fi
-          gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
           if [[ "$CHANNEL" == "beta" ]]; then
-            if gh release view beta --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              gh release upload beta latest.json --clobber --repo "$GITHUB_REPOSITORY"
-            else
-              gh release create beta latest.json \
-                --target "$GITHUB_SHA" \
-                --title "MyKVM Beta Updates" \
-                --notes "Updater manifest for beta builds." \
-                --prerelease \
-                --latest=false \
+            if ! gh release view beta --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release create beta --draft --prerelease --latest=false \
+                --target "$GITHUB_SHA" --title "MyKVM bate" --notes "Rolling beta builds." \
                 --repo "$GITHUB_REPOSITORY"
             fi
+            # Each package URL contains its version. Keep the previous manifest
+            # available until every new platform asset has finished uploading.
+            gh release upload beta dl/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload beta latest.json --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            if [[ -f dl/mykvm-windows-x64-setup.exe ]]; then
+              gh release upload "$TAG" dl/mykvm-windows-x64-setup.exe \
+                dl/mykvm-windows-x64-setup.exe.sig --clobber --repo "$GITHUB_REPOSITORY"
+            fi
+            gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
           fi
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
+          RELEASE_NOTES: ${{ needs.prepare.outputs.release_notes }}
         run: |
           set -euo pipefail
-          # Now that every platform bundle AND latest.json are attached, flip the
-          # draft to published. Only at this point does releases/latest advance to
-          # this tag, so the in-app updater never sees a manifest-less release.
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          fs.writeFileSync('beta-notes.md', `Current build: v${process.env.VERSION}\nSource: https://github.com/${process.env.GITHUB_REPOSITORY}/commit/${process.env.GITHUB_SHA}\n\n${process.env.RELEASE_NOTES}`);
+          NODE
           if [[ "$CHANNEL" == "beta" ]]; then
-            gh release edit "$TAG" --draft=false --prerelease --latest=false --repo "$GITHUB_REPOSITORY"
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/beta" \
+              -f sha="$GITHUB_SHA" -F force=true
+            gh release edit beta --draft=false --prerelease --latest=false \
+              --title "MyKVM bate" --notes-file beta-notes.md --repo "$GITHUB_REPOSITORY"
           else
             gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
           fi
+
+      - name: Retain the latest three rolling beta builds
+        if: needs.prepare.outputs.channel == 'beta'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { obsoleteBetaAssets } from './scripts/assemble-updater-manifest.mjs';
+          const repo = process.env.GITHUB_REPOSITORY;
+          const release = JSON.parse(execFileSync('gh', ['api', `repos/${repo}/releases/tags/beta`], { encoding: 'utf8' }));
+          const assets = JSON.parse(execFileSync('gh', ['api', '--paginate', '--slurp', `repos/${repo}/releases/${release.id}/assets?per_page=100`], { encoding: 'utf8' })).flat();
+          for (const asset of obsoleteBetaAssets(assets, process.env.VERSION)) {
+            execFileSync('gh', ['api', '--method', 'DELETE', `repos/${repo}/releases/assets/${asset.id}`], { stdio: 'inherit' });
+          }
+          NODE
