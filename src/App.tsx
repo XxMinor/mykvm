@@ -207,7 +207,7 @@ function App() {
   const [fileTransferPendingTargetId, setFileTransferPendingTargetId] =
     useState<string | null>(null);
   const [fileDragTargetId, setFileDragTargetId] = useState<string | null>(null);
-  const [fileTransferMessage, setFileTransferMessage] = useState<string | null>(
+  const [fileTransferMessage, setFileTransferMessage] = useState<{ text: string } | null>(
     null,
   );
   const [fileTransfers, setFileTransfers] = useState<
@@ -278,6 +278,12 @@ function App() {
   useEffect(() => {
     snapshotRef.current = snapshot;
   }, [snapshot]);
+
+  useEffect(() => {
+    if (!fileTransferMessage) return;
+    const timeout = window.setTimeout(() => setFileTransferMessage(null), 5_000);
+    return () => window.clearTimeout(timeout);
+  }, [fileTransferMessage]);
 
   useEffect(() => {
     fileTransferFallbackTargetIdRef.current =
@@ -1022,9 +1028,10 @@ function App() {
 
   async function handleRequestClientUpdate(deviceId: string) {
     setErrorMessage(null);
+    setFileTransferMessage(null);
     try {
       await requestClientUpdate(deviceId);
-      setFileTransferMessage(ui.settings.updateClientSent);
+      setFileTransferMessage({ text: ui.settings.updateClientSent });
     } catch (error: unknown) {
       setErrorMessage(
         error instanceof Error ? error.message : ui.errors.updateRuntime,
@@ -1107,7 +1114,7 @@ function App() {
 
       try {
         const summary = await sendFilesToDevice(targetDeviceId, transferPaths);
-        setFileTransferMessage(formatFileTransferSummary(summary, language));
+        setFileTransferMessage({ text: formatFileTransferSummary(summary, language) });
       } catch (error: unknown) {
         setErrorMessage(
           error instanceof Error ? error.message : ui.errors.fileTransfer,
@@ -2103,6 +2110,15 @@ function App() {
     return (
       <div className="info-banner" role="status">
         <span>{message}</span>
+        <button
+          type="button"
+          className="info-banner-close"
+          onClick={() => setFileTransferMessage(null)}
+          aria-label={ui.errors.close}
+          title={ui.errors.close}
+        >
+          <WindowCloseIcon />
+        </button>
       </div>
     );
   }
@@ -2417,7 +2433,7 @@ function App() {
       </header>
 
       {errorMessage ? renderErrorDialog(errorMessage) : null}
-      {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
+      {fileTransferMessage ? renderInfoBanner(fileTransferMessage.text) : null}
       {renderFileTransferToasts()}
       {shownInputServiceAction
         ? renderInputServicePrompt(shownInputServiceAction)

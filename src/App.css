@@ -1722,6 +1722,9 @@
 }
 
 .info-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   margin: 0;
   padding: 10px 12px;
   border: 1px solid rgba(45, 212, 191, 0.28);
@@ -1731,6 +1734,34 @@
   font-size: 13px;
   font-weight: 700;
   overflow-wrap: anywhere;
+}
+
+.info-banner > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.info-banner-close {
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.info-banner-close:hover {
+  background: rgba(45, 212, 191, 0.16);
+}
+
+.info-banner-close:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }
 
 .error-dialog-backdrop {
