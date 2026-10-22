@@ -4222,14 +4222,17 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     }
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
-    if wparam as u32 == WM_MOUSEMOVE && WINDOWS_CURSOR_WARPS.lock()
-        .map(|mut warps| warps.take((event.pt.x, event.pt.y), Instant::now())).unwrap_or(false) {
-        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
-    }
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
     if windows_hook_receipt(context.capture_thread_id).is_none() {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    // Our own cursor warps still prove this hook is receiving callbacks. Record
+    // their receipt before filtering them, so idle repinning cannot look like a
+    // removed hook when Windows' last-input timestamp keeps advancing.
+    if wparam as u32 == WM_MOUSEMOVE && WINDOWS_CURSOR_WARPS.lock()
+        .map(|mut warps| warps.take((event.pt.x, event.pt.y), Instant::now())).unwrap_or(false) {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
     let message = wparam as u32;
