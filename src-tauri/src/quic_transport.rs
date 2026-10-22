@@ -1110,6 +1110,7 @@ mod tests {
         let receiver_dir = tempfile::tempdir().unwrap();
         let sender_dir = tempfile::tempdir().unwrap();
         let (input_tx, input_rx) = mpsc::channel();
+        let (clipboard_started_tx, clipboard_started_rx) = mpsc::channel();
         let receiver = start(
             free_port(),
             receiver_dir.path().to_path_buf(),
@@ -1118,7 +1119,8 @@ mod tests {
                 // establishes the peer. It is not an input event.
                 if !payload.is_empty() { let _ = input_tx.send(payload); }
             }),
-            Arc::new(|_, _| {
+            Arc::new(move |_, _| {
+                let _ = clipboard_started_tx.send(());
                 thread::sleep(Duration::from_millis(2300));
                 true
             }),
@@ -1137,11 +1139,13 @@ mod tests {
         let stream_sender = sender.clone();
         let stream_peer = peer.clone();
         let send = thread::spawn(move || stream_sender.send_stream_expect_ack(stream_peer, b"clipboard".to_vec()));
-        let ready_by = Instant::now() + Duration::from_secs(2);
-        while !sender.send_datagram(peer.clone(), b"drag-move".to_vec()).unwrap() {
-            assert!(Instant::now() < ready_by);
-            thread::sleep(Duration::from_millis(10));
-        }
+        // Start the input deadline only after the clipboard handler is blocked.
+        // Racing a warmup dial against the stream dial can replace a connection
+        // and drop the single unreliable input datagram before this check.
+        clipboard_started_rx.recv_timeout(Duration::from_secs(5))
+            .expect("clipboard handler must start before measuring input latency");
+        assert!(sender.send_datagram(peer, b"drag-move".to_vec()).unwrap(),
+            "the clipboard stream must have established the connection");
         assert_eq!(input_rx.recv_timeout(Duration::from_millis(300)).unwrap(), b"drag-move");
         let result = send.join().unwrap();
         sender.stop_and_wait().unwrap();
