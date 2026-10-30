@@ -28,6 +28,7 @@ release will reuse them).
 
 ### Fixed
 
+- A controlled device whose IP address changed (for example macOS rotating its private Wi-Fi address) no longer ignores mouse, keyboard, clipboard, file, and diagnostic requests from its paired controller.
 - Windows: cursor recentering counts as a live mouse-hook callback, preventing unnecessary hook reinstalls while controlling an idle remote screen.
 - Success banners such as remote client update requests close automatically after five seconds and include a Close button.
 - Windows: input-service actions have the same spacing below the local information grid as other settings controls and wrap on narrower windows.
