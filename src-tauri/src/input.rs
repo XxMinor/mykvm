@@ -2551,10 +2551,6 @@ pub(crate) fn handle_input_datagram_with_sink(
             } else if !input_origin_recently_authorized(source) {
                 return true;
             }
-            let local_peer_id = cached_local_peer_id(&layout);
-            if !packet_targets_local(&layout, &packet.target_device_id, &local_peer_id) {
-                return true;
-            }
             if let Some(held) = &held {
                 held_is_current = accept_held_sequence(source, held.sequence);
                 if !held_is_current && matches!(packet.event, InputEvent::MouseButton { .. }) {
@@ -2621,31 +2617,10 @@ pub(crate) fn handle_input_datagram_with_sink(
         let Ok(layout) = layout_state.lock() else {
             return false;
         };
-        let local_peer_id = cached_local_peer_id(&layout);
-        return handle_control_packet(&layout, packet, source, &local_peer_id, sink);
+        return handle_control_packet(&layout, packet, source, sink);
     }
 
     false
-}
-
-/// The local peer id is derived from the hostname + LAN address and is needed
-/// for every received packet; deriving it builds a full LanPeer (screens and
-/// all). Cache the id briefly instead of rebuilding it per datagram.
-fn cached_local_peer_id(layout: &LayoutState) -> String {
-    const LOCAL_PEER_ID_TTL: Duration = Duration::from_secs(5);
-    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
-
-    if let Ok(mut cached) = CACHE.lock() {
-        if let Some((resolved_at, id)) = cached.as_ref() {
-            if resolved_at.elapsed() < LOCAL_PEER_ID_TTL {
-                return id.clone();
-            }
-        }
-        let id = crate::local_peer_from_layout(layout).id;
-        *cached = Some((Instant::now(), id.clone()));
-        return id;
-    }
-    crate::local_peer_from_layout(layout).id
 }
 
 /// Persist the controller as our clipboard peer so a copy made on this
@@ -2694,7 +2669,6 @@ fn handle_control_packet(
     layout: &LayoutState,
     packet: InputControlPacket,
     source: SocketAddr,
-    local_peer_id: &str,
     sink: &dyn Fn(InputCommand) -> bool,
 ) -> bool {
     if packet.protocol != INPUT_CONTROL_PROTOCOL {
@@ -2703,10 +2677,6 @@ fn handle_control_packet(
 
     if !control_packet_authorized(layout, &packet) {
         warn_unauthorized_control_packet(layout, &packet);
-        return true;
-    }
-
-    if !packet_targets_local(layout, &packet.target_device_id, local_peer_id) {
         return true;
     }
 
@@ -2858,20 +2828,6 @@ fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlP
         },
         reason
     );
-}
-
-fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer_id: &str) -> bool {
-    if target_device_id.trim().is_empty() {
-        return true;
-    }
-    if target_device_id == local_peer_id {
-        return true;
-    }
-
-    layout
-        .devices
-        .iter()
-        .any(|device| device.role == "local" && device.id == target_device_id)
 }
 
 fn decode_input_packet(payload: &[u8]) -> Option<InputPacket> {
@@ -10575,6 +10531,44 @@ mod tests {
         let after = crate::performance::read_macos_physical_footprint_mb().unwrap();
         eprintln!("100000 scroll events: footprint {before:.2} -> {after:.2} MiB (increase {:.2} MiB)", after - before);
         assert!(after - before < 8.0, "a fresh private source per event retains roughly 1.5 GiB here");
+    }
+
+    #[test]
+    fn input_reaches_client_after_its_ip_changes() {
+        let mut layout = layout_for_target_tests();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![crate::PairedController {
+            id: "ip-change-server".into(), name: "Server".into(), host: "server".into(),
+            ip: "192.0.2.13".into(), transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(), paired_at_ms: 1,
+        }];
+        let packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            // What a controller keeps sending: device ids embed the IP from
+            // first discovery and are never rewritten when the peer moves.
+            target_device_id: "peer-client-192-168-66-93".into(),
+            origin_device_id: "ip-change-server".into(), origin_port: 47834,
+            origin_transport_public_key: "server-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(), pair_secret: layout.pair_secret.clone(),
+            event: InputEvent::MouseMove {
+                screen_id: layout.devices[0].screens[0].id.clone(), x: 100, y: 200,
+            },
+            held: None,
+            cursor: None,
+        };
+        let delivered = AtomicBool::new(false);
+        assert!(handle_input_datagram_with_sink(
+            &Arc::new(Mutex::new(layout.clone())),
+            &Arc::new(Mutex::new(layout)),
+            &rmp_serde::to_vec_named(&packet).unwrap(),
+            "192.0.2.13:47834".parse().unwrap(),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(Mutex::new(None)),
+            &|_| { delivered.store(true, Ordering::Relaxed); true },
+        ));
+        assert!(delivered.load(Ordering::Relaxed), "input dropped on a stale target id");
     }
 
     #[test]

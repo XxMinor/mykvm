@@ -930,7 +930,7 @@ impl AppRuntime {
             }
 
             if let Some(accepted) = handle_clipboard_files_commit(
-                &payload, &layout, &current_peer.id, &clipboard_seen_text, &clipboard_echo_until,
+                &payload, &layout, &clipboard_seen_text, &clipboard_echo_until,
             ) {
                 if accepted {
                     transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
@@ -6239,14 +6239,12 @@ fn paste_remote_clipboard(state: tauri::State<'_, AppRuntime>) -> Result<(), Str
 fn handle_clipboard_files_commit(
     payload: &[u8],
     layout: &LayoutState,
-    local_id: &str,
     clipboard_seen: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
 ) -> Option<bool> {
     let accepted = handle_clipboard_files_commit_with_writer(
         payload,
         layout,
-        local_id,
         clipboard_seen,
         clipboard_echo_until,
         |paths| {
@@ -6274,7 +6272,6 @@ fn handle_clipboard_files_commit(
 fn handle_clipboard_files_commit_with_writer<F>(
     payload: &[u8],
     layout: &LayoutState,
-    local_id: &str,
     clipboard_seen: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     mut write_files: F,
@@ -6307,9 +6304,7 @@ where
         packet.pair_secret,
         0,
     );
-    if !clipboard_packet_authorized(layout, &auth)
-        || !clipboard_packet_targets_local(layout, &auth, local_id)
-    {
+    if !clipboard_packet_authorized(layout, &auth) {
         return Some(false);
     }
     let Some(paths) = clipboard_exchange::take_files(&packet.origin_id, &packet.ids) else {
@@ -7014,10 +7009,6 @@ where
         return false;
     }
 
-    if !clipboard_packet_targets_local(layout, &packet, local_peer_id) {
-        return false;
-    }
-
     if packet.origin_id == local_peer_id {
         return true;
     }
@@ -7099,21 +7090,6 @@ fn remember_clipboard_packet_sequence(
             .and_modify(|last_sequence| *last_sequence = (*last_sequence).max(sequence))
             .or_insert(sequence);
     }
-}
-
-fn clipboard_packet_targets_local(
-    layout: &LayoutState,
-    packet: &ClipboardPacket,
-    local_peer_id: &str,
-) -> bool {
-    if packet.target_id.trim().is_empty() || packet.target_id == local_peer_id {
-        return true;
-    }
-
-    layout
-        .devices
-        .iter()
-        .any(|device| device.role == "local" && device.id == packet.target_id)
 }
 
 fn clipboard_content_from_packet(packet: ClipboardPacket) -> Option<ClipboardContent> {
@@ -7905,7 +7881,7 @@ fn handle_drag_control_packet(
     {
         return false;
     }
-    if packet.target_id != local_peer_id || packet.origin_id == local_peer_id {
+    if packet.origin_id == local_peer_id {
         return false;
     }
 
@@ -8295,7 +8271,7 @@ fn authorize_peer_request(
     {
         return None;
     }
-    if packet.target_id != local_peer_id || packet.origin_id == local_peer_id {
+    if packet.origin_id == local_peer_id {
         return None;
     }
     Some(request)
@@ -8443,9 +8419,6 @@ fn handle_decoded_file_transfer_packet(
         return false;
     }
     if !file_transfer_packet_authorized(layout, &packet) {
-        return false;
-    }
-    if !file_transfer_packet_targets_local(layout, &packet, local_peer_id) {
         return false;
     }
     if packet.origin_id == local_peer_id {
@@ -8691,21 +8664,6 @@ fn file_transfer_packet_authorized(layout: &LayoutState, packet: &FileTransferPa
     }
 
     true
-}
-
-fn file_transfer_packet_targets_local(
-    layout: &LayoutState,
-    packet: &FileTransferPacket,
-    local_peer_id: &str,
-) -> bool {
-    if packet.target_id.trim().is_empty() || packet.target_id == local_peer_id {
-        return true;
-    }
-
-    layout
-        .devices
-        .iter()
-        .any(|device| device.role == "local" && device.id == packet.target_id)
 }
 
 fn sanitize_transfer_file_name(name: &str) -> Option<String> {
@@ -11300,7 +11258,6 @@ mod tests {
             let result = handle_clipboard_files_commit_with_writer(
                 &encode_wire_packet(&packet).unwrap(),
                 &blocked,
-                "local-device",
                 &seen,
                 &echo,
                 |_| panic!("a rejected file clipboard must not be written"),
@@ -11312,7 +11269,6 @@ mod tests {
             handle_clipboard_files_commit_with_writer(
                 &encode_wire_packet(&packet).unwrap(),
                 &layout,
-                "local-device",
                 &seen,
                 &echo,
                 |paths| {
@@ -11389,7 +11345,6 @@ mod tests {
                 if let Some(accepted) = handle_clipboard_files_commit_with_writer(
                     &payload,
                     &receive_layout,
-                    "local-device",
                     &receive_seen,
                     &receive_echo,
                     |paths| {
@@ -12079,13 +12034,15 @@ mod tests {
         );
         // Another device that knows the secret is not the paired controller.
         assert_eq!(update(&peer_request(REMOTE_UPDATE_PROTOCOL, "other"), &layout), None);
-        // A wrong secret, or a request meant for another device.
+        // A wrong secret.
         let mut wrong_secret = peer_request(REMOTE_UPDATE_PROTOCOL, "controller");
         wrong_secret.pair_secret = "guess".into();
         assert_eq!(update(&wrong_secret, &layout), None);
-        let mut elsewhere = peer_request(REMOTE_UPDATE_PROTOCOL, "controller");
-        elsewhere.target_id = "someone-else".into();
-        assert_eq!(update(&elsewhere, &layout), None);
+        // The controller's id for this device embeds the IP from first
+        // discovery, so it goes stale after a DHCP change and must not matter.
+        let mut stale_target = peer_request(REMOTE_UPDATE_PROTOCOL, "controller");
+        stale_target.target_id = "peer-client-192-168-66-93".into();
+        assert_eq!(update(&stale_target, &layout), Some(PeerRequest::Update));
         // Unpaired (paired list cleared, secret kept): answers no one.
         let mut unpaired = layout.clone();
         unpaired.paired_controllers.clear();
