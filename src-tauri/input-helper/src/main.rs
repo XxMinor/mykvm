@@ -633,6 +633,14 @@ mod windows_helper {
     }
 
     fn run_worker() -> Result<(), String> {
+        // No manifest: without this the worker is DPI-unaware, GetSystemMetrics
+        // reports the scaled virtual desktop, and the physical-pixel moves it
+        // is sent overshoot on a scaled lock screen (issue #50).
+        unsafe {
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+        }
         let session_id = current_session_id()?;
         let mut desktop = DesktopAttachment::new();
         let mut pressed_keys = Vec::new();

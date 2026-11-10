@@ -28,6 +28,7 @@ release will reuse them).
 
 ### Fixed
 
+- Windows: on a scaled display, the cursor lands where it should on the lock screen and UAC prompts; the input service worker is now per-monitor DPI aware.
 - Multiple local displays: the cursor no longer jumps to a remote machine while it is still moving on another local display that lies beyond the shared edge. A crossing has to start on the display that borders the remote screen (#50).
 - Layout: a scaled display shows its real resolution and scale (for example `2560 x 1600 · 200%`) instead of only its scaled size (#50).
 - Two remote screens placed along the same edge of one local display are both reachable; the cursor enters the one it is facing.
