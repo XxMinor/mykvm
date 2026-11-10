@@ -2514,9 +2514,7 @@ function App() {
                     ) : null}
                     <strong>{screen.name}</strong>
                     <span>{screen.deviceName}</span>
-                    <small>
-                      {screen.width} x {screen.height}
-                    </small>
+                    <small>{screenResolutionLabel(screen)}</small>
                   </button>
                 );
               })}
@@ -3844,6 +3842,19 @@ function screenStatusKind(screen: FlattenedScreen) {
   }
 
   return screen.online ? "online" : "offline";
+}
+
+// Issue #50: layout units are pixels / scale, so a 2560x1600 panel at 200%
+// read as "1280 x 800". Show the panel's real resolution plus its scale.
+// Halving before rounding undoes the logical-size rounding at 150%
+// (1707 * 1.5 = 2560.5); panel dimensions are even in practice.
+function screenResolutionLabel(screen: FlattenedScreen) {
+  const scale = screen.scale > 0 ? screen.scale : 1;
+  if (scale === 1) {
+    return `${screen.width} x ${screen.height}`;
+  }
+  const pixels = (units: number) => Math.round((units * scale) / 2) * 2;
+  return `${pixels(screen.width)} x ${pixels(screen.height)} · ${Math.round(scale * 100)}%`;
 }
 
 function screenStatusLabel(

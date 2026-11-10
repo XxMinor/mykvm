@@ -28,6 +28,9 @@ release will reuse them).
 
 ### Fixed
 
+- Multiple local displays: the cursor no longer jumps to a remote machine while it is still moving on another local display that lies beyond the shared edge. A crossing has to start on the display that borders the remote screen (#50).
+- Layout: a scaled display shows its real resolution and scale (for example `2560 x 1600 · 200%`) instead of only its scaled size (#50).
+- Two remote screens placed along the same edge of one local display are both reachable; the cursor enters the one it is facing.
 - A controlled device whose IP address changed (for example macOS rotating its private Wi-Fi address) no longer ignores mouse, keyboard, clipboard, file, and diagnostic requests from its paired controller.
 - Windows: cursor recentering counts as a live mouse-hook callback, preventing unnecessary hook reinstalls while controlling an idle remote screen.
 - Success banners such as remote client update requests close automatically after five seconds and include a Close button.
