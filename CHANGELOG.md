@@ -28,6 +28,10 @@ release will reuse them).
 
 ### Fixed
 
+- Layout: a screen you just dragged is no longer snapped back by the background refresh, and the arrow keys move the selected screen.
+- Settings: the port field applies on Enter or when you leave the field instead of on every keystroke.
+- A capture or input error is shown once per cause instead of reopening every two seconds.
+- Windows: files dropped on a device in the window go to that device on scaled displays.
 - Lower idle CPU use: the clipboard watcher sleeps between polls, the macOS cursor watcher slows down while the window is hidden, and diagnostics and performance sampling pause while the window is not visible.
 - The periodic local-address check no longer runs on input threads, so it cannot stall mouse handling on a Windows controller.
 - Saved devices, role, and pairings are no longer discarded at startup when a device's address is 192.168.31.24 or 192.168.31.63.

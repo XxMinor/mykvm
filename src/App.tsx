@@ -274,10 +274,19 @@ function App() {
   const fileTransferFallbackTargetIdRef = useRef<string | null>(null);
   const updateCheckRequest = useRef(0);
   const snapshotRef = useRef<AppStateSnapshot | null>(null);
+  // The 2 s poll returns the layout on disk; a drag or a save still in flight
+  // holds newer positions that it must not replace.
+  const draggingRef = useRef(false);
+  const savesInFlight = useRef(0);
+  const lastRuntimeError = useRef<string | null>(null);
 
   useEffect(() => {
     snapshotRef.current = snapshot;
   }, [snapshot]);
+
+  useEffect(() => {
+    draggingRef.current = dragState !== null;
+  }, [dragState]);
 
   useEffect(() => {
     if (!fileTransferMessage) return;
@@ -639,7 +648,14 @@ function App() {
 
           setSnapshot((current) =>
             current
-              ? { ...nextSnapshot, runtime: nextRuntime }
+              ? {
+                  ...nextSnapshot,
+                  layout:
+                    draggingRef.current || savesInFlight.current > 0
+                      ? current.layout
+                      : nextSnapshot.layout,
+                  runtime: nextRuntime,
+                }
               : nextSnapshot,
           );
 
@@ -662,14 +678,22 @@ function App() {
               .catch(() => {});
           }
 
-          // Keep a persistent blocking condition visible. The inject stage holds
-          // the receiver-side reason keys/clicks get dropped (macOS Accessibility
+          // Surface a blocking condition. The inject stage holds the
+          // receiver-side reason keys/clicks get dropped (macOS Accessibility
           // missing, or Secure Keyboard Entry on); it is otherwise never shown.
-          if (nextRuntime.started) {
-            if (nextRuntime.capture.state === "error") {
-              setErrorMessage(nextRuntime.capture.detail);
-            } else if (nextRuntime.inject.state === "error") {
-              setErrorMessage(nextRuntime.inject.detail);
+          // Once per distinct reason: re-raising the modal on every poll
+          // locked the user out of the settings needed to fix it.
+          const runtimeError = !nextRuntime.started
+            ? null
+            : nextRuntime.capture.state === "error"
+              ? nextRuntime.capture.detail
+              : nextRuntime.inject.state === "error"
+                ? nextRuntime.inject.detail
+                : null;
+          if (runtimeError !== lastRuntimeError.current) {
+            lastRuntimeError.current = runtimeError;
+            if (runtimeError) {
+              setErrorMessage(runtimeError);
             }
           }
         })
@@ -1083,6 +1107,7 @@ function App() {
 
   async function persistLayout(nextLayout: LayoutState) {
     setIsSaving(true);
+    savesInFlight.current += 1;
     try {
       const persistedSnapshot = await saveLayout(nextLayout);
       setSnapshot(persistedSnapshot);
@@ -1091,6 +1116,7 @@ function App() {
         error instanceof Error ? error.message : ui.errors.saveLayout,
       );
     } finally {
+      savesInFlight.current -= 1;
       setIsSaving(false);
     }
   }
@@ -1099,8 +1125,9 @@ function App() {
     const current = snapshotRef.current?.layout;
     if (!current) throw new Error(ui.errors.saveLayout);
     setIsSaving(true);
+    savesInFlight.current += 1;
     try { setSnapshot(await saveLayout(mutator(current))); }
-    finally { setIsSaving(false); }
+    finally { savesInFlight.current -= 1; setIsSaving(false); }
   }
 
   const sendDroppedFiles = useEffectEvent(
@@ -1250,6 +1277,10 @@ function App() {
         x: dragState.startX + deltaX,
         y: dragState.startY + deltaY,
       });
+      const screen = getScreenById(current.layout, dragState.screenId);
+      if (screen && screen.x === nextPosition.x && screen.y === nextPosition.y) {
+        return current;
+      }
 
       return {
         ...current,
@@ -1445,6 +1476,9 @@ function App() {
       }
 
       const nextLayout = mutator(current.layout);
+      if (nextLayout === current.layout) {
+        return current;
+      }
       void persistLayout(nextLayout);
 
       return {
@@ -1510,10 +1544,12 @@ function App() {
         return layoutState;
       }
 
-      const nextPosition = snapScreenPosition(layoutState, currentScreen.id, {
+      // No edge snapping: its pull is wider than a key step, so an aligned
+      // screen was dragged straight back and the arrow keys did nothing.
+      const nextPosition = {
         x: currentScreen.x + delta.x,
         y: currentScreen.y + delta.y,
-      });
+      };
 
       if (screenPositionOverlaps(layoutState, currentScreen.id, nextPosition)) {
         return layoutState;
@@ -2793,11 +2829,25 @@ function App() {
                     type="number"
                     min="1024"
                     max="65535"
-                    value={layout.transportPort}
+                    // Commit on blur/Enter: saving per keystroke clamped
+                    // and rebound the network on every half-typed port.
+                    key={layout.transportPort}
+                    defaultValue={layout.transportPort}
                     placeholder={ui.settings.portPlaceholder}
-                    onChange={(event) =>
-                      setTransportPort(Number(event.target.value))
-                    }
+                    onBlur={(event) => {
+                      const raw = event.target.value.trim();
+                      const port =
+                        raw === "" ? layout.transportPort : normalizePort(Number(raw));
+                      event.target.value = String(port);
+                      if (port !== layout.transportPort) {
+                        setTransportPort(port);
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.currentTarget.blur();
+                      }
+                    }}
                   />
                 </div>
               </section>
@@ -4032,7 +4082,15 @@ function fileTransferTargetIdAtPosition(
     return fallbackTargetId ?? null;
   }
 
-  const element = document.elementFromPoint(position.x, position.y);
+  // wry reports the drop position in physical pixels on Windows and in
+  // points on macOS; elementFromPoint takes CSS pixels.
+  const ratio = navigator.userAgent.includes("Windows")
+    ? window.devicePixelRatio
+    : 1;
+  const element = document.elementFromPoint(
+    position.x / ratio,
+    position.y / ratio,
+  );
   const target = element?.closest<HTMLElement>("[data-file-transfer-target]");
   return target?.dataset.fileTransferTarget ?? fallbackTargetId ?? null;
 }
