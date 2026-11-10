@@ -4203,7 +4203,12 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     }
 
     let handled = match message {
-        WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
+        WM_MOUSEMOVE => handle_windows_mouse_move(
+            &context,
+            event.pt.x as f64,
+            event.pt.y as f64,
+            event.flags & windows_sys::Win32::UI::WindowsAndMessaging::LLMHF_INJECTED != 0,
+        ),
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
         | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
             // For the X (side) buttons the pressed button rides the high word of
@@ -4564,7 +4569,7 @@ fn windows_input_desktop_name() -> Result<String, u32> {
 }
 
 #[cfg(target_os = "windows")]
-fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) -> bool {
+fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64, injected: bool) -> bool {
     let mut active = match context.active.lock() {
         Ok(active) => active,
         Err(_) => return false,
@@ -4574,6 +4579,15 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         release_windows_remote_control(context, false);
         log::warn!("cleared a stale remote target after local control resumed");
         return false;
+    }
+    if injected && active.is_some() {
+        let anchor = context.anchor.lock().ok().and_then(|anchor| *anchor);
+        if anchor.is_some_and(|anchor| injected_move_reclaims_local(anchor, x, y)) {
+            drop(active);
+            release_windows_remote_control(context, false);
+            log::info!("returning to local: remote-control software moved this machine's cursor");
+            return false;
+        }
     }
     if active.is_none() && (context.local_capture_hold.load(Ordering::Relaxed) || crate::input_guard::screenshot_is_active(&context.input_guard)) {
         if let Ok(mut last_point) = context.last_point.lock() { *last_point = Some((x, y)); }
@@ -4808,6 +4822,15 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     };
     let local_screens = local_device(&context.native_layout).map_or(&[][..], |device| &device.screens);
     if let Some(active_target) = crossing_target(&targets, local_screens, x, y, dx, dy) {
+        // RDP input is not flagged as injected, so the session is asked too.
+        let rdp = unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+            GetSystemMetrics(SM_REMOTESESSION) != 0
+        };
+        if injected || rdp {
+            note_injected_crossing_refused(if rdp { "a Remote Desktop session" } else { "another program (remote-control software)" });
+            return false;
+        }
         let edge_anchor = local_anchor_point(&active_target);
 
         // A left-button file drag reaching the edge: do NOT cross yet. Crossing
@@ -5219,6 +5242,8 @@ fn handle_macos_event(
             dx,
             dy,
             matches!(event_type, CGEventType::LeftMouseDragged),
+            // Hardware events carry no poster; remote-desktop tools post theirs.
+            event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID),
         );
     }
 
@@ -5410,10 +5435,19 @@ fn handle_macos_mouse_move(
     dx: f64,
     dy: f64,
     left_drag: bool,
+    poster_pid: i64,
 ) -> core_graphics::event::CallbackResult {
     use core_graphics::{event::CallbackResult, geometry::CGPoint};
 
     let location = event.location();
+    if poster_pid != 0 && context.remote_active.load(Ordering::Relaxed) {
+        let anchor = context.anchor.lock().ok().and_then(|anchor| *anchor);
+        if anchor.is_some_and(|anchor| injected_move_reclaims_local(anchor, location.x, location.y)) {
+            return_to_local_macos(context);
+            log::info!("returning to local: process {poster_pid} moved this machine's cursor");
+            return CallbackResult::Keep;
+        }
+    }
     if let Ok(mut active) = context.active.lock() {
         if let Some(active_target) = active.as_mut() {
             // First mouse event since crossing: it moved the still-attached
@@ -5563,6 +5597,10 @@ fn handle_macos_mouse_move(
     }
     let local_screens = local_device(&context.native_layout).map_or(&[][..], |device| &device.screens);
     if let Some(active_target) = crossing_target(&targets, local_screens, location.x, location.y, dx, dy) {
+        if poster_pid != 0 {
+            note_injected_crossing_refused(&format!("process {poster_pid}"));
+            return CallbackResult::Keep;
+        }
         let transition_started = Instant::now();
         let anchor = local_anchor_point(&active_target);
         // Keep local cursor state intact while a new connection is warming.
@@ -6263,6 +6301,34 @@ fn crossing_return_cooldown_active(last_return: Option<Instant>, now: Instant) -
     last_return.is_some_and(|at| {
         now.saturating_duration_since(at) < Duration::from_millis(RETURN_COOLDOWN_MS)
     })
+}
+
+/// Farthest a software-injected move may land from the pinned local cursor and
+/// still pass as noise: a jiggler nudges by a few pixels, a remote-desktop tool
+/// places the cursor anywhere on this screen.
+const INJECTED_TAKEOVER_DISTANCE: f64 = 48.0;
+
+/// While the pointer is on another machine the local cursor is pinned to
+/// `anchor`. A software-injected move landing well away from it is someone
+/// steering THIS machine through remote-desktop software; they see only this
+/// screen, so control comes back here.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn injected_move_reclaims_local(anchor: (f64, f64), x: f64, y: f64) -> bool {
+    (x - anchor.0).abs().max((y - anchor.1).abs()) > INJECTED_TAKEOVER_DISTANCE
+}
+
+/// Injected movement never starts a crossing (the remote operator would lose
+/// the pointer onto a screen they cannot see). Logged at most once every 10s so
+/// "the edge stopped working" can be traced to the software doing the injecting.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn note_injected_crossing_refused(source: &str) {
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let now = crate::now_ms();
+    if now.saturating_sub(LAST_MS.load(Ordering::Relaxed)) < 10_000 {
+        return;
+    }
+    LAST_MS.store(now, Ordering::Relaxed);
+    log::info!("edge crossing ignored: the mouse movement came from {source}, not a physical mouse");
 }
 
 /// Issue #50: the edge test is open-ended past the edge, so a cursor roaming a
@@ -9801,6 +9867,16 @@ mod tests {
         };
         assert_eq!(entered(500.0), "peer-device");
         assert_eq!(entered(1300.0), "lower");
+    }
+
+    #[test]
+    fn only_a_far_injected_move_takes_the_pointer_back_from_the_remote() {
+        let anchor = (960.0, 540.0);
+        // A jiggler's nudge around the pinned cursor keeps the remote session.
+        assert!(!injected_move_reclaims_local(anchor, 965.0, 536.0));
+        // A remote-desktop tool placing the cursor by absolute position ends it.
+        assert!(injected_move_reclaims_local(anchor, 300.0, 540.0));
+        assert!(injected_move_reclaims_local(anchor, 960.0, 700.0));
     }
 
     /// Issue #50: the remote hangs under DISPLAY1, and a second local display
