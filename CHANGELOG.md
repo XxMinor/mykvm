@@ -28,6 +28,13 @@ release will reuse them).
 
 ### Fixed
 
+- Saved devices, role, and pairings are no longer discarded at startup when a device's address is 192.168.31.24 or 192.168.31.63.
+- Pairing: after a mistyped code, entering the code shown on the other machine works. The code is no longer replaced behind the dialog on every retry.
+- A peer announcing a display with a zero or absurd size is ignored instead of crashing the controller.
+- A peer that changed its IP address is reached at the new address right away instead of after up to 90 seconds.
+- A display newly attached to a remote machine is placed next to that machine's other screens instead of on top of unrelated ones.
+- A remote client keeps its "updating" state while the main window is open.
+- Sending files from the window no longer freezes the app, and Cancel works during the transfer.
 - Windows: on a scaled display, the cursor lands where it should on the lock screen and UAC prompts; the input service worker is now per-monitor DPI aware.
 - Multiple local displays: the cursor no longer jumps to a remote machine while it is still moving on another local display that lies beyond the shared edge. A crossing has to start on the display that borders the remote screen (#50).
 - Layout: a scaled display shows its real resolution and scale (for example `2560 x 1600 · 200%`) instead of only its scaled size (#50).

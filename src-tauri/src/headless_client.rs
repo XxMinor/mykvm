@@ -30,10 +30,13 @@ impl HeadlessClientHandle {
             return Ok(());
         }
         let transport_result = self.transport.stop_and_wait();
-        input::close_windows_input_helper_pipe();
+        // Join first: the discovery thread probes the helper pipe on its way
+        // out and would reopen it, holding the worker's only pipe instance
+        // away from the app that is taking over.
         if let Some(thread) = self.discovery_thread.take() {
             let _ = thread.join();
         }
+        input::close_windows_input_helper_pipe();
         transport_result
     }
 }
