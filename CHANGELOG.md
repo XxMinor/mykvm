@@ -28,6 +28,8 @@ release will reuse them).
 
 ### Fixed
 
+- Lower idle CPU use: the clipboard watcher sleeps between polls, the macOS cursor watcher slows down while the window is hidden, and diagnostics and performance sampling pause while the window is not visible.
+- The periodic local-address check no longer runs on input threads, so it cannot stall mouse handling on a Windows controller.
 - Saved devices, role, and pairings are no longer discarded at startup when a device's address is 192.168.31.24 or 192.168.31.63.
 - Pairing: after a mistyped code, entering the code shown on the other machine works. The code is no longer replaced behind the dialog on every retry.
 - A peer announcing a display with a zero or absurd size is ignored instead of crashing the controller.

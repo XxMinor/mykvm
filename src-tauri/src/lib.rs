@@ -91,7 +91,6 @@ const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 // we never echo received content straight back.
 const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
-const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 // A peer that stays down doubles the wait each time, up to a minute.
 const CLIPBOARD_RETRY_MAX_MS: u64 = 60_000;
@@ -3475,11 +3474,15 @@ fn setup_macos_cursor_hider(app: &tauri::App) {
     // synchronous calls — the "cursor hides a second late, sometimes instantly"
     // stutter. Leaving only the DOM mirror keeps that path free of cursor work.
     let remote_active = app.state::<AppRuntime>().remote_input_active.clone();
+    let window_visible = app.state::<AppRuntime>().main_window_visible.clone();
     let app_handle = app.handle().clone();
     thread::spawn(move || {
         let mut was_active = false;
         loop {
-            thread::sleep(Duration::from_millis(8));
+            // The app lives in the tray: hidden, there is no DOM to mirror to,
+            // so do not wake 125 times a second for the life of the process.
+            let visible = window_visible.load(Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(if visible { 8 } else { 250 }));
             let active = remote_active.load(Ordering::Relaxed);
             if active == was_active {
                 continue;
@@ -5875,20 +5878,34 @@ fn local_ip_address() -> Option<String> {
     // origin resolution) and the discovery loop; the UDP-socket probe is four
     // syscalls. The LAN address changes on network reconfigs, not per event —
     // cache it briefly.
+    //
+    // Only the very first call probes inline. Later ones answer from the cache
+    // and refresh it on a worker: the probe enumerates network adapters, and
+    // callers hold the layout lock or sit on the Windows mouse-hook thread,
+    // where it stalled every pointer event on the system once per TTL.
     const LOCAL_IP_CACHE_TTL: Duration = Duration::from_secs(5);
     static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+    static REFRESHING: AtomicBool = AtomicBool::new(false);
 
-    if let Ok(mut cached) = CACHE.lock() {
-        if let Some((probed_at, address)) = cached.as_ref() {
-            if probed_at.elapsed() < LOCAL_IP_CACHE_TTL {
-                return address.clone();
-            }
+    fn store(address: &Option<String>) {
+        if let Ok(mut cached) = CACHE.lock() {
+            *cached = Some((Instant::now(), address.clone()));
         }
-        let fresh = probe_local_ip_address();
-        *cached = Some((Instant::now(), fresh.clone()));
-        return fresh;
     }
-    probe_local_ip_address()
+
+    let cached = CACHE.lock().ok().and_then(|cached| cached.clone());
+    let Some((probed_at, address)) = cached else {
+        let fresh = probe_local_ip_address();
+        store(&fresh);
+        return fresh;
+    };
+    if probed_at.elapsed() >= LOCAL_IP_CACHE_TTL && !REFRESHING.swap(true, Ordering::Relaxed) {
+        thread::spawn(|| {
+            store(&probe_local_ip_address());
+            REFRESHING.store(false, Ordering::Relaxed);
+        });
+    }
+    address
 }
 
 fn probe_local_ip_address() -> Option<String> {
@@ -6654,8 +6671,12 @@ fn run_clipboard_sync(
             continue;
         };
 
-        if last_poll.elapsed() < Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS) {
-            thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
+        // One sleep for the rest of the interval: waking every 25 ms took the
+        // layout lock and cloned the target 40 times a second to learn that.
+        let wait = Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS)
+            .saturating_sub(last_poll.elapsed());
+        if !wait.is_zero() {
+            thread::sleep(wait);
             continue;
         }
         last_poll = Instant::now();
