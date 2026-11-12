@@ -4203,7 +4203,12 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     }
 
     let handled = match message {
-        WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
+        WM_MOUSEMOVE => handle_windows_mouse_move(
+            &context,
+            event.pt.x as f64,
+            event.pt.y as f64,
+            event.flags & windows_sys::Win32::UI::WindowsAndMessaging::LLMHF_INJECTED != 0,
+        ),
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
         | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
             // For the X (side) buttons the pressed button rides the high word of
@@ -4564,7 +4569,7 @@ fn windows_input_desktop_name() -> Result<String, u32> {
 }
 
 #[cfg(target_os = "windows")]
-fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) -> bool {
+fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64, injected: bool) -> bool {
     let mut active = match context.active.lock() {
         Ok(active) => active,
         Err(_) => return false,
@@ -4574,6 +4579,15 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         release_windows_remote_control(context, false);
         log::warn!("cleared a stale remote target after local control resumed");
         return false;
+    }
+    if injected && active.is_some() {
+        let anchor = context.anchor.lock().ok().and_then(|anchor| *anchor);
+        if anchor.is_some_and(|anchor| injected_move_reclaims_local(anchor, x, y)) {
+            drop(active);
+            release_windows_remote_control(context, false);
+            log::info!("returning to local: remote-control software moved this machine's cursor");
+            return false;
+        }
     }
     if active.is_none() && (context.local_capture_hold.load(Ordering::Relaxed) || crate::input_guard::screenshot_is_active(&context.input_guard)) {
         if let Ok(mut last_point) = context.last_point.lock() { *last_point = Some((x, y)); }
@@ -4806,7 +4820,17 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         Ok(targets) => Arc::clone(&targets),
         Err(_) => return false,
     };
-    if let Some(active_target) = crossing_target(&targets, x, y, dx, dy) {
+    let local_screens = local_device(&context.native_layout).map_or(&[][..], |device| &device.screens);
+    if let Some(active_target) = crossing_target(&targets, local_screens, x, y, dx, dy) {
+        // RDP input is not flagged as injected, so the session is asked too.
+        let rdp = unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+            GetSystemMetrics(SM_REMOTESESSION) != 0
+        };
+        if injected || rdp {
+            note_injected_crossing_refused(if rdp { "a Remote Desktop session" } else { "another program (remote-control software)" });
+            return false;
+        }
         let edge_anchor = local_anchor_point(&active_target);
 
         // A left-button file drag reaching the edge: do NOT cross yet. Crossing
@@ -5218,6 +5242,8 @@ fn handle_macos_event(
             dx,
             dy,
             matches!(event_type, CGEventType::LeftMouseDragged),
+            // Hardware events carry no poster; remote-desktop tools post theirs.
+            event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID),
         );
     }
 
@@ -5409,10 +5435,19 @@ fn handle_macos_mouse_move(
     dx: f64,
     dy: f64,
     left_drag: bool,
+    poster_pid: i64,
 ) -> core_graphics::event::CallbackResult {
     use core_graphics::{event::CallbackResult, geometry::CGPoint};
 
     let location = event.location();
+    if poster_pid != 0 && context.remote_active.load(Ordering::Relaxed) {
+        let anchor = context.anchor.lock().ok().and_then(|anchor| *anchor);
+        if anchor.is_some_and(|anchor| injected_move_reclaims_local(anchor, location.x, location.y)) {
+            return_to_local_macos(context);
+            log::info!("returning to local: process {poster_pid} moved this machine's cursor");
+            return CallbackResult::Keep;
+        }
+    }
     if let Ok(mut active) = context.active.lock() {
         if let Some(active_target) = active.as_mut() {
             // First mouse event since crossing: it moved the still-attached
@@ -5560,7 +5595,12 @@ fn handle_macos_mouse_move(
     if crossing_return_cooldown_active(last_return, Instant::now()) {
         return CallbackResult::Keep;
     }
-    if let Some(active_target) = crossing_target(&targets, location.x, location.y, dx, dy) {
+    let local_screens = local_device(&context.native_layout).map_or(&[][..], |device| &device.screens);
+    if let Some(active_target) = crossing_target(&targets, local_screens, location.x, location.y, dx, dy) {
+        if poster_pid != 0 {
+            note_injected_crossing_refused(&format!("process {poster_pid}"));
+            return CallbackResult::Keep;
+        }
         let transition_started = Instant::now();
         let anchor = local_anchor_point(&active_target);
         // Keep local cursor state intact while a new connection is warming.
@@ -6263,8 +6303,65 @@ fn crossing_return_cooldown_active(last_return: Option<Instant>, now: Instant) -
     })
 }
 
+/// Farthest a software-injected move may land from the pinned local cursor and
+/// still pass as noise: a jiggler nudges by a few pixels, a remote-desktop tool
+/// places the cursor anywhere on this screen.
+const INJECTED_TAKEOVER_DISTANCE: f64 = 48.0;
+
+/// While the pointer is on another machine the local cursor is pinned to
+/// `anchor`. A software-injected move landing well away from it is someone
+/// steering THIS machine through remote-desktop software; they see only this
+/// screen, so control comes back here.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn injected_move_reclaims_local(anchor: (f64, f64), x: f64, y: f64) -> bool {
+    (x - anchor.0).abs().max((y - anchor.1).abs()) > INJECTED_TAKEOVER_DISTANCE
+}
+
+/// Injected movement never starts a crossing (the remote operator would lose
+/// the pointer onto a screen they cannot see). Logged at most once every 10s so
+/// "the edge stopped working" can be traced to the software doing the injecting.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn note_injected_crossing_refused(source: &str) {
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let now = crate::now_ms();
+    if now.saturating_sub(LAST_MS.load(Ordering::Relaxed)) < 10_000 {
+        return;
+    }
+    LAST_MS.store(now, Ordering::Relaxed);
+    log::info!("edge crossing ignored: the mouse movement came from {source}, not a physical mouse");
+}
+
+/// Issue #50: the edge test is open-ended past the edge, so a cursor roaming a
+/// second local display that lies beyond it (in native coordinates) looked
+/// like a crossing. Only a move that starts on the target's own screen counts.
+/// A point on no display at all is the unclamped overshoot of a push against
+/// an outer edge and stays valid.
+fn left_from_other_local_screen(
+    target: &InputTarget,
+    native_local_screens: &[Screen],
+    x: f64,
+    y: f64,
+) -> bool {
+    !point_in_screen(&target.local_screen, x, y)
+        && native_local_screens
+            .iter()
+            .any(|screen| point_in_screen(&platform_native_screen(screen), x, y))
+}
+
+/// How far along the shared edge a crossing point lies from the remote
+/// screen's own span: zero where the two screens actually face each other.
+fn distance_from_remote_span(target: &InputTarget, (x, y): (f64, f64)) -> f64 {
+    let remote = &target.remote_screen;
+    let (at, start, length) = match target.edge {
+        Edge::Left | Edge::Right => (y, remote.y, remote.height),
+        Edge::Top | Edge::Bottom => (x, remote.x, remote.width),
+    };
+    (start as f64 - at).max(at - (start + length) as f64).max(0.0)
+}
+
 fn crossing_target(
     targets: &[InputTarget],
+    native_local_screens: &[Screen],
     x: f64,
     y: f64,
     dx: f64,
@@ -6272,12 +6369,23 @@ fn crossing_target(
 ) -> Option<ActiveTarget> {
     targets
         .iter()
-        .find_map(|target| {
+        .filter_map(|target| {
             // No per-move online re-check here: build_input_targets only
             // emits online + input-ready devices and the target cache
             // refreshes within INPUT_TARGETS_TTL, so the check only re-took
             // the layout lock per target per event to learn the same answer.
-            crossing_layout_point(target, x, y, dx, dy).map(|point| (target, point))
+            crossing_layout_point(target, x, y, dx, dy)
+                .filter(|_| {
+                    !left_from_other_local_screen(target, native_local_screens, x - dx, y - dy)
+                })
+                .map(|point| (target, point))
+        })
+        // Several screens can hang off one local edge (two clients stacked on
+        // the right). Enter the one facing the cursor; the first listed used
+        // to win everywhere, leaving the others unreachable. Ties keep order.
+        .min_by(|(a, a_point), (b, b_point)| {
+            distance_from_remote_span(a, *a_point)
+                .total_cmp(&distance_from_remote_span(b, *b_point))
         })
         .map(|(target, (mapped_x, mapped_y))| {
             let entry_dx = dx * target.layout_local_screen.width.max(1) as f64
@@ -9286,7 +9394,7 @@ mod tests {
     fn local_control_never_forwards_clicks_or_keys_to_a_stale_remote_target() {
         let layout = layout_for_target_tests();
         let targets = build_input_targets(&layout, &layout);
-        let active = Mutex::new(crossing_target(&targets, 1919.0, 540.0, 3.0, 0.0));
+        let active = Mutex::new(crossing_target(&targets, &[], 1919.0, 540.0, 3.0, 0.0));
         let remote = AtomicBool::new(true);
         assert!(remote_target_for_input(&active, &remote).is_some());
         remote.store(false, Ordering::Relaxed);
@@ -9347,7 +9455,7 @@ mod tests {
     fn game_recentering_at_windows_anchor_does_not_return_to_local() {
         let layout = layout_for_target_tests();
         let targets = build_input_targets(&layout, &layout);
-        let mut active = crossing_target(&targets, 1919.0, 540.0, 3.0, 0.0).unwrap();
+        let mut active = crossing_target(&targets, &[], 1919.0, 540.0, 3.0, 0.0).unwrap();
         let anchor = windows_remote_anchor_point(&active);
         assert_eq!(anchor, (960.0, 540.0));
 
@@ -9368,7 +9476,7 @@ mod tests {
     fn windows_client_edge_keeps_control_through_idle_jitter_but_allows_a_real_return() {
         let layout = layout_for_target_tests();
         let targets = build_input_targets(&layout, &layout);
-        let mut active = crossing_target(&targets, 1919.0, 540.0, 3.0, 0.0).unwrap();
+        let mut active = crossing_target(&targets, &[], 1919.0, 540.0, 3.0, 0.0).unwrap();
         active.x = 0.0; // Reproduce the entry-edge position in the captured log.
         let layout = Arc::new(Mutex::new(layout));
         let now = Instant::now();
@@ -9723,12 +9831,12 @@ mod tests {
 
     #[test]
     fn bottom_push_never_crosses_top_neighbour() {
-        assert!(crossing_target(&[top_neighbour_target()], 800.0, 1049.0, 0.0, 3.0).is_none());
+        assert!(crossing_target(&[top_neighbour_target()], &[], 800.0, 1049.0, 0.0, 3.0).is_none());
     }
 
     #[test]
     fn top_push_crosses_top_neighbour() {
-        let active = crossing_target(&[top_neighbour_target()], 800.0, 0.0, 0.0, -3.0)
+        let active = crossing_target(&[top_neighbour_target()], &[], 800.0, 0.0, 0.0, -3.0)
             .expect("an upward push at the top edge crosses");
         assert_eq!(active.target.edge, Edge::Top);
     }
@@ -9736,7 +9844,64 @@ mod tests {
     #[test]
     fn targetless_stacked_display_stays_local() {
         // Bottom of the 1080x1920 portrait display at x=1680.., pushed down.
-        assert!(crossing_target(&[top_neighbour_target()], 2000.0, 1919.0, 0.0, 3.0).is_none());
+        assert!(crossing_target(&[top_neighbour_target()], &[], 2000.0, 1919.0, 0.0, 3.0).is_none());
+    }
+
+    #[test]
+    fn stacked_remotes_on_one_edge_are_entered_where_they_face_the_cursor() {
+        let mut upper = target_for_coordinate_tests();
+        upper.local_screen = screen("local-device", "local-display-1", 0, 0, 2560, 2160);
+        upper.layout_local_screen = upper.local_screen.clone();
+        upper.remote_screen = screen("upper", "upper-display-1", 2560, 0, 1920, 1080);
+        upper.edge = Edge::Right;
+        let mut lower = upper.clone();
+        lower.device_id = "lower".into();
+        lower.remote_screen = screen("lower", "lower-display-1", 2560, 1080, 1920, 1080);
+        let targets = [upper, lower];
+
+        let entered = |y: f64| {
+            crossing_target(&targets, &[], 2559.0, y, 3.0, 0.0)
+                .expect("the right edge crosses")
+                .target
+                .device_id
+        };
+        assert_eq!(entered(500.0), "peer-device");
+        assert_eq!(entered(1300.0), "lower");
+    }
+
+    #[test]
+    fn only_a_far_injected_move_takes_the_pointer_back_from_the_remote() {
+        let anchor = (960.0, 540.0);
+        // A jiggler's nudge around the pinned cursor keeps the remote session.
+        assert!(!injected_move_reclaims_local(anchor, 965.0, 536.0));
+        // A remote-desktop tool placing the cursor by absolute position ends it.
+        assert!(injected_move_reclaims_local(anchor, 300.0, 540.0));
+        assert!(injected_move_reclaims_local(anchor, 960.0, 700.0));
+    }
+
+    /// Issue #50: the remote hangs under DISPLAY1, and a second local display
+    /// sits below DISPLAY1 in native coordinates.
+    #[test]
+    fn roaming_a_local_display_beyond_the_edge_never_crosses() {
+        let mut target = target_for_coordinate_tests();
+        target.local_screen = screen("local-device", "local-display-1", 0, 0, 2560, 1440);
+        target.layout_local_screen = screen("local-device", "local-display-1", 0, 0, 2048, 1152);
+        target.remote_screen =
+            screen("peer-device", "peer-device-local-display-1", 536, 1152, 1512, 982);
+        target.edge = Edge::Bottom;
+        let below = screen("local-device", "local-display-3", -1280, 1440, 2560, 1600);
+        let locals = [target.local_screen.clone(), below];
+        let targets = [target];
+
+        // Drifting down-right in the middle of the lower display: the edge
+        // test alone matches, knowing the local displays rejects it.
+        assert!(crossing_target(&targets, &[], 500.0, 2000.0, 2.0, 1.0).is_some());
+        assert!(crossing_target(&targets, &locals, 500.0, 2000.0, 2.0, 1.0).is_none());
+        // Leaving DISPLAY1 through its bottom edge still crosses...
+        assert!(crossing_target(&targets, &locals, 1500.0, 1441.0, 0.0, 3.0).is_some());
+        // ...also when the previous point already overshot an outer edge
+        // (Windows hook points are not clamped to the desktop).
+        assert!(crossing_target(&targets, &locals, 1500.0, 1445.0, 0.0, 3.0).is_some());
     }
 
     fn target_for_coordinate_tests() -> InputTarget {
@@ -10278,7 +10443,7 @@ mod tests {
     fn remote_cursor_memory_separates_devices_and_screens_and_clamps_a_resized_screen() {
         let points = Mutex::new(HashMap::new());
         let target = target_for_coordinate_tests();
-        let mut active = crossing_target(&[target.clone()], 1919.0, 500.0, 40.0, 0.0).unwrap();
+        let mut active = crossing_target(&[target.clone()], &[], 1919.0, 500.0, 40.0, 0.0).unwrap();
         active.x = 2000.0;
         active.y = 1200.0;
         remember_remote_screen_point(&points, &active);
@@ -10399,7 +10564,7 @@ mod tests {
 
     #[test]
     fn hotkey_return_uses_recorded_point_then_local_screen_center() {
-        let mut active = crossing_target(&[target_for_coordinate_tests()], 1919.0, 500.0, 40.0, 0.0)
+        let mut active = crossing_target(&[target_for_coordinate_tests()], &[], 1919.0, 500.0, 40.0, 0.0)
         .expect("target should be active");
         assert_eq!(local_hotkey_return_point(&active), (1919.0, 500.0));
         active.return_point = Some((321.0, 654.0));
@@ -11487,7 +11652,7 @@ mod tests {
     fn fast_crossing_carries_entry_delta_into_remote() {
         let target = target_for_coordinate_tests();
         let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
-        let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0)
+        let active = crossing_target(&[target], &[], 1919.0, 500.0, 40.0, 0.0)
             .expect("fast edge movement should cross");
 
         assert!(

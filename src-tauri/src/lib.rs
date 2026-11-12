@@ -91,7 +91,6 @@ const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 // we never echo received content straight back.
 const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
-const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 // A peer that stays down doubles the wait each time, up to a minute.
 const CLIPBOARD_RETRY_MAX_MS: u64 = 60_000;
@@ -1635,6 +1634,9 @@ fn merge_disk_layout_into_runtime(mut disk: LayoutState, current: &LayoutState) 
     }
 
     merge_local_runtime_device_fields(&mut disk, current);
+    // The window's 2 s poll reloads the disk layout, which never holds the
+    // grace timer: without this the badge died as soon as the client dropped.
+    merge_remote_upgrading_fields(&mut disk, current);
     disk
 }
 
@@ -2454,7 +2456,9 @@ fn send_secure_attention(
     Ok(())
 }
 
-#[tauri::command]
+// async: a synchronous command runs on the main thread, where a whole
+// transfer froze the window and kept `cancel_file_transfer` from running.
+#[tauri::command(async)]
 fn send_files_to_device(
     device_id: String,
     paths: Vec<String>,
@@ -3470,11 +3474,15 @@ fn setup_macos_cursor_hider(app: &tauri::App) {
     // synchronous calls — the "cursor hides a second late, sometimes instantly"
     // stutter. Leaving only the DOM mirror keeps that path free of cursor work.
     let remote_active = app.state::<AppRuntime>().remote_input_active.clone();
+    let window_visible = app.state::<AppRuntime>().main_window_visible.clone();
     let app_handle = app.handle().clone();
     thread::spawn(move || {
         let mut was_active = false;
         loop {
-            thread::sleep(Duration::from_millis(8));
+            // The app lives in the tray: hidden, there is no DOM to mirror to,
+            // so do not wake 125 times a second for the life of the process.
+            let visible = window_visible.load(Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(if visible { 8 } else { 250 }));
             let active = remote_active.load(Ordering::Relaxed);
             if active == was_active {
                 continue;
@@ -5770,8 +5778,10 @@ fn is_old_demo_layout(layout: &LayoutState) -> bool {
 }
 
 fn is_old_demo_device(device: &Device) -> bool {
+    // Ids only. This used to match two demo host IPs as well, which threw
+    // away the whole saved config of anyone whose client got 192.168.31.24 or
+    // .63 (the default Xiaomi router subnet).
     matches!(device.id.as_str(), "studio-win" | "macbook-pro")
-        || matches!(device.host.as_str(), "192.168.31.24" | "192.168.31.63")
 }
 
 fn same_monitor(a: &Monitor, b: &Monitor) -> bool {
@@ -5868,20 +5878,34 @@ fn local_ip_address() -> Option<String> {
     // origin resolution) and the discovery loop; the UDP-socket probe is four
     // syscalls. The LAN address changes on network reconfigs, not per event —
     // cache it briefly.
+    //
+    // Only the very first call probes inline. Later ones answer from the cache
+    // and refresh it on a worker: the probe enumerates network adapters, and
+    // callers hold the layout lock or sit on the Windows mouse-hook thread,
+    // where it stalled every pointer event on the system once per TTL.
     const LOCAL_IP_CACHE_TTL: Duration = Duration::from_secs(5);
     static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+    static REFRESHING: AtomicBool = AtomicBool::new(false);
 
-    if let Ok(mut cached) = CACHE.lock() {
-        if let Some((probed_at, address)) = cached.as_ref() {
-            if probed_at.elapsed() < LOCAL_IP_CACHE_TTL {
-                return address.clone();
-            }
+    fn store(address: &Option<String>) {
+        if let Ok(mut cached) = CACHE.lock() {
+            *cached = Some((Instant::now(), address.clone()));
         }
-        let fresh = probe_local_ip_address();
-        *cached = Some((Instant::now(), fresh.clone()));
-        return fresh;
     }
-    probe_local_ip_address()
+
+    let cached = CACHE.lock().ok().and_then(|cached| cached.clone());
+    let Some((probed_at, address)) = cached else {
+        let fresh = probe_local_ip_address();
+        store(&fresh);
+        return fresh;
+    };
+    if probed_at.elapsed() >= LOCAL_IP_CACHE_TTL && !REFRESHING.swap(true, Ordering::Relaxed) {
+        thread::spawn(|| {
+            store(&probe_local_ip_address());
+            REFRESHING.store(false, Ordering::Relaxed);
+        });
+    }
+    address
 }
 
 fn probe_local_ip_address() -> Option<String> {
@@ -6647,8 +6671,12 @@ fn run_clipboard_sync(
             continue;
         };
 
-        if last_poll.elapsed() < Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS) {
-            thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
+        // One sleep for the rest of the interval: waking every 25 ms took the
+        // layout lock and cloned the target 40 times a second to learn that.
+        let wait = Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS)
+            .saturating_sub(last_poll.elapsed());
+        if !wait.is_zero() {
+            thread::sleep(wait);
             continue;
         }
         last_poll = Instant::now();
@@ -8785,9 +8813,12 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
             continue;
         }
 
+        // Newest wins: a peer id embeds its IP, so after an address change the
+        // old entry lingers until it ages out, and it sorts first.
         let peer = peers
             .iter()
-            .find(|peer| device_matches_peer(device, peer, &cluster_id));
+            .filter(|peer| device_matches_peer(device, peer, &cluster_id))
+            .max_by_key(|peer| peer.last_seen_ms);
         if let Some(peer) = peer {
             update_device_from_peer(device, peer);
         } else {
@@ -8812,7 +8843,8 @@ fn refresh_paired_controller_addresses(layout: &mut LayoutState, peers: &[LanPee
     for controller in &mut layout.paired_controllers {
         let Some(peer) = peers
             .iter()
-            .find(|peer| paired_controller_identity_matches_peer(controller, peer))
+            .filter(|peer| paired_controller_identity_matches_peer(controller, peer))
+            .max_by_key(|peer| peer.last_seen_ms)
         else {
             continue;
         };
@@ -8942,6 +8974,21 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
         .map(|screen| screen.y)
         .min()
         .unwrap_or_default();
+    // A screen the user has not placed yet (a monitor plugged in on the peer)
+    // keeps its offset from one that is placed. Anchoring it at the canvas
+    // origin dropped it onto other devices, where roaming could trap the cursor.
+    let (offset_x, offset_y) = peer
+        .screens
+        .iter()
+        .enumerate()
+        .find_map(|(index, peer_screen)| {
+            let id = unique_peer_screen_id(device_id, peer_screen, index);
+            existing_screens
+                .iter()
+                .find(|screen| screen.id == id)
+                .map(|screen| (screen.x - peer_screen.x, screen.y - peer_screen.y))
+        })
+        .unwrap_or((-peer_min_x, -peer_min_y));
     peer.screens
         .iter()
         .enumerate()
@@ -8959,10 +9006,10 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
                 },
                 x: existing_screen
                     .map(|screen| screen.x)
-                    .unwrap_or(peer_screen.x - peer_min_x),
+                    .unwrap_or(peer_screen.x + offset_x),
                 y: existing_screen
                     .map(|screen| screen.y)
-                    .unwrap_or(peer_screen.y - peer_min_y),
+                    .unwrap_or(peer_screen.y + offset_y),
                 width: peer_screen.width,
                 height: peer_screen.height,
                 scale: peer_screen.scale,
@@ -9469,6 +9516,17 @@ fn peer_from_discovery_packet(
     {
         peer.input_ready = false;
     }
+    // Announces are unauthenticated and this geometry ends up as `clamp`
+    // bounds inside the mouse hook, where a panic aborts the process.
+    peer.screens.retain(|screen| {
+        (1..=65_535).contains(&screen.width)
+            && (1..=65_535).contains(&screen.height)
+            && screen.x.abs() <= 1_000_000
+            && screen.y.abs() <= 1_000_000
+    });
+    for screen in &mut peer.screens {
+        screen.scale = safe_scale(screen.scale);
+    }
     peer.last_seen_ms = now_ms();
     Some(IncomingDiscovery {
         kind: packet.kind,
@@ -9756,12 +9814,11 @@ fn begin_pairing_challenge(
         if let Some(existing) = challenge.as_mut() {
             if existing.expires_at > now {
                 if existing.requester_id == requester.id {
-                    if existing.attempts > 0 {
-                        existing.code = random_pairing_code();
-                        existing.expires_at = expires_at;
-                        existing.expires_at_ms = expires_at_ms;
-                        existing.attempts = 0;
-                    }
+                    // Keep the code and the failed-attempt count. The server
+                    // sends a pair-request ahead of every pair-confirm, so
+                    // rotating here after a wrong guess replaced the code just
+                    // before each retry was checked: one typo made every
+                    // later attempt fail, and it handed out fresh guesses.
                     existing.requester_ip = requester_ip;
                     existing.requester_host = requester.host.clone();
                     existing.requester_public_key = requester.transport_public_key.clone();
@@ -10804,7 +10861,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_challenge_refreshes_code_after_failed_attempt() {
+    fn repeat_pairing_request_keeps_code_and_failed_attempts() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
         layout.paired_controllers.clear();
@@ -10837,8 +10894,9 @@ mod tests {
 
         let stored = challenge.lock().expect("challenge lock");
         let stored = stored.as_ref().expect("challenge");
-        assert_eq!(stored.attempts, 0);
-        assert_ne!(stored.expires_at_ms, 42);
+        assert_eq!(stored.code, "000000");
+        assert_eq!(stored.attempts, 1);
+        assert_eq!(stored.expires_at_ms, 42);
     }
 
     #[test]
@@ -10955,6 +11013,20 @@ mod tests {
         assert_eq!(merged.cluster_id, "runtime-cluster");
         assert_eq!(merged.pair_secret, "runtime-secret");
         assert_eq!(merged.paired_controllers, current.paired_controllers);
+    }
+
+    #[test]
+    fn disk_refresh_keeps_the_remote_upgrade_grace() {
+        let mut current = test_layout();
+        current.devices[1].upgrading = true;
+        current.devices[1].upgrading_until_ms = 42;
+        let mut disk = current.clone();
+        // What a reload yields: the grace timer is never serialized.
+        disk.devices[1].upgrading_until_ms = 0;
+
+        let merged = merge_disk_layout_into_runtime(disk, &current);
+
+        assert_eq!(merged.devices[1].upgrading_until_ms, 42);
     }
 
     #[test]
