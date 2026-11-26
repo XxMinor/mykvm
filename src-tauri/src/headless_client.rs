@@ -117,7 +117,7 @@ pub fn start(config_path: PathBuf) -> Result<Option<HeadlessClientHandle>, Strin
         .name("mykvm-headless-discovery".into())
         .spawn(move || {
             let mut buffer = [0_u8; 4096];
-            let mut last_announce = Instant::now() - Duration::from_secs(10);
+            let mut last_announce = crate::instant_ago(Duration::from_secs(10));
 
             while !thread_stop.load(Ordering::Relaxed) {
                 if last_announce.elapsed() >= Duration::from_secs(3) {

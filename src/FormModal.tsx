@@ -1,7 +1,8 @@
 import { useEffect, useId, useRef, type ReactNode } from 'react'
 
-export function FormModal({ title, description, pending = false, onClose, children }: {
+export function FormModal({ title, description, closeLabel, pending = false, onClose, children }: {
   title: string
+  closeLabel: string
   description?: string
   pending?: boolean
   onClose: () => void
@@ -20,7 +21,7 @@ export function FormModal({ title, description, pending = false, onClose, childr
     onCancel={event => { event.preventDefault(); if (!pending) onClose() }}>
     <div className="form-modal-heading">
       <div><h2 id={titleId}>{title}</h2>{description ? <p id={descriptionId}>{description}</p> : null}</div>
-      <button type="button" className="form-modal-close" aria-label="Close" disabled={pending} onClick={onClose}>×</button>
+      <button type="button" className="form-modal-close" aria-label={closeLabel} disabled={pending} onClick={onClose}>×</button>
     </div>
     {children}
   </dialog>

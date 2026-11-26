@@ -10,6 +10,12 @@ release will reuse them).
 
 ### Added
 
+- Japanese and Korean: the window, the tray menu and its tooltip can be shown in either, alongside Chinese and English (Settings → Language).
+- A transfer shows in a corner of the screen while the MyKVM window is closed to the tray, minimized or behind other windows, top right on a Mac and bottom right on Windows: the file, how far along it is, how fast it is going and how long it has left, and the other computer's name, with a Cancel button. Transfers running at once each have a card of their own, up to three. A Mac fetching a large copy can cancel it there too. It used to show only inside the window.
+- macOS: a file dragged over from Windows shows in the folder it was dropped on while it arrives, as a `.part` file with Finder's progress bar on its icon, replaced by the file itself once all of it is there.
+- Files cross the network about a third smaller. A file's bytes went out in a form that took half as much again as the file itself; a 2 GB copy was 2.9 GB of traffic. Computers on older versions read the new form.
+- A pinch on a Mac's trackpad zooms on the Windows computer it is controlling, as a pinch on a Windows touchpad does. Trackpad gestures used to be dropped while another computer was being controlled.
+- Peer control is on by default for a new controller. A controller already set up keeps the choice it had.
 - App Updates offers Stable and Beta (bate) channels. The selected channel is saved and also applies to remote client update requests.
 - Per-device reverse scrolling: Devices → Device settings → Reverse scroll direction changes both scroll axes for that remote device, independently of macOS natural scrolling or MOS (discussion #29).
 - Device settings use a modal form. Pointer and scroll speeds are saved together; pairing and removal actions are grouped inside the form.
@@ -25,9 +31,43 @@ release will reuse them).
 - Per-device pointer and scroll speed: on the controller, each added device in Devices has its own pointer (0.5×–2×) and scroll (0.5×–3×) speed.
 - Lock sync (Settings, off by default): locking the controller locks its online clients too. Only locking is synced; each computer unlocks with its own password.
 - Windows clients offer the unattended-control service once when it is not installed; it is what keeps a client controllable before sign-in and while MyKVM restarts for an update.
+- Peer control (Settings on the controller, off by default): every paired computer's keyboard and mouse can cross the screen edges to control the others, the controller included. The controller shares its screen arrangement with its clients, so screens are still arranged in one place; with three or more computers the pointer goes from one straight onto the next. Whoever last used a keyboard or mouse is in control, and a computer that was controlling another hands over as soon as someone starts using it from elsewhere. Screen-switch hotkeys stay on the controller. Requires every computer on this version or newer.
+- Smooth scrolling: a trackpad or a free-spinning wheel scrolls the other computer as it moves instead of one notch at a time. A computer on an older version still scrolls by the notch.
+- A modifier held while the pointer crosses a screen edge stays held on the other side, so Shift+click and Ctrl+scroll work across the edge. (Alt and the Windows key are not carried onto a Windows computer, where letting go of them alone would open a menu.)
+- Copied files no longer pass through the transfers folder on the computer they are copied to (Windows and macOS). Up to 256 MB they are fetched at once and put on its clipboard the way its own file manager copies files, so they paste into folders, chat windows and upload boxes alike. A larger copy comes over when it is wanted: on Windows when pasted, in Explorer, which shows the progress; on a Mac by the paste itself, typed on the computer that controls it, or on the Mac's own keyboard when the Mac shares its keyboard and mouse too (peer control). The Edit menu, the right-click menu, and the Mac's own keyboard without peer control paste what the Mac held before. Pasted in Finder it goes straight into the folder, as a dropped file does, showing as a `.part` file with a progress bar until it is there; pasted in any other program, a pop-up shows it arriving and it is pasted there once it has, unless another program has come to the front meanwhile. A copy on its way into a folder goes on when something else is copied meanwhile. A computer on an older version receives copied files whole, as before.
+- A copy marked as secret by its source (password managers do this) stays out of clipboard history on the computer it is synced to: Windows clipboard history and cloud clipboard, and macOS clipboard managers that honour the marker.
+- Windows: MyKVM follows display changes while it is running (a monitor plugged in or removed, a new resolution or scaling), as it already did on macOS. A display seen for the first time is placed beside the ones already arranged.
 
 ### Fixed
 
+- macOS: a slider, drawing or other control dragged on a web page with the other computer's mouse lets go when the button is released outside it. It could keep following the pointer afterwards without the button held.
+- Windows: files can again be dragged from Explorer across the edge to the other computer. Since MyKVM started running as administrator (v0.9.13) Explorer could no longer hand it a drag, and every one ended at the edge.
+- macOS: files dragged over from Windows land in the folder they were dropped on however long they take to arrive. One that finished more than three seconds after the button was let go stayed in a hidden folder, and a drag of several files could show its icon at the pointer again after it had been dropped.
+- The tray menu no longer mixes English and Chinese; it follows the language chosen in Settings.
+- The pointer no longer freezes for up to two seconds as it crosses onto a computer that had not been controlled for a few seconds, when a single packet was lost on the way (a Wi-Fi link loses some).
+- Windows: MyKVM and its sign-in screen service no longer crash on a warning raised within the first minute after the computer starts.
+- Error messages show the actual reason ("file transfer is turned off", "that shortcut is already in use") instead of a general "failed to save" or "failed to update".
+- Pairing a device again keeps its pointer speed, scroll speed and scroll direction.
+- The keypad `=` key on a Mac keyboard types `=` on the other computer, not `-`.
+- A Windows computer receiving files dragged across the edge from another Windows computer puts them on its Desktop; they used to stay in a hidden folder under the transfers folder.
+- Windows: a copied folder is no longer sent as a picture when the clipboard also holds one.
+- The window no longer freezes while a device is being probed or paired, or a log or an update is requested from a computer that does not answer.
+- Stopping sharing, or changing a setting that restarts it, no longer leaves it marked as running with nothing running when the network part fails to start.
+- After an address change, files and log requests from a client go to its controller's new address, not the old one for another minute and a half.
+- Less background work: an empty clipboard is no longer read again every 150 ms (on macOS each read started a helper program), the status the window shows is asked for once every two seconds instead of twice, and a file dragged against a screen edge no longer writes a log line per mouse movement.
+- Copying the same files several times within two seconds (a held Cmd+C or Ctrl+C) sends them once.
+- Pressing the role that is already selected in Settings does nothing, instead of saving, switching tab and starting sharing again.
+- Copied images (screenshots) reach the other computer several times faster: they are compressed for the trip instead of sent as raw pixels.
+- Windows controller: less work per mouse movement while controlling another computer (the hidden pointer is no longer re-positioned on every movement of a fast mouse).
+- Copying formatted text (Excel cells, Word, a web page) no longer has the source clipboard replaced a moment later by the copy coming back from a Mac, which dropped the app's own formats.
+- A Mac you are controlling stays awake: remote keyboard and mouse input now wakes its display and holds off display sleep like local input does.
+- macOS controller: the Back and Forward mouse buttons reach the controlled machine instead of acting as a middle click.
+- Discovery reaches peers on networks that are not /24 (a /16 or /23 subnet, for example), and follows the network when it changes while MyKVM is running.
+- Fetching the other machine's log works after that machine's IP address changed.
+- Pairing: after five wrong codes the code is refused until it expires, instead of a new code being issued straight away.
+- Received files keep a leading dot (`.gitignore`) and keep their extension when a very long name is shortened; Windows device names such as `NUL` are prefixed with `_`.
+- macOS/Linux: the files holding the pairing secret and the transport key are readable only by your own user.
+- The log now records a crash, and once a minute while you control another machine it records the link's round trip and lost packets, so a stuttering pointer can be told apart from a bad network.
 - Remote-desktop sessions: when the controller is itself operated through remote-control software or RDP, the pointer stays on that machine instead of slipping onto a screen the remote operator cannot see. If the pointer was left on another machine, moving the remote mouse brings control back.
 - Layout: a screen you just dragged is no longer snapped back by the background refresh, and the arrow keys move the selected screen.
 - Settings: the port field applies on Enter or when you leave the field instead of on every keystroke.

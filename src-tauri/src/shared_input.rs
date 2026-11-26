@@ -18,8 +18,32 @@ pub const SERVICE_OWNER_SID_ARG: &str = "--owner-sid";
 pub enum InputEvent {
     MouseMove { screen_id: String, x: i32, y: i32 },
     MouseButton { button: MouseButton, down: bool },
-    Scroll { delta_x: i32, delta_y: i32 },
+    /// `delta_*` counts whole wheel notches (all an older receiver reads);
+    /// `fine_*` is the same motion in 1/120ths of a notch, so a touchpad or a
+    /// smooth wheel scrolls the far side as it moves instead of a notch at a time.
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        fine_x: i32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        fine_y: i32,
+    },
     Key { key_code: u16, down: bool },
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
+}
+
+/// One axis of a scroll in 1/120ths of a notch: the fine amount when the
+/// sender supplied one, else its whole notches.
+pub fn scroll_fine(delta: i32, fine: i32) -> i32 {
+    if fine != 0 {
+        fine
+    } else {
+        delta.saturating_mul(120)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +80,12 @@ pub enum InputCommand {
     Scroll {
         delta_x: i32,
         delta_y: i32,
+        // As on the wire. A helper older than this app ignores them and
+        // scrolls by whole notches.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        fine_x: i32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        fine_y: i32,
     },
     Key {
         key_code: u16,
@@ -142,5 +172,24 @@ mod tests {
             decode_input_command(&framed[4..]).expect("decode input command"),
             command
         );
+    }
+
+    #[test]
+    fn a_scroll_reads_the_same_with_or_without_its_fine_amount() {
+        // What a version without the fine fields sends and understands.
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        #[serde(tag = "type", rename_all = "camelCase")]
+        enum Old {
+            Scroll { delta_x: i32, delta_y: i32 },
+        }
+        let old = rmp_serde::to_vec_named(&Old::Scroll { delta_x: 0, delta_y: -2 }).unwrap();
+        let InputEvent::Scroll { delta_y, fine_y, .. } = rmp_serde::from_slice(&old).unwrap() else {
+            panic!("not a scroll");
+        };
+        assert_eq!(scroll_fine(delta_y, fine_y), -240);
+
+        let new = rmp_serde::to_vec_named(&InputEvent::Scroll { delta_x: 0, delta_y: 0, fine_x: 0, fine_y: 30 }).unwrap();
+        assert_eq!(rmp_serde::from_slice::<Old>(&new).unwrap(), Old::Scroll { delta_x: 0, delta_y: 0 });
+        assert_eq!(scroll_fine(0, 30), 30);
     }
 }

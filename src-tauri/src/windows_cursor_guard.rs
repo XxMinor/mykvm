@@ -7,7 +7,7 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorInfo, RegisterClassW, SetCursor,
         SetLayeredWindowAttributes, SetWindowPos, ShowWindow, CURSORINFO, HTCLIENT, HWND_TOPMOST,
-        LWA_ALPHA, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE,
+        LWA_ALPHA, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
         WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     },
@@ -74,16 +74,30 @@ impl Drop for CursorGuard {
     }
 }
 pub(crate) fn show_at(handle: usize, x: i32, y: i32) {
+    place(handle, x - 1, y - 1, 3, 3);
+}
+
+/// Stretch the guard over both points and `margin` pixels around them, so
+/// the cursor is hidden where it is and stays hidden where it is put next.
+/// Windows shows the cursor of whichever thread owns the window under it; a
+/// jump from one small guard to another crosses other programs' windows.
+pub(crate) fn cover(handle: usize, a: (i32, i32), b: (i32, i32), margin: i32) {
+    let (left, top) = (a.0.min(b.0) - margin, a.1.min(b.1) - margin);
+    let (right, bottom) = (a.0.max(b.0) + margin, a.1.max(b.1) + margin);
+    place(handle, left, top, right - left + 1, bottom - top + 1);
+}
+
+fn place(handle: usize, x: i32, y: i32, width: i32, height: i32) {
     if handle != 0 {
         unsafe {
             SetWindowPos(
                 handle as HWND,
                 HWND_TOPMOST,
-                x - 1,
-                y - 1,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
         }
     }
@@ -95,6 +109,17 @@ pub(crate) fn hide(handle: usize) {
         }
     }
 }
+/// Whether nothing is drawn for the cursor right now: it is switched off for
+/// the thread that owns it, or that thread has set no cursor image.
+pub(crate) fn cursor_hidden() -> bool {
+    let mut info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    let read = unsafe { GetCursorInfo(&mut info) } != 0;
+    read && (info.flags & 1 == 0 || info.hCursor.is_null())
+}
+
 pub(crate) fn visibility() -> Option<u32> {
     let mut info = CURSORINFO {
         cbSize: std::mem::size_of::<CURSORINFO>() as u32,

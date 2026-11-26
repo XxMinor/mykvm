@@ -8,6 +8,12 @@ test('preserves Tauri string rejections and JavaScript errors', () => {
   assert.equal(formatUnknownError(new Error(detail), 'Operation failed'), detail)
 })
 
+test('a Chinese backend message follows the localized summary in other languages', () => {
+  assert.equal(formatUnknownError('文件传输未开启。', 'Operation failed', false), 'Operation failed (文件传输未开启。)')
+  assert.equal(formatUnknownError('文件传输未开启。', '操作失败'), '文件传输未开启。')
+  assert.equal(formatUnknownError('Access denied', 'Operation failed', false), 'Access denied')
+})
+
 test('keeps structured backend errors readable', () => {
   assert.equal(
     formatUnknownError({ message: 'Access denied', code: 5 }, 'Operation failed'),

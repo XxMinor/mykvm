@@ -690,10 +690,13 @@ mod windows_helper {
                 );
             }
 
-            let release_result = windows_input::release_pressed_inputs_on_fresh_input_desktop(
-                &mut pressed_keys,
-                &mut button_mask,
-            );
+            // On the worker's own attachment: a second one made for this
+            // could not close its desktop while the thread was on it, and
+            // left a handle behind for every connection.
+            let release_result = desktop.attach_current_input_desktop().map(|name| {
+                windows_input::release_pressed_inputs(&mut pressed_keys, &mut button_mask);
+                name
+            });
             write_worker_desktop_status(
                 session_id,
                 release_result
@@ -715,9 +718,9 @@ mod windows_helper {
         pressed_keys: &mut Vec<u16>,
         button_mask: &mut u64,
     ) {
-        // Every command is injected on the worker's main thread against the
-        // cached DesktopAttachment. attach_current_input_desktop() caches by
-        // desktop name, so on a stable desktop this is cheap.
+        // Every command is injected on the worker's main thread, attached
+        // again to whatever the input desktop is now (see
+        // attach_current_input_desktop for why that is not cached by name).
         let desktop_result = desktop.attach_current_input_desktop();
         write_worker_desktop_status(
             session_id,

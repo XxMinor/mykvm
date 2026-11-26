@@ -29,8 +29,10 @@ mod rich_clipboard;
 mod clipboard_exchange;
 mod folder_transfer;
 mod transfer_jobs;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod drag_buffer;
+#[cfg(target_os = "macos")]
+mod macos_file_offer;
 #[cfg(target_os = "windows")]
 pub mod headless_client;
 mod input;
@@ -54,7 +56,7 @@ pub mod windows_drop_catcher;
 pub mod windows_input;
 #[cfg(any(target_os = "windows", test))]
 mod windows_keyboard_monitor;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod windows_mouse_motion;
 #[cfg(target_os = "windows")]
 mod windows_keyboard_capture;
@@ -103,6 +105,22 @@ const DRAG_TREE_PROTOCOL: &str = "mykvm.drag-tree.v1";
 const CLIPBOARD_FILES_PROTOCOL: &str = "mykvm.clipboard-files.v1";
 const CLIPBOARD_PULL_PROTOCOL: &str = "mykvm.clipboard-pull.v1";
 const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
+/// A list of copied files, sent in place of the files; the receiver asks for
+/// them (the pull) when something pastes.
+const CLIPBOARD_OFFER_PROTOCOL: &str = "mykvm.clipboard-offer.v1";
+const CLIPBOARD_OFFER_PULL_PROTOCOL: &str = "mykvm.clipboard-offer-pull.v1";
+/// The controller's screen arrangement, shared with its clients (peer control).
+const CLUSTER_LAYOUT_PROTOCOL: &str = "mykvm.cluster-layout.v1";
+/// A client that never got the arrangement (asleep, restarted) is sent it again.
+const CLUSTER_LAYOUT_REFRESH: Duration = Duration::from_secs(60);
+/// Every copy is offered to a peer that takes offers (Windows) in place of
+/// being sent whole. It fetches a small one at once and puts it on its
+/// clipboard as files, and a large one when it is pasted; neither passes
+/// through the transfers folder. Raise this to send small copies whole again.
+const CLIPBOARD_OFFER_MIN_BYTES: u64 = 0;
+/// A peer that refused an offer (a Mac, an older version) is not asked again
+/// for this long; its copies are sent whole.
+const CLIPBOARD_OFFER_REFUSAL_KEPT: Duration = Duration::from_secs(600);
 const LOG_REQUEST_PROTOCOL: &str = "mykvm.log-request.v1";
 // A paired controller asks a client to update itself (it runs its own updater,
 // so the update is still verified against this app's updater key).
@@ -297,6 +315,11 @@ struct LayoutState {
     /// Controller: locking this machine locks its online clients too.
     #[serde(default)]
     lock_sync: bool,
+    /// Any device of the cluster may drive any other: each one both captures
+    /// its own keyboard and mouse and takes input. Chosen on the controller,
+    /// which shares it with its clients along with the screen arrangement.
+    #[serde(default)]
+    peer_control: bool,
     #[serde(default)]
     input_protection: InputProtection,
     #[serde(default = "default_language")]
@@ -321,6 +344,18 @@ struct LayoutState {
     edge_switch_hotkey: String,
     #[serde(default)]
     screen_switch_hotkeys: ScreenSwitchHotkeys,
+}
+
+impl LayoutState {
+    /// Captures this machine's keyboard and mouse to drive other devices.
+    pub(crate) fn captures_input(&self) -> bool {
+        self.input_mode != "receive" || self.peer_control
+    }
+
+    /// Takes keyboard and mouse input from other devices.
+    pub(crate) fn accepts_input(&self) -> bool {
+        self.input_mode == "receive" || self.peer_control
+    }
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -384,6 +419,10 @@ struct LanPeer {
     screen_count: usize,
     #[serde(default)]
     input_ready: bool,
+    /// Takes input from every device of its cluster, not only its controller.
+    /// A version from before peer control never says so.
+    #[serde(default)]
+    peer_control: bool,
     #[serde(default)]
     upgrading: bool,
     #[serde(default)]
@@ -505,9 +544,7 @@ struct PairingChallenge {
     requester_id: String,
     requester_name: String,
     requester_ip: String,
-    requester_host: String,
     requester_public_key: String,
-    requester_protocol_version: u16,
     expires_at: Instant,
     expires_at_ms: u64,
     attempts: u8,
@@ -560,12 +597,13 @@ struct FileTransferSummary {
     byte_count: u64,
 }
 
-// One progress update for the sending-side toast. `file_index` is 1-based.
+// One progress update for the transfer toasts. `file_index` is 1-based.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FileTransferProgress {
     transfer_id: String,
     file_name: String,
+    /// The other machine: where the file goes, or where it comes from.
     target_name: String,
     sent_bytes: u64,
     total_bytes: u64,
@@ -573,6 +611,181 @@ struct FileTransferProgress {
     file_count: usize,
     done: bool,
     error: Option<String>,
+    /// Arriving here, not leaving.
+    incoming: bool,
+    /// Zero until measured: `report_transfer_progress` fills it in.
+    bytes_per_second: u64,
+}
+
+/// How fast a transfer runs, from its speed so far and what the last
+/// `seconds` moved. A report weighs as the time it covers, a whole second
+/// counting in full: two that come at once say nothing of the speed.
+fn transfer_speed(before: u64, moved: u64, seconds: f64) -> u64 {
+    let now = moved as f64 / seconds.max(1e-6);
+    match before {
+        0 if seconds < 0.05 => 0,
+        0 => now as u64,
+        before => {
+            let weight = seconds.min(1.0);
+            (before as f64 * (1.0 - weight) + now * weight) as u64
+        }
+    }
+}
+
+/// The pop-up in the corner of the screen that shows a transfer while the
+/// main window is not being looked at: closed to the tray it does not exist,
+/// and its own list of transfers went with it.
+const TRANSFER_TOAST_LABEL: &str = "transfer-toast";
+/// What it shows, a card each: the last update of every transfer under way
+/// or just over, and when it came.
+static TRANSFER_TOAST: Mutex<Vec<(FileTransferProgress, Instant)>> = Mutex::new(Vec::new());
+static TRANSFER_TOAST_OPEN: AtomicBool = AtomicBool::new(false);
+static MAIN_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
+/// As many cards as the pop-up has room for.
+const TRANSFER_TOAST_CARDS: usize = 3;
+
+/// Take away what is over and has been shown for a moment, and what has gone
+/// quiet (its sender gone without a word).
+fn drop_shown_transfers_over(shown: &mut Vec<(FileTransferProgress, Instant)>) {
+    const SHOWN_AFTER_DONE: Duration = Duration::from_secs(3);
+    const QUIET: Duration = Duration::from_secs(30);
+    shown.retain(|(progress, at)| at.elapsed() <= if progress.done { SHOWN_AFTER_DONE } else { QUIET });
+}
+
+/// Put `progress` among what the pop-up shows, with its speed filled in.
+fn note_shown_transfer(shown: &mut Vec<(FileTransferProgress, Instant)>, progress: &mut FileTransferProgress) {
+    drop_shown_transfers_over(shown);
+    let now = Instant::now();
+    if let Some((before, at)) = shown.iter_mut().find(|(before, _)| before.transfer_id == progress.transfer_id) {
+        progress.bytes_per_second = transfer_speed(
+            before.bytes_per_second,
+            progress.sent_bytes.saturating_sub(before.sent_bytes),
+            at.elapsed().as_secs_f64(),
+        );
+        (*before, *at) = (progress.clone(), now);
+        return;
+    }
+    // The next file of a copy takes the card of the one before it. Any other
+    // transfer has a card of its own: two at once took turns in the one card
+    // there was, and one that ended took the other's away with it.
+    let follows = shown.iter_mut().find(|(before, _)| {
+        before.done
+            && before.error.is_none()
+            && before.incoming == progress.incoming
+            && before.target_name == progress.target_name
+    });
+    match follows {
+        Some(before) => *before = (progress.clone(), now),
+        None => shown.push((progress.clone(), now)),
+    }
+}
+
+/// The cards of the pop-up, from the top down: where it hangs from the top
+/// of the screen the newest is lowest, where it stands on the bottom the
+/// newest is highest, so that none moves when another comes.
+#[tauri::command]
+fn shown_file_transfers() -> Vec<FileTransferProgress> {
+    let Ok(shown) = TRANSFER_TOAST.lock() else {
+        return Vec::new();
+    };
+    let newest = shown.len().saturating_sub(TRANSFER_TOAST_CARDS);
+    let mut cards: Vec<_> = shown[newest..].iter().map(|(progress, _)| progress.clone()).collect();
+    if !cfg!(target_os = "macos") {
+        cards.reverse();
+    }
+    cards
+}
+
+fn report_transfer_progress(app: &AppHandle, mut progress: FileTransferProgress) {
+    if let Ok(mut shown) = TRANSFER_TOAST.lock() {
+        note_shown_transfer(&mut shown, &mut progress);
+    }
+    let _ = app.emit(FILE_TRANSFER_PROGRESS_EVENT, &progress);
+    let watched = MAIN_WINDOW_FOCUSED.load(Ordering::Relaxed)
+        && app.try_state::<AppRuntime>().is_some_and(|state| state.main_window_visible.load(Ordering::Relaxed));
+    if !watched && !TRANSFER_TOAST_OPEN.swap(true, Ordering::Relaxed) {
+        let app = app.clone();
+        // Off this thread: it is sending a file, and a window is made on the
+        // main one.
+        thread::spawn(move || {
+            show_transfer_toast(&app);
+            TRANSFER_TOAST_OPEN.store(false, Ordering::Relaxed);
+        });
+    }
+}
+
+/// Open the pop-up and keep it, as tall as its cards, until the last transfer
+/// has been over for a moment or has gone quiet.
+fn show_transfer_toast(app: &AppHandle) {
+    // A card is 352 by 96, and the next 8 under it; around them the room
+    // their shadow takes: 8 above, 14 beside, 20 below
+    // (`.transfer-toast-window` in App.css).
+    const WIDTH: f64 = 380.0;
+    let height = |cards: usize| 20.0 + 104.0 * cards as f64;
+    // What that room leaves to add for the cards to stand 16 from the right
+    // of the screen, and 12 under the menu bar.
+    const INSET: (f64, f64) = (2.0, 4.0);
+    // On the main screen, where each system shows its own notices: top right
+    // under the menu bar on a Mac, bottom right above the taskbar elsewhere.
+    let place = |cards: usize| {
+        let monitor = app.primary_monitor().ok().flatten()?;
+        let scale = monitor.scale_factor();
+        let area = monitor.work_area();
+        let top = f64::from(area.position.y) / scale;
+        Some(tauri::LogicalPosition::new(
+            (f64::from(area.position.x) + f64::from(area.size.width)) / scale - WIDTH - INSET.0,
+            if cfg!(target_os = "macos") {
+                top + INSET.1
+            } else {
+                top + f64::from(area.size.height) / scale - height(cards)
+            },
+        ))
+    };
+    let mut cards = 1;
+    let mut builder = WebviewWindowBuilder::new(app, TRANSFER_TOAST_LABEL, WebviewUrl::App("index.html".into()))
+        .title("MyKVM")
+        .inner_size(WIDTH, height(cards))
+        .resizable(false)
+        .decorations(false)
+        // Nothing but the card shows: its corners are round and its shadow
+        // its own.
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .skip_taskbar(true)
+        // Never the window being typed in: it comes up while something else is used.
+        .focused(false)
+        .focusable(false)
+        .accept_first_mouse(true);
+    if let Some(at) = place(cards) {
+        builder = builder.position(at.x, at.y);
+    }
+    let window = match builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            log::warn!("the transfer pop-up could not be opened: {error}");
+            return;
+        }
+    };
+    loop {
+        thread::sleep(Duration::from_millis(250));
+        let showing = TRANSFER_TOAST.lock().map_or(0, |mut shown| {
+            drop_shown_transfers_over(&mut shown);
+            shown.len().min(TRANSFER_TOAST_CARDS)
+        });
+        if showing == 0 {
+            break;
+        }
+        if showing != cards {
+            cards = showing;
+            let _ = window.set_size(tauri::LogicalSize::new(WIDTH, height(cards)));
+            if let Some(at) = place(cards) {
+                let _ = window.set_position(at);
+            }
+        }
+    }
+    let _ = window.destroy();
 }
 
 // Carries what a per-file send needs to emit progress. Optional throughout the
@@ -593,8 +806,8 @@ impl FileTransferProgressReporter<'_> {
         done: bool,
         error: Option<String>,
     ) {
-        let _ = self.app.emit(
-            FILE_TRANSFER_PROGRESS_EVENT,
+        report_transfer_progress(
+            self.app,
             FileTransferProgress {
                 transfer_id: transfer_id.into(),
                 file_name: file.name.clone(),
@@ -605,9 +818,19 @@ impl FileTransferProgressReporter<'_> {
                 file_count: self.file_count,
                 done,
                 error,
+                incoming: false,
+                bytes_per_second: 0,
             },
         );
     }
+}
+
+/// A chunk's bytes as one block. Left to the derive they went out as a list of
+/// numbers, two bytes for every one of 128 and above: half as much again on
+/// the wire for a file that does not compress, and a 2 GB copy was 2.9 GB of
+/// traffic. Every version reads either form.
+fn serialize_as_bytes<S: serde::Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bytes(data)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,7 +847,7 @@ struct FileTransferPacket {
     total_bytes: u64,
     chunk_index: u64,
     offset: u64,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_as_bytes")]
     data: Vec<u8>,
     // Edge drag-drop: land the file on the receiver's Desktop instead of the
     // transfers folder. Named-field msgpack, so old peers just ignore it (and
@@ -663,7 +886,6 @@ struct AppRuntime {
     clipboard_last_sequences: Arc<Mutex<HashMap<String, u64>>>,
     remote_input_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
-    main_window_focused: Arc<AtomicBool>,
     allow_explicit_quit: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     input_receive_enabled: Arc<AtomicBool>,
@@ -675,7 +897,7 @@ struct AppRuntime {
     clipboard_packets: Arc<AtomicU64>,
     runtime_toggle_shortcut: Mutex<Option<String>>,
     clipboard_paste_shortcut: Mutex<Option<String>>,
-    runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
+    tray_menu: Mutex<Option<Menu<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
@@ -717,7 +939,6 @@ impl AppRuntime {
             clipboard_last_sequences: Arc::new(Mutex::new(HashMap::new())),
             remote_input_active: Arc::new(AtomicBool::new(false)),
             main_window_visible: Arc::new(AtomicBool::new(false)),
-            main_window_focused: Arc::new(AtomicBool::new(false)),
             allow_explicit_quit: Arc::new(AtomicBool::new(false)),
             clipboard_target: Arc::new(Mutex::new(None)),
             input_receive_enabled: Arc::new(AtomicBool::new(false)),
@@ -729,7 +950,7 @@ impl AppRuntime {
             clipboard_packets: Arc::new(AtomicU64::new(0)),
             runtime_toggle_shortcut: Mutex::new(None),
             clipboard_paste_shortcut: Mutex::new(None),
-            runtime_toggle_menu_item: Mutex::new(None),
+            tray_menu: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
             config_path,
@@ -746,11 +967,13 @@ impl AppRuntime {
     }
 
     fn refresh_layout_from_disk(&self) {
+        // The value behind a poisoned lock, not the empty fallback layout:
+        // normalize_saved_layout indexes its first device and would panic.
         let native_layout = self
             .native_layout
             .lock()
-            .map(|layout| layout.clone())
-            .unwrap_or_else(|_| detect_fallback_layout());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let Some(saved_layout) = load_layout_from_disk(&self.config_path) else {
             return;
         };
@@ -784,7 +1007,7 @@ impl AppRuntime {
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
-        if runtime.started && layout.machine_role == "server" {
+        if runtime.started && layout.captures_input() {
             let protection = input_guard::snapshot(&self.input_guard);
             if !protection.capture_available {
                 runtime.capture = NativeStageStatus { state: "error".into(), detail: "输入捕获未就绪，请检查系统权限或重新启动共享。".into() };
@@ -913,6 +1136,15 @@ impl AppRuntime {
             };
             let current_peer = local_peer_from_layout(&layout);
 
+            if let Some(accepted) =
+                handle_cluster_layout_packet(&payload, &layout, &app_handle_for_file_transfer)
+            {
+                if accepted {
+                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                }
+                return accepted;
+            }
+
             if handle_drag_control_packet(&payload, &layout, &current_peer.id) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -926,6 +1158,21 @@ impl AppRuntime {
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 return true;
+            }
+
+            if let Some(accepted) = handle_clipboard_offer_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &app_handle_for_file_transfer,
+                &clipboard_seen_text,
+                &clipboard_echo_until,
+            ) {
+                if accepted {
+                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                    clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                }
+                return accepted;
             }
 
             if let Some(accepted) = handle_clipboard_files_commit(
@@ -950,6 +1197,9 @@ impl AppRuntime {
             }
 
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
+                if decode_wire_packet::<ClipboardPacket>(&payload).is_some_and(|packet| packet.protocol == CLIPBOARD_PROTOCOL) {
+                    log::info!("a copy was refused: clipboard sharing is not running on this computer");
+                }
                 return false;
             }
             if handle_clipboard_packet(
@@ -1062,9 +1312,28 @@ impl AppRuntime {
         );
         sync_layout_peer_presence(&self.layout, &self.peers);
 
+        // A thread of its own: each send waits for the client's answer, which
+        // must not hold up announces or replies.
+        {
+            let (layout_state, transport, stop) =
+                (Arc::clone(&self.layout), quic_transport.clone(), Arc::clone(&stop));
+            thread::spawn(move || {
+                let mut sent = HashMap::new();
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_secs(1));
+                    let layout = match layout_state.lock() {
+                        Ok(layout) if layout.machine_role == "server" => layout.clone(),
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    };
+                    share_cluster_layout(&layout, &transport, &mut sent);
+                }
+            });
+        }
+
         thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
-            let mut last_announce = Instant::now() - Duration::from_secs(10);
+            let mut last_announce = instant_ago(Duration::from_secs(10));
             let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
             let mut last_upgrading = upgrading.load(Ordering::Relaxed);
 
@@ -1078,9 +1347,10 @@ impl AppRuntime {
                     let announcement = layout_state
                         .lock()
                         .map(|layout| {
-                            if !should_send_public_announce(&layout) {
-                                return None;
-                            }
+                            // A paired client announces too, so its server
+                            // sees it again within one cycle of a restart
+                            // without relying on the reply path alone. Only
+                            // public fields travel, never the pair secret.
                             let mut peer = local_peer_from_layout(&layout);
                             apply_transport_to_peer(&mut peer, &quic_transport);
                             peer.input_ready = advertised_input_ready(&layout, current_input_ready);
@@ -1091,7 +1361,9 @@ impl AppRuntime {
                         })
                         .unwrap_or_else(|_| Some((local_peer.clone(), Vec::new())));
                     if let Some((local_peer, direct_targets)) = announcement {
-                        for target in &broadcast_targets {
+                        // Recomputed each time: the subnet can change under a
+                        // running app (Wi-Fi roam, VPN, wake on another network).
+                        for target in &broadcast_addrs(desired_port) {
                             let _ = send_discovery_packet(
                                 &socket,
                                 "announce",
@@ -1292,7 +1564,7 @@ impl AppRuntime {
     fn start_input(&self, layout: LayoutState) -> (NativeStageStatus, NativeStageStatus) {
         sync_layout_peer_presence(&self.layout, &self.peers);
         self.input_receive_enabled.store(
-            layout.input_mode == "receive" && input::NATIVE_INPUT_SUPPORTED,
+            layout.accepts_input() && input::NATIVE_INPUT_SUPPORTED,
             Ordering::Relaxed,
         );
         let native_layout = self.native_layout();
@@ -1333,7 +1605,6 @@ impl AppRuntime {
             Arc::clone(&stop),
             Arc::clone(&self.remote_input_active),
             Arc::clone(&self.main_window_visible),
-            Arc::clone(&self.main_window_focused),
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
             Arc::clone(&self.screen_switch_request),
@@ -1341,9 +1612,11 @@ impl AppRuntime {
         );
         *input_stop = Some(stop);
         #[cfg(target_os = "macos")]
-        input::set_macos_app_nap_suppressed(
-            statuses.0.state == "ready" || statuses.1.state == "ready",
-        );
+        // Whenever sharing runs, whatever the statuses say: started at the
+        // lock screen, injection reports an error (secure keyboard entry), and
+        // a napping app then delivered the controller's input late for as long
+        // as it ran.
+        input::set_macos_app_nap_suppressed(true);
         // These were only shown in the window, so a startup failure left no
         // trace in the log once the window was closed.
         for (stage, status) in [("capture", &statuses.0), ("inject", &statuses.1)] {
@@ -1506,11 +1779,6 @@ fn load_app_state(state: tauri::State<'_, AppRuntime>) -> AppStateSnapshot {
 }
 
 #[tauri::command]
-fn read_runtime_status(state: tauri::State<'_, AppRuntime>) -> RuntimeStatus {
-    state.runtime_status()
-}
-
-#[tauri::command]
 fn read_diagnostic_info(
     app: AppHandle,
     state: tauri::State<'_, AppRuntime>,
@@ -1571,6 +1839,9 @@ fn save_layout(
             state.start_discovery()?;
         }
     }
+    if previous_layout.language != saved_layout.language {
+        update_runtime_tray_state(&state.app_handle, state.runtime_status().started);
+    }
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
     sync_clipboard_paste_shortcut(&state.app_handle)?;
@@ -1593,6 +1864,26 @@ fn merge_runtime_owned_layout_fields(
         && !current.paired_controllers.is_empty()
     {
         incoming.paired_controllers = current.paired_controllers.clone();
+    }
+
+    // A machine that becomes a client waits for its controller's word; what it
+    // chose as a controller must not leave it capturing on its own.
+    if incoming.machine_role == "client" && current.machine_role != "client" {
+        incoming.peer_control = false;
+    }
+    // On a client, peer control, the other devices and where its own screens
+    // sit all come from the controller. A settings snapshot taken before the
+    // controller's last word must not put the old ones back.
+    if current.machine_role == "client" && incoming.machine_role == "client" {
+        incoming.peer_control = current.peer_control;
+        let local = incoming.devices.iter().find(|device| device.role == "local").cloned();
+        incoming.devices = current.devices.clone();
+        if let (Some(local), Some(kept)) =
+            (local, incoming.devices.iter_mut().find(|device| device.role == "local"))
+        {
+            kept.name = local.name;
+            kept.color = local.color;
+        }
     }
 
     merge_local_runtime_device_fields(&mut incoming, current);
@@ -1665,6 +1956,7 @@ fn runtime_relevant_layout_changed(previous: &LayoutState, next: &LayoutState) -
     // Restarting on every device edit is what forced users to stop/start the
     // server (and churned QUIC keys) before a freshly added client would work.
     previous.input_mode != next.input_mode
+        || previous.peer_control != next.peer_control
         || previous.machine_role != next.machine_role
         || previous.clipboard_sync != next.clipboard_sync
         || previous.transport_port_mode != next.transport_port_mode
@@ -1688,7 +1980,11 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
     // QUIC endpoint on the same UDP port can briefly race the old endpoint and
     // make peers see "server refused to accept a new connection".
     thread::sleep(Duration::from_millis(300));
-    state.start_discovery()?;
+    // Not `?`, as in start_runtime_inner: input and the clipboard were just
+    // stopped and must come back whether or not discovery does.
+    if let Err(error) = state.start_discovery() {
+        log::warn!("discovery could not be restarted: {error}");
+    }
     let layout = state.layout_snapshot();
     let (capture, inject) = state.start_input(layout.clone());
     let clipboard = state.start_clipboard(layout.clone());
@@ -1794,7 +2090,8 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
 
     let mut lines = vec![
         "MyKVM diagnostics".to_string(),
-        format!("version: v{}", env!("CARGO_PKG_VERSION")),
+        // The version the package was built as, not the one in Cargo.toml.
+        format!("version: v{}", APP_VERSION.get().map_or(env!("CARGO_PKG_VERSION"), String::as_str)),
         format!("platform: {}", current_platform()),
         format!("role: {}", layout.machine_role),
         format!(
@@ -1922,7 +2219,11 @@ fn ipv4_from_host_value(host_value: &str) -> Option<std::net::Ipv4Addr> {
 fn stop_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
     state.stop_input();
     state.stop_clipboard();
-    state.start_discovery()?;
+    // Not `?`: input is already stopped, and returning here left the runtime
+    // marked as started with nothing running.
+    if let Err(error) = state.start_discovery() {
+        log::warn!("discovery could not be kept running while stopping: {error}");
+    }
 
     let mut runtime = state
         .runtime
@@ -1968,32 +2269,79 @@ fn notify_runtime_state_changed(app: &AppHandle, runtime: &RuntimeStatus) {
 }
 
 fn update_runtime_tray_state(app: &AppHandle, started: bool) {
-    if let Some(state) = app.try_state::<AppRuntime>() {
-        if let Ok(item) = state.runtime_toggle_menu_item.lock() {
-            if let Some(item) = item.as_ref() {
-                let _ = item.set_text(runtime_toggle_menu_label(started));
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return;
+    };
+    let text = tray_text(&state.layout_snapshot().language);
+    if let Ok(menu) = state.tray_menu.lock() {
+        for (id, label) in [
+            ("show", text.show),
+            ("runtime-toggle", if started { text.started } else { text.stopped }),
+            ("hide", text.hide),
+            ("quit", text.quit),
+        ] {
+            if let Some(item) = menu.as_ref().and_then(|menu| menu.get(id)) {
+                if let Some(item) = item.as_menuitem() {
+                    let _ = item.set_text(label);
+                }
             }
         }
     }
-
     if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_tooltip(Some(runtime_tray_tooltip(started)));
+        let _ = tray.set_tooltip(Some(if started { text.tooltip_started } else { text.tooltip_stopped }));
     }
 }
 
-fn runtime_toggle_menu_label(started: bool) -> &'static str {
-    if started {
-        "快捷启停：已启动"
-    } else {
-        "快捷启停：已停止"
-    }
+struct TrayText {
+    show: &'static str,
+    hide: &'static str,
+    quit: &'static str,
+    started: &'static str,
+    stopped: &'static str,
+    tooltip_started: &'static str,
+    tooltip_stopped: &'static str,
 }
 
-fn runtime_tray_tooltip(started: bool) -> &'static str {
-    if started {
-        "mykvm · 已启动"
-    } else {
-        "mykvm · 已停止"
+/// The tray menu in the window's language. It mixed two: these items were
+/// written in English, the start/stop one and the tooltip in Chinese.
+fn tray_text(language: &str) -> TrayText {
+    match language {
+        "en" => TrayText {
+            show: "Show MyKVM",
+            hide: "Hide to tray",
+            quit: "Quit",
+            started: "Sharing: on",
+            stopped: "Sharing: off",
+            tooltip_started: "MyKVM · sharing",
+            tooltip_stopped: "MyKVM · stopped",
+        },
+        "ja" => TrayText {
+            show: "MyKVM を表示",
+            hide: "トレイに隠す",
+            quit: "終了",
+            started: "共有：オン",
+            stopped: "共有：オフ",
+            tooltip_started: "MyKVM · 共有中",
+            tooltip_stopped: "MyKVM · 停止中",
+        },
+        "ko" => TrayText {
+            show: "MyKVM 표시",
+            hide: "트레이로 숨기기",
+            quit: "종료",
+            started: "공유: 켬",
+            stopped: "공유: 끔",
+            tooltip_started: "MyKVM · 공유 중",
+            tooltip_stopped: "MyKVM · 중지됨",
+        },
+        _ => TrayText {
+            show: "显示 MyKVM",
+            hide: "隐藏到托盘",
+            quit: "退出",
+            started: "快捷启停：已启动",
+            stopped: "快捷启停：已停止",
+            tooltip_started: "mykvm · 已启动",
+            tooltip_stopped: "mykvm · 已停止",
+        },
     }
 }
 
@@ -2032,6 +2380,10 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
 }
 
 fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<String>, String> {
+    // The server only. A client under peer control captures its keyboard too,
+    // but giving it these as well made it register whatever bindings it had
+    // kept from an earlier time as a server: on a Mac, Option+Shift+arrows,
+    // which is how text is selected by the word. It needs to be asked first.
     if layout.machine_role != "server" || input::hotkey_recording() || input::owns_native_shortcuts() {
         return Ok(None);
     }
@@ -2494,6 +2846,8 @@ fn send_files_to_device_inner(
     let total_files = files.len();
     let mut file_count = 0_usize;
     let mut byte_count = 0_u64;
+    // One id for the lot, numbered per file (`transfer_batch`).
+    let batch = new_transfer_id("file");
 
     for (index, file) in files.iter().enumerate() {
         let reporter = FileTransferProgressReporter {
@@ -2507,7 +2861,7 @@ fn send_files_to_device_inner(
             &local_peer.id,
             &target,
             file,
-            &new_transfer_id("file"),
+            &format!("{batch}-{index}"),
             drop_mode,
             Some(&reporter),
             None,
@@ -2526,9 +2880,6 @@ fn send_files_to_device_inner(
     })
 }
 
-/// Ask an online peer (a client, or the paired controller) for its recent log.
-/// The log arrives asynchronously in the "MyKVM Remote Logs" folder (which this
-/// opens); returns its path.
 /// Lock sync (controller side): when this machine locks, ask its online
 /// clients to lock as well. Polled, since neither platform hands a lock to a
 /// tray app without a window to receive it.
@@ -2560,7 +2911,7 @@ fn lock_online_clients(state: &AppRuntime) {
         .iter()
         .filter(|device| device.role != "local" && device.online)
     {
-        match send_peer_request(state, &device.id, LOCK_SCREEN_PROTOCOL) {
+        match send_peer_request(state, &device.id, LOCK_SCREEN_PROTOCOL, String::new()) {
             Ok(()) => log::info!("lock sync: locked {}", device.name),
             Err(error) => log::warn!("lock sync: could not lock {}: {error}", device.name),
         }
@@ -2664,7 +3015,7 @@ fn lock_local_screen() {
 fn lock_local_screen() {}
 
 /// Send a paired peer a request (`protocol`) over the stream channel.
-fn send_peer_request(state: &AppRuntime, device_id: &str, protocol: &str) -> Result<(), String> {
+fn send_peer_request(state: &AppRuntime, device_id: &str, protocol: &str, token: String) -> Result<(), String> {
     state.start_discovery()?;
     let layout = state.layout_snapshot();
     let mut local_peer = local_peer_from_layout(&layout);
@@ -2677,7 +3028,8 @@ fn send_peer_request(state: &AppRuntime, device_id: &str, protocol: &str) -> Res
 
     let packet = PeerRequestPacket {
         protocol: protocol.into(),
-            paste_token: String::new(),        origin_id: local_peer.id.clone(),
+        paste_token: token,
+        origin_id: local_peer.id.clone(),
         target_id: target.device_id.clone(),
         cluster_id: target.cluster_id.clone(),
         pair_secret: target.pair_secret.clone(),
@@ -2694,7 +3046,9 @@ fn send_peer_request(state: &AppRuntime, device_id: &str, protocol: &str) -> Res
 /// Ask an online peer (a client, or the paired controller) for its recent log.
 /// The log arrives asynchronously in the "MyKVM Remote Logs" folder (which this
 /// opens); returns its path.
-#[tauri::command]
+// async, as send_files_to_device is: it waits on the network, and a
+// synchronous command would do that on the main thread with the window frozen.
+#[tauri::command(async)]
 fn fetch_client_log(
     device_id: String,
     state: tauri::State<'_, AppRuntime>,
@@ -2703,7 +3057,7 @@ fn fetch_client_log(
     if !state.layout_snapshot().file_transfer_enabled {
         return Err("文件传输未开启，无法拉取日志。".into());
     }
-    send_peer_request(state, &device_id, LOG_REQUEST_PROTOCOL)
+    send_peer_request(state, &device_id, LOG_REQUEST_PROTOCOL, String::new())
         .map_err(|error| format!("拉取日志失败: {error}"))?;
 
     let dir = client_log_dir(&state.app_handle)?;
@@ -2714,12 +3068,14 @@ fn fetch_client_log(
 
 /// Ask a client to update itself; it installs the release its own updater
 /// finds and restarts, while the controller keeps control through the hand-off.
-#[tauri::command]
+// async, as send_files_to_device is: it waits on the network, and a
+// synchronous command would do that on the main thread with the window frozen.
+#[tauri::command(async)]
 fn request_client_update(
     device_id: String,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<(), String> {
-    send_peer_request(state.inner(), &device_id, REMOTE_UPDATE_PROTOCOL)
+    send_peer_request(state.inner(), &device_id, REMOTE_UPDATE_PROTOCOL, String::new())
         .map_err(|error| format!("请求客户端更新失败: {error}"))
 }
 
@@ -2755,7 +3111,6 @@ fn minimize_main_window(app: AppHandle) -> Result<(), String> {
 
     if result.is_ok() {
         set_main_window_visible(&app, false);
-        set_main_window_focused(&app, false);
     }
 
     result
@@ -2792,11 +3147,6 @@ fn start_window_drag(app: AppHandle) -> Result<(), String> {
         .ok_or_else(|| "main window is not available".to_string())?
         .start_dragging()
         .map_err(|error| format!("failed to start dragging main window: {error}"))
-}
-
-#[tauri::command]
-fn read_clipboard_text() -> Result<String, String> {
-    clipboard::read_text()
 }
 
 #[tauri::command]
@@ -2855,7 +3205,9 @@ async fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<Discovery
     Ok(state.discovery_status())
 }
 
-#[tauri::command]
+// async, as send_files_to_device is: it waits on the network, and a
+// synchronous command would do that on the main thread with the window frozen.
+#[tauri::command(async)]
 fn probe_lan_peer(host: String, state: tauri::State<'_, AppRuntime>) -> Result<LanPeer, String> {
     state.start_discovery()?;
     let layout = state
@@ -2873,7 +3225,9 @@ fn probe_lan_peer(host: String, state: tauri::State<'_, AppRuntime>) -> Result<L
     Ok(peer)
 }
 
-#[tauri::command]
+// async, as send_files_to_device is: it waits on the network, and a
+// synchronous command would do that on the main thread with the window frozen.
+#[tauri::command(async)]
 fn request_lan_pairing(
     host: String,
     state: tauri::State<'_, AppRuntime>,
@@ -2903,7 +3257,9 @@ fn request_lan_pairing(
     Ok(peer)
 }
 
-#[tauri::command]
+// async, as send_files_to_device is: it waits on the network, and a
+// synchronous command would do that on the main thread with the window frozen.
+#[tauri::command(async)]
 fn confirm_lan_pairing(
     host: String,
     code: String,
@@ -2972,6 +3328,11 @@ fn reset_pairing(state: tauri::State<'_, AppRuntime>) -> Result<AppStateSnapshot
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
         layout.paired_controllers.clear();
+        if layout.machine_role == "client" {
+            // What the controller shared goes with the pairing.
+            layout.peer_control = false;
+            layout.devices.retain(|device| device.role == "local");
+        }
         layout.clone()
     };
     write_layout_to_disk(&state.config_path, &updated_layout)?;
@@ -3223,10 +3584,6 @@ fn release_single_instance() {
         }
     }
 }
-
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-#[cfg(not(target_os = "windows"))]
-fn release_single_instance() {}
 
 pub fn activate_existing_instance() -> bool {
     #[cfg(target_os = "windows")]
@@ -3521,11 +3878,13 @@ fn setup_macos_window_visibility_watcher(app: &tauri::App) {
     });
 }
 
-// Poll for display reconfiguration (lid open/close, monitor plug/unplug) and
-// refresh the announced screen list. macOS enumerates displays via NSScreen,
-// which must run on the main thread, so the change is applied there.
-#[cfg(target_os = "macos")]
-fn setup_macos_display_watcher(app: &tauri::App) {
+// Poll for display reconfiguration (lid open/close, monitor plug/unplug, a
+// resolution or scaling change) and refresh the announced screen list. macOS
+// enumerates displays via NSScreen, which must run on the main thread, so the
+// change is applied there. Windows kept the screens it saw at startup until
+// the app was restarted, so the cursor crossed at the old edges.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn setup_display_watcher(app: &tauri::App) {
     let app_handle = app.handle().clone();
     thread::spawn(move || {
         // Empty so the first stable reading re-checks what startup detected.
@@ -3533,7 +3892,7 @@ fn setup_macos_display_watcher(app: &tauri::App) {
         let mut pending = None;
         loop {
             thread::sleep(Duration::from_millis(1500));
-            let now = macos_display_fingerprint();
+            let now = display_fingerprint(&app_handle);
             if now == applied {
                 pending = None;
                 continue;
@@ -3558,7 +3917,7 @@ fn setup_macos_display_watcher(app: &tauri::App) {
 /// NSScreen enumeration behind `detect_local_screens`, which needs the main
 /// thread. Bounds catch resolution and arrangement changes as well.
 #[cfg(target_os = "macos")]
-fn macos_display_fingerprint() -> Vec<(u32, i64, i64, i64, i64)> {
+fn display_fingerprint(_app: &AppHandle) -> Vec<(u32, i64, i64, i64, i64)> {
     use core_graphics::display::CGDisplay;
 
     let mut displays: Vec<_> = CGDisplay::active_displays()
@@ -3577,6 +3936,102 @@ fn macos_display_fingerprint() -> Vec<(u32, i64, i64, i64, i64)> {
         .collect();
     displays.sort_unstable();
     displays
+}
+
+/// Scale, position and size of every monitor. Windows enumerates them with
+/// EnumDisplayMonitors, which any thread may call.
+#[cfg(target_os = "windows")]
+fn display_fingerprint(app: &AppHandle) -> Vec<(u32, i64, i64, i64, i64)> {
+    let mut displays: Vec<_> = app
+        .available_monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(|monitor| {
+            (
+                (monitor.scale_factor() * 100.0).round() as u32,
+                i64::from(monitor.position().x),
+                i64::from(monitor.position().y),
+                i64::from(monitor.size().width),
+                i64::from(monitor.size().height),
+            )
+        })
+        .collect();
+    displays.sort_unstable();
+    displays
+}
+
+/// Diagnostic, for `examples/fetch_peer_log.rs`: ask the controller this
+/// machine is paired with for its log, as the app's "fetch log" button does,
+/// and take the answer here. The app must not be running: this stands in for
+/// it on its own port, which is where the controller sends the log.
+pub fn fetch_controller_log(config_dir: &Path, receive_dir: &Path) -> Result<PathBuf, String> {
+    let layout = load_layout_from_disk(&config_dir.join("layout.json"))
+        .ok_or("no saved layout in that directory")?;
+    let controller = layout
+        .paired_controllers
+        .first()
+        .ok_or("this machine is not paired with a controller")?
+        .clone();
+    let controller_port = layout
+        .devices
+        .iter()
+        .find(|device| device.transport_public_key == controller.transport_public_key)
+        .map(|device| normalize_quic_port(device.transport_port, device.quic_port))
+        .unwrap_or_else(|| preferred_quic_port(DISCOVERY_PORT));
+    let local_id = local_peer_from_layout(&layout).id;
+    let transfers = Arc::new(Mutex::new(HashMap::new()));
+    let (stream_layout, stream_id, stream_root, stream_transfers) =
+        (layout.clone(), local_id.clone(), receive_dir.to_path_buf(), Arc::clone(&transfers));
+    let transport = quic_transport::start(
+        normalize_quic_port(layout.transport_port, layout.quic_port),
+        config_dir.to_path_buf(),
+        Arc::new(|_, _| {}),
+        Arc::new(move |payload, _| {
+            decode_wire_packet::<FileTransferPacket>(&payload).is_some_and(|packet| {
+                handle_decoded_file_transfer_packet(
+                    packet,
+                    &stream_layout,
+                    &stream_id,
+                    &stream_transfers,
+                    &stream_root,
+                    None,
+                )
+            })
+        }),
+    )?;
+    let before: Vec<PathBuf> = fs::read_dir(receive_dir)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    let packet = PeerRequestPacket {
+        protocol: LOG_REQUEST_PROTOCOL.into(),
+        paste_token: String::new(),
+        origin_id: local_id,
+        target_id: controller.id.clone(),
+        cluster_id: layout.cluster_id.clone(),
+        pair_secret: layout.pair_secret.clone(),
+    };
+    let peer = transport.peer(
+        format!("{}:{controller_port}", controller.ip),
+        controller.transport_public_key.clone(),
+        controller.protocol_version,
+    );
+    let sent = transport.send_stream_expect_ack(peer, encode_wire_packet(&packet)?);
+    let mut received = None;
+    if sent.is_ok() {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while received.is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(200));
+            received = fs::read_dir(receive_dir).ok().and_then(|entries| {
+                entries.flatten().map(|entry| entry.path()).find(|path| {
+                    !before.contains(path)
+                        && !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                })
+            });
+        }
+    }
+    let _ = transport.stop_and_wait();
+    sent?;
+    received.ok_or_else(|| "the controller took the request but no log arrived".into())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3603,12 +4058,12 @@ pub fn run() {
         )
         .on_window_event(|window, event| {
             if window.label() == "main" {
-                if let WindowEvent::Focused(focused) = event {
-                    set_main_window_focused(window.app_handle(), *focused);
-                }
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = hide_main_window_handle(window.app_handle());
+                }
+                if let WindowEvent::Focused(focused) = event {
+                    MAIN_WINDOW_FOCUSED.store(*focused, Ordering::Relaxed);
                 }
             }
         })
@@ -3640,6 +4095,12 @@ pub fn run() {
             if let Ok(log_dir) = app.path().app_log_dir() {
                 log::info!("file logging enabled at {}", log_dir.display());
             }
+            // A crash used to leave nothing in the log a user sends us.
+            let default_panic_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                log::error!("panic: {info}");
+                default_panic_hook(info);
+            }));
 
             let config_dir = app
                 .path()
@@ -3672,9 +4133,11 @@ pub fn run() {
                 let Some(files) = pending_files.upgrade() else { break; };
                 if let Ok(mut transfers) = files.lock() {
                     let now = now_ms();
-                    transfers.retain(|_, transfer| {
+                    transfers.retain(|_id, transfer| {
                         if now.saturating_sub(transfer.touched_ms) <= 5 * 60 * 1000 { return true; }
                         let _ = fs::remove_file(&transfer.temp_path);
+                        #[cfg(target_os = "macos")]
+                        drag_place::abort(_id);
                         false
                     });
                 };
@@ -3719,8 +4182,8 @@ pub fn run() {
             setup_macos_cursor_hider(app);
             #[cfg(target_os = "macos")]
             setup_macos_window_visibility_watcher(app);
-            #[cfg(target_os = "macos")]
-            setup_macos_display_watcher(app);
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            setup_display_watcher(app);
             setup_tray(app)?;
             if let Err(error) = sync_runtime_toggle_shortcut(app.handle()) {
                 log::warn!("failed to register quick start/stop shortcut: {error}");
@@ -3888,15 +4351,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             load_app_state,
-            read_runtime_status,
             read_diagnostic_info,
             open_log_directory,
             save_layout,
             cancel_file_transfer,
+            shown_file_transfers,
             paste_remote_clipboard,
             start_runtime,
             stop_runtime,
-            read_clipboard_text,
             write_clipboard_text,
             read_performance_sample,
             updates::check_app_update,
@@ -3958,30 +4420,35 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .try_state::<AppRuntime>()
         .map(|state| state.runtime_status().started)
         .unwrap_or(false);
-    let show_item = MenuItem::with_id(app, "show", "Show mykvm", true, None::<&str>)?;
+    let text = tray_text(
+        &app.try_state::<AppRuntime>()
+            .map(|state| state.layout_snapshot().language)
+            .unwrap_or_default(),
+    );
+    let show_item = MenuItem::with_id(app, "show", text.show, true, None::<&str>)?;
     let runtime_toggle_item = MenuItem::with_id(
         app,
         "runtime-toggle",
-        runtime_toggle_menu_label(runtime_started),
+        if runtime_started { text.started } else { text.stopped },
         true,
         None::<&str>,
     )?;
-    let hide_item = MenuItem::with_id(app, "hide", "Hide to tray", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, "hide", text.hide, true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", text.quit, true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[&show_item, &runtime_toggle_item, &hide_item, &quit_item],
     )?;
 
     if let Some(state) = app.try_state::<AppRuntime>() {
-        if let Ok(mut item) = state.runtime_toggle_menu_item.lock() {
-            *item = Some(runtime_toggle_item);
+        if let Ok(mut stored) = state.tray_menu.lock() {
+            *stored = Some(menu.clone());
         }
     }
 
     let mut tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
-        .tooltip(runtime_tray_tooltip(runtime_started))
+        .tooltip(if runtime_started { text.tooltip_started } else { text.tooltip_stopped })
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => {
@@ -4048,7 +4515,6 @@ fn hide_main_window_handle(app: &AppHandle) -> Result<(), String> {
 fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window("main") else {
         set_main_window_visible(app, false);
-        set_main_window_focused(app, false);
         return Ok(());
     };
     let result = window
@@ -4057,7 +4523,6 @@ fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
 
     if result.is_ok() {
         set_main_window_visible(app, false);
-        set_main_window_focused(app, false);
     }
 
     result
@@ -4102,12 +4567,6 @@ fn set_main_window_visible(app: &AppHandle, visible: bool) {
     } else {
         tauri::ActivationPolicy::Accessory
     });
-}
-
-fn set_main_window_focused(app: &AppHandle, focused: bool) {
-    if let Some(state) = app.try_state::<AppRuntime>() {
-        state.main_window_focused.store(focused, Ordering::Relaxed);
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -4171,7 +4630,10 @@ fn write_layout_to_disk(path: &PathBuf, layout: &LayoutState) -> Result<(), Stri
         .map_err(|error| format!("failed to serialize layout: {error}"))?;
 
     fs::write(path, json)
-        .map_err(|error| format!("failed to write layout file {}: {error}", path.display()))
+        .map_err(|error| format!("failed to write layout file {}: {error}", path.display()))?;
+    // The layout holds the pair secret.
+    quic_transport::restrict_to_owner(path);
+    Ok(())
 }
 
 fn default_runtime(layout: &LayoutState) -> RuntimeStatus {
@@ -5374,6 +5836,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: default_file_transfer_enabled(),
         lock_sync: false,
+        peer_control: true,
         input_protection: Default::default(),
         language: default_language(),
         theme_mode: default_theme_mode(),
@@ -5425,6 +5888,7 @@ fn detect_fallback_layout() -> LayoutState {
         clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: default_file_transfer_enabled(),
         lock_sync: false,
+        peer_control: true,
         input_protection: Default::default(),
         language: default_language(),
         theme_mode: default_theme_mode(),
@@ -5495,7 +5959,7 @@ fn detect_local_screens(app: &AppHandle, device_id: &str) -> Vec<Screen> {
 /// Called when the display configuration changes (e.g. a MacBook lid closes)
 /// so the announce loop advertises the current screens instead of the stale
 /// list captured at startup.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn refresh_local_screens(app: &AppHandle) {
     let Some(state) = app.try_state::<AppRuntime>() else {
         return;
@@ -5563,7 +6027,7 @@ fn refresh_local_screens(app: &AppHandle) {
 }
 
 // Keep disconnected displays for the next lid-open/reconnect event.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn screen_layout_memory() -> &'static Mutex<Vec<Screen>> {
     static MEMORY: Mutex<Vec<Screen>> = Mutex::new(Vec::new());
     &MEMORY
@@ -5590,6 +6054,12 @@ fn restore_local_screen_layout(
     }
     let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut merged: Vec<Screen> = Vec::with_capacity(detected.len());
+    // Where the arrangement sits relative to what the system reports, taken
+    // from the first display that was already placed. A display seen for the
+    // first time is put beside it as the system has it, not at the system's
+    // own coordinates, which mean nothing once the others were moved.
+    let mut placed_offset = None;
+    let mut unplaced = Vec::new();
     for mut screen in detected {
         let saved = memory
             .iter()
@@ -5607,15 +6077,24 @@ fn restore_local_screen_layout(
                 )
             });
         if let Some(saved) = saved {
+            placed_offset.get_or_insert((saved.x - screen.x, saved.y - screen.y));
             screen.id = saved.id.clone();
             screen.x = saved.x;
             screen.y = saved.y;
+        } else {
+            unplaced.push(merged.len());
         }
         while used_ids.contains(&screen.id) {
             screen.id = format!("{}-b", screen.id);
         }
         used_ids.insert(screen.id.clone());
         merged.push(screen);
+    }
+    if let Some((dx, dy)) = placed_offset {
+        for index in unplaced {
+            merged[index].x += dx;
+            merged[index].y += dy;
+        }
     }
     merged
 }
@@ -5641,7 +6120,7 @@ fn align_native_screen_ids(native: &mut LayoutState, arranged: &LayoutState) {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn apply_detected_local_screens(
     layout: &mut LayoutState,
     native: &mut LayoutState,
@@ -5739,6 +6218,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         clipboard_paste_hotkey: default_clipboard_paste_hotkey(),
         file_transfer_enabled: saved_layout.file_transfer_enabled,
         lock_sync: saved_layout.lock_sync,
+        peer_control: saved_layout.peer_control,
         input_protection: InputProtection::default(),
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
@@ -6110,7 +6590,7 @@ fn set_hotkey_recording(
 ) -> Result<(), String> {
     let was_recording = input::hotkey_recording();
     if !recording && (was_recording || captured.is_some()) {
-        input::finish_shortcut_recording(captured.as_deref());
+        input::finish_shortcut_recording();
     }
     input::set_hotkey_recording(recording);
     sync_runtime_toggle_shortcut(&app)?;
@@ -6215,12 +6695,601 @@ fn send_clipboard_files(
     Ok(packet_count + 1)
 }
 
+/// Files this machine copied and offered to a peer, kept so the peer can
+/// fetch them when it pastes.
+struct ClipboardOffer {
+    id: String,
+    target: FileTransferTarget,
+    files: Vec<(String, TransferFile)>,
+}
+
+// The last few: moving on to another machine offers the same copy there, and
+// the first machine may still paste its own.
+fn clipboard_offers() -> &'static Mutex<Vec<Arc<ClipboardOffer>>> {
+    static OFFERS: Mutex<Vec<Arc<ClipboardOffer>>> = Mutex::new(Vec::new());
+    &OFFERS
+}
+
+fn remember_clipboard_offer(offer: Arc<ClipboardOffer>) {
+    if let Ok(mut offers) = clipboard_offers().lock() {
+        if offers.len() >= 4 {
+            offers.remove(0);
+        }
+        offers.push(offer);
+    }
+}
+
+fn clipboard_offer(id: &str) -> Option<Arc<ClipboardOffer>> {
+    clipboard_offers().lock().ok()?.iter().find(|offer| offer.id == id).cloned()
+}
+
+fn forget_clipboard_offer(id: &str) {
+    if let Ok(mut offers) = clipboard_offers().lock() {
+        offers.retain(|offer| offer.id != id);
+    }
+}
+
+/// The list a large copy is offered as, or None when it is small enough to be
+/// sent whole (or cannot be listed, which the whole send then reports).
+fn clipboard_offer_files(paths: &[String], min_bytes: u64) -> Option<Vec<(String, TransferFile)>> {
+    // Two of one name (picked out of different folders) would be saved one
+    // over the other where the list is fetched. Sent whole, the second is
+    // given a name of its own.
+    let mut names: Vec<String> = paths
+        .iter()
+        .filter_map(|path| transfer_file_name(Path::new(path)).ok())
+        .map(|name| name.to_lowercase())
+        .collect();
+    names.sort_unstable();
+    if names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return None;
+    }
+    let files = collect_virtual_files(paths, u64::MAX).ok()?;
+    let total = files.iter().fold(0_u64, |sum, file| sum.saturating_add(file.total_bytes));
+    (total >= min_bytes).then(|| {
+        files.into_iter().map(|file| (new_transfer_id("offer"), file)).collect()
+    })
+}
+
+/// Tell `target` what was copied in place of sending it. `Ok(false)` when the
+/// copy should be sent whole after all: it is small, or the peer does not take
+/// offers (it is not Windows, or runs an older version).
+fn offer_clipboard_files(
+    transport: &quic_transport::TransportHandle,
+    local_id: &str,
+    target: &FileTransferTarget,
+    paths: &[String],
+) -> Result<bool, String> {
+    static REFUSED: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+    let refused_lately = REFUSED.lock().is_ok_and(|refused| {
+        refused
+            .as_ref()
+            .and_then(|refused| refused.get(&target.transport_public_key))
+            .is_some_and(|at| at.elapsed() < CLIPBOARD_OFFER_REFUSAL_KEPT)
+    });
+    if refused_lately {
+        return Ok(false);
+    }
+    let Some(files) = clipboard_offer_files(paths, CLIPBOARD_OFFER_MIN_BYTES) else {
+        return Ok(false);
+    };
+    let id = new_transfer_id("offer");
+    let packet = DragControlPacket {
+        protocol: CLIPBOARD_OFFER_PROTOCOL.into(),
+        kind: id.clone(),
+        origin_id: local_id.into(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        files: files
+            .iter()
+            .map(|(transfer_id, file)| DragControlFile {
+                transfer_id: transfer_id.clone(),
+                name: file.name.clone(),
+                size: file.total_bytes,
+                directory: file.directory,
+            })
+            .collect(),
+    };
+    // Remembered first: the peer may paste as soon as it has the offer.
+    remember_clipboard_offer(Arc::new(ClipboardOffer { id: id.clone(), target: target.clone(), files }));
+    let peer = transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    let listed = packet.files.len();
+    match transport.send_stream_expect_ack(peer, encode_wire_packet(&packet)?) {
+        Ok(_) => {
+            log::info!("copied files offered to {}: {listed} item(s), sent when pasted there", target.name);
+            Ok(true)
+        }
+        Err(error) if error.contains(quic_transport::STREAM_REJECTED) => {
+            forget_clipboard_offer(&id);
+            if let Ok(mut refused) = REFUSED.lock() {
+                refused
+                    .get_or_insert_with(HashMap::new)
+                    .insert(target.transport_public_key.clone(), Instant::now());
+            }
+            log::info!("{} did not take the list of copied files; sending the files whole", target.name);
+            Ok(false)
+        }
+        // No answer is not a refusal: the peer may hold the offer and paste
+        // it. Stay able to serve it; the caller offers again.
+        Err(error) => Err(error),
+    }
+}
+
+/// The peer is pasting an offer: stream its files, under the ids the offer
+/// listed, to the machine the offer was made to.
+fn send_offered_clipboard_files(app: &AppHandle, offer: Arc<ClipboardOffer>) {
+    let state = app.state::<AppRuntime>();
+    let Some(transport) = state.quic_transport_handle() else {
+        return;
+    };
+    let local_id = local_peer_from_layout(&state.layout_snapshot()).id;
+    let still_offered = || clipboard_offer(&offer.id).is_some();
+    for (index, (transfer_id, file)) in offer.files.iter().enumerate() {
+        let reporter = FileTransferProgressReporter {
+            app,
+            target_name: &offer.target.name,
+            file_index: index + 1,
+            file_count: offer.files.len(),
+        };
+        match send_transfer_file(
+            &transport,
+            &local_id,
+            &offer.target,
+            file,
+            transfer_id,
+            DropMode::TransfersFolder,
+            Some(&reporter),
+            Some(&still_offered),
+        ) {
+            Ok(packets) => {
+                state.transport_packets.fetch_add(packets, Ordering::Relaxed);
+            }
+            Err(error) => {
+                log::warn!("offered clipboard files: sending {} failed: {error}", file.name);
+                return;
+            }
+        }
+    }
+    log::info!("offered clipboard files: sent {} item(s) to {}", offer.files.len(), offer.target.name);
+}
+
+/// A paste was typed here. When a large copy made on another computer is
+/// still held for it (`macos_file_offer::hold`), the paste is what fetches it
+/// and the caller keeps the keystroke: let through, it would paste what this
+/// clipboard held before. In Finder the copy goes into the folder a paste
+/// would fill, as a drop does; anywhere else it goes on the clipboard, and is
+/// pasted once the pop-up says it is there.
+#[cfg(target_os = "macos")]
+pub(crate) fn paste_held_offer(typed_on: &str) -> bool {
+    let Some(held) = macos_file_offer::take_held() else {
+        return false;
+    };
+    log::info!("a paste typed on {typed_on} asks for the copy held for it");
+    // Off the input thread: asking Finder for its folder starts osascript.
+    thread::spawn(move || held.fetch(input::finder_paste_folder()));
+    true
+}
+
+/// The transport key of the device that calls itself `id`, as far as known.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn transport_key_of(layout: &LayoutState, id: &str) -> String {
+    layout
+        .devices
+        .iter()
+        .find(|device| device.id == id)
+        .map(|device| device.transport_public_key.clone())
+        .or_else(|| {
+            layout
+                .paired_controllers
+                .iter()
+                .find(|peer| peer.id == id)
+                .map(|peer| peer.transport_public_key.clone())
+        })
+        .or_else(|| {
+            announced().lock().ok().and_then(|seen| {
+                seen.iter().find(|(_, (announced_id, _))| announced_id == id).map(|(key, _)| key.clone())
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// The receiving side of an offer. `None` when `payload` is not one.
+fn handle_clipboard_offer_packet(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    app: &AppHandle,
+    clipboard_seen: &Arc<Mutex<Option<String>>>,
+    clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
+) -> Option<bool> {
+    let packet = decode_wire_packet::<DragControlPacket>(payload)
+        .filter(|packet| packet.protocol == CLIPBOARD_OFFER_PROTOCOL)?;
+    if !layout.clipboard_sync
+        || !layout.file_transfer_enabled
+        || layout.clipboard_on_demand
+        || packet.origin_id == local_peer_id
+        || !stream_origin_trusted(layout, &packet.cluster_id, &packet.pair_secret, &packet.origin_id)
+    {
+        return Some(false);
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        #[cfg(target_os = "macos")]
+        use macos_file_offer::OfferFile;
+        #[cfg(target_os = "windows")]
+        use windows_drag::DragFileMeta as OfferFile;
+        // Up to this much is fetched at once and put on the clipboard as
+        // files on disk, the way the system's own file manager copies them,
+        // so that every program pastes it without a wait (a chat window takes
+        // nothing else). More than this is fetched when it is wanted: on
+        // Windows as a list, when pasted; on a Mac, which has no such list
+        // (see `macos_file_offer`), by the paste itself (`paste_held_offer`).
+        const WHOLE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+        let total = packet.files.iter().fold(0_u64, |sum, file| sum.saturating_add(file.size));
+        let origin_key = transport_key_of(layout, &packet.origin_id);
+        let files: Vec<OfferFile> = packet
+            .files
+            .into_iter()
+            .map(|file| OfferFile {
+                transfer_id: file.transfer_id,
+                name: file.name,
+                size: file.size,
+                directory: file.directory,
+            })
+            .collect();
+        let (app, origin, offer_id) = (app.clone(), packet.origin_id.clone(), packet.kind);
+        #[cfg(target_os = "macos")]
+        let first_file = files.first().map(|file| file.transfer_id.clone()).unwrap_or_default();
+        let fetch = move || {
+            let (app, origin, offer_id) = (app.clone(), origin.clone(), offer_id.clone());
+            #[cfg(target_os = "macos")]
+            let first_file = first_file.clone();
+            thread::spawn(move || {
+                let state = app.state::<AppRuntime>();
+                if let Err(error) = send_peer_request(state.inner(), &origin, CLIPBOARD_OFFER_PULL_PROTOCOL, offer_id) {
+                    // Fail the paste now instead of leaving it to time out.
+                    log::warn!("could not fetch the copied files from {origin}: {error}");
+                    #[cfg(target_os = "windows")]
+                    windows_drag::abandon_clipboard_offer();
+                    #[cfg(target_os = "macos")]
+                    macos_file_offer::abort_file(&first_file);
+                }
+            });
+        };
+        #[cfg(target_os = "windows")]
+        if total > WHOLE_MAX_BYTES {
+            // Held across the write so the poll cannot read between it and the guard.
+            let Ok(mut seen) = clipboard_seen.lock() else {
+                return Some(false);
+            };
+            if !windows_drag::offer_clipboard_files(files, Box::new(fetch)) {
+                log::warn!("could not offer the files copied on {}; it will send them whole", packet.origin_id);
+                return Some(false);
+            }
+            *seen = None;
+            arm_clipboard_echo_guard(clipboard_echo_until);
+            log::info!("copied files offered by {}; they are fetched when pasted", packet.origin_id);
+            return Some(true);
+        }
+        let (seen, echo) = (Arc::clone(clipboard_seen), Arc::clone(clipboard_echo_until));
+        let origin = packet.origin_id.clone();
+        let done = move |saved: Vec<PathBuf>| {
+            let paths: Vec<String> =
+                saved.iter().map(|path| path.to_string_lossy().into_owned()).collect();
+            // Held across the write so the poll cannot read between it and the guard.
+            let Ok(mut seen) = seen.lock() else {
+                return;
+            };
+            if let Err(error) = retry_clipboard_write(
+                CLIPBOARD_WRITE_ATTEMPTS,
+                Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
+                || rich_clipboard::write_files(&paths),
+            ) {
+                log::warn!("the files copied on {origin} could not be put on the clipboard: {error}");
+                return;
+            }
+            let signature = clipboard::files_signature(&paths);
+            note_clipboard_received(&signature, &origin_key);
+            *seen = Some(signature);
+            arm_clipboard_echo_guard(&echo);
+            log::info!("the files copied on {origin} are on the clipboard: {} item(s)", paths.len());
+        };
+        #[cfg(target_os = "windows")]
+        let taken = windows_drag::fetch_clipboard_files(files, Box::new(fetch), Box::new(done));
+        #[cfg(target_os = "macos")]
+        let taken = if total > WHOLE_MAX_BYTES {
+            macos_file_offer::hold(files, Box::new(fetch), Box::new(done))
+        } else {
+            macos_file_offer::fetch_now(files, Box::new(fetch), Box::new(done))
+        };
+        if !taken {
+            log::warn!("could not take the files copied on {}; it will send them whole", packet.origin_id);
+            return Some(false);
+        }
+        log::info!(
+            "copied files offered by {}: {} in all, fetched {}",
+            packet.origin_id,
+            format_bytes(total),
+            if cfg!(target_os = "macos") && total > WHOLE_MAX_BYTES { "when pasted here" } else { "now" }
+        );
+        Some(true)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // Nothing here can put files it does not have yet on the clipboard.
+        let _ = (app, clipboard_seen, clipboard_echo_until);
+        Some(false)
+    }
+}
+
+/// What the controller tells each client about the cluster: whether any device
+/// may drive any other, and if so every device and where its screens sit, so
+/// the client can cross onto them from its own keyboard and mouse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterLayoutPacket {
+    protocol: String,
+    origin_id: String,
+    origin_transport_public_key: String,
+    cluster_id: String,
+    pair_secret: String,
+    peer_control: bool,
+    /// As the controller holds them; its own entry is the one with role
+    /// "local". Empty while peer control is off.
+    devices: Vec<Device>,
+}
+
+/// This client's layout once the controller's arrangement is applied: its own
+/// screens where the controller placed them, and every other device (the
+/// controller included) as one it can cross onto. With peer control off, only
+/// itself again.
+fn apply_cluster_layout(current: &LayoutState, packet: &ClusterLayoutPacket) -> LayoutState {
+    let mut next = current.clone();
+    next.peer_control = packet.peer_control;
+    let Some(mut local) = current.devices.iter().find(|device| device.role == "local").cloned() else {
+        return next;
+    };
+    let mut devices = Vec::new();
+    if packet.peer_control {
+        let own_key = local.transport_public_key.trim();
+        let own_entry = packet.devices.iter().find(|device| {
+            device.role != "local" && !own_key.is_empty() && device.transport_public_key == own_key
+        });
+        if let Some(own_entry) = own_entry {
+            for screen in &mut local.screens {
+                let placed_id = format!("{}-{}", own_entry.id, sanitize_id(&screen.id));
+                if let Some(placed) = own_entry.screens.iter().find(|placed| placed.id == placed_id) {
+                    screen.x = placed.x;
+                    screen.y = placed.y;
+                }
+            }
+        }
+        for shared in &packet.devices {
+            // Every entry that is this machine: the controller may hold a
+            // second one from before an address change.
+            if shared.role != "local" && !own_key.is_empty() && shared.transport_public_key == own_key {
+                continue;
+            }
+            let mut device = shared.clone();
+            if device.role == "local" {
+                // The controller itself, under the id it announces. Its own
+                // entry names itself with a label; the address is the one
+                // this machine is paired with.
+                device.id = packet.origin_id.clone();
+                device.role = "server".into();
+                let key = packet.origin_transport_public_key.trim();
+                if let Some(controller) = current.paired_controllers.iter().find(|controller| {
+                    (!key.is_empty() && controller.transport_public_key == key)
+                        || controller.id == packet.origin_id
+                }) {
+                    let address = if controller.ip.trim().is_empty() { &controller.host } else { &controller.ip };
+                    device.host = address.clone();
+                }
+                for screen in &mut device.screens {
+                    screen.id = format!("{}-{}", device.id, sanitize_id(&screen.id));
+                    screen.device_id = device.id.clone();
+                }
+            }
+            // The controller decides who is in the cluster and where each
+            // screen sits. How to reach a device, and what it says its screens
+            // are, is what this machine found out for itself: the controller's
+            // word for those (its own name for itself is not even an address)
+            // must not replace it each time the arrangement is sent again.
+            device.online = false;
+            device.input_ready = false;
+            device.upgrading = false;
+            device.upgrading_until_ms = 0;
+            // Never an address pinned by hand on another machine: discovery
+            // keeps this one current from here.
+            device.source = "detected".into();
+            if let Some(known) = current.devices.iter().find(|known| known.role != "local" && known.id == device.id) {
+                for screen in &mut device.screens {
+                    if let Some(seen) = known.screens.iter().find(|seen| seen.id == screen.id) {
+                        *screen = Screen { x: screen.x, y: screen.y, ..seen.clone() };
+                    }
+                }
+                // Only what it found and still sees: an entry left over from
+                // an earlier setup may hold an address that is long gone.
+                if known.online {
+                    device = Device {
+                        transport_public_key: device.transport_public_key,
+                        color: device.color,
+                        pointer_speed: device.pointer_speed,
+                        scroll_speed: device.scroll_speed,
+                        invert_scroll: device.invert_scroll,
+                        screens: device.screens,
+                        role: device.role,
+                        source: device.source,
+                        ..known.clone()
+                    };
+                }
+            }
+            devices.push(device);
+        }
+    }
+    devices.insert(0, local);
+    next.devices = devices;
+    next
+}
+
+/// Client side: take the arrangement from the controller this machine is
+/// paired with. `None` when `payload` is not one.
+fn handle_cluster_layout_packet(payload: &[u8], layout: &LayoutState, app: &AppHandle) -> Option<bool> {
+    let packet = decode_wire_packet::<ClusterLayoutPacket>(payload)
+        .filter(|packet| packet.protocol == CLUSTER_LAYOUT_PROTOCOL)?;
+    let key = packet.origin_transport_public_key.trim();
+    let from_paired_controller = layout.machine_role == "client"
+        && !layout.cluster_id.trim().is_empty()
+        && !layout.pair_secret.trim().is_empty()
+        && packet.cluster_id == layout.cluster_id
+        && packet.pair_secret == layout.pair_secret
+        && layout.paired_controllers.iter().any(|controller| {
+            (!key.is_empty() && controller.transport_public_key == key)
+                || controller.id == packet.origin_id
+        });
+    if !from_paired_controller {
+        return Some(false);
+    }
+    let state = app.state::<AppRuntime>();
+    let restart = {
+        let Ok(mut stored) = state.layout.lock() else {
+            return Some(false);
+        };
+        let next = apply_cluster_layout(&stored, &packet);
+        if next == *stored {
+            return Some(true);
+        }
+        if let Err(error) = write_layout_to_disk(&state.config_path, &next) {
+            log::warn!("failed to save the arrangement shared by the controller: {error}");
+        }
+        let restart = runtime_relevant_layout_changed(&stored, &next);
+        log::info!(
+            "arrangement shared by {}: peer control {}, {} other device(s)",
+            packet.origin_id,
+            if next.peer_control { "on" } else { "off" },
+            next.devices.len().saturating_sub(1)
+        );
+        *stored = next;
+        restart
+    };
+    sync_layout_peer_presence(&state.layout, &state.peers);
+    if restart {
+        // Capture starts or stops with peer control. Off this thread: the
+        // restart waits on the transport that is delivering this very packet.
+        let app = app.clone();
+        thread::spawn(move || {
+            if let Err(error) = restart_runtime_if_running(app.state::<AppRuntime>().inner()) {
+                log::warn!("failed to apply the controller's peer control setting: {error}");
+            }
+        });
+    }
+    Some(true)
+}
+
+/// Controller side: one pass of sharing the arrangement with every client
+/// that is online and has not got this version of it yet. `sent` remembers,
+/// per client key, what it was last sent and when.
+fn share_cluster_layout(
+    layout: &LayoutState,
+    transport: &quic_transport::TransportHandle,
+    sent: &mut HashMap<String, (u64, Instant)>,
+) {
+    if layout.machine_role != "server"
+        || layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+    {
+        return;
+    }
+    let mut local_peer = local_peer_from_layout(layout);
+    apply_transport_to_peer(&mut local_peer, transport);
+    let packet = ClusterLayoutPacket {
+        protocol: CLUSTER_LAYOUT_PROTOCOL.into(),
+        origin_id: local_peer.id,
+        origin_transport_public_key: local_peer.transport_public_key,
+        cluster_id: layout.cluster_id.clone(),
+        pair_secret: layout.pair_secret.clone(),
+        peer_control: layout.peer_control,
+        devices: if layout.peer_control { cluster_layout_devices(layout) } else { Vec::new() },
+    };
+    let Ok(payload) = encode_wire_packet(&packet) else {
+        return;
+    };
+    let version = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        payload.hash(&mut hasher);
+        hasher.finish()
+    };
+    for device in layout.devices.iter().filter(|device| {
+        device.role != "local"
+            && device.online
+            && device.protocol_version == quic_transport::PROTOCOL_VERSION
+            && !device.transport_public_key.trim().is_empty()
+    }) {
+        let key = &device.transport_public_key;
+        if sent.get(key).is_some_and(|(last, at)| *last == version && at.elapsed() < CLUSTER_LAYOUT_REFRESH) {
+            continue;
+        }
+        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
+        let Some(host) = file_transfer_host(&device.host) else {
+            continue;
+        };
+        let peer = transport.peer(format!("{host}:{quic_port}"), key.clone(), device.protocol_version);
+        // Remembered once it is taken, or refused: a client too old to
+        // understand this refuses it every time, and need not be asked every
+        // second. One that could not be reached is asked again: remembered,
+        // it went without the arrangement for the next minute.
+        let outcome = transport.send_stream_expect_ack(peer, payload.clone());
+        if outcome.as_ref().map_or_else(|error| error.contains(quic_transport::STREAM_REJECTED), |_| true) {
+            sent.insert(key.clone(), (version, Instant::now()));
+        }
+        if let Err(error) = outcome {
+            log::debug!("arrangement not taken by {}: {error}", device.name);
+        }
+    }
+    sent.retain(|key, _| layout.devices.iter().any(|device| device.online && &device.transport_public_key == key));
+}
+
+/// The arrangement as shared: who and where, without what only this
+/// controller's own view holds (whether each device is reachable from here).
+fn cluster_layout_devices(layout: &LayoutState) -> Vec<Device> {
+    layout
+        .devices
+        .iter()
+        .cloned()
+        .map(|mut device| {
+            device.online = false;
+            device.input_ready = false;
+            device.upgrading = false;
+            device.upgrading_until_ms = 0;
+            device
+        })
+        .collect()
+}
+
+/// Same cluster and pair secret, and, on a client, a machine it is paired
+/// with: the trust every stream request rests on.
+fn stream_origin_trusted(layout: &LayoutState, cluster_id: &str, pair_secret: &str, origin_id: &str) -> bool {
+    !layout.cluster_id.trim().is_empty()
+        && !layout.pair_secret.trim().is_empty()
+        && cluster_id == layout.cluster_id
+        && pair_secret == layout.pair_secret
+        && (layout.machine_role != "client"
+            || layout.paired_controllers.is_empty()
+            || layout.paired_controllers.iter().any(|controller| controller.id == origin_id)
+            || peer_control_member(layout, origin_id, ""))
+}
+
 fn send_current_clipboard(state: &AppRuntime, target: &FileTransferTarget, paste: bool, token: String) -> Result<(), String> {
     let layout = state.layout_snapshot();
     if !layout.clipboard_sync { return Err("剪贴板同步未开启。".into()); }
     let transport = state.quic_transport_handle().ok_or("传输尚未就绪。")?;
     let mut local = local_peer_from_layout(&layout); apply_transport_to_peer(&mut local, &transport);
-    let peer = transport.peer(target.addr.clone(), target.transport_public_key.clone(), target.protocol_version);
     let paths = rich_clipboard::read_files();
     if !paths.is_empty() {
         if !layout.file_transfer_enabled { return Err("文件传输未开启。".into()); }
@@ -6232,7 +7301,8 @@ fn send_current_clipboard(state: &AppRuntime, target: &FileTransferTarget, paste
     let mut packet = clipboard_packet_from_content(content, local.id, transport.public_key().into(), target.device_id.clone(),
         target.cluster_id.clone(), target.pair_secret.clone(), next_clipboard_sequence());
     packet.paste = paste; packet.paste_token = token;
-    transport.send_stream_expect_ack(peer, encode_wire_packet(&packet)?)
+    packet.concealed = rich_clipboard::is_concealed();
+    send_clipboard_packet(&transport, &target.addr, &target.transport_public_key, target.protocol_version, packet)
 }
 
 fn request_clipboard_paste(state: &AppRuntime, target: input::ClipboardTarget, remote: bool) -> Result<(), String> {
@@ -6342,7 +7412,10 @@ where
         log::warn!("file clipboard receive write failed: {error}");
         return Some(false);
     }
-    *seen = Some(clipboard::files_signature(&paths));
+    log::info!("copied files from {} are on the clipboard: {} item(s)", packet.origin_id, paths.len());
+    let signature = clipboard::files_signature(&paths);
+    note_clipboard_received(&signature, &packet.origin_transport_public_key);
+    *seen = Some(signature);
     arm_clipboard_echo_guard(clipboard_echo_until);
     Some(true)
 }
@@ -6437,7 +7510,7 @@ fn normalize_paired_controllers(controllers: Vec<PairedController>) -> Vec<Paire
 
 fn normalize_language(language: &str) -> String {
     match language {
-        "en" => "en".into(),
+        "en" | "ja" | "ko" => language.into(),
         _ => "cn".into(),
     }
 }
@@ -6480,10 +7553,9 @@ fn choose_available_transport_port(preferred: u16) -> u16 {
 fn bind_available_udp_port(preferred: u16) -> Result<(UdpSocket, u16), String> {
     let start = normalize_transport_port(preferred);
     for offset in 0..64_u16 {
-        let candidate = start.saturating_add(offset);
-        if candidate > TRANSPORT_PORT_MAX {
+        let Some(candidate) = start.checked_add(offset) else {
             break;
-        }
+        };
 
         if let Ok(socket) = bind_reusable_udp_port(candidate) {
             return Ok((socket, candidate));
@@ -6563,11 +7635,15 @@ struct ClipboardPacket {
     // (text-only) still decode.
     #[serde(default)]
     text: String,
-    // Present only for image copies. Skipped on the wire for text packets, and
-    // defaulted so text-only peers still decode image-capable packets.
+    // Never sent by this version (an image travels in `formats`); read so an
+    // image copied on an older peer still arrives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<ClipboardImage>,
     sequence: u64,
+    /// The source marked this copy as secret; keep it out of clipboard history
+    /// here as well. Older peers ignore it and paste as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    concealed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6600,7 +7676,7 @@ fn clipboard_packet_from_content(
 ) -> ClipboardPacket {
     let signature = content.signature();
     let (text, formats) = match content {
-        ClipboardContent::Text(text) => (text.clone(), vec![ClipboardFormat { kind: "plainText".into(), text, image: None }]),
+        ClipboardContent::Text(text) | ClipboardContent::Concealed(text) => (text.clone(), vec![ClipboardFormat { kind: "plainText".into(), text, image: None }]),
         ClipboardContent::Image(image) => (String::new(), vec![ClipboardFormat { kind: "imageRgba".into(), text: String::new(), image: Some(image) }]),
         ClipboardContent::Rich(rich) => {
             let mut formats = Vec::new();
@@ -6612,12 +7688,32 @@ fn clipboard_packet_from_content(
     };
     ClipboardPacket { protocol: CLIPBOARD_PROTOCOL.into(),
             paste: false, paste_token: String::new(), origin_id, origin_transport_public_key,
-        target_id, cluster_id, pair_secret, signature, formats, text, image: None, sequence }
+        target_id, cluster_id, pair_secret, signature, formats, text, image: None, sequence, concealed: false }
 }
 
 fn clipboard_retry_delay(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(5);
     Duration::from_millis((CLIPBOARD_RETRY_INTERVAL_MS << doublings).min(CLIPBOARD_RETRY_MAX_MS))
+}
+
+/// Say, once a copy, why copied files were not sent. Three rounds of real
+/// logs had no word of a file copy, and nothing to tell a copy that was never
+/// made from one that was passed over.
+fn note_files_kept(noted: &mut Option<u64>, version: Option<u64>, why: &str) {
+    if *noted != version {
+        *noted = version;
+        log::info!("copied files (clipboard version {version:?}) were not sent: {why}");
+    }
+}
+
+/// Say, once a copy, what kind of thing the clipboard was read as: never what
+/// it held. Six rounds of real logs could not tell a copy that was never made
+/// from one this loop never read, as nothing is written before the send.
+fn note_clipboard_read(noted: &mut Option<u64>, version: Option<u64>, what: &str) {
+    if *noted != version {
+        *noted = version;
+        log::info!("clipboard version {version:?}: {what}");
+    }
 }
 
 fn run_clipboard_sync(
@@ -6636,8 +7732,14 @@ fn run_clipboard_sync(
     // (device, addr, signature, failed_at, consecutive failures)
     let mut last_failed: Option<(String, String, String, Instant, u32)> = None;
     let mut last_read: Option<(u64, String, String)> = None;
-    let mut last_poll = Instant::now() - Duration::from_secs(1);
+    // The clipboard version last read as nothing, and how many times running.
+    let mut empty_reads: (Option<u64>, u32) = (None, 0);
+    // (device, signature, when) of the files last sent or offered.
+    let mut last_files: Option<(String, String, Instant)> = None;
+    let mut last_poll = instant_ago(Duration::from_secs(1));
     let mut last_file_sync_enabled = false;
+    let mut kept_noted: Option<u64> = None;
+    let mut read_noted: Option<u64> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let Some((sync, on_demand, file_transfer_enabled)) =
@@ -6666,8 +7768,9 @@ fn run_clipboard_sync(
         }
 
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
+            note_clipboard_read(&mut read_noted, clipboard::change_count(), "no computer to send it to yet");
             thread::sleep(Duration::from_millis(120));
-            last_poll = Instant::now() - Duration::from_secs(1);
+            last_poll = instant_ago(Duration::from_secs(1));
             continue;
         };
 
@@ -6691,8 +7794,28 @@ fn run_clipboard_sync(
             continue;
         }
         let Some(content) = clipboard::read_snapshot() else {
+            // Nothing this syncs (an emptied clipboard, a format of its own).
+            // It may only have been busy, so it is read twice more; after
+            // that the version is remembered. Unremembered, it was read again
+            // every 150 ms until the next copy, and each read on macOS starts
+            // a `pbpaste`.
+            empty_reads = if empty_reads.0 == version { (version, empty_reads.1 + 1) } else { (version, 1) };
+            if empty_reads.1 >= 3 {
+                note_clipboard_read(&mut read_noted, version, "nothing this app syncs, read three times");
+                last_read = version.map(|version| (version, target.device_id.clone(), target.addr.clone()));
+            }
             continue;
         };
+        empty_reads = (None, 0);
+        match &content {
+            clipboard::ClipboardSnapshot::Files(paths) => {
+                note_clipboard_read(&mut read_noted, version, &format!("{} copied file(s) or folder(s)", paths.len()))
+            }
+            clipboard::ClipboardSnapshot::Content(ClipboardContent::Image(_)) => {
+                note_clipboard_read(&mut read_noted, version, "a picture")
+            }
+            clipboard::ClipboardSnapshot::Content(_) => note_clipboard_read(&mut read_noted, version, "text"),
+        }
         // Only cache a stable read. A copy racing the read must be polled again.
         last_read = version
             .filter(|version| Some(*version) == clipboard::change_count())
@@ -6708,8 +7831,15 @@ fn run_clipboard_sync(
             let is_known_echo = clipboard_seen_text
                 .lock()
                 .map(|seen| seen.as_deref() == Some(signature.as_str()))
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || clipboard_is_own_write(
+                    version,
+                    CLIPBOARD_OWN_WRITE_VERSION.load(Ordering::Relaxed),
+                );
             if is_known_echo {
+                if is_files {
+                    note_files_kept(&mut kept_noted, version, "this computer was just given them");
+                }
                 last_failed = None;
                 continue;
             }
@@ -6718,9 +7848,15 @@ fn run_clipboard_sync(
             }
         }
 
+        let came_from_there = clipboard_came_from(&signature, &target.transport_public_key);
         if matches!(&content, clipboard::ClipboardSnapshot::Content(content) if content.is_oversized())
             || (is_files && !file_transfer_enabled)
+            || came_from_there
         {
+            if is_files {
+                let why = if came_from_there { "they came from that computer" } else { "file transfer is off" };
+                note_files_kept(&mut kept_noted, version, why);
+            }
             last_failed = None;
             continue;
         }
@@ -6732,7 +7868,20 @@ fn run_clipboard_sync(
             })
             .unwrap_or(false)
         {
+            if is_files {
+                note_files_kept(&mut kept_noted, version, "that computer already has this copy");
+            }
             last_failed = None;
+            continue;
+        }
+        // The same files copied again within moments (a held Cmd+C repeats
+        // itself; a real log showed three copies in a second). The peer is
+        // already fetching the first, and each further offer made it start
+        // over.
+        if is_files && files_just_sent(&last_files, &target.device_id, &signature, Instant::now()) {
+            log::info!("the same files were copied again (clipboard version {version:?}); not sent a second time");
+            last_failed = None;
+            last_sent = Some((target.device_id.clone(), target.addr.clone(), send_key));
             continue;
         }
         if last_failed
@@ -6761,6 +7910,9 @@ fn run_clipboard_sync(
             .unwrap_or(true);
 
         if !should_send {
+            if is_files {
+                note_files_kept(&mut kept_noted, version, "this computer was just given them");
+            }
             last_failed = None;
             last_sent = Some((target.device_id.clone(), target.addr.clone(), send_key));
             continue;
@@ -6801,19 +7953,23 @@ fn run_clipboard_sync(
                         clipboard::change_count(),
                     )
                 };
-                send_clipboard_files(
-                    &quic_transport,
-                    &local_peer_id,
-                    &destination,
-                    &paths,
-                    false,
-                    String::new(),
-                    Some(&app),
-                    Some(&keep_going),
-                )
+                match offer_clipboard_files(&quic_transport, &local_peer_id, &destination, &paths) {
+                    Ok(true) => Ok(1),
+                    Ok(false) => send_clipboard_files(
+                        &quic_transport,
+                        &local_peer_id,
+                        &destination,
+                        &paths,
+                        false,
+                        String::new(),
+                        Some(&app),
+                        Some(&keep_going),
+                    ),
+                    Err(error) => Err(error),
+                }
             }
             clipboard::ClipboardSnapshot::Content(content) => {
-                let packet = clipboard_packet_from_content(
+                let mut packet = clipboard_packet_from_content(
                     content,
                     local_peer_id.clone(),
                     quic_transport.public_key().into(),
@@ -6822,16 +7978,15 @@ fn run_clipboard_sync(
                     target.pair_secret.clone(),
                     next_clipboard_sequence(),
                 );
-                encode_wire_packet(&packet).and_then(|payload| {
-                    let peer = quic_transport.peer(
-                        target.addr.clone(),
-                        target.transport_public_key.clone(),
-                        target.protocol_version,
-                    );
-                    quic_transport
-                        .send_stream_expect_ack(peer, payload)
-                        .map(|_| 1)
-                })
+                packet.concealed = rich_clipboard::is_concealed();
+                send_clipboard_packet(
+                    &quic_transport,
+                    &target.addr,
+                    &target.transport_public_key,
+                    target.protocol_version,
+                    packet,
+                )
+                .map(|_| 1)
             }
         };
         // Retries of this same content (the peer is still down).
@@ -6847,11 +8002,17 @@ fn run_clipboard_sync(
             if failures > 0 {
                 log::info!("clipboard send recovered after {failures} failed attempt(s)");
             }
+            if is_files {
+                last_files = Some((target.device_id.clone(), signature, Instant::now()));
+            }
             last_failed = None;
             last_sent = Some((target.device_id, target.addr, send_key));
         } else {
             let error = send_result.err().unwrap_or_default();
             if error == CLIPBOARD_FILES_SUPERSEDED || error == "传输已取消。" {
+                // Was silent, and left the files in the peer's transfers
+                // folder without ever reaching its clipboard.
+                log::info!("copied files were not put on the peer's clipboard: {error}");
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, send_key));
                 continue;
@@ -6897,6 +8058,20 @@ fn file_clipboard_sync_current(
             .unwrap_or(false)
 }
 
+/// How long the same files, copied again, are not sent to the same peer again.
+const CLIPBOARD_RECOPY_QUIET: Duration = Duration::from_secs(2);
+
+fn files_just_sent(
+    last: &Option<(String, String, Instant)>,
+    device_id: &str,
+    signature: &str,
+    now: Instant,
+) -> bool {
+    last.as_ref().is_some_and(|(device, sent, at)| {
+        device == device_id && sent == signature && now.saturating_duration_since(*at) < CLIPBOARD_RECOPY_QUIET
+    })
+}
+
 fn clipboard_poll_unchanged(
     version: Option<u64>,
     previous: &Option<(u64, String, String)>,
@@ -6932,27 +8107,89 @@ fn arm_clipboard_echo_guard(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) 
     if let Ok(mut until) = clipboard_echo_until.lock() {
         *until = Some(Instant::now() + Duration::from_millis(CLIPBOARD_ECHO_GRACE_MS));
     }
+    CLIPBOARD_OWN_WRITE_VERSION.store(clipboard::change_count().unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Clipboard version our last received write left behind (0 = none). Reading
+/// that version back is never a local copy, whatever its bytes: macOS hands
+/// HTML back wrapped in a full document, so the signature no longer matched
+/// and every rich copy bounced to its source, replacing the formats there.
+/// A copy landing between the write and this reading is missed until the next
+/// one; that window is a few microseconds.
+static CLIPBOARD_OWN_WRITE_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Swap the packet's raw image for its deflated form and return the raw one,
+/// or None when there is no image to shrink.
+fn deflate_packet_image(packet: &mut ClipboardPacket) -> Option<ClipboardFormat> {
+    let format = packet.formats.iter_mut().find(|format| format.kind == "imageRgba")?;
+    let deflated = clipboard::deflate_image(format.image.as_ref()?)?;
+    Some(std::mem::replace(
+        format,
+        ClipboardFormat { kind: "imageRgbaDeflate".into(), text: String::new(), image: Some(deflated) },
+    ))
+}
+
+/// Send a clipboard packet, its image deflated. A peer from before that form
+/// existed refuses it; it is then sent the raw pixels, now and from here on.
+// ponytail: any refusal counts (sync switched off there looks the same), at
+// the cost of raw images to that peer until this app restarts.
+fn send_clipboard_packet(
+    transport: &quic_transport::TransportHandle,
+    addr: &str,
+    key: &str,
+    protocol_version: u16,
+    mut packet: ClipboardPacket,
+) -> Result<(), String> {
+    static RAW_IMAGE_PEERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let wants_raw = RAW_IMAGE_PEERS.lock().is_ok_and(|peers| peers.iter().any(|peer| peer == key));
+    let raw = if wants_raw { None } else { deflate_packet_image(&mut packet) };
+    let peer = || transport.peer(addr.to_string(), key.to_string(), protocol_version);
+    match (transport.send_stream_expect_ack(peer(), encode_wire_packet(&packet)?), raw) {
+        (Err(error), Some(raw)) if error.contains(quic_transport::STREAM_REJECTED) => {
+            if let Ok(mut peers) = RAW_IMAGE_PEERS.lock() {
+                peers.push(key.to_string());
+            }
+            if let Some(format) = packet.formats.iter_mut().find(|format| format.kind == "imageRgbaDeflate") {
+                *format = raw;
+            }
+            transport.send_stream_expect_ack(peer(), encode_wire_packet(&packet)?)
+        }
+        (result, _) => result,
+    }
+}
+
+/// What this machine last took from a peer, and from whom (its transport
+/// key). It is never sent back there: with control going both ways a copy
+/// could otherwise return to the machine it was made on, files and all.
+static CLIPBOARD_LAST_RECEIVED: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+fn note_clipboard_received(signature: &str, origin_key: &str) {
+    if let Ok(mut received) = CLIPBOARD_LAST_RECEIVED.lock() {
+        *received = Some((signature.into(), origin_key.into()));
+    }
+}
+
+fn clipboard_came_from(signature: &str, peer_key: &str) -> bool {
+    CLIPBOARD_LAST_RECEIVED
+        .lock()
+        .is_ok_and(|received| received_from(&received, signature, peer_key))
+}
+
+fn received_from(received: &Option<(String, String)>, signature: &str, peer_key: &str) -> bool {
+    !peer_key.trim().is_empty()
+        && received.as_ref().is_some_and(|(seen, origin)| seen == signature && origin == peer_key)
+}
+
+fn clipboard_is_own_write(version: Option<u64>, own_write: u64) -> bool {
+    own_write != 0 && version == Some(own_write)
 }
 
 fn write_clipboard_content_with_retry(content: &ClipboardContent) -> Result<(), String> {
-    retry_clipboard_content_write(
-        content,
+    retry_clipboard_write(
         CLIPBOARD_WRITE_ATTEMPTS,
         Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
-        clipboard::write_content,
+        || clipboard::write_content(content),
     )
-}
-
-fn retry_clipboard_content_write<F>(
-    content: &ClipboardContent,
-    attempts: usize,
-    retry_delay: Duration,
-    mut write_content: F,
-) -> Result<(), String>
-where
-    F: FnMut(&ClipboardContent) -> Result<(), String>,
-{
-    retry_clipboard_write(attempts, retry_delay, || write_content(content))
 }
 
 fn retry_clipboard_write<F>(
@@ -7029,12 +8266,26 @@ where
         return false;
     }
 
-    if layout.clipboard_on_demand && !packet.paste { return false; }
+    // Why a copy was turned away: the sender only learns that it was, and a
+    // real log held 25 refusals in two hours with nothing here to say why.
+    let origin = packet.origin_id.clone();
+    let refused = |why: &str| {
+        // ponytail: one line per run of refusals. An older sender offers
+        // refused content again every 2 s, and would fill the log.
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        let now = now_ms();
+        if now.saturating_sub(LAST_MS.swap(now, Ordering::Relaxed)) >= 2_500 {
+            log::info!("a copy from {origin} was refused: {why}");
+        }
+        false
+    };
+
+    if layout.clipboard_on_demand && !packet.paste { return refused("this computer takes copies only when asked"); }
     if packet.paste && layout.machine_role != "client"
-        && !clipboard_exchange::paste_expected(&packet.paste_token, &packet.origin_transport_public_key) { return false; }
+        && !clipboard_exchange::paste_expected(&packet.paste_token, &packet.origin_transport_public_key) { return refused("it asks for a paste nobody here requested"); }
 
     if !clipboard_packet_authorized(layout, &packet) {
-        return false;
+        return refused("its pairing does not match this computer's");
     }
 
     if packet.origin_id == local_peer_id {
@@ -7042,17 +8293,20 @@ where
     }
 
     if !clipboard_packet_sequence_is_current(&packet, clipboard_last_sequences) {
-        return false;
+        return refused("it is older than the last copy taken from that computer");
     }
 
     let accepted_sequence = clipboard_packet_sequence(&packet);
-    let content = clipboard_content_from_packet(packet);
+    let origin_key = packet.origin_transport_public_key.clone();
+    let concealed = packet.concealed;
+    let content = clipboard_content_from_packet(packet)
+        .map(|content| if concealed { content.concealed() } else { content });
 
     let Some(content) = content else {
-        return false;
+        return refused("nothing in it that this version reads");
     };
     if content.is_oversized() {
-        return false;
+        return refused("it is larger than a synced copy may be");
     }
 
     let signature = content.signature();
@@ -7071,6 +8325,7 @@ where
         // Remember what we just wrote so our own poll loop recognizes it as an
         // echo (signature match) and arm the time-based guard as a backstop in
         // case the OS hands the bitmap back to us with slightly different bytes.
+        note_clipboard_received(&signature, &origin_key);
         if let Ok(mut seen) = clipboard_seen_text.lock() {
             *seen = Some(signature);
         }
@@ -7150,6 +8405,7 @@ fn clipboard_content_from_format(format: ClipboardFormat) -> Option<ClipboardCon
     match format.kind.as_str() {
         "plainText" if !format.text.is_empty() => Some(ClipboardContent::Text(format.text)),
         "imageRgba" => format.image.map(ClipboardContent::Image),
+        "imageRgbaDeflate" => format.image.and_then(clipboard::inflate_image).map(ClipboardContent::Image),
         _ => None,
     }
 }
@@ -7176,7 +8432,8 @@ fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -
                 || controller.id == packet.origin_id
         }) || (layout.paired_controllers.len() == 1
             && packet.origin_id == "local-device"
-            && !key.is_empty());
+            && !key.is_empty())
+            || peer_control_member(layout, &packet.origin_id, key);
     }
 
     true
@@ -7202,13 +8459,16 @@ fn file_transfer_target_for_device(
             .iter()
             .find(|controller| controller.id == device_id)
         {
+            // Newest wins, as in apply_peer_presence: after an address change
+            // the old entry lingers until it ages out, and it sorts first.
             let peer = peers
                 .iter()
-                .find(|peer| {
+                .filter(|peer| {
                     peer.id == controller.id
                         || (!controller.transport_public_key.trim().is_empty()
                             && peer.transport_public_key == controller.transport_public_key)
                 })
+                .max_by_key(|peer| peer.last_seen_ms)
                 .ok_or_else(|| format!("{} 当前不在线，无法传输文件。", controller.name))?;
             if peer.protocol_version != quic_transport::PROTOCOL_VERSION
                 || peer.transport_public_key.trim().is_empty()
@@ -7240,11 +8500,20 @@ fn file_transfer_target_for_device(
         }
     }
 
-    if let Some(device) = layout
-        .devices
+    // A peer id is host + IP and a controller keeps the id it first saw, so a
+    // request from a peer whose IP changed since names an id no device has
+    // (its log reply and clipboard pull then found "no target"). The transport
+    // key that peer announces still identifies the paired device.
+    let announced_key = peers
         .iter()
-        .find(|device| device.id == device_id && device.role != "local")
-    {
+        .find(|peer| peer.id == device_id)
+        .map(|peer| peer.transport_public_key.as_str())
+        .filter(|key| !key.trim().is_empty());
+    if let Some(device) = layout.devices.iter().find(|device| {
+        device.role != "local"
+            && (device.id == device_id
+                || announced_key == Some(device.transport_public_key.as_str()))
+    }) {
         if !device.online || !device.input_ready {
             return Err(format!("{} 当前不在线，无法传输文件。", device.name));
         }
@@ -7297,7 +8566,7 @@ fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String>
             continue;
         }
         if !metadata.is_file() {
-            return Err(format!("暂不支持传输文件夹或特殊文件：{}", path.display()));
+            return Err(format!("暂不支持传输特殊文件：{}", path.display()));
         }
         if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
             return Err(format!(
@@ -7323,19 +8592,29 @@ fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String>
     }
 }
 
-#[cfg(target_os = "macos")]
-fn collect_native_drag_files(paths: &[String]) -> Result<Vec<TransferFile>, String> {
+/// Every file and folder under `paths`, one entry each, as Windows lists
+/// virtual files. `max_bytes` bounds each file and each folder's total.
+fn collect_virtual_files(paths: &[String], max_bytes: u64) -> Result<Vec<TransferFile>, String> {
     let mut files = Vec::new();
     for raw in paths {
         let root = Path::new(raw);
         let name = transfer_file_name(root)?;
         if root.is_dir() {
-            for (relative, directory, size) in folder_transfer::walk(root)? {
+            for (relative, directory, size) in folder_transfer::walk_up_to(root, max_bytes)? {
                 let virtual_name = Path::new(&name).join(&relative).to_string_lossy().replace('\\', "/");
                 if virtual_name.encode_utf16().count() >= 260 { return Err(format!("{DRAG_CONTROL_FAILED}: 文件夹路径过长，请使用普通文件传输。")); }
                 files.push(TransferFile { path: root.join(relative), name: virtual_name, total_bytes: size, directory, bundle: None });
             }
-        } else { files.extend(collect_transfer_files(&[raw.clone()])?); }
+        } else {
+            let metadata = fs::metadata(root).map_err(|error| format!("无法读取文件 {}: {error}", root.display()))?;
+            if !metadata.is_file() {
+                return Err(format!("暂不支持传输特殊文件：{}", root.display()));
+            }
+            if metadata.len() > max_bytes {
+                return Err(format!("{} 超过单文件上限 {}。", root.display(), format_bytes(max_bytes)));
+            }
+            files.push(TransferFile { path: root.to_path_buf(), name, total_bytes: metadata.len(), directory: false, bundle: None });
+        }
         if files.len() > folder_transfer::MAX_ENTRIES { return Err("拖放条目过多。".into()); }
     }
     if files.is_empty() { return Err("请选择要传输的文件。".into()); }
@@ -7436,6 +8715,14 @@ fn send_transfer_file(
 
 fn new_transfer_id(prefix: &str) -> String {
     format!("{prefix}-{}-{}", now_ms(), random_hex(8))
+}
+
+/// What the files of one send have in common: all of their transfer id but
+/// its last part, the file's number. A sender older than that numbering gives
+/// each file an id of its own, and so a batch of its own.
+#[cfg(any(target_os = "macos", test))]
+fn transfer_batch(transfer_id: &str) -> &str {
+    transfer_id.rsplit_once('-').map_or(transfer_id, |(batch, _)| batch)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7543,13 +8830,26 @@ fn send_transfer_file_bytes(
 }
 
 #[tauri::command]
-fn cancel_file_transfer(transfer_id: String) -> bool { transfer_jobs::cancel(&transfer_id) }
+fn cancel_file_transfer(transfer_id: String) -> bool {
+    if transfer_jobs::cancel(&transfer_id) {
+        return true;
+    }
+    // Not one being sent: a copy this Mac is fetching, given up from here.
+    // Its sender finds the next piece refused, and says the transfer is over.
+    #[cfg(target_os = "macos")]
+    if macos_file_offer::abort_file(&transfer_id) {
+        return true;
+    }
+    false
+}
 
 fn abort_incoming_file_transfer(packet: FileTransferPacket, transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>) -> bool {
     let Ok(mut transfers) = transfers.lock() else { return false; };
     let Some(transfer) = transfers.get(&packet.transfer_id) else { return true; };
     if transfer.origin_id != packet.origin_id || transfer.target_id != packet.target_id { return false; }
     if let Some(transfer) = transfers.remove(&packet.transfer_id) { let _ = fs::remove_file(transfer.temp_path); }
+    #[cfg(target_os = "macos")]
+    drag_place::abort(&packet.transfer_id);
     true
 }
 
@@ -7668,7 +8968,7 @@ fn send_file_transfer_packet(
 #[serde(rename_all = "camelCase")]
 struct DragControlPacket {
     protocol: String,
-    kind: String, // "start" | "drop" | "cancel"
+    kind: String, // "start" | "drop" | "cancel" | "pull"; an offer's id for a clipboard offer
     origin_id: String,
     target_id: String,
     cluster_id: String,
@@ -7719,7 +9019,7 @@ fn send_ole_drag_start(
 
     let peers = active_peer_snapshot(&state.peers);
     let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
-    let files = collect_native_drag_files(paths)?;
+    let files = collect_virtual_files(paths, folder_transfer::MAX_BYTES)?;
     let tree = files.iter().any(|file| file.directory);
 
     // Pre-assign a transfer id per file so the client can match the streamed
@@ -7891,22 +9191,7 @@ fn handle_drag_control_packet(
     if !layout.file_transfer_enabled {
         return false;
     }
-    // Reuse the file-transfer trust checks: same cluster, same pair secret, and
-    // (on a client) an origin we are paired to.
-    if layout.cluster_id.trim().is_empty()
-        || layout.pair_secret.trim().is_empty()
-        || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
-    {
-        return false;
-    }
-    if layout.machine_role == "client"
-        && !layout.paired_controllers.is_empty()
-        && !layout
-            .paired_controllers
-            .iter()
-            .any(|controller| controller.id == packet.origin_id)
-    {
+    if !stream_origin_trusted(layout, &packet.cluster_id, &packet.pair_secret, &packet.origin_id) {
         return false;
     }
     if packet.origin_id == local_peer_id {
@@ -7927,7 +9212,15 @@ fn handle_drag_control_packet(
                         directory: file.directory,
                     })
                     .collect();
-                let mode = native_drag::NativeDragMode::for_role(&layout.machine_role);
+                // Under peer control either side may be the one driving: the
+                // machine that just asked for this drag back holds the button.
+                let mode = if !layout.peer_control {
+                    native_drag::NativeDragMode::for_role(&layout.machine_role)
+                } else if windows_drag::controller_handoff_pending() {
+                    native_drag::NativeDragMode::Controller
+                } else {
+                    native_drag::NativeDragMode::Receiver
+                };
                 if windows_drag::start_drag_session(files, mode) {
                     log::info!("native drag session started from {}", packet.origin_id);
                 } else { return false; }
@@ -7964,30 +9257,160 @@ fn handle_drag_control_packet(
 mod drag_place {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
+    /// A drag is every file of one send (`super::transfer_batch`).
     struct State {
-        active: bool,
+        /// The drag in the user's hand, as the batches its files come in: its
+        /// finished files wait for the release. One batch from a sender that
+        /// numbers the files of a send; from an older one, a batch a file.
+        hand: Vec<String>,
         staged: Vec<PathBuf>,
-        target: Option<PathBuf>,
-        target_at: Option<Instant>,
+        /// Where the last few drags were let go of, for their files still on
+        /// the way: a large one arrives minutes after the button is released,
+        /// and the second of two may not have started by then.
+        released: Vec<(String, PathBuf)>,
+        /// The files still on the way, by transfer id.
+        arriving: BTreeMap<String, Arriving>,
+    }
+
+    struct Arriving {
+        name: String,
+        total: u64,
+        shown: Option<Placeholder>,
     }
 
     fn state() -> &'static Mutex<State> {
-        static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-        STATE.get_or_init(|| {
-            Mutex::new(State {
-                active: false,
-                staged: Vec::new(),
-                target: None,
-                target_at: None,
-            })
-        })
+        static STATE: Mutex<State> =
+            Mutex::new(State { hand: Vec::new(), staged: Vec::new(), released: Vec::new(), arriving: BTreeMap::new() });
+        &STATE
     }
 
-    fn fresh(at: Option<Instant>) -> bool {
-        at.map(|t| t.elapsed() < Duration::from_secs(3)).unwrap_or(false)
+    /// What stands in the folder a drag was dropped on for a file still on
+    /// the way: an empty file under its name with `.part` added, on whose icon
+    /// Finder draws how far it has come. Gone when let go of.
+    // ponytail: one left behind by quitting mid-transfer stays, empty, until
+    // deleted by hand. Keep a list on disk to clear at start if that happens.
+    pub(crate) struct Placeholder {
+        path: PathBuf,
+        progress: finder::Progress,
+        total: u64,
+        told: u64,
+    }
+
+    impl Placeholder {
+        pub(crate) fn new(folder: &Path, name: &str, total: u64) -> Option<Self> {
+            let _ = fs::create_dir_all(folder);
+            let path = super::unique_transfer_destination(folder, &format!("{name}.part"));
+            if let Err(error) = fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                log::warn!("drag drop: nothing could stand in {} for {name}: {error}", folder.display());
+                return None;
+            }
+            let Some(progress) = finder::Progress::publish(&path, total) else {
+                let _ = fs::remove_file(&path);
+                return None;
+            };
+            log::info!("drag drop: {} stands in for the file while it arrives", path.display());
+            Some(Self { path, progress, total, told: 0 })
+        }
+
+        /// So much of it has arrived: Finder is told, two hundred times a
+        /// file and not once a chunk.
+        pub(crate) fn arrived(&mut self, received: u64) {
+            if received.saturating_sub(self.told) >= self.total / 200 {
+                self.told = received;
+                self.progress.set(received);
+            }
+        }
+    }
+
+    impl Drop for Placeholder {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            log::info!("drag drop: {} taken away again", self.path.display());
+        }
+    }
+
+    /// A file's progress as Finder draws it on the file's icon, the way a
+    /// browser's download shows there.
+    mod finder {
+        use std::ffi::{c_char, c_void, CString};
+        use std::path::Path;
+
+        type Id = *mut c_void;
+
+        #[link(name = "objc")]
+        extern "C" {
+            fn objc_getClass(name: *const c_char) -> Id;
+            fn sel_registerName(name: *const c_char) -> Id;
+            fn objc_msgSend();
+            fn objc_autoreleasePoolPush() -> *mut c_void;
+            fn objc_autoreleasePoolPop(pool: *mut c_void);
+        }
+
+        #[link(name = "Foundation", kind = "framework")]
+        extern "C" {
+            static NSProgressKindFile: Id;
+            static NSProgressFileOperationKindKey: Id;
+            static NSProgressFileOperationKindDownloading: Id;
+            static NSProgressFileURLKey: Id;
+        }
+
+        unsafe fn send<A, B>(receiver: Id, selector: &'static [u8], first: A, second: B) -> Id {
+            let send: unsafe extern "C" fn(Id, Id, A, B) -> Id = std::mem::transmute(objc_msgSend as *const ());
+            send(receiver, sel_registerName(selector.as_ptr().cast()), first, second)
+        }
+
+        unsafe fn class(name: &'static [u8]) -> Id {
+            objc_getClass(name.as_ptr().cast())
+        }
+
+        pub struct Progress(Id);
+
+        // NSProgress is made to be updated from whichever thread does the work.
+        unsafe impl Send for Progress {}
+
+        impl Progress {
+            pub fn publish(file: &Path, total: u64) -> Option<Self> {
+                let path = CString::new(file.to_str()?).ok()?;
+                unsafe {
+                    let pool = objc_autoreleasePoolPush();
+                    let path = send(class(b"NSString\0"), b"stringWithUTF8String:\0", path.as_ptr(), 0usize);
+                    let url = send(class(b"NSURL\0"), b"fileURLWithPath:\0", path, 0usize);
+                    let about = send(class(b"NSMutableDictionary\0"), b"dictionary\0", 0usize, 0usize);
+                    send(about, b"setObject:forKey:\0", NSProgressFileOperationKindDownloading, NSProgressFileOperationKindKey);
+                    send(about, b"setObject:forKey:\0", url, NSProgressFileURLKey);
+                    let progress = send(class(b"NSProgress\0"), b"alloc\0", 0usize, 0usize);
+                    let progress = send(progress, b"initWithParent:userInfo:\0", std::ptr::null_mut::<c_void>(), about);
+                    if !progress.is_null() {
+                        send(progress, b"setKind:\0", NSProgressKindFile, 0usize);
+                        // No stop button on the icon: a drag is stopped where
+                        // it is sent from.
+                        send(progress, b"setCancellable:\0", false, 0usize);
+                        send(progress, b"setTotalUnitCount:\0", total as i64, 0usize);
+                        send(progress, b"publish\0", 0usize, 0usize);
+                    }
+                    objc_autoreleasePoolPop(pool);
+                    (!progress.is_null()).then_some(Self(progress))
+                }
+            }
+
+            pub fn set(&self, done: u64) {
+                unsafe {
+                    send(self.0, b"setCompletedUnitCount:\0", done as i64, 0usize);
+                }
+            }
+        }
+
+        impl Drop for Progress {
+            fn drop(&mut self) {
+                unsafe {
+                    send(self.0, b"unpublish\0", 0usize, 0usize);
+                    send(self.0, b"release\0", 0usize, 0usize);
+                }
+            }
+        }
     }
 
     fn desktop_dir() -> PathBuf {
@@ -7996,62 +9419,99 @@ mod drag_place {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// A Windows→Mac drag started delivering files. `file_name` seeds the drag
-    /// overlay icon with that file type.
-    pub fn begin(file_name: &str) {
-        let first = {
+    fn dropped_on(state: &State, batch: &str) -> Option<PathBuf> {
+        state.released.iter().find(|(released, _)| released == batch).map(|(_, target)| target.clone())
+    }
+
+    /// A file of a Windows→Mac drag started arriving. The first of a drag
+    /// puts it in the user's hand; `file_name` seeds the overlay icon with
+    /// that file type. One of a drag already let go of shows where it was
+    /// dropped from now on.
+    pub fn begin(transfer_id: &str, file_name: &str, total: u64) {
+        let batch = super::transfer_batch(transfer_id);
+        {
             let Ok(mut state) = state().lock() else {
                 return;
             };
-            let first = !state.active;
-            if first {
-                state.staged.clear();
-                state.target = None;
-                state.target_at = None;
+            let target = dropped_on(&state, batch);
+            let shown = target.as_deref().and_then(|folder| Placeholder::new(folder, file_name, total));
+            state.arriving.insert(transfer_id.to_string(), Arriving { name: file_name.to_string(), total, shown });
+            if target.is_some() || state.hand.iter().any(|held| held == batch) {
+                return;
             }
-            state.active = true;
-            first
-        };
-        if first {
-            let extension = Path::new(file_name)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_string());
-            crate::input::drag_overlay_show(extension);
+            // Another batch while one is in hand is more of the same drag (a
+            // drag ends before the next can begin): taken for a new one, it
+            // left the files before it in the staging folder.
+            state.hand.push(batch.to_string());
+            if state.hand.len() > 1 {
+                return;
+            }
+            state.staged.clear();
         }
+        let extension = Path::new(file_name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_string());
+        crate::input::drag_overlay_show(extension);
+    }
+
+    /// So much of a file has arrived: Finder is told, on its placeholder.
+    pub fn progress(transfer_id: &str, received: u64) {
+        let Ok(mut state) = state().lock() else {
+            return;
+        };
+        if let Some(Arriving { shown: Some(placeholder), .. }) = state.arriving.get_mut(transfer_id) {
+            placeholder.arrived(received);
+        }
+    }
+
+    /// A file will not arrive: the sender gave up, or went silent.
+    pub fn abort(transfer_id: &str) {
+        let gone = state().lock().ok().and_then(|mut state| state.arriving.remove(transfer_id));
+        drop(gone);
     }
 
     /// A file finished transferring into the staging dir.
-    pub fn stage(path: PathBuf) {
-        let ready_target = {
+    pub fn stage(transfer_id: &str, path: PathBuf) {
+        let batch = super::transfer_batch(transfer_id);
+        let (target, arrived) = {
             let Ok(mut state) = state().lock() else {
                 return;
             };
-            match state.target.clone() {
-                // Released already: drop it straight in.
-                Some(target) if fresh(state.target_at) => Some(target),
-                _ => {
-                    state.staged.push(path.clone());
-                    None
-                }
+            // Released already: drop it straight in.
+            let target = dropped_on(&state, batch);
+            if target.is_none() && state.hand.iter().any(|held| held == batch) {
+                state.staged.push(path.clone());
             }
+            (target, state.arriving.remove(transfer_id))
         };
-        if let Some(target) = ready_target {
+        if let Some(target) = target {
             place(&path, &target);
         }
+        // Its placeholder goes once the file itself is there.
+        drop(arrived);
     }
 
-    /// The drag was released over the Mac; `folder` is the folder under the
-    /// cursor (None = Desktop). Places everything staged so far.
+    /// The drag in hand was released over the Mac; `folder` is the folder
+    /// under the cursor (None = Desktop). Places everything staged so far.
     pub fn release(folder: Option<PathBuf>) {
         let target = folder.unwrap_or_else(desktop_dir);
         let staged = {
             let Ok(mut state) = state().lock() else {
                 return;
             };
-            state.target = Some(target.clone());
-            state.target_at = Some(Instant::now());
-            state.active = false;
+            let batches = std::mem::take(&mut state.hand);
+            if batches.is_empty() {
+                return;
+            }
+            for (transfer_id, arriving) in &mut state.arriving {
+                if batches.iter().any(|batch| batch == super::transfer_batch(transfer_id)) {
+                    arriving.shown = Placeholder::new(&target, &arriving.name, arriving.total);
+                }
+            }
+            state.released.extend(batches.into_iter().map(|batch| (batch, target.clone())));
+            let kept = state.released.len().saturating_sub(8);
+            state.released.drain(..kept);
             std::mem::take(&mut state.staged)
         };
         crate::input::drag_overlay_hide();
@@ -8061,13 +9521,11 @@ mod drag_place {
         }
     }
 
-    /// Whether a pulled drag is genuinely still in the user's hand, i.e. it can
-    /// be relayed onward to another machine. Stricter than `is_active`, whose
-    /// grace window stays true for seconds AFTER a release so late-arriving
-    /// files still get placed — crossing within that window must not be
-    /// mistaken for a relay.
-    pub fn is_relaying() -> bool {
-        state().lock().map(|state| state.active).unwrap_or(false)
+    /// Whether a drag is still in the user's hand: its release is to be
+    /// placed, or it can be relayed onward to another machine. Cheap — checked
+    /// on every injected button-up.
+    pub fn in_hand() -> bool {
+        state().lock().is_ok_and(|state| !state.hand.is_empty())
     }
 
     /// Client→client relay: take the files that finished streaming in and end
@@ -8082,25 +9540,14 @@ mod drag_place {
             let Ok(mut state) = state().lock() else {
                 return Vec::new();
             };
-            state.active = false;
-            state.target = None;
-            state.target_at = None;
+            state.hand.clear();
             std::mem::take(&mut state.staged)
         };
         crate::input::drag_overlay_hide();
         staged
     }
 
-    /// Whether a drag is in flight (so the release hook bothers to resolve the
-    /// folder under the cursor). Cheap — checked on every injected button-up.
-    pub fn is_active() -> bool {
-        state()
-            .lock()
-            .map(|state| state.active || fresh(state.target_at))
-            .unwrap_or(false)
-    }
-
-    fn place(staged: &Path, folder: &Path) {
+    pub(crate) fn place(staged: &Path, folder: &Path) {
         let Some(name) = staged.file_name() else {
             return;
         };
@@ -8146,21 +9593,65 @@ fn handle_file_transfer_packet(
     //  - otherwise → the transfers folder (None here).
     let drop_root = if packet.client_log {
         client_log_dir(app).ok()
-    } else if packet.drag_drop {
+    } else if packet.drag_drop && cfg!(target_os = "macos") {
         Some(receive_root.join(".mykvm-drag-staging"))
-    } else if packet.drop_to_desktop {
+    } else if packet.drop_to_desktop || packet.drag_drop {
+        // Only macOS places a staged drag; anywhere else it stayed in the
+        // staging folder for good.
         app.path().desktop_dir().ok()
     } else {
         None
     };
-    handle_decoded_file_transfer_packet(
+    // A copy this Mac is fetching shows nowhere else, and nothing can paste
+    // it until all of it is here.
+    #[cfg(target_os = "macos")]
+    let fetched = (packet.transfer_id.starts_with("offer-")
+        && !macos_file_offer::pasted_into_folder(&packet.transfer_id)
+        && {
+        // Its beginning and end, and of its chunks as many as a sender tells of.
+        static REPORTED_MS: AtomicU64 = AtomicU64::new(0);
+        let now = now_ms();
+        let due = packet.kind != "chunk"
+            || now.saturating_sub(REPORTED_MS.load(Ordering::Relaxed)) >= FILE_TRANSFER_PROGRESS_INTERVAL_MS;
+        if due {
+            REPORTED_MS.store(now, Ordering::Relaxed);
+        }
+        due
+    })
+    .then(|| FileTransferProgress {
+        transfer_id: packet.transfer_id.clone(),
+        file_name: packet.file_name.clone(),
+        target_name: layout
+            .devices
+            .iter()
+            .find(|device| device.id == packet.origin_id)
+            .map_or_else(|| packet.origin_id.clone(), |device| device.name.clone()),
+        sent_bytes: if packet.kind == "finish" {
+            packet.total_bytes
+        } else {
+            packet.offset.saturating_add(packet.data.len() as u64)
+        },
+        total_bytes: packet.total_bytes,
+        file_index: 1,
+        file_count: 1,
+        done: matches!(packet.kind.as_str(), "finish" | "abort"),
+        error: (packet.kind == "abort").then(|| "传输已取消。".to_string()),
+        incoming: true,
+        bytes_per_second: 0,
+    });
+    let handled = handle_decoded_file_transfer_packet(
         packet,
         layout,
         local_peer_id,
         transfers,
         &receive_root,
         drop_root.as_deref(),
-    )
+    );
+    #[cfg(target_os = "macos")]
+    if let (true, Some(progress)) = (handled, fetched) {
+        report_transfer_progress(app, progress);
+    }
+    handled
 }
 
 fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -8244,8 +9735,9 @@ fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, Str
 }
 
 // Control channel: a paired peer asks this device for something — its recent
-// log (sent back as an ordinary file transfer tagged `client_log`) or, from
-// its controller, to update itself.
+// log (sent back as an ordinary file transfer tagged `client_log`), what is on
+// its clipboard, the files it offered or, from its controller, to update or
+// lock itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PeerRequestPacket {
@@ -8265,6 +9757,7 @@ enum PeerRequest {
     Update,
     Lock,
     Clipboard,
+    OfferedFiles,
 }
 
 /// Whether `packet` may ask this device for anything, and what (`None` =
@@ -8280,6 +9773,9 @@ fn authorize_peer_request(
     let request = match packet.protocol.as_str() {
         LOG_REQUEST_PROTOCOL if layout.file_transfer_enabled => PeerRequest::Log,
         CLIPBOARD_PULL_PROTOCOL if layout.clipboard_sync => PeerRequest::Clipboard,
+        CLIPBOARD_OFFER_PULL_PROTOCOL if layout.clipboard_sync && layout.file_transfer_enabled => {
+            PeerRequest::OfferedFiles
+        }
         REMOTE_UPDATE_PROTOCOL if layout.machine_role == "client" => PeerRequest::Update,
         LOCK_SCREEN_PROTOCOL if layout.machine_role == "client" => PeerRequest::Lock,
         _ => return None,
@@ -8296,6 +9792,10 @@ fn authorize_peer_request(
             .paired_controllers
             .iter()
             .any(|controller| controller.id == packet.origin_id)
+        // Another device of the cluster may ask for a clipboard or a log, but
+        // only the controller this client is paired with may update or lock it.
+        && !(matches!(request, PeerRequest::Log | PeerRequest::Clipboard | PeerRequest::OfferedFiles)
+            && peer_control_member(layout, &packet.origin_id, ""))
     {
         return None;
     }
@@ -8319,12 +9819,26 @@ fn handle_peer_request_packet(
     };
     if !matches!(
         packet.protocol.as_str(),
-        LOG_REQUEST_PROTOCOL | REMOTE_UPDATE_PROTOCOL | LOCK_SCREEN_PROTOCOL | CLIPBOARD_PULL_PROTOCOL
+        LOG_REQUEST_PROTOCOL
+            | REMOTE_UPDATE_PROTOCOL
+            | LOCK_SCREEN_PROTOCOL
+            | CLIPBOARD_PULL_PROTOCOL
+            | CLIPBOARD_OFFER_PULL_PROTOCOL
     ) {
         return false;
     }
     match authorize_peer_request(&packet, layout, local_peer_id) {
-        None => return packet.protocol != CLIPBOARD_PULL_PROTOCOL,
+        // A refused pull is rejected, so the asking side stops waiting.
+        None => return !matches!(packet.protocol.as_str(), CLIPBOARD_PULL_PROTOCOL | CLIPBOARD_OFFER_PULL_PROTOCOL),
+        Some(PeerRequest::OfferedFiles) => {
+            let Some(offer) = clipboard_offer(&packet.paste_token) else {
+                log::warn!("{} asked for copied files that are no longer offered", packet.origin_id);
+                return false;
+            };
+            let app = app.clone();
+            thread::spawn(move || send_offered_clipboard_files(&app, offer));
+            return true;
+        }
         Some(PeerRequest::Update) => {
             log::info!("update requested by controller {}", packet.origin_id);
             run_requested_update(app.clone());
@@ -8446,7 +9960,7 @@ fn handle_decoded_file_transfer_packet(
     if !layout.file_transfer_enabled {
         return false;
     }
-    if !file_transfer_packet_authorized(layout, &packet) {
+    if !stream_origin_trusted(layout, &packet.cluster_id, &packet.pair_secret, &packet.origin_id) {
         return false;
     }
     if packet.origin_id == local_peer_id {
@@ -8454,6 +9968,30 @@ fn handle_decoded_file_transfer_packet(
     }
     if packet.protocol == CLIPBOARD_FILES_PROTOCOL && !layout.clipboard_sync { return false; }
     if packet.kind == "directory-probe" || packet.kind == "clipboard-probe" { return true; }
+    // A file of an offer whose paste is over (cancelled, or the clipboard
+    // moved on): refuse it, which stops the sender, instead of letting the
+    // rest of the copy pile up in the transfers folder.
+    #[cfg(target_os = "windows")]
+    let pasting = windows_drag::session_wants(&packet.transfer_id);
+    #[cfg(target_os = "macos")]
+    let pasting = macos_file_offer::session_wants(&packet.transfer_id);
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let pasting = false;
+    if packet.transfer_id.starts_with("offer-") && !pasting {
+        // Its word that it has stopped is taken: that is what ends the card
+        // of a copy given up here, which stood at its last figure for 30 s.
+        return packet.kind == "abort";
+    }
+    #[cfg(target_os = "macos")]
+    if pasting {
+        return match packet.kind.as_str() {
+            "start" => true,
+            "chunk" => macos_file_offer::feed_chunk(&packet.transfer_id, &packet.data),
+            "finish" => macos_file_offer::finish_file(&packet.transfer_id),
+            "abort" => macos_file_offer::abort_file(&packet.transfer_id),
+            _ => false,
+        };
+    }
 
     // A file that belongs to an active native drag session feeds that session's
     // in-memory stream (read by the OLE drop target) instead of landing on disk.
@@ -8533,7 +10071,7 @@ fn start_incoming_file_transfer(
     // A ShareMouse-style drag: hold the file for release-time placement.
     #[cfg(target_os = "macos")]
     if packet.drag_drop {
-        drag_place::begin(&packet.file_name);
+        drag_place::begin(&packet.transfer_id, &file_name, packet.total_bytes);
     }
 
     let transfer = IncomingFileTransfer {
@@ -8603,6 +10141,10 @@ fn append_incoming_file_transfer_chunk(
         .saturating_add(packet.data.len() as u64);
     transfer.next_chunk_index = transfer.next_chunk_index.saturating_add(1);
     transfer.touched_ms = now_ms();
+    #[cfg(target_os = "macos")]
+    if transfer.staged {
+        drag_place::progress(&packet.transfer_id, transfer.received_bytes);
+    }
     true
 }
 
@@ -8643,7 +10185,7 @@ fn finish_incoming_file_transfer(
     };
 
     // The staging dir and the final dir can sit on different volumes (e.g. a
-    // redirected Desktop), where rename fails — fall back to copy + delete.
+    // redirected Desktop), where a hard link fails — it then copies.
     let finalize = finalize_received_transfer(&temp_path, &mut final_path, directory_bundle);
     match finalize {
         Ok(()) => {
@@ -8656,7 +10198,7 @@ fn finish_incoming_file_transfer(
             // cursor when the drag is released (or right away if already).
             #[cfg(target_os = "macos")]
             if staged {
-                drag_place::stage(final_path.clone());
+                drag_place::stage(&packet.transfer_id, final_path.clone());
                 return true;
             }
             let _ = staged;
@@ -8675,43 +10217,36 @@ fn finish_incoming_file_transfer(
     }
 }
 
-fn file_transfer_packet_authorized(layout: &LayoutState, packet: &FileTransferPacket) -> bool {
-    if layout.cluster_id.trim().is_empty()
-        || layout.pair_secret.trim().is_empty()
-        || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
-    {
-        return false;
-    }
-
-    if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
-        return layout
-            .paired_controllers
-            .iter()
-            .any(|controller| controller.id == packet.origin_id);
-    }
-
-    true
-}
-
 fn sanitize_transfer_file_name(name: &str) -> Option<String> {
-    let mut output = String::with_capacity(name.len().min(180));
-    for character in name.trim().chars() {
-        let safe = match character {
+    let clean: String = name
+        .trim()
+        .chars()
+        .map(|character| match character {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
             character if character.is_control() => '_',
             character => character,
-        };
-        output.push(safe);
-        if output.len() >= 180 {
-            break;
-        }
+        })
+        .collect();
+    // Cut an over-long name in its stem: a 60-character Chinese title is
+    // already 180 bytes, and cutting at the end dropped the ".docx".
+    let (stem, extension) = match clean.rfind('.') {
+        Some(dot) if dot > 0 && clean.len() - dot <= 16 => clean.split_at(dot),
+        _ => (clean.as_str(), ""),
+    };
+    let mut end = stem.len().min(180 - extension.len());
+    while !stem.is_char_boundary(end) {
+        end -= 1;
     }
-    let output = output.trim().trim_matches('.').trim().to_string();
-    if output.is_empty() || output == "." || output == ".." {
+    let output = format!("{}{extension}", &stem[..end]);
+    // Windows cannot keep a trailing dot or space. A leading dot is part of
+    // the name (.gitignore); "." and ".." trim to nothing.
+    let output = output.trim_end_matches(['.', ' ']);
+    if output.is_empty() {
         None
+    } else if folder_transfer::windows_reserved_name(output) {
+        Some(format!("_{output}"))
     } else {
-        Some(output)
+        Some(output.to_string())
     }
 }
 
@@ -8881,7 +10416,6 @@ fn same_cluster_host(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -
         && (same_host(&device.host, &peer.host) || same_host(&device.host, &peer.ip))
 }
 
-#[allow(dead_code)]
 fn same_host(value: &str, host: &str) -> bool {
     let host = host.trim().to_ascii_lowercase();
     if host.is_empty() {
@@ -8928,8 +10462,61 @@ fn sanitize_id(value: &str) -> String {
         .to_string()
 }
 
+/// What each device last announced, by transport key: its id and whether it
+/// takes input from its whole cluster. A device entry keeps the id it had when
+/// it was added, and both ids embed an IP address that changes; a packet that
+/// names its sender only by id is matched through this.
+fn announced() -> &'static Mutex<HashMap<String, (String, bool)>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, (String, bool)>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_announced(key: &str, id: &str, peer_control: bool) {
+    if key.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut seen) = announced().lock() {
+        if seen.get(key).is_none_or(|known| known.0 != id || known.1 != peer_control) {
+            seen.insert(key.into(), (id.into(), peer_control));
+        }
+    }
+}
+
+/// Whether `device` takes input from this machine. A controller's clients
+/// always do. From a client it takes peer control on the far side as well:
+/// a device on an older version, or one that has not heard from the controller
+/// yet, would drop the input without a word and leave this machine's cursor
+/// hidden on a screen that does not respond.
+pub(crate) fn device_takes_input_from_here(layout: &LayoutState, device: &Device) -> bool {
+    layout.machine_role != "client"
+        || announced()
+            .lock()
+            .is_ok_and(|seen| seen.get(&device.transport_public_key).is_some_and(|known| known.1))
+}
+
+/// Under peer control, a device of this machine's cluster: one the
+/// controller's arrangement lists. `origin_key` may be empty (several packets
+/// name their sender by id alone).
+pub(crate) fn peer_control_member(layout: &LayoutState, origin_id: &str, origin_key: &str) -> bool {
+    if !layout.peer_control {
+        return false;
+    }
+    let (origin_id, origin_key) = (origin_id.trim(), origin_key.trim());
+    layout.devices.iter().filter(|device| device.role != "local").any(|device| {
+        let key = device.transport_public_key.trim();
+        (!origin_key.is_empty() && key == origin_key)
+            || (!origin_id.is_empty()
+                && (device.id == origin_id
+                    || (!key.is_empty()
+                        && announced()
+                            .lock()
+                            .is_ok_and(|seen| seen.get(key).is_some_and(|known| known.0 == origin_id)))))
+    })
+}
+
 fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.online = true;
+    note_announced(&peer.transport_public_key, &peer.id, peer.peer_control);
     device.input_ready = peer.input_ready;
     if device.source != "manual" {
         device.host = if peer.ip.trim().is_empty() {
@@ -9058,8 +10645,6 @@ struct DiscoveryPacket {
     pair_cluster_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pair_secret: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pairing_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -9067,7 +10652,6 @@ struct DiscoveryPairingFields {
     code: Option<String>,
     cluster_id: Option<String>,
     secret: Option<String>,
-    error: Option<String>,
 }
 
 struct IncomingDiscovery {
@@ -9110,6 +10694,7 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
             .unwrap_or_else(default_protocol_version),
         screen_count: local_device.map(|device| device.screens.len()).unwrap_or(0),
         input_ready: false,
+        peer_control: layout.peer_control && !pairing_required(layout),
         upgrading: false,
         screens: local_device
             .map(|device| device.screens.iter().map(screen_to_peer_screen).collect())
@@ -9161,23 +10746,6 @@ fn advertised_input_ready(layout: &LayoutState, input_ready: bool) -> bool {
     input_ready && !pairing_required(layout) && !layout.cluster_id.trim().is_empty()
 }
 
-fn should_send_public_announce(layout: &LayoutState) -> bool {
-    // Paired clients used to stay silent on public announces and only reply
-    // to their paired server's probes. But if the reply path ever fails (the
-    // server's announce arrives while the client is still starting up after an
-    // admin-restart, or the cluster_id the server broadcasts momentarily
-    // differs), the server never sees the client come back online and the
-    // cursor can't cross — the "paired but shows online and nothing happens"
-    // trap that forces a re-pair. Letting a paired client also announce means
-    // the server's apply_peer_presence picks it up within one announce cycle
-    // (3 s) without relying solely on the reply path. The announce only
-    // carries public fields (cluster_id, transport_public_key, host, screens)
-    // — never the pair_secret — and MyKVM is designed for trusted LANs, so
-    // this does not lower the security posture.
-    let _ = layout;
-    true
-}
-
 fn screen_to_peer_screen(screen: &Screen) -> LanPeerScreen {
     LanPeerScreen {
         id: screen.id.clone(),
@@ -9192,20 +10760,7 @@ fn screen_to_peer_screen(screen: &Screen) -> LanPeerScreen {
 }
 
 fn local_peer_id(host: &str, ip: &str) -> String {
-    let seed = format!("{host}-{ip}");
-    let normalized = seed
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-
+    let normalized = sanitize_id(&format!("{host}-{ip}"));
     if normalized.is_empty() {
         "peer-local".into()
     } else {
@@ -9394,7 +10949,6 @@ fn confirm_pairing_for_peer(
         code: Some(code.trim().into()),
         cluster_id: Some(local_peer.cluster_id.clone()),
         secret: Some(pair_secret.trim().into()),
-        error: None,
     };
     let payload = encode_discovery_payload("pair-confirm", local_peer, fields)?;
     let target_addr = format!("{}:{}", challenge_peer.ip, challenge_peer.quic_port);
@@ -9446,23 +11000,7 @@ fn send_discovery_packet(
     local_peer: &LanPeer,
     target: impl std::net::ToSocketAddrs,
 ) -> Result<(), String> {
-    send_discovery_packet_with_pairing(
-        socket,
-        kind,
-        local_peer,
-        target,
-        DiscoveryPairingFields::default(),
-    )
-}
-
-fn send_discovery_packet_with_pairing(
-    socket: &UdpSocket,
-    kind: &str,
-    local_peer: &LanPeer,
-    target: impl std::net::ToSocketAddrs,
-    pairing: DiscoveryPairingFields,
-) -> Result<(), String> {
-    let payload = encode_discovery_payload(kind, local_peer, pairing)?;
+    let payload = encode_discovery_payload(kind, local_peer, DiscoveryPairingFields::default())?;
     socket
         .send_to(&payload, target)
         .map(|_| ())
@@ -9483,7 +11021,6 @@ fn encode_discovery_payload(
         pairing_code: pairing.code,
         pair_cluster_id: pairing.cluster_id,
         pair_secret: pairing.secret,
-        pairing_error: pairing.error,
     };
     encode_wire_packet(&packet)
         .map_err(|error| format!("failed to encode discovery packet: {error}"))
@@ -9820,9 +11357,7 @@ fn begin_pairing_challenge(
                     // before each retry was checked: one typo made every
                     // later attempt fail, and it handed out fresh guesses.
                     existing.requester_ip = requester_ip;
-                    existing.requester_host = requester.host.clone();
                     existing.requester_public_key = requester.transport_public_key.clone();
-                    existing.requester_protocol_version = requester.protocol_version;
                     return true;
                 }
                 return false;
@@ -9834,9 +11369,7 @@ fn begin_pairing_challenge(
             requester_id: requester.id.clone(),
             requester_name: requester.name.clone(),
             requester_ip,
-            requester_host: requester.host.clone(),
             requester_public_key: requester.transport_public_key.clone(),
-            requester_protocol_version: requester.protocol_version,
             expires_at,
             expires_at_ms,
             attempts: 0,
@@ -9880,11 +11413,14 @@ fn complete_pairing_from_confirm(
         {
             return Err("配对请求来源不一致，请重新发起配对。".into());
         }
+        // A burnt challenge stays until it expires. Clearing it let the next
+        // pair-request mint a fresh code at once, so a LAN host could keep
+        // guessing five codes at a time without ever waiting.
+        if existing.attempts >= PAIRING_MAX_ATTEMPTS {
+            return Err("验证码错误次数过多，请等验证码过期后重新发起配对。".into());
+        }
         if existing.code != code.trim() {
             existing.attempts = existing.attempts.saturating_add(1);
-            if existing.attempts >= PAIRING_MAX_ATTEMPTS {
-                *challenge = None;
-            }
             return Err("验证码不正确。".into());
         }
         *challenge = None;
@@ -9954,7 +11490,35 @@ fn discovery_detail(peer_count: usize, listening: bool, port: u16) -> String {
 /// whole span — rather than a single port — lets us reach peers that drifted
 /// onto a neighbouring port when their preferred port was momentarily taken.
 pub(crate) fn broadcast_addrs(base_port: u16) -> Vec<String> {
-    broadcast_addrs_for_ips(base_port, &local_ipv4_addresses())
+    let mut addresses = broadcast_addrs_for_ips(base_port, &local_ipv4_addresses());
+    // The /24 guess above never reaches the far half of a /16 or /23 network;
+    // add the broadcast address each interface's own netmask gives.
+    let subnets = interface_broadcasts();
+    for port in discovery_target_ports(base_port) {
+        addresses.extend(subnets.iter().map(|ip| format!("{ip}:{port}")));
+    }
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+fn interface_broadcasts() -> Vec<Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(address) if usable_discovery_ipv4(address.ip) => {
+                ipv4_broadcast(address.ip, address.netmask)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// None for point-to-point links (/31, /32), which have no broadcast address.
+fn ipv4_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Ipv4Addr> {
+    let host_bits = !u32::from(netmask);
+    (host_bits > 1).then(|| Ipv4Addr::from(u32::from(ip) | host_bits))
 }
 
 fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
@@ -10050,9 +11614,6 @@ fn discovery_target_ports(base: u16) -> Vec<u16> {
         let Some(port) = base.checked_add(offset) else {
             break;
         };
-        if port > TRANSPORT_PORT_MAX {
-            break;
-        }
         ports.push(port);
     }
     ports
@@ -10171,6 +11732,14 @@ fn ensure_windows_firewall_rule() {
     }
 }
 
+/// `ago` before now, for "long enough ago that the first check is due".
+/// `Instant::now() - ago` panics on Windows while the machine has been up for
+/// less than `ago` (its `Instant` counts from boot), which is exactly when a
+/// service started at boot runs this.
+pub(crate) fn instant_ago(ago: Duration) -> Instant {
+    Instant::now().checked_sub(ago).unwrap_or_else(Instant::now)
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -10237,27 +11806,96 @@ mod tests {
         }
     }
 
-    /// A drag pulled off one controlled machine can be relayed onward to
-    /// another only while it is still in the user's hand. `is_active` stays
-    /// true for seconds after the release so files still in flight get placed,
-    /// and reading THAT as "a relay is in progress" made the next crossing
-    /// forward a drag that had already been dropped here.
+    #[test]
+    fn a_transfer_is_timed_over_about_a_second() {
+        const RATE: u64 = 20 << 20;
+        assert_eq!(transfer_speed(0, 1 << 18, 0.001), 0, "two reports at once say nothing");
+        assert_eq!(transfer_speed(0, RATE / 10, 0.1), RATE);
+        // A stall of a tenth of a second dents the figure, it does not zero it.
+        assert_eq!(transfer_speed(RATE, 0, 0.1), RATE / 10 * 9);
+        let mut speed = RATE;
+        for _ in 0..50 {
+            speed = transfer_speed(speed, RATE / 20, 0.1);
+        }
+        assert!(speed.abs_diff(RATE / 2) < RATE / 100, "half the rate for five seconds reads as half: {speed}");
+    }
+
+    #[test]
+    fn the_pop_up_keeps_a_card_for_each_transfer_and_one_for_the_files_of_a_copy() {
+        let report = |id: &str, target: &str, done: bool, error: Option<&str>| FileTransferProgress {
+            transfer_id: id.into(),
+            file_name: "a.bin".into(),
+            target_name: target.into(),
+            sent_bytes: 0,
+            total_bytes: 1,
+            file_index: 1,
+            file_count: 1,
+            done,
+            error: error.map(Into::into),
+            incoming: false,
+            bytes_per_second: 0,
+        };
+        let mut shown = Vec::new();
+        let ids = |shown: &Vec<(FileTransferProgress, Instant)>| {
+            shown.iter().map(|(progress, _)| progress.transfer_id.clone()).collect::<Vec<_>>()
+        };
+        note_shown_transfer(&mut shown, &mut report("one", "Mac", false, None));
+        note_shown_transfer(&mut shown, &mut report("two", "Mac", false, None));
+        assert_eq!(ids(&shown), ["one", "two"], "two at once are both shown");
+        // One is given up: the other keeps its card, and the next transfer
+        // does not take the place of the one that failed.
+        note_shown_transfer(&mut shown, &mut report("two", "Mac", true, Some("cancelled")));
+        note_shown_transfer(&mut shown, &mut report("three", "Mac", false, None));
+        assert_eq!(ids(&shown), ["one", "two", "three"]);
+        // The next file of a copy stands where the one before it stood.
+        note_shown_transfer(&mut shown, &mut report("one", "Mac", true, None));
+        note_shown_transfer(&mut shown, &mut report("one-next", "Mac", false, None));
+        assert_eq!(ids(&shown), ["one-next", "two", "three"]);
+    }
+
+    /// A drag is in the user's hand until it is let go of, and only then can
+    /// it be relayed onward to another machine. Its files still on the way
+    /// follow it to where it was dropped however long they take: one that only
+    /// starts afterwards is not a drag picked up anew.
     #[cfg(target_os = "macos")]
     #[test]
-    fn drag_place_relay_closes_before_the_placement_grace_window() {
-        drag_place::begin("photo.png");
-        assert!(drag_place::is_relaying());
-        assert!(drag_place::is_active());
+    fn a_released_drag_keeps_its_folder_for_the_files_still_coming() {
+        let root = temp_test_dir("drag-place");
+        let (staging, folder) = (root.join("staging"), root.join("dropped"));
+        fs::create_dir_all(&staging).unwrap();
+        let (a, b) = ("file-1795099079202-ab12cd34-0", "file-1795099079202-ab12cd34-1");
+        assert_eq!(transfer_batch(a), transfer_batch(b));
 
-        drag_place::release(None);
-        assert!(
-            drag_place::is_active(),
-            "late files must still find their target"
-        );
-        assert!(
-            !drag_place::is_relaying(),
-            "a released drag must not be forwarded to the next machine"
-        );
+        drag_place::begin(a, "a.png", 1);
+        assert!(drag_place::in_hand());
+        drag_place::release(Some(folder.clone()));
+        assert!(!drag_place::in_hand(), "a released drag must not be forwarded to the next machine");
+        assert!(folder.join("a.png.part").exists(), "a file on its way shows where it was dropped");
+
+        drag_place::begin(b, "b.png", 1);
+        assert!(!drag_place::in_hand(), "the next file of a drag already dropped is not a new drag");
+        assert!(folder.join("b.png.part").exists());
+        drag_place::progress(b, 1);
+        drag_place::abort(b);
+        assert!(!folder.join("b.png.part").exists(), "a file that will not come leaves nothing behind");
+
+        fs::write(staging.join("a.png"), b"x").unwrap();
+        drag_place::stage(a, staging.join("a.png"));
+        assert!(folder.join("a.png").exists(), "the file must land where the drag was dropped");
+        assert!(!folder.join("a.png.part").exists());
+
+        // A sender older than numbered ids: every file of its drag has an id,
+        // and so a batch, of its own. They are one drag all the same.
+        let (first, second) = ("file-1795099079300-0a0a0a0a", "file-1795099079400-0b0b0b0b");
+        for (id, name) in [(first, "c.png"), (second, "d.png")] {
+            drag_place::begin(id, name, 1);
+            fs::write(staging.join(name), b"x").unwrap();
+            drag_place::stage(id, staging.join(name));
+        }
+        drag_place::release(Some(folder.clone()));
+        assert!(folder.join("c.png").exists(), "the first file is not left behind for the second");
+        assert!(folder.join("d.png").exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]
@@ -10468,6 +12106,7 @@ mod tests {
     fn test_layout() -> LayoutState {
         LayoutState {
             lock_sync: false,
+            peer_control: false,
             input_protection: Default::default(),
             devices: vec![
                 Device {
@@ -10554,6 +12193,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_count: 1,
             input_ready: true,
+            peer_control: false,
             upgrading: false,
             screens: vec![LanPeerScreen {
                 id: "local-display-1".into(),
@@ -10613,17 +12253,24 @@ mod tests {
     fn runtime_toggle_shortcut_disabled_for_client_role() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
+        layout.input_mode = "receive".into();
 
         assert_eq!(
             runtime_toggle_shortcut_for_layout(&layout).expect("shortcut"),
             None
         );
+        // Nor under peer control: a client keeps bindings from any time it
+        // was a server, and they would start taking keys there unasked.
+        layout.peer_control = true;
+        assert_eq!(runtime_toggle_shortcut_for_layout(&layout).expect("shortcut"), None);
+        assert!(screen_switch_shortcuts_for_layout(&layout).left.is_empty());
     }
 
     #[test]
     fn screen_switch_shortcuts_disabled_for_client_role() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
+        layout.input_mode = "receive".into();
 
         assert_eq!(
             screen_switch_shortcuts_for_layout(&layout),
@@ -10915,28 +12562,6 @@ mod tests {
     }
 
     #[test]
-    fn paired_client_still_announces_publicly() {
-        // A paired client keeps sending public announces so the server can pick
-        // it back up within one announce cycle after the client restarts (e.g. an
-        // admin-restart), instead of depending solely on the reply path. The
-        // announce only carries public fields, never the pair_secret.
-        let mut layout = test_layout();
-        layout.machine_role = "client".into();
-        layout.paired_controllers = vec![PairedController {
-            id: "server".into(),
-            name: "Server".into(),
-            host: "server".into(),
-            ip: "10.0.0.1".into(),
-            transport_public_key: "server-key".into(),
-            protocol_version: quic_transport::PROTOCOL_VERSION,
-            cluster_id: layout.cluster_id.clone(),
-            paired_at_ms: now_ms(),
-        }];
-
-        assert!(should_send_public_announce(&layout));
-    }
-
-    #[test]
     fn save_merge_preserves_backend_pairing_from_stale_settings_snapshot() {
         let mut current = test_layout();
         current.machine_role = "client".into();
@@ -11050,9 +12675,7 @@ mod tests {
             requester_id: server.id.clone(),
             requester_name: server.name.clone(),
             requester_ip: server.ip.clone(),
-            requester_host: server.host.clone(),
             requester_public_key: server.transport_public_key.clone(),
-            requester_protocol_version: server.protocol_version,
             expires_at: Instant::now() + Duration::from_secs(60),
             expires_at_ms: now_ms() + 60_000,
             attempts: 0,
@@ -11067,7 +12690,6 @@ mod tests {
                 code: Some("123456".into()),
                 cluster_id: Some("server-cluster".into()),
                 secret: Some("server-secret".into()),
-                error: None,
             },
         )
         .expect("pair-confirm should encode");
@@ -11109,9 +12731,7 @@ mod tests {
             requester_id: server.id.clone(),
             requester_name: server.name.clone(),
             requester_ip: server.ip.clone(),
-            requester_host: server.host.clone(),
             requester_public_key: server.transport_public_key.clone(),
-            requester_protocol_version: server.protocol_version,
             expires_at: Instant::now() + Duration::from_secs(60),
             expires_at_ms: now_ms() + 60_000,
             attempts: 0,
@@ -11126,7 +12746,6 @@ mod tests {
                 code: Some("000000".into()),
                 cluster_id: Some("server-cluster".into()),
                 secret: Some("server-secret".into()),
-                error: None,
             },
         )
         .expect("pair-confirm should encode");
@@ -11185,6 +12804,7 @@ mod tests {
             text: "hello".into(),
             image: None,
             sequence: 1,
+            concealed: false,
         };
 
         assert!(!clipboard_packet_authorized(&layout, &packet));
@@ -11228,6 +12848,7 @@ mod tests {
             text: "hi".into(),
             image: None,
             sequence: 1,
+            concealed: false,
         };
 
         assert!(
@@ -11511,7 +13132,6 @@ mod tests {
             protocol_version: 1,
             cluster_id: "cluster".into(),
             pair_secret: "secret".into(),
-            expires_at: None,
         };
         let previous = Some((7, target.device_id.clone(), target.addr.clone()));
         assert!(clipboard_poll_unchanged(Some(7), &previous, &target, false));
@@ -11590,10 +13210,9 @@ mod tests {
 
     #[test]
     fn clipboard_write_retries_transient_failures() {
-        let content = ClipboardContent::Text("hello".into());
         let mut calls = 0;
 
-        let result = retry_clipboard_content_write(&content, 3, Duration::ZERO, |_| {
+        let result = retry_clipboard_write(3, Duration::ZERO, || {
             calls += 1;
             if calls < 3 {
                 Err("clipboard busy".into())
@@ -11626,6 +13245,7 @@ mod tests {
             text: String::new(),
             image: None,
             sequence: 1,
+            concealed: false,
         };
         let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
         let clipboard_seen_text = Arc::new(Mutex::new(None));
@@ -11713,6 +13333,7 @@ mod tests {
             text: "legacy".into(),
             image: None,
             sequence: 1,
+            concealed: false,
         };
         let payload = encode_wire_packet(&packet).expect("legacy clipboard packet should encode");
         let clipboard_seen_text = Arc::new(Mutex::new(None));
@@ -11819,6 +13440,21 @@ mod tests {
     }
 
     #[test]
+    fn file_transfer_target_follows_a_peer_whose_ip_changed() {
+        let layout = test_layout();
+        let mut peer = test_peer();
+        peer.id = "peer-client-10-0-0-9".into();
+
+        assert!(file_transfer_target_for_device(&layout, &[], &peer.id).is_err());
+        let target = file_transfer_target_for_device(&layout, &[peer.clone()], &peer.id).unwrap();
+        assert_eq!(target.device_id, "peer-client-10-0-0-2");
+
+        // An announce with another key names no paired device.
+        peer.transport_public_key = "someone-else".into();
+        assert!(file_transfer_target_for_device(&layout, &[peer.clone()], &peer.id).is_err());
+    }
+
+    #[test]
     fn file_transfer_target_uses_peer_quic_port() {
         let layout = test_layout();
         let target = file_transfer_target_for_device(&layout, &[], "peer-client-10-0-0-2").unwrap();
@@ -11856,6 +13492,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             screen_count: 1,
             input_ready: false,
+            peer_control: false,
             upgrading: false,
             screens: vec![],
             app_version: "0.1.0".into(),
@@ -11948,6 +13585,38 @@ mod tests {
     }
 
     #[test]
+    fn a_file_of_an_offer_nobody_is_pasting_is_refused_not_saved() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-offer-over");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let start = test_file_transfer_packet("start", "offer-1-abcd", "movie.mov", 5, 0, 0, b"");
+        assert!(!handle_file_transfer_packet_with_root(
+            &encode_wire_packet(&start).expect("start should encode"),
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+        assert!(transfers.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_machine_that_becomes_a_client_stops_capturing_until_its_controller_says_so() {
+        let mut controller = test_layout();
+        controller.peer_control = true;
+        let mut as_client = controller.clone();
+        as_client.machine_role = "client".into();
+        as_client.input_mode = "receive".into();
+        let saved = merge_runtime_owned_layout_fields(as_client, &controller);
+        assert!(!saved.peer_control && !saved.captures_input());
+        // A controller's own choice is its to keep, and it always reaches its clients.
+        let kept = merge_runtime_owned_layout_fields(controller.clone(), &controller);
+        assert!(kept.peer_control);
+        assert!(device_takes_input_from_here(&controller, &controller.devices[1]));
+    }
+
+    #[test]
     fn file_transfer_rejects_out_of_order_chunks() {
         let layout = test_layout();
         let root = temp_test_dir("file-transfer-order");
@@ -11979,10 +13648,65 @@ mod tests {
     fn file_transfer_sanitizes_received_file_names() {
         assert_eq!(
             sanitize_transfer_file_name("../bad:name?.txt").as_deref(),
-            Some("_bad_name_.txt")
+            Some(".._bad_name_.txt") // no separator left, so it stays one file name
         );
         assert!(sanitize_transfer_file_name("..").is_none());
         assert!(sanitize_transfer_file_name("  ").is_none());
+        assert_eq!(sanitize_transfer_file_name(".gitignore").as_deref(), Some(".gitignore"));
+        assert_eq!(sanitize_transfer_file_name("notes. ").as_deref(), Some("notes"));
+        assert_eq!(sanitize_transfer_file_name("nul.txt").as_deref(), Some("_nul.txt"));
+        let long = sanitize_transfer_file_name(&format!("{}.docx", "汉".repeat(80))).unwrap();
+        assert!(long.len() <= 180 && long.ends_with(".docx"), "{long}");
+    }
+
+    #[test]
+    fn a_burnt_pairing_code_stays_burnt_until_it_expires() {
+        let requester = test_peer();
+        let challenge = Arc::new(Mutex::new(Some(PairingChallenge {
+            code: "123456".into(),
+            requester_id: requester.id.clone(),
+            requester_name: String::new(),
+            requester_ip: String::new(),
+            requester_public_key: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+            expires_at_ms: 0,
+            attempts: 0,
+        })));
+        let layout = Arc::new(Mutex::new(test_layout()));
+        let confirm = |code: &str| {
+            complete_pairing_from_confirm(
+                &layout,
+                &challenge,
+                &PathBuf::from("unused"),
+                &requester,
+                Some(code.into()),
+                Some("cluster".into()),
+                Some("secret".into()),
+            )
+        };
+        for _ in 0..PAIRING_MAX_ATTEMPTS {
+            assert_eq!(confirm("000000").unwrap_err(), "验证码不正确。");
+        }
+        // The right code no longer works, and the challenge is still there,
+        // so a new pair-request cannot mint a fresh one.
+        assert!(confirm("123456").unwrap_err().contains("次数过多"));
+        assert!(challenge.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn broadcast_follows_the_interface_netmask() {
+        let broadcast = |ip: [u8; 4], mask: [u8; 4]| ipv4_broadcast(ip.into(), mask.into());
+        assert_eq!(broadcast([10, 1, 2, 3], [255, 255, 0, 0]), Some([10, 1, 255, 255].into()));
+        assert_eq!(broadcast([192, 168, 66, 89], [255, 255, 254, 0]), Some([192, 168, 67, 255].into()));
+        assert_eq!(broadcast([10, 88, 0, 2], [255, 255, 255, 255]), None);
+    }
+
+    #[test]
+    fn our_own_clipboard_write_is_an_echo_whatever_it_reads_back_as() {
+        assert!(clipboard_is_own_write(Some(41), 41));
+        assert!(!clipboard_is_own_write(Some(42), 41));
+        assert!(!clipboard_is_own_write(None, 41));
+        assert!(!clipboard_is_own_write(Some(0), 0));
     }
 
     #[test]
@@ -12088,6 +13812,308 @@ mod tests {
             paired_at_ms: 0,
         }];
         layout
+    }
+
+    /// The controller's layout with a second client beside the first, and the
+    /// first client's own layout before it has heard from the controller.
+    fn peer_control_cluster() -> (LayoutState, LayoutState) {
+        let screen = |id: &str, device: &str, x: i32| Screen {
+            id: id.into(),
+            device_id: device.into(),
+            name: "Display".into(),
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            is_primary: true,
+        };
+        let mut controller = test_layout();
+        controller.peer_control = true;
+        controller.devices[0].screens = vec![screen("local-display-1", "local-device", 0)];
+        controller.devices[1].screens =
+            vec![screen("peer-client-10-0-0-2-local-display-1", "peer-client-10-0-0-2", 1920)];
+        let mut second = controller.devices[1].clone();
+        second.id = "peer-other-10-0-0-3".into();
+        second.name = "Other".into();
+        second.transport_public_key = "other-public-key".into();
+        second.screens = vec![screen("peer-other-10-0-0-3-local-display-1", "peer-other-10-0-0-3", -1920)];
+        controller.devices.push(second);
+
+        let mut client = paired_client_layout();
+        client.input_mode = "receive".into();
+        client.devices.truncate(1);
+        client.devices[0].transport_public_key = "peer-public-key".into();
+        client.devices[0].screens = vec![screen("local-display-1", "local-device", 0)];
+        (controller, client)
+    }
+
+    fn shared_by(controller: &LayoutState) -> ClusterLayoutPacket {
+        ClusterLayoutPacket {
+            protocol: CLUSTER_LAYOUT_PROTOCOL.into(),
+            origin_id: "controller".into(),
+            origin_transport_public_key: "key".into(),
+            cluster_id: controller.cluster_id.clone(),
+            pair_secret: controller.pair_secret.clone(),
+            peer_control: controller.peer_control,
+            devices: if controller.peer_control { cluster_layout_devices(controller) } else { Vec::new() },
+        }
+    }
+
+    #[test]
+    fn a_client_sees_the_shared_arrangement_from_its_own_seat() {
+        let (controller, client) = peer_control_cluster();
+        let applied = apply_cluster_layout(&client, &shared_by(&controller));
+
+        assert!(applied.peer_control && applied.captures_input() && applied.accepts_input());
+        let ids: Vec<_> = applied.devices.iter().map(|device| (device.id.as_str(), device.role.as_str())).collect();
+        assert_eq!(ids, [("local-device", "local"), ("controller", "server"), ("peer-other-10-0-0-3", "client")]);
+        // Its own screen sits where the controller placed it; its id is its own.
+        assert_eq!((applied.devices[0].screens[0].id.as_str(), applied.devices[0].screens[0].x), ("local-display-1", 1920));
+        // The controller's screen is named so that it resolves on the controller.
+        let controller_screen = &applied.devices[1].screens[0];
+        assert_eq!(controller_screen.id, "controller-local-display-1");
+        // Reachability is this machine's own finding, never the controller's.
+        assert!(applied.devices[1..].iter().all(|device| !device.online && !device.input_ready));
+        // The controller is reached at the address this machine paired with.
+        assert_eq!(applied.devices[1].host, "10.0.0.1");
+        // An entry left from when this machine was a controller itself, with
+        // an address pinned by hand that is long gone, lends nothing.
+        let mut leftover = client.clone();
+        let mut stale = controller.devices[1].clone();
+        stale.id = "controller".into();
+        stale.host = "172.16.9.9".into();
+        stale.source = "manual".into();
+        stale.online = false;
+        leftover.devices.push(stale);
+        let renewed = apply_cluster_layout(&leftover, &shared_by(&controller));
+        assert_eq!((renewed.devices[1].host.as_str(), renewed.devices[1].source.as_str()), ("10.0.0.1", "detected"));
+        assert_eq!(renewed.devices.len(), 3);
+
+        // Both neighbours touch its screen: one target each way.
+        let mut reachable = applied.clone();
+        for device in &mut reachable.devices[1..] {
+            device.online = true;
+            device.input_ready = true;
+        }
+        // What this machine found out for itself: where the controller is
+        // (the controller's own entry names no address) and its real screen.
+        reachable.devices[1].host = "10.0.0.1".into();
+        reachable.devices[1].quic_port = 50_001;
+        reachable.devices[1].screens[0].width = 2560;
+        // The same arrangement sent again changes none of it.
+        let again = apply_cluster_layout(&reachable, &shared_by(&controller));
+        assert_eq!(again, reachable);
+        // A screen the controller moved does move, and keeps its found size.
+        let mut rearranged = controller.clone();
+        rearranged.devices[0].screens[0].y = 400;
+        let moved = apply_cluster_layout(&reachable, &shared_by(&rearranged));
+        assert_eq!((moved.devices[1].screens[0].y, moved.devices[1].screens[0].width), (400, 2560));
+        assert_eq!(moved.devices[1].host, "10.0.0.1");
+
+        // Peer control off again: only itself, no capture.
+        let mut off = controller.clone();
+        off.peer_control = false;
+        let reverted = apply_cluster_layout(&reachable, &shared_by(&off));
+        assert_eq!(reverted.devices.len(), 1);
+        assert!(!reverted.captures_input());
+    }
+
+    #[test]
+    fn peer_control_trusts_the_cluster_and_nothing_else() {
+        let (controller, client) = peer_control_cluster();
+        let applied = apply_cluster_layout(&client, &shared_by(&controller));
+        // A sibling, by key or by the id the controller knows it under.
+        assert!(peer_control_member(&applied, "", "other-public-key"));
+        assert!(peer_control_member(&applied, "peer-other-10-0-0-3", ""));
+        assert!(!peer_control_member(&applied, "stranger", "stranger-key"));
+        assert!(!peer_control_member(&applied, "local-device", "peer-public-key"), "never itself");
+        // Its address changed since: the id it announces now is matched through its key.
+        let mut moved = test_peer();
+        moved.id = "peer-other-10-0-0-77".into();
+        moved.transport_public_key = "other-public-key".into();
+        let mut found = applied.clone();
+        apply_peer_presence(&mut found, &[moved]);
+        assert!(peer_control_member(&found, "peer-other-10-0-0-77", ""));
+        // The controller takes input from its clients only while it is on.
+        assert!(peer_control_member(&controller, "", "peer-public-key"));
+        let mut off = controller.clone();
+        off.peer_control = false;
+        assert!(!peer_control_member(&off, "", "peer-public-key"));
+
+        // A sibling may send files and ask for the clipboard, but only the
+        // paired controller may update or lock this client.
+        let mut applied = applied;
+        applied.clipboard_sync = true;
+        let ask = |protocol: &str, origin: &str| {
+            authorize_peer_request(&peer_request(protocol, origin), &applied, "local-device")
+        };
+        assert_eq!(ask(CLIPBOARD_PULL_PROTOCOL, "peer-other-10-0-0-3"), Some(PeerRequest::Clipboard));
+        assert_eq!(ask(REMOTE_UPDATE_PROTOCOL, "peer-other-10-0-0-3"), None);
+        assert_eq!(ask(LOCK_SCREEN_PROTOCOL, "peer-other-10-0-0-3"), None);
+        assert_eq!(ask(REMOTE_UPDATE_PROTOCOL, "controller"), Some(PeerRequest::Update));
+        assert!(stream_origin_trusted(&applied, "cluster-test", "secret-test", "peer-other-10-0-0-3"));
+    }
+
+    #[test]
+    fn a_settings_save_on_a_client_keeps_what_the_controller_shared() {
+        let (controller, client) = peer_control_cluster();
+        let applied = apply_cluster_layout(&client, &shared_by(&controller));
+        // The window still holds the layout from before the controller spoke.
+        let mut stale = client.clone();
+        stale.clipboard_sync = true;
+        stale.devices[0].name = "Renamed".into();
+        let saved = merge_runtime_owned_layout_fields(stale, &applied);
+        assert!(saved.peer_control && saved.clipboard_sync);
+        assert_eq!(saved.devices.len(), 3);
+        assert_eq!(saved.devices[0].name, "Renamed");
+        assert_eq!(saved.devices[0].screens[0].x, 1920);
+    }
+
+    #[test]
+    fn a_display_seen_for_the_first_time_is_placed_beside_the_arranged_ones() {
+        let screen = |id: &str, name: &str, x: i32, width: i32| Screen {
+            id: id.into(),
+            device_id: "local-device".into(),
+            name: name.into(),
+            x,
+            y: 0,
+            width,
+            height: 1080,
+            scale: 1.0,
+            is_primary: false,
+        };
+        // Arranged at x = 5000 by the controller; the system has it at 0.
+        let current = vec![screen("local-display-1", "Main", 5000, 1920)];
+        let detected = vec![screen("local-display-1", "Main", 0, 1920), screen("local-display-2", "Side", 1920, 1280)];
+        let merged = restore_local_screen_layout(detected, &current, &mut Vec::new());
+        assert_eq!((merged[0].x, merged[1].x), (5000, 6920));
+    }
+
+    #[test]
+    fn a_chunk_goes_out_as_one_block_and_both_forms_are_read() {
+        #[derive(Serialize)]
+        struct AsList {
+            data: Vec<u8>,
+        }
+        #[derive(Serialize)]
+        struct AsBlock {
+            #[serde(serialize_with = "serialize_as_bytes")]
+            data: Vec<u8>,
+        }
+        #[derive(Deserialize)]
+        struct Read {
+            data: Vec<u8>,
+        }
+        // Half of what does not compress is 128 and above.
+        let data: Vec<u8> = (0..4096_u32).map(|index| (index * 37 % 256) as u8).collect();
+        // As every version so far sends it, and as this one does.
+        let list = encode_wire_packet(&AsList { data: data.clone() }).unwrap();
+        let block = encode_wire_packet(&AsBlock { data: data.clone() }).unwrap();
+        assert!(list.len() > data.len() * 14 / 10);
+        assert!(block.len() < data.len() + 16);
+        assert_eq!(decode_wire_packet::<Read>(&list).unwrap().data, data);
+        assert_eq!(decode_wire_packet::<Read>(&block).unwrap().data, data);
+    }
+
+    #[test]
+    fn the_same_files_copied_again_at_once_are_not_sent_twice() {
+        let at = Instant::now();
+        let last = Some(("peer-a".to_string(), "files:1".to_string(), at));
+        assert!(files_just_sent(&last, "peer-a", "files:1", at + Duration::from_millis(600)));
+        // Other files, another peer, or the same files later are all sent.
+        assert!(!files_just_sent(&last, "peer-a", "files:2", at));
+        assert!(!files_just_sent(&last, "peer-b", "files:1", at));
+        assert!(!files_just_sent(&last, "peer-a", "files:1", at + CLIPBOARD_RECOPY_QUIET));
+        assert!(!files_just_sent(&None, "peer-a", "files:1", at));
+    }
+
+    #[test]
+    fn what_a_peer_sent_is_not_sent_back_to_it() {
+        let received = Some(("files:abc".to_string(), "mac-key".to_string()));
+        assert!(received_from(&received, "files:abc", "mac-key"));
+        // It still goes on to a third machine, and a new copy goes anywhere.
+        assert!(!received_from(&received, "files:abc", "other-key"));
+        assert!(!received_from(&received, "text:new", "mac-key"));
+        // A peer that names no key is never mistaken for the source.
+        assert!(!received_from(&Some(("files:abc".into(), String::new())), "files:abc", ""));
+        assert!(!received_from(&None, "files:abc", "mac-key"));
+    }
+
+    #[test]
+    fn a_large_copy_is_offered_as_a_list_and_a_small_one_is_sent_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("album/raw")).unwrap();
+        fs::write(dir.path().join("album/raw/照片.bin"), vec![0_u8; 300]).unwrap();
+        fs::write(dir.path().join("clip.mov"), vec![0_u8; 200]).unwrap();
+        let paths: Vec<String> = ["album", "clip.mov"]
+            .iter()
+            .map(|name| dir.path().join(name).to_string_lossy().into_owned())
+            .collect();
+
+        assert!(clipboard_offer_files(&paths, 501).is_none(), "500 bytes is under the bar");
+        let files = clipboard_offer_files(&paths, 500).expect("at the bar it is offered");
+        let listed: Vec<_> = files
+            .iter()
+            .map(|(_, file)| (file.name.as_str(), file.directory, file.total_bytes))
+            .collect();
+        assert_eq!(
+            listed,
+            [("album/", true, 0), ("album/raw", true, 0), ("album/raw/照片.bin", false, 300), ("clip.mov", false, 200)]
+        );
+        // Each entry travels under its own id.
+        let ids: std::collections::HashSet<_> = files.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), files.len());
+        // Something that cannot be listed falls back to the whole send, which reports it.
+        assert!(clipboard_offer_files(&["/no/such/file".into()], 0).is_none());
+        // So do two of one name: listed, one would be saved over the other.
+        fs::write(dir.path().join("album/Clip.mov"), b"other").unwrap();
+        let same_name = [paths[1].clone(), dir.path().join("album/Clip.mov").to_string_lossy().into_owned()];
+        assert!(clipboard_offer_files(&same_name, 0).is_none());
+    }
+
+    #[test]
+    fn an_offer_can_be_fetched_until_newer_ones_push_it_out() {
+        let offer = |id: &str| {
+            Arc::new(ClipboardOffer {
+                id: id.into(),
+                target: FileTransferTarget {
+                    device_id: "peer".into(),
+                    name: "Peer".into(),
+                    addr: "10.0.0.2:1".into(),
+                    transport_public_key: "key".into(),
+                    protocol_version: quic_transport::PROTOCOL_VERSION,
+                    cluster_id: "cluster-test".into(),
+                    pair_secret: "secret-test".into(),
+                },
+                files: Vec::new(),
+            })
+        };
+        remember_clipboard_offer(offer("offer-test-first"));
+        assert!(clipboard_offer("offer-test-first").is_some());
+        for index in 0..4 {
+            remember_clipboard_offer(offer(&format!("offer-test-{index}")));
+        }
+        assert!(clipboard_offer("offer-test-first").is_none());
+        assert!(clipboard_offer("offer-test-3").is_some());
+        forget_clipboard_offer("offer-test-3");
+        assert!(clipboard_offer("offer-test-3").is_none());
+
+        // Who may fetch: the paired controller, with clipboard and files on.
+        let mut layout = paired_client_layout();
+        layout.clipboard_sync = true;
+        let pull = |origin: &str, layout: &LayoutState| {
+            authorize_peer_request(&peer_request(CLIPBOARD_OFFER_PULL_PROTOCOL, origin), layout, "local-device")
+        };
+        assert_eq!(pull("controller", &layout), Some(PeerRequest::OfferedFiles));
+        assert_eq!(pull("other", &layout), None);
+        layout.file_transfer_enabled = false;
+        assert_eq!(pull("controller", &layout), None);
+        // And whose offer is taken.
+        let layout = paired_client_layout();
+        assert!(stream_origin_trusted(&layout, "cluster-test", "secret-test", "controller"));
+        assert!(!stream_origin_trusted(&layout, "cluster-test", "secret-test", "other"));
+        assert!(!stream_origin_trusted(&layout, "cluster-test", "guess", "controller"));
     }
 
     #[test]

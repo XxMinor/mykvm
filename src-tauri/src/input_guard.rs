@@ -161,7 +161,7 @@ pub(crate) fn spawn_monitor(
     std::thread::spawn(move || {
         let mut protection = InputProtection::default();
         #[cfg(target_os = "windows")]
-        let mut last_snipaste_check = std::time::Instant::now() - Duration::from_secs(2);
+        let mut last_snipaste_check = crate::instant_ago(Duration::from_secs(2));
         while !stop.load(Ordering::Relaxed) {
             if let Ok(layout) = layout.try_lock() {
                 protection = layout.input_protection.clone();

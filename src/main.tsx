@@ -1,7 +1,10 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
+import { isTauri } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import './index.css'
 import App from './App.tsx'
+import TransferToast from './TransferToast.tsx'
 
 const nonPassiveCapture = { capture: true, passive: false } as AddEventListenerOptions
 
@@ -45,8 +48,14 @@ function preventWebviewPageZoom() {
 
 preventWebviewPageZoom()
 
+// The same page serves the pop-up that shows a transfer in the corner of the
+// screen; the backend opens that window under this label.
+const transferToast = isTauri() && getCurrentWindow().label === 'transfer-toast'
+if (transferToast) {
+  // Nothing of the page shows around the card (App.css).
+  document.documentElement.dataset.window = 'transfer-toast'
+}
+
 createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
+  <StrictMode>{transferToast ? <TransferToast /> : <App />}</StrictMode>,
 )

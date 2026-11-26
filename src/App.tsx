@@ -32,7 +32,6 @@ import {
   readDiagnosticInfo,
   readInputServiceStatus,
   readPerformanceSample,
-  readRuntimeStatus,
   relaunchApp,
   requestLanPairing,
   resetPairing,
@@ -47,7 +46,6 @@ import {
   startRuntime,
   startWindowDrag,
   stopRuntime,
-  cancelFileTransfer,
   syncWindowChrome,
   toggleMaximizeMainWindow,
   uninstallInputService,
@@ -56,8 +54,9 @@ import {
 import type { AppUpdateInfo } from "./desktopApi";
 import { compareVersions } from "./versions";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
-import { TEXT } from "./i18n";
+import { formatFileTransferBytes, TEXT } from "./i18n";
 import type { AppText } from "./i18n";
+import { TransferRow } from "./TransferToast";
 import {
   formatEdgeSwitchHotkeyForDisplay,
   hotkeyFromKeyboardEvent,
@@ -82,6 +81,7 @@ import type {
   RuntimeStatus,
 } from "./runtime";
 import type {
+  FileTransferProgressEntry,
   AppLanguage,
   Device,
   LayoutState,
@@ -174,20 +174,15 @@ type NativeFileDragPayload =
   | { type: "cancel" }
   | { type: string; paths?: string[]; position?: FileDropPosition };
 
-// Mirrors the Rust FileTransferProgress payload (camelCase serde).
-interface FileTransferProgressEntry {
-  transferId: string;
-  fileName: string;
-  targetName: string;
-  sentBytes: number;
-  totalBytes: number;
-  fileIndex: number;
-  fileCount: number;
-  done: boolean;
-  error: string | null;
-}
-
 const INPUT_SERVICE_OFFER_DISMISSED_KEY = "mykvm.inputServiceOfferDismissed";
+
+// Each language under its own name, whatever language the window is in.
+const LANGUAGES: [AppLanguage, string][] = [
+  ["cn", "简体中文"],
+  ["en", "English"],
+  ["ja", "日本語"],
+  ["ko", "한국어"],
+];
 
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
@@ -493,9 +488,7 @@ function App() {
             .catch((error: unknown) => {
               if (active) {
                 setErrorMessage(
-                  error instanceof Error
-                    ? error.message
-                    : TEXT.cn.errors.updateRuntime,
+                  formatUnknownError(error, TEXT.cn.errors.updateRuntime),
                 );
               }
             })
@@ -509,7 +502,7 @@ function App() {
       .catch((error: unknown) => {
         if (active) {
           setErrorMessage(
-            error instanceof Error ? error.message : TEXT.cn.errors.loadState,
+            formatUnknownError(error, TEXT.cn.errors.loadState),
           );
         }
       });
@@ -640,11 +633,14 @@ function App() {
       // Refresh runtime + layout together: device online/inputReady status
       // lives in layout, and without re-fetching it the UI shows stale
       // "offline" even after discovery has found the peer again.
-      Promise.all([readRuntimeStatus(), loadAppState()])
-        .then(([nextRuntime, nextSnapshot]) => {
+      // One call: the snapshot carries the same runtime status a second
+      // command used to be asked for alongside it.
+      loadAppState()
+        .then((nextSnapshot) => {
           if (!active) {
             return;
           }
+          const nextRuntime = nextSnapshot.runtime;
 
           setSnapshot((current) =>
             current
@@ -762,6 +758,8 @@ function App() {
   const updateChannel = layout?.updateChannel ?? "stable";
   const resolvedTheme = resolveTheme(themeMode, systemTheme);
   const ui = TEXT[language];
+  const describeError = (error: unknown, fallback: string) =>
+    formatUnknownError(error, fallback, language === "cn");
   const hasLoadedSnapshot = Boolean(snapshot);
   const isAvailableUpdateDismissed =
     Boolean(availableUpdate) &&
@@ -1014,7 +1012,7 @@ function App() {
       setDiagnosticInfo(await readDiagnosticInfo());
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        describeError(error, ui.errors.updateRuntime),
       );
     } finally {
       setIsDiagnosticPending(false);
@@ -1034,7 +1032,7 @@ function App() {
       setDiagnosticMessage(ui.settings.diagnosticsCopied);
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.writeClipboard,
+        describeError(error, ui.errors.writeClipboard),
       );
     } finally {
       setIsDiagnosticPending(false);
@@ -1049,7 +1047,7 @@ function App() {
       await openLogDirectory();
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        describeError(error, ui.errors.updateRuntime),
       );
     } finally {
       setIsDiagnosticPending(false);
@@ -1064,7 +1062,7 @@ function App() {
       setFileTransferMessage({ text: ui.settings.updateClientSent });
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        describeError(error, ui.errors.updateRuntime),
       );
     }
   }
@@ -1098,7 +1096,7 @@ function App() {
       setDiagnosticMessage(ui.settings.fetchClientLogSent);
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        describeError(error, ui.errors.updateRuntime),
       );
     } finally {
       setIsDiagnosticPending(false);
@@ -1113,7 +1111,7 @@ function App() {
       setSnapshot(persistedSnapshot);
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.saveLayout,
+        describeError(error, ui.errors.saveLayout),
       );
     } finally {
       savesInFlight.current -= 1;
@@ -1150,7 +1148,7 @@ function App() {
         setFileTransferMessage({ text: formatFileTransferSummary(summary, language) });
       } catch (error: unknown) {
         setErrorMessage(
-          error instanceof Error ? error.message : ui.errors.fileTransfer,
+          describeError(error, ui.errors.fileTransfer),
         );
       } finally {
         setFileTransferPendingTargetId(null);
@@ -1335,7 +1333,7 @@ function App() {
       );
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        describeError(error, ui.errors.updateRuntime),
       );
     } finally {
       setIsRuntimePending(false);
@@ -1368,7 +1366,7 @@ function App() {
     try {
       updateInputServiceStatus(await readInputServiceStatus());
     } catch (error: unknown) {
-      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
+      setErrorMessage(describeError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -1381,7 +1379,7 @@ function App() {
       updateInputServiceStatus(await installInputService());
       setInputServiceAction(null);
     } catch (error: unknown) {
-      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
+      setErrorMessage(describeError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -1394,7 +1392,7 @@ function App() {
       updateInputServiceStatus(await uninstallInputService());
       setInputServiceAction(null);
     } catch (error: unknown) {
-      setErrorMessage(formatUnknownError(error, ui.errors.updateRuntime));
+      setErrorMessage(describeError(error, ui.errors.updateRuntime));
     } finally {
       setIsInputServicePending(false);
     }
@@ -1430,7 +1428,7 @@ function App() {
       );
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.scanLan,
+        describeError(error, ui.errors.scanLan),
       );
     } finally {
       clearInterval(countdownTimer);
@@ -1577,6 +1575,10 @@ function App() {
 
   function setLockSync(lockSync: boolean) {
     updateLayout((layoutState) => ({ ...layoutState, lockSync }));
+  }
+
+  function setPeerControl(peerControl: boolean) {
+    updateLayout((layoutState) => ({ ...layoutState, peerControl }));
   }
 
   function setModifierRemap(modifierRemap: boolean) {
@@ -1762,7 +1764,7 @@ function App() {
       await restartAsAdmin();
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        describeError(error, ui.errors.updateRuntime),
       );
       setIsAdminRestartPending(false);
     }
@@ -1775,14 +1777,16 @@ function App() {
       await relaunchApp();
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        describeError(error, ui.errors.updateRuntime),
       );
       setIsAppRelaunchPending(false);
     }
   }
 
   async function setMachineRole(machineRole: Exclude<MachineRole, "unset">) {
-    if (!layout) {
+    // The role already chosen: pressing it again saved, switched tab and, on
+    // a client, started sharing that had been stopped on purpose.
+    if (!layout || machineRole === layout.machineRole) {
       return;
     }
 
@@ -1807,7 +1811,7 @@ function App() {
       const nextSnapshot = await resetPairing();
       setSnapshot(nextSnapshot);
     } catch (error: unknown) {
-      setErrorMessage(formatUnknownError(error, ui.errors.pairingFailed));
+      setErrorMessage(describeError(error, ui.errors.pairingFailed));
     }
   }
 
@@ -1821,7 +1825,7 @@ function App() {
       setAutostartEnabled(next);
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        describeError(error, ui.errors.updateRuntime),
       );
     }
   }
@@ -1859,9 +1863,7 @@ function App() {
       setManualDeviceHost("");
     } catch (error: unknown) {
       setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : `${host}: ${ui.errors.probeFailed}`,
+        describeError(error, `${host}: ${ui.errors.probeFailed}`),
       );
     } finally {
       setIsAddingDevice(false);
@@ -1901,7 +1903,7 @@ function App() {
       setServerPairingCode("");
       setServerPairingError(null);
     } catch (error: unknown) {
-      setErrorMessage(formatUnknownError(error, ui.errors.pairingFailed));
+      setErrorMessage(describeError(error, ui.errors.pairingFailed));
     } finally {
       setIsPairingDevice(false);
     }
@@ -1947,7 +1949,7 @@ function App() {
       setServerPairingCode("");
       setServerPairingError(null);
     } catch (error: unknown) {
-      setServerPairingError(formatUnknownError(error, ui.errors.pairingFailed));
+      setServerPairingError(describeError(error, ui.errors.pairingFailed));
     } finally {
       setIsPairingDevice(false);
     }
@@ -1968,7 +1970,7 @@ function App() {
           : current,
       );
     } catch (error: unknown) {
-      setErrorMessage(formatUnknownError(error, ui.errors.pairingFailed));
+      setErrorMessage(describeError(error, ui.errors.pairingFailed));
     } finally {
       setIsDismissingPairing(false);
     }
@@ -2060,7 +2062,7 @@ function App() {
     try {
       await saveModalLayout((current) => ({ ...current, updateChannel: channel }));
     } catch (error: unknown) {
-      setErrorMessage(formatUnknownError(error, ui.errors.saveLayout));
+      setErrorMessage(describeError(error, ui.errors.saveLayout));
     }
   }
 
@@ -2175,61 +2177,9 @@ function App() {
 
     return (
       <div className="file-transfer-toasts" aria-live="polite">
-        {transfers.map((transfer) => {
-          const percent =
-            transfer.totalBytes > 0
-              ? Math.min(
-                  100,
-                  Math.round((transfer.sentBytes / transfer.totalBytes) * 100),
-                )
-              : transfer.done && !transfer.error
-                ? 100
-                : 0;
-          const failed = Boolean(transfer.error);
-          const status = failed
-            ? ui.devices.fileTransferFailed
-            : transfer.done
-              ? ui.devices.fileTransferSent
-              : ui.devices.fileTransferSending;
-          const counter =
-            transfer.fileCount > 1
-              ? ` (${transfer.fileIndex}/${transfer.fileCount})`
-              : "";
-          return (
-            <div
-              key={transfer.transferId}
-              className={`file-transfer-toast${failed ? " failed" : ""}${
-                transfer.done && !failed ? " done" : ""
-              }`}
-              role="status"
-            >
-              <div className="file-transfer-toast-head">
-                <span className="file-transfer-toast-name" title={transfer.fileName}>
-                  {transfer.fileName}
-                </span>
-                <span className="file-transfer-toast-status">
-                  {status}
-                  {counter}
-                </span>
-                {!transfer.done ? <button type="button" className="secondary-button compact-button"
-                  onClick={() => void cancelFileTransfer(transfer.transferId)}>{ui.common.cancel}</button> : null}
-              </div>
-              <div className="file-transfer-toast-track">
-                <div
-                  className="file-transfer-toast-fill"
-                  style={{ width: `${failed ? 100 : percent}%` }}
-                />
-              </div>
-              <div className="file-transfer-toast-meta">
-                {failed
-                  ? transfer.error
-                  : `${formatFileTransferBytes(transfer.sentBytes)} / ${formatFileTransferBytes(
-                      transfer.totalBytes,
-                    )} · ${transfer.targetName}`}
-              </div>
-            </div>
-          );
-        })}
+        {transfers.map((transfer) => (
+          <TransferRow key={transfer.transferId} transfer={transfer} ui={ui} />
+        ))}
       </div>
     );
   }
@@ -2401,7 +2351,7 @@ function App() {
     return (
       <button type="button" className="secondary-button compact-button"
         disabled={isPairingDevice || isSaving} onClick={() => setEditingDevice(device)}>
-        {language === "cn" ? "设置" : "Settings"}
+        {ui.tabs.settings}
       </button>
     );
   }
@@ -2857,20 +2807,16 @@ function App() {
                 <div className="settings-control-row">
                   <span>{ui.settings.language}</span>
                   <div className="segmented-control">
-                    <button
-                      type="button"
-                      className={language === "cn" ? "active" : ""}
-                      onClick={() => setLanguage("cn")}
-                    >
-                      {ui.settings.simplifiedChinese}
-                    </button>
-                    <button
-                      type="button"
-                      className={language === "en" ? "active" : ""}
-                      onClick={() => setLanguage("en")}
-                    >
-                      {ui.settings.english}
-                    </button>
+                    {LANGUAGES.map(([code, name]) => (
+                      <button
+                        key={code}
+                        type="button"
+                        className={language === code ? "active" : ""}
+                        onClick={() => setLanguage(code)}
+                      >
+                        {name}
+                      </button>
+                    ))}
                   </div>
                 </div>
                 <div className="settings-control-row">
@@ -3030,6 +2976,33 @@ function App() {
                         {ui.common.disabled}
                       </button>
                     </div>
+                  </div>
+                ) : null}
+                {machineRole === "server" ? (
+                  <div className="settings-control-row">
+                    <span>{ui.settings.peerControl}<InfoTip label={ui.settings.peerControl} text={ui.settings.peerControlCopy} /></span>
+                    <div className="segmented-control">
+                      <button
+                        type="button"
+                        className={layout.peerControl ? "active" : ""}
+                        onClick={() => setPeerControl(true)}
+                      >
+                        {ui.common.enabled}
+                      </button>
+                      <button
+                        type="button"
+                        className={!layout.peerControl ? "active" : ""}
+                        onClick={() => setPeerControl(false)}
+                      >
+                        {ui.common.disabled}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {machineRole === "client" ? (
+                  <div className="settings-control-row">
+                    <span>{ui.settings.peerControl}<InfoTip label={ui.settings.peerControl} text={ui.settings.peerControlClientCopy} /></span>
+                    <span>{layout.peerControl ? ui.common.enabled : ui.common.disabled}</span>
                   </div>
                 ) : null}
                 {machineRole === "client" ? (
@@ -3413,10 +3386,10 @@ function App() {
         </section>
       ) : null}
 
-      {editingDevice ? <DeviceSettingsModal key={editingDevice.id} device={editingDevice} language={language}
+      {editingDevice ? <DeviceSettingsModal key={editingDevice.id} device={editingDevice} ui={ui}
         onClose={() => setEditingDevice(null)}
         onSave={(pointerSpeed, scrollSpeed, invertScroll) => saveModalLayout(current => {
-          if (!current.devices.some(device => device.id === editingDevice.id)) throw new Error(language === "cn" ? "设备已移除。" : "Device no longer available.");
+          if (!current.devices.some(device => device.id === editingDevice.id)) throw new Error(ui.errors.deviceRemoved);
           return { ...current, devices: current.devices.map(device => device.id === editingDevice.id ? { ...device, pointerSpeed, scrollSpeed, invertScroll } : device) };
         })}
         onRepair={() => { setEditingDevice(null); void handleRepairDevice(editingDevice); }}
@@ -4021,6 +3994,10 @@ function createDeviceFromPeer(
     inputReady: peer.inputReady,
     role: "client",
     source: manual || existingDevice?.source === "manual" ? "manual" : "detected",
+    // Pairing again rebuilt the device without these and reset them.
+    pointerSpeed: existingDevice?.pointerSpeed,
+    scrollSpeed: existingDevice?.scrollSpeed,
+    invertScroll: existingDevice?.invertScroll,
     screens: createScreensFromPeer(layout, id, peer.screens, existingDevice),
   };
 }
@@ -4069,9 +4046,7 @@ function createScreensFromPeer(
 }
 
 function formatScreenCount(count: number, language: AppLanguage) {
-  return language === "en"
-    ? `${count} ${count === 1 ? "screen" : "screens"}`
-    : `${count} 屏`;
+  return TEXT[language].devices.screenCount(count);
 }
 
 function fileTransferTargetIdAtPosition(
@@ -4119,29 +4094,11 @@ function formatFileTransferSummary(
   summary: { targetName: string; fileCount: number; byteCount: number },
   language: AppLanguage,
 ) {
-  const size = formatFileTransferBytes(summary.byteCount);
-  if (language === "en") {
-    return `${TEXT.en.devices.fileTransferSent} ${summary.fileCount} ${
-      summary.fileCount === 1 ? "file" : "files"
-    } to ${summary.targetName} · ${size}`;
-  }
-
-  return `${summary.fileCount} 个文件${TEXT.cn.devices.fileTransferSent}到 ${summary.targetName} · ${size}`;
-}
-
-function formatFileTransferBytes(bytes: number) {
-  const gib = 1024 * 1024 * 1024;
-  const mib = 1024 * 1024;
-  if (bytes >= gib) {
-    return `${(bytes / gib).toFixed(1)} GiB`;
-  }
-  if (bytes >= mib) {
-    return `${(bytes / mib).toFixed(1)} MiB`;
-  }
-  if (bytes >= 1024) {
-    return `${(bytes / 1024).toFixed(1)} KiB`;
-  }
-  return `${bytes} B`;
+  return TEXT[language].devices.fileTransferSummary(
+    summary.fileCount,
+    summary.targetName,
+    formatFileTransferBytes(summary.byteCount),
+  );
 }
 
 function updateStatusLabel(status: UpdateStatus, ui: AppText) {

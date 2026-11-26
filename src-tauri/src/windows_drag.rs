@@ -42,12 +42,14 @@ use windows::Win32::System::Com::IBindCtx;
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{
-    DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize, DROPEFFECT,
-    DROPEFFECT_COPY,
+    DoDragDrop, IDropSource, IDropSource_Impl, OleFlushClipboard, OleInitialize, OleSetClipboard,
+    OleUninitialize, DROPEFFECT, DROPEFFECT_COPY,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, SHCreateStdEnumFmtEtc,
+    BHID_DataObject, IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, ILFree,
+    IShellItemArray, SHCreateShellItemArrayFromIDLists, SHCreateStdEnumFmtEtc, SHParseDisplayName,
     FD_ATTRIBUTES, FD_FILESIZE, FILEDESCRIPTORW,
 };
 
@@ -67,14 +69,34 @@ pub(crate) fn prepare_controller_handoff() {
     }
 }
 
+/// This machine crossed back mid-drag and asked the far side for its files.
+pub(crate) fn controller_handoff_pending() -> bool {
+    CONTROLLER_HANDOFF_PENDING
+        .lock()
+        .map(|pending| pending.is_some_and(|at| at.elapsed() < Duration::from_secs(2)))
+        .unwrap_or(false)
+}
+
 /// Keep mouse input local while a drag comes back from the controlled machine.
 /// A plain selection/window drag produces no file reply, so the wait expires.
 pub(crate) fn controller_drag_in_progress() -> bool {
-    active_session().is_some_and(|session| session.mode == NativeDragMode::Controller)
+    active_session()
+        .is_some_and(|session| session.mode == NativeDragMode::Controller && !session.is_cancelled())
         || CONTROLLER_HANDOFF_PENDING
             .lock()
             .map(|pending| pending.is_some_and(|at| at.elapsed() < Duration::from_secs(2)))
             .unwrap_or(false)
+}
+
+/// The drag this controller took back is being carried off its screen again:
+/// end it, so the cursor is free to cross. False when there is none to end.
+pub(crate) fn abandon_controller_drag() -> bool {
+    let dragging = active_session()
+        .is_some_and(|session| session.mode == NativeDragMode::Controller && !session.is_cancelled());
+    if dragging {
+        cancel_session();
+    }
+    dragging
 }
 
 /// Files whose transfer feeds a drag session. `transfer_id` matches the id the
@@ -101,10 +123,21 @@ fn active_session() -> Option<Arc<DragSession>> {
 /// keep streaming into these buffers after `DoDragDrop` returned.
 static FINISHING: Mutex<Vec<Arc<DragSession>>> = Mutex::new(Vec::new());
 
-/// The dragging or finishing session that owns `transfer_id`.
+/// Files a peer copied, on this machine's clipboard as virtual files. Nothing
+/// is fetched until a program pastes them.
+static CLIPBOARD_SESSION: Mutex<Option<Arc<DragSession>>> = Mutex::new(None);
+
+fn clipboard_session() -> Option<Arc<DragSession>> {
+    CLIPBOARD_SESSION.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// The dragging, offered or finishing session that owns `transfer_id`.
 fn session_for(transfer_id: &str) -> Option<Arc<DragSession>> {
     active_session()
         .filter(|session| session.by_transfer_id.contains_key(transfer_id))
+        .or_else(|| {
+            clipboard_session().filter(|session| session.by_transfer_id.contains_key(transfer_id))
+        })
         .or_else(|| {
             FINISHING.lock().ok().and_then(|finishing| {
                 finishing
@@ -140,6 +173,9 @@ struct DragSession {
     operation_done: AtomicBool,
     // Start or last file bytes; a drag with nothing happening is abandoned.
     last_activity: Mutex<Instant>,
+    // Clipboard offers only: asks the peer for the files, on the first paste.
+    fetch: Option<Box<dyn Fn() + Send + Sync>>,
+    fetch_started: AtomicBool,
 }
 
 impl DragSession {
@@ -172,6 +208,24 @@ impl DragSession {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.lock().map(|v| *v).unwrap_or(true)
+    }
+
+    fn fetch_once(&self) {
+        if let Some(fetch) = &self.fetch {
+            if !self.fetch_started.swap(true, Ordering::Relaxed) {
+                log::info!("fetching the copied files: {} item(s)", self.order.len());
+                fetch();
+            }
+        }
+    }
+
+    fn cancel(&self) {
+        if let Ok(mut cancelled) = self.cancelled.lock() {
+            *cancelled = true;
+        }
+        for buffer in &self.order {
+            buffer.abort();
+        }
     }
 }
 
@@ -209,10 +263,236 @@ pub fn finish_file(transfer_id: &str) -> bool {
 
 pub(crate) fn abort_file(transfer_id: &str) -> bool {
     let Some(session) = session_for(transfer_id) else { return false; };
-    if let Ok(mut cancelled) = session.cancelled.lock() { *cancelled = true; }
-    for buffer in &session.order { buffer.abort(); }
-    inject_left_button(false);
+    session.cancel();
+    // Only a drag has a synthetic button to lift.
+    if session.fetch.is_none() {
+        inject_left_button(false);
+    }
     true
+}
+
+/// Whether the clipboard holds files this module offered. This app's own
+/// clipboard poll leaves those alone: they are not something copied here.
+pub(crate) fn clipboard_offer_current() -> bool {
+    clipboard_session().is_some()
+}
+
+/// Fetch an offer's files now and hand `done` where they were saved. For a
+/// copy small enough to have whole before anyone pastes it: it then goes on
+/// the clipboard as files on disk, which every program can paste.
+pub(crate) fn fetch_clipboard_files(
+    files: Vec<DragFileMeta>,
+    fetch: Box<dyn Fn() + Send + Sync>,
+    done: Box<dyn FnOnce(Vec<std::path::PathBuf>) + Send>,
+) -> bool {
+    let Some(session) = new_session(files, NativeDragMode::Receiver, Some(fetch)) else {
+        return false;
+    };
+    // A newer copy replaces whatever an earlier one left: files offered on
+    // the clipboard, or a fetch still running.
+    if let Ok(mut slot) = CLIPBOARD_SESSION.lock() {
+        if let Some(previous) = slot.replace(Arc::clone(&session)) {
+            previous.cancel();
+        }
+    }
+    std::thread::spawn(move || {
+        let saved = saved_files(&session);
+        let latest = CLIPBOARD_SESSION.lock().is_ok_and(|mut slot| {
+            let latest = slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &session));
+            if latest {
+                *slot = None;
+            }
+            latest
+        });
+        // ponytail: something copied on this machine while the fetch ran is
+        // overwritten; compare clipboard sequence numbers if that is hit.
+        match saved {
+            Ok(paths) if latest => done(paths),
+            Ok(_) => log::info!("a newer copy replaced the one being fetched"),
+            Err(error) => log::warn!("the copied files could not be fetched: {error}"),
+        }
+    });
+    true
+}
+
+/// Put files that are on this disk on the clipboard exactly as Explorer does
+/// when they are copied there: the shell's own data object, with every format
+/// it carries. A bare list of paths was not pasted by every program.
+pub(crate) fn copy_files_to_clipboard(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    let paths = paths.to_vec();
+    // OLE wants a thread of its own kind; the caller's may be anything.
+    std::thread::spawn(move || unsafe {
+        let _ = OleInitialize(None);
+        let placed = shell_data_object(&paths).and_then(|object| {
+            let mut refusal = Ok(());
+            for attempt in 0..10 {
+                if attempt > 0 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let _access = crate::clipboard::lock_windows_clipboard();
+                // Flushed: the data stays after this thread is gone.
+                refusal = OleSetClipboard(&object).and_then(|()| OleFlushClipboard());
+                if refusal.is_ok() {
+                    break;
+                }
+            }
+            refusal
+        });
+        OleUninitialize();
+        if placed.is_ok() {
+            log::info!("files on the clipboard as Explorer copies them");
+        }
+        placed.map_err(|error| error.to_string())
+    })
+    .join()
+    .unwrap_or_else(|_| Err("the clipboard thread failed".into()))
+}
+
+/// The shell's data object for `paths`, marked "copy" as Explorer's Ctrl+C is.
+unsafe fn shell_data_object(paths: &[std::path::PathBuf]) -> windows::core::Result<IDataObject> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut ids: Vec<*mut ITEMIDLIST> = Vec::with_capacity(paths.len());
+    let mut parsed = Ok(());
+    for path in paths {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut id = std::ptr::null_mut();
+        parsed = SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut id, 0, None);
+        if parsed.is_err() {
+            break;
+        }
+        ids.push(id);
+    }
+    let object = parsed.and_then(|()| {
+        let list: Vec<*const ITEMIDLIST> = ids.iter().map(|id| id.cast_const()).collect();
+        let items: IShellItemArray = SHCreateShellItemArrayFromIDLists(&list)?;
+        items.BindToHandler::<_, IDataObject>(None::<&IBindCtx>, &BHID_DataObject)
+    });
+    for id in ids {
+        ILFree(Some(id.cast_const()));
+    }
+    let object = object?;
+
+    // DROPEFFECT_COPY | DROPEFFECT_LINK, what Explorer writes for a copy.
+    let effect = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>())?;
+    let slot = GlobalLock(effect) as *mut u32;
+    if !slot.is_null() {
+        slot.write(5);
+        let _ = GlobalUnlock(effect);
+        let format = FORMATETC {
+            cfFormat: RegisterClipboardFormatW(windows::core::w!("Preferred DropEffect")) as u16,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        let medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: effect },
+            pUnkForRelease: ManuallyDrop::new(None),
+        };
+        // The object takes the memory when it accepts it.
+        let _ = object.SetData(&format, &medium, true);
+    }
+    Ok(object)
+}
+
+/// The peer could not be asked for an offer's files: fail the paste now and
+/// take the files off the clipboard.
+pub(crate) fn abandon_clipboard_offer() {
+    if let Some(session) = clipboard_session() {
+        session.cancel();
+    }
+}
+
+/// Put `files` on the clipboard as virtual files and return once they are
+/// there. `fetch` runs when a program first asks for a file's contents.
+pub(crate) fn offer_clipboard_files(
+    files: Vec<DragFileMeta>,
+    fetch: Box<dyn Fn() + Send + Sync>,
+) -> bool {
+    let Some(session) = new_session(files, NativeDragMode::Receiver, Some(fetch)) else {
+        return false;
+    };
+    let (placed, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || run_clipboard_thread(session, placed));
+    wait.recv_timeout(Duration::from_secs(2)).unwrap_or(false)
+}
+
+/// OLE asks the thread that set the clipboard for its data, so this one keeps
+/// taking messages for as long as the files are on it.
+fn run_clipboard_thread(session: Arc<DragSession>, placed: std::sync::mpsc::Sender<bool>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, MSG, PM_REMOVE, QS_ALLINPUT,
+    };
+    unsafe {
+        let _ = OleInitialize(None);
+        let data_object: IDataObject = DragDataObject {
+            files: session.order.clone(),
+            streams: Vec::new(),
+            session: Arc::clone(&session),
+        }
+        .into();
+        // Other programs, and this app's own clipboard poll, hold the
+        // clipboard open for moments at a time: one refusal is not the answer.
+        let mut refusal = None;
+        let on_clipboard = (0..10).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _access = crate::clipboard::lock_windows_clipboard();
+            match OleSetClipboard(&data_object) {
+                Ok(()) => true,
+                Err(error) => {
+                    refusal = Some(error);
+                    false
+                }
+            }
+        });
+        if !on_clipboard {
+            log::warn!("could not put the offered files on the clipboard: {refusal:?}");
+        }
+        if on_clipboard {
+            if let Ok(mut slot) = CLIPBOARD_SESSION.lock() {
+                *slot = Some(Arc::clone(&session));
+            }
+        }
+        let _ = placed.send(on_clipboard);
+        // The raw call: S_FALSE ("no longer yours") is a success code, which
+        // the wrapped one cannot tell from S_OK.
+        let still_ours = || {
+            use windows::core::Interface;
+            windows_sys::Win32::System::Ole::OleIsCurrentClipboard(data_object.as_raw()) == 0
+        };
+        if on_clipboard {
+            let mut message: MSG = std::mem::zeroed();
+            while still_ours() && !session.is_cancelled() {
+                while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    DispatchMessageW(&message);
+                }
+                MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 250, QS_ALLINPUT);
+            }
+            // Never flushed: that would fetch every file just to keep a copy.
+            if still_ours() {
+                let _ = OleSetClipboard(None::<&IDataObject>);
+            }
+            if let Ok(mut slot) = CLIPBOARD_SESSION.lock() {
+                if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &session)) {
+                    *slot = None;
+                }
+            }
+            // A paste still copying keeps reading after the clipboard moved on.
+            if session.async_started.load(Ordering::Relaxed)
+                && !session.operation_done.load(Ordering::Relaxed)
+            {
+                finish_async_drop(&session);
+            }
+        }
+        for buffer in &session.order {
+            buffer.abort();
+        }
+        drop(data_object);
+        OleUninitialize();
+    }
 }
 
 /// The controller released the drag over this machine: perform the drop.
@@ -245,8 +525,7 @@ pub fn cancel_session() {
 /// Begin a drag session and spawn the DoDragDrop thread. Returns false if a
 /// drag is already in flight or `files` is empty.
 pub(crate) fn start_drag_session(files: Vec<DragFileMeta>, mode: NativeDragMode) -> bool {
-    if files.is_empty() || files.len() > crate::folder_transfer::MAX_ENTRIES
-        || files.iter().any(|file| file.name.encode_utf16().count() >= 260 || crate::folder_transfer::validate_relative_path(std::path::Path::new(&file.name)).is_err() || (file.directory && file.size != 0)) {
+    if !files_acceptable(&files) {
         return false;
     }
     // One drag at a time, and the controller starts one only after the last
@@ -270,26 +549,9 @@ pub(crate) fn start_drag_session(files: Vec<DragFileMeta>, mode: NativeDragMode)
         return false;
     }
 
-    let mut order = Vec::with_capacity(files.len());
-    let mut by_transfer_id = HashMap::with_capacity(files.len());
-    for meta in files {
-        let buffer = match FileBuffer::new(meta.name, meta.size, meta.directory) {
-            Ok(buffer) => Arc::new(buffer),
-            Err(error) => { log::warn!("native drag spool failed: {error}"); return false; }
-        };
-        by_transfer_id.insert(meta.transfer_id, Arc::clone(&buffer));
-        order.push(buffer);
-    }
-    let session = Arc::new(DragSession {
-        order,
-        by_transfer_id,
-        released: Mutex::new(false),
-        cancelled: Mutex::new(false),
-        mode,
-        async_started: AtomicBool::new(false),
-        operation_done: AtomicBool::new(false),
-        last_activity: Mutex::new(Instant::now()),
-    });
+    let Some(session) = new_session(files, mode, None) else {
+        return false;
+    };
     *slot = Some(Arc::clone(&session));
     drop(slot);
     if mode == NativeDragMode::Controller {
@@ -321,6 +583,45 @@ pub(crate) fn start_drag_session(files: Vec<DragFileMeta>, mode: NativeDragMode)
         run_drag_thread(session);
     });
     true
+}
+
+fn files_acceptable(files: &[DragFileMeta]) -> bool {
+    crate::drag_buffer::offer_acceptable(files.iter().map(|file| (file.name.as_str(), file.size, file.directory)))
+}
+
+fn new_session(
+    files: Vec<DragFileMeta>,
+    mode: NativeDragMode,
+    fetch: Option<Box<dyn Fn() + Send + Sync>>,
+) -> Option<Arc<DragSession>> {
+    if !files_acceptable(&files) {
+        return None;
+    }
+    let mut order = Vec::with_capacity(files.len());
+    let mut by_transfer_id = HashMap::with_capacity(files.len());
+    for meta in files {
+        let buffer = match FileBuffer::new(meta.name, meta.size, meta.directory) {
+            Ok(buffer) => Arc::new(buffer),
+            Err(error) => {
+                log::warn!("native drag spool failed: {error}");
+                return None;
+            }
+        };
+        by_transfer_id.insert(meta.transfer_id, Arc::clone(&buffer));
+        order.push(buffer);
+    }
+    Some(Arc::new(DragSession {
+        order,
+        by_transfer_id,
+        released: Mutex::new(false),
+        cancelled: Mutex::new(false),
+        mode,
+        async_started: AtomicBool::new(false),
+        operation_done: AtomicBool::new(false),
+        last_activity: Mutex::new(Instant::now()),
+        fetch,
+        fetch_started: AtomicBool::new(false),
+    }))
 }
 
 // --- the DoDragDrop thread -------------------------------------------------
@@ -425,9 +726,10 @@ unsafe fn drag_from_window_under_cursor(
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-        MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, ShowWindow, MSG, PM_REMOVE,
-        QS_ALLINPUT, SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WNDCLASSW, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetLayeredWindowAttributes,
+        ShowWindow, LWA_ALPHA, MSG, PM_REMOVE, QS_ALLINPUT, SW_HIDE, SW_SHOWNOACTIVATE,
+        WM_LBUTTONDOWN, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_POPUP,
     };
 
     let instance = GetModuleHandleW(std::ptr::null());
@@ -439,17 +741,24 @@ unsafe fn drag_from_window_under_cursor(
         ..std::mem::zeroed()
     };
     RegisterClassW(&window_class); // Fails harmlessly once already registered.
+    // The cursor is in motion: the hand is mid-drag, and the press is sent a
+    // few milliseconds after the cursor is read. An 8 px window was no longer
+    // under it by then, the press fell on whatever was, and every drag that
+    // did not arrive standing still was cancelled. So the window reaches far
+    // enough round the cursor for any hand, and is as good as invisible (it
+    // still takes the press: one part in 255 of opacity is enough for that).
+    const REACH: i32 = 300;
     let mut cursor = POINT { x: 0, y: 0 };
     GetCursorPos(&mut cursor);
     let hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         class.as_ptr(),
         std::ptr::null(),
         WS_POPUP,
-        cursor.x - 4,
-        cursor.y - 4,
-        8,
-        8,
+        cursor.x - REACH,
+        cursor.y - REACH,
+        2 * REACH,
+        2 * REACH,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         instance,
@@ -459,6 +768,7 @@ unsafe fn drag_from_window_under_cursor(
         log::warn!("native drag: could not create its source window");
         return DRAGDROP_S_CANCEL;
     }
+    SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     inject_left_button(true);
 
@@ -504,21 +814,10 @@ fn drag_formats() -> &'static DragFormats {
     static FORMATS: OnceLock<DragFormats> = OnceLock::new();
     FORMATS.get_or_init(|| unsafe {
         DragFormats {
-            file_descriptor: RegisterClipboardFormatW(w("FileGroupDescriptorW")) as u16,
-            file_contents: RegisterClipboardFormatW(w("FileContents")) as u16,
+            file_descriptor: RegisterClipboardFormatW(windows::core::w!("FileGroupDescriptorW")) as u16,
+            file_contents: RegisterClipboardFormatW(windows::core::w!("FileContents")) as u16,
         }
     })
-}
-
-// PCWSTR from a &str literal — leaks a small NUL-terminated UTF-16 buffer once
-// per distinct string; only called for the two fixed clipboard-format names.
-fn w(value: &str) -> PCWSTR {
-    let mut units: Vec<u16> = value.encode_utf16().collect();
-    units.push(0);
-    let boxed = units.into_boxed_slice();
-    let ptr = boxed.as_ptr();
-    std::mem::forget(boxed);
-    PCWSTR(ptr)
 }
 
 // --- IStream over a FileBuffer --------------------------------------------
@@ -735,10 +1034,18 @@ impl IDataObject_Impl for DragDataObject_Impl {
                 return Err(windows::core::Error::from(DV_E_TYMED));
             }
             let index = format.lindex;
-            if index < 0 || index as usize >= self.streams.len() {
+            if index < 0 || index as usize >= self.files.len() {
                 return Err(windows::core::Error::from(DV_E_LINDEX));
             }
-            let stream = self.streams[index as usize].clone();
+            // A drag is dropped once and shares its streams. An offer may be
+            // pasted again and again, each time read from the start.
+            let stream = match self.streams.get(index as usize) {
+                Some(stream) => stream.clone(),
+                None => {
+                    self.session.fetch_once();
+                    FileReadStream::new(Arc::clone(&self.files[index as usize]))
+                }
+            };
             return Ok(STGMEDIUM {
                 tymed: TYMED_ISTREAM.0 as u32,
                 u: STGMEDIUM_0 {
@@ -795,21 +1102,16 @@ impl IDataObject_Impl for DragDataObject_Impl {
             return Err(windows::core::Error::from(E_NOTIMPL));
         }
         let formats = drag_formats();
+        let entry = |format, tymed: u32| FORMATETC {
+            cfFormat: format,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed,
+        };
         let entries = [
-            FORMATETC {
-                cfFormat: formats.file_descriptor,
-                ptd: std::ptr::null_mut(),
-                dwAspect: DVASPECT_CONTENT.0,
-                lindex: -1,
-                tymed: TYMED_HGLOBAL.0 as u32,
-            },
-            FORMATETC {
-                cfFormat: formats.file_contents,
-                ptd: std::ptr::null_mut(),
-                dwAspect: DVASPECT_CONTENT.0,
-                lindex: -1,
-                tymed: TYMED_ISTREAM.0 as u32,
-            },
+            entry(formats.file_descriptor, TYMED_HGLOBAL.0 as u32),
+            entry(formats.file_contents, TYMED_ISTREAM.0 as u32),
         ];
         unsafe { SHCreateStdEnumFmtEtc(&entries) }
     }
@@ -853,6 +1155,8 @@ impl IDataObjectAsyncCapability_Impl for DragDataObject_Impl {
         &self,
         _pbcreserved: windows::core::Ref<'_, IBindCtx>,
     ) -> windows::core::Result<()> {
+        // An offer on the clipboard can be pasted more than once.
+        self.session.operation_done.store(false, Ordering::Relaxed);
         self.session.async_started.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -873,6 +1177,13 @@ impl IDataObjectAsyncCapability_Impl for DragDataObject_Impl {
         self.session.operation_done.store(true, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// Fetch every file of an offer and save it under its own name; the paths of
+/// what was copied (not of what is inside copied folders).
+fn saved_files(session: &DragSession) -> std::io::Result<Vec<std::path::PathBuf>> {
+    session.fetch_once();
+    crate::drag_buffer::save_all(&session.order)
 }
 
 fn build_file_group_descriptor(files: &[Arc<FileBuffer>]) -> windows::core::Result<HGLOBAL> {

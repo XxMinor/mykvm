@@ -13,11 +13,51 @@ pub(crate) struct ClipboardImage {
     pub(crate) rgba_base64: String,
 }
 
+/// The image with its pixels deflated, as a peer that understands it is sent
+/// it: raw, a high-resolution screenshot is tens of megabytes on the wire.
+pub(crate) fn deflate_image(image: &ClipboardImage) -> Option<ClipboardImage> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use std::io::Write;
+    let pixels = BASE64.decode(image.rgba_base64.as_bytes()).ok()?;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&pixels).ok()?;
+    Some(ClipboardImage {
+        width: image.width,
+        height: image.height,
+        rgba_base64: BASE64.encode(encoder.finish().ok()?),
+    })
+}
+
+/// The reverse. None unless it inflates to exactly the pixels its size names,
+/// so a small packet cannot unfold into more than an image may hold.
+pub(crate) fn inflate_image(image: ClipboardImage) -> Option<ClipboardImage> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use std::io::Read;
+    let expected = (image.width as usize).checked_mul(image.height as usize)?.checked_mul(4)?;
+    if expected == 0 || expected > CLIPBOARD_MAX_IMAGE_BYTES {
+        return None;
+    }
+    let deflated = BASE64.decode(image.rgba_base64.as_bytes()).ok()?;
+    let mut pixels = Vec::with_capacity(expected);
+    flate2::read::ZlibDecoder::new(deflated.as_slice())
+        .take(expected as u64 + 1)
+        .read_to_end(&mut pixels)
+        .ok()?;
+    (pixels.len() == expected).then(|| ClipboardImage {
+        width: image.width,
+        height: image.height,
+        rgba_base64: BASE64.encode(pixels),
+    })
+}
+
 /// One unit of clipboard content read from (or written to) the local system.
 pub(crate) enum ClipboardContent {
     Text(String),
     Image(ClipboardImage),
     Rich(crate::rich_clipboard::RichText),
+    /// Text its source marked as secret (a password manager's copy). Written
+    /// with the marker this system's clipboard history honours; never read.
+    Concealed(String),
 }
 
 pub(crate) enum ClipboardSnapshot {
@@ -68,7 +108,13 @@ fn snapshot_for_files(
     // Chat apps can expose a private-container file URL AND bitmap pixels.
     // Use the current bitmap when macOS denies that URL; keep readable files
     // as files and preserve the original error if no bitmap is available.
-    if paths.iter().any(|path| std::fs::File::open(path).is_err()) {
+    // A folder is not an unreadable file: Windows cannot open one this way, so
+    // every copied folder was taken for one (and sent as the picture, when the
+    // clipboard also held one).
+    let unreadable = |path: &String| {
+        !std::path::Path::new(path).is_dir() && std::fs::File::open(path).is_err()
+    };
+    if paths.iter().any(unreadable) {
         if let Some(content @ ClipboardContent::Image(_)) = read_image() {
             return ClipboardSnapshot::Content(content);
         }
@@ -119,7 +165,9 @@ impl ClipboardContent {
             ClipboardContent::Rich(rich) => rich.text.len() > CLIPBOARD_MAX_TEXT_BYTES
                 || rich.html.as_ref().is_some_and(|s| s.len() > crate::rich_clipboard::MAX_FORMAT_BYTES)
                 || rich.rtf.as_ref().is_some_and(|s| s.len() > crate::rich_clipboard::MAX_FORMAT_BYTES),
-            ClipboardContent::Text(text) => text.len() > CLIPBOARD_MAX_TEXT_BYTES,
+            ClipboardContent::Text(text) | ClipboardContent::Concealed(text) => {
+                text.len() > CLIPBOARD_MAX_TEXT_BYTES
+            }
             ClipboardContent::Image(image) => {
                 // base64 inflates ~4/3; compare against the decoded RGBA budget.
                 let padding = image
@@ -135,6 +183,16 @@ impl ClipboardContent {
         }
     }
 
+    /// The form secret content takes on the receiving machine: its plain text,
+    /// marked. An image has no marker to carry and is written as it is.
+    pub(crate) fn concealed(self) -> Self {
+        match self {
+            ClipboardContent::Text(text) => ClipboardContent::Concealed(text),
+            ClipboardContent::Rich(rich) => ClipboardContent::Concealed(rich.text),
+            other => other,
+        }
+    }
+
     /// A stable fingerprint used to detect "did the clipboard change" and to
     /// suppress echoing content we just received from a peer.
     pub(crate) fn signature(&self) -> String {
@@ -142,7 +200,10 @@ impl ClipboardContent {
             ClipboardContent::Rich(rich) => format!("rich:{:x}:{:x}:{:x}", clipboard_signature_hash(rich.text.as_bytes()),
                 clipboard_signature_hash(rich.html.as_deref().unwrap_or("").as_bytes()),
                 clipboard_signature_hash(rich.rtf.as_deref().unwrap_or(&[]))),
-            ClipboardContent::Text(text) => format!("text:{text}"),
+            // Read back, concealed text is plain text again.
+            ClipboardContent::Text(text) | ClipboardContent::Concealed(text) => {
+                format!("text:{text}")
+            }
             ClipboardContent::Image(image) => {
                 format!(
                     "image:{}x{}:{}:{:016x}",
@@ -175,6 +236,7 @@ pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
         ClipboardContent::Rich(rich) => crate::rich_clipboard::write(rich),
         ClipboardContent::Text(text) => write_text(text),
         ClipboardContent::Image(image) => write_image(image),
+        ClipboardContent::Concealed(text) => crate::rich_clipboard::write_concealed_text(text),
     }
 }
 
@@ -270,11 +332,64 @@ mod tests {
     }
 
     #[test]
+    fn secret_text_stays_text_and_is_recognised_when_read_back() {
+        let rich = ClipboardContent::Rich(crate::rich_clipboard::RichText {
+            text: "hunter2".into(),
+            html: Some("<b>hunter2</b>".into()),
+            rtf: None,
+        });
+        let secret = rich.concealed();
+        assert!(matches!(&secret, ClipboardContent::Concealed(text) if text == "hunter2"));
+        // The poll reads it back as plain text; the echo check must match.
+        assert_eq!(secret.signature(), ClipboardContent::Text("hunter2".into()).signature());
+        let image = ClipboardContent::Image(ClipboardImage { width: 1, height: 1, rgba_base64: "AAAAAA==".into() });
+        assert!(matches!(image.concealed(), ClipboardContent::Image(_)));
+    }
+
+    /// Replaces the real clipboard: run alone, with `--ignored`.
+    #[test]
+    #[ignore = "writes the system clipboard"]
+    #[cfg(target_os = "macos")]
+    fn secret_text_is_written_with_the_marker_clipboard_managers_honour() {
+        write_content(&ClipboardContent::Concealed("mykvm-secret-check".into())).unwrap();
+        assert!(crate::rich_clipboard::is_concealed());
+        assert_eq!(read_text().unwrap(), "mykvm-secret-check");
+        write_text("mykvm-plain-check").unwrap();
+        assert!(!crate::rich_clipboard::is_concealed());
+    }
+
+    #[test]
+    fn a_screenshot_travels_deflated_and_arrives_as_the_same_pixels() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        // A window on a flat background, as screenshots mostly are.
+        let (width, height) = (640_u32, 400_u32);
+        let mut pixels = vec![0xF2_u8; (width * height * 4) as usize];
+        for (index, pixel) in pixels.chunks_mut(4).enumerate() {
+            if index % 97 < 13 {
+                pixel.copy_from_slice(&[(index % 251) as u8, 40, 90, 255]);
+            }
+        }
+        let image = ClipboardImage { width, height, rgba_base64: BASE64.encode(&pixels) };
+        let deflated = deflate_image(&image).unwrap();
+        assert!(deflated.rgba_base64.len() * 5 < image.rgba_base64.len(), "at least five times smaller");
+        let restored = inflate_image(deflated.clone()).unwrap();
+        assert_eq!(restored.rgba_base64, image.rgba_base64);
+        // A size that does not match the data is refused, either way round.
+        assert!(inflate_image(ClipboardImage { width: width + 1, ..deflated.clone() }).is_none());
+        assert!(inflate_image(ClipboardImage { width: 1, height: 1, ..deflated }).is_none());
+        assert!(inflate_image(ClipboardImage { width: 70_000, height: 70_000, rgba_base64: String::new() }).is_none());
+    }
+
+    #[test]
     fn readable_file_copies_keep_file_transfer_semantics() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("image.png");
         std::fs::write(&path, b"file data").unwrap();
         let snapshot = snapshot_for_files(vec![path.to_string_lossy().into_owned()], || panic!("a readable file must not be converted to bitmap"));
+        assert!(matches!(snapshot, ClipboardSnapshot::Files(_)));
+        // Nor a folder, which Windows cannot open as a file at all.
+        let folder = dir.path().to_string_lossy().into_owned();
+        let snapshot = snapshot_for_files(vec![folder], || panic!("a folder is not an unreadable file"));
         assert!(matches!(snapshot, ClipboardSnapshot::Files(_)));
     }
 

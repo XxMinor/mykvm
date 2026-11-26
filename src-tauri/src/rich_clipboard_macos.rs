@@ -106,6 +106,50 @@ pub(super) fn write_rtf(bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+// nspasteboard.org: the types clipboard managers agree to keep out of history.
+const CONCEALED_TYPE: &str = "org.nspasteboard.ConcealedType";
+const TRANSIENT_TYPE: &str = "org.nspasteboard.TransientType";
+
+pub(super) fn is_concealed() -> bool {
+    let _pool = crate::input::macos_appkit::autorelease_pool();
+    unsafe {
+        let types = obj(pasteboard(), b"types\0");
+        let contains: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool =
+            std::mem::transmute(objc_msgSend as *const ());
+        !types.is_null()
+            && [CONCEALED_TYPE, TRANSIENT_TYPE]
+                .into_iter()
+                .any(|name| contains(types, sel(b"containsObject:\0"), ns(name)))
+    }
+}
+
+pub(super) fn write_concealed_text(text: &str) -> Result<(), String> {
+    let _pool = crate::input::macos_appkit::autorelease_pool();
+    unsafe {
+        let board = pasteboard();
+        let types = obj(
+            objc_getClass(b"NSMutableArray\0".as_ptr().cast()),
+            b"array\0",
+        );
+        one(types, b"addObject:\0", ns("public.utf8-plain-text"));
+        one(types, b"addObject:\0", ns(CONCEALED_TYPE));
+        // One declaration, so a clipboard manager never sees the text unmarked.
+        let declare: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> isize =
+            std::mem::transmute(objc_msgSend as *const ());
+        declare(board, sel(b"declareTypes:owner:\0"), types, std::ptr::null_mut());
+        let set: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> bool =
+            std::mem::transmute(objc_msgSend as *const ());
+        let string = ns(text);
+        if string.is_null()
+            || !set(board, sel(b"setString:forType:\0"), string, ns("public.utf8-plain-text"))
+            || !set(board, sel(b"setString:forType:\0"), ns(""), ns(CONCEALED_TYPE))
+        {
+            return Err("剪贴板写入失败。".into());
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn read_files() -> Vec<String> {
     let _pool = crate::input::macos_appkit::autorelease_pool();
     unsafe {

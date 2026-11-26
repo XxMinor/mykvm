@@ -508,6 +508,7 @@ fn load_or_create_identity(dir: &Path) -> Result<TransportIdentity, String> {
 
     if let (Ok(cert_der), Ok(key_der)) = (fs::read(&cert_path), fs::read(&key_path)) {
         if !cert_der.is_empty() && !key_der.is_empty() {
+            restrict_to_owner(&key_path);
             return Ok(TransportIdentity {
                 public_key: BASE64.encode(&cert_der),
                 cert_der,
@@ -534,12 +535,26 @@ fn load_or_create_identity(dir: &Path) -> Result<TransportIdentity, String> {
     if let Err(error) = fs::write(&key_path, &key_der) {
         log::warn!("failed to persist QUIC key: {error}");
     }
+    restrict_to_owner(&key_path);
 
     Ok(TransportIdentity {
         public_key: BASE64.encode(&cert_der),
         cert_der,
         key_der,
     })
+}
+
+/// Files holding a secret (the transport key, the pair secret) were written
+/// world-readable. Owner-only on Unix; Windows keeps per-user app data private
+/// through the directory ACL.
+pub(crate) fn restrict_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn candidate_ports(preferred_port: u16) -> Vec<u16> {
@@ -549,9 +564,6 @@ fn candidate_ports(preferred_port: u16) -> Vec<u16> {
         let Some(port) = start.checked_add(offset) else {
             break;
         };
-        if port == 0 {
-            continue;
-        }
         ports.push(port);
     }
     ports.push(0);
@@ -602,8 +614,8 @@ fn tuned_transport_config() -> quinn::TransportConfig {
 
 /// Certificate-pinning verifier for the QUIC transport.
 ///
-/// Each peer generates a fresh self-signed certificate at startup and
-/// advertises it during discovery. We pin *exactly* that certificate instead
+/// Each peer generates a self-signed certificate on its first start, keeps
+/// it, and advertises it during discovery. We pin *exactly* that certificate instead
 /// of running a WebPKI chain/CA validation over a self-signed leaf — the latter
 /// is brittle across platforms and was rejecting otherwise valid peers with
 /// `invalid peer certificate: BadSignature` (Mac↔Windows handshakes failed, so
@@ -830,8 +842,18 @@ fn send_datagram_nonblocking(
     };
 
     if let Some(connection) = ready {
+        // An empty payload is discovery keeping a connection warm, not input:
+        // with two peers online it took the link report over from the one
+        // being driven every few seconds, so the report never filled its
+        // minute and the round trip read was the other machine's.
+        let is_input = !payload.is_empty();
         match connection.send_datagram(payload.into()) {
-            Ok(()) => record_peer_success(health, &peer.addr),
+            Ok(()) => {
+                record_peer_success(health, &peer.addr);
+                if is_input {
+                    note_link_quality(&connection, &peer.addr);
+                }
+            }
             // TooLarge/Disabled say nothing about the peer; only a closed
             // connection is re-dialed and counted against its health.
             Err(error) if connection.close_reason().is_some() => {
@@ -870,6 +892,77 @@ fn send_datagram_nonblocking(
             }
         }
     });
+}
+
+/// Worst smoothed round trip seen on the connection carrying input, reported
+/// once a minute with the packets lost meanwhile. "The cursor stutters" could
+/// not be told apart from a bad Wi-Fi link by reading the log. Sampled on the
+/// send path, so it costs no timer and is silent while nothing is controlled.
+struct LinkQuality {
+    connection: usize,
+    since: Instant,
+    worst_rtt: Duration,
+    lost: u64,
+    sent: u64,
+}
+
+impl LinkQuality {
+    /// True when a minute of samples is in and the caller should report.
+    fn sample(&mut self, now: Instant, rtt: Duration) -> bool {
+        self.worst_rtt = self.worst_rtt.max(rtt);
+        now.saturating_duration_since(self.since) >= Duration::from_secs(60)
+    }
+}
+
+static LAST_ROUND_TRIP_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The link's round trip as of the last input sent (zero before any was).
+pub(crate) fn last_round_trip() -> Duration {
+    Duration::from_micros(LAST_ROUND_TRIP_MICROS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn note_link_quality(connection: &quinn::Connection, addr: &str) {
+    static LINK: Mutex<Option<LinkQuality>> = Mutex::new(None);
+    LAST_ROUND_TRIP_MICROS.store(
+        connection.rtt().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let Ok(mut link) = LINK.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let id = connection.stable_id();
+    if link.as_ref().is_none_or(|link| link.connection != id) {
+        let path = connection.stats().path;
+        *link = Some(LinkQuality {
+            connection: id,
+            since: now,
+            worst_rtt: Duration::ZERO,
+            lost: path.lost_packets,
+            sent: path.sent_packets,
+        });
+    }
+    let Some(link) = link.as_mut() else {
+        return;
+    };
+    if !link.sample(now, connection.rtt()) {
+        return;
+    }
+    let path = connection.stats().path;
+    log::info!(
+        "link {addr}: rtt {}ms now, {}ms worst; {} of {} packets lost since the last report",
+        path.rtt.as_millis(),
+        link.worst_rtt.as_millis(),
+        path.lost_packets.saturating_sub(link.lost),
+        path.sent_packets.saturating_sub(link.sent),
+    );
+    *link = LinkQuality {
+        connection: id,
+        since: now,
+        worst_rtt: Duration::ZERO,
+        lost: path.lost_packets,
+        sent: path.sent_packets,
+    };
 }
 
 /// Stream send running inside its own task: reuses a ready connection or
@@ -1008,6 +1101,23 @@ fn resolve_peer_addr(addr: &str) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_quality_keeps_the_worst_round_trip_and_reports_once_a_minute() {
+        let start = Instant::now();
+        let mut link = LinkQuality {
+            connection: 1,
+            since: start,
+            worst_rtt: Duration::ZERO,
+            lost: 0,
+            sent: 0,
+        };
+        assert!(!link.sample(start + Duration::from_secs(1), Duration::from_millis(5)));
+        assert!(!link.sample(start + Duration::from_secs(2), Duration::from_millis(62)));
+        assert!(!link.sample(start + Duration::from_secs(59), Duration::from_millis(4)));
+        assert!(link.sample(start + Duration::from_secs(60), Duration::from_millis(6)));
+        assert_eq!(link.worst_rtt, Duration::from_millis(62));
+    }
 
     #[test]
     fn peer_health_fast_fails_after_threshold_and_recovers_on_success() {

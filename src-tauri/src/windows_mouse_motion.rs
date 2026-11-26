@@ -3,10 +3,12 @@ use std::time::{Duration, Instant};
 
 /// SetCursorPos can re-enter the mouse hook before the caller releases its
 /// remote-state lock. Recognize those moves before touching capture state.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) struct CursorWarps {
     pending: VecDeque<((i32, i32), Instant)>,
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl CursorWarps {
     pub(crate) const fn new() -> Self {
         Self {
@@ -48,23 +50,70 @@ impl CursorWarps {
 }
 
 /// Small jitter at the client's entry edge must not hand control back. A
-/// deliberate push, even slow one-pixel steps, still crosses without a timer.
+/// deliberate push, even slow one-pixel steps, still crosses without a timer,
+/// and a cursor swept across the edge crosses on the spot.
 #[derive(Default)]
 pub(crate) struct EdgeReturnGate {
     pressure: f64,
     last_push: Option<Instant>,
+    /// The unbroken outward run the cursor is on: when it began, its last
+    /// step, and how far it has gone.
+    run: Option<(Instant, Instant, f64)>,
 }
+
+/// A run ends at a pause this long (or at any step back).
+const RUN_PAUSE: Duration = Duration::from_millis(60);
+/// A run this long and this fast (px, px/s) arriving at the edge is a sweep
+/// across it, not a cursor that was resting there.
+const SWEEP_DISTANCE: f64 = 16.0;
+const SWEEP_SPEED: f64 = 300.0;
 
 impl EdgeReturnGate {
     pub(crate) fn reset(&mut self) {
         self.pressure = 0.0;
         self.last_push = None;
+        self.run = None;
+    }
+
+    /// A move that stayed on the remote screen. Travel toward the entry edge
+    /// is remembered: without it a cursor swept across the edge stopped dead
+    /// there for the 8 px a resting cursor has to push, a hitch on each return.
+    pub(crate) fn approach(&mut self, outward: f64, now: Instant) {
+        self.pressure = 0.0;
+        self.last_push = None;
+        self.extend_run(outward, now);
+    }
+
+    fn extend_run(&mut self, outward: f64, now: Instant) {
+        if !outward.is_finite() || outward <= 0.0 {
+            self.run = None;
+            return;
+        }
+        match &mut self.run {
+            Some((_, last, distance)) if now.saturating_duration_since(*last) <= RUN_PAUSE => {
+                *last = now;
+                *distance += outward;
+            }
+            _ => self.run = Some((now, now, outward)),
+        }
+    }
+
+    fn swept(&self, now: Instant) -> bool {
+        self.run.is_some_and(|(began, _, distance)| {
+            distance >= SWEEP_DISTANCE
+                && distance >= SWEEP_SPEED * now.saturating_duration_since(began).as_secs_f64()
+        })
     }
 
     pub(crate) fn push(&mut self, outward: f64, now: Instant) -> bool {
         if !outward.is_finite() || outward <= 0.0 {
             self.reset();
             return false;
+        }
+        self.extend_run(outward, now);
+        if self.swept(now) {
+            self.reset();
+            return true;
         }
         if self
             .last_push
@@ -116,5 +165,36 @@ mod tests {
         assert!(!gate.push(7.0, now + Duration::from_secs(2)));
         gate.reset(); // An inward move or a screen switch clears edge pressure.
         assert!(!gate.push(1.0, now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_cursor_swept_across_the_edge_returns_without_stopping_there() {
+        let now = Instant::now();
+        let step = |index: u64| now + Duration::from_millis(index * 8);
+        // 5 px every 8 ms (625 px/s) up to the edge: the first step past it returns.
+        let mut gate = EdgeReturnGate::default();
+        for index in 0..10 {
+            gate.approach(5.0, step(index));
+        }
+        assert!(gate.push(1.0, step(10)));
+        // Creeping up to it (125 px/s, as when reaching for something at the
+        // edge) still has to push.
+        let mut gate = EdgeReturnGate::default();
+        for index in 0..60 {
+            gate.approach(1.0, step(index));
+        }
+        assert!(!gate.push(1.0, step(60)));
+        // So does a sweep that stopped short of the edge, or turned back.
+        let mut gate = EdgeReturnGate::default();
+        for index in 0..10 {
+            gate.approach(5.0, step(index));
+        }
+        assert!(!gate.push(1.0, step(10) + Duration::from_millis(200)));
+        let mut gate = EdgeReturnGate::default();
+        for index in 0..10 {
+            gate.approach(5.0, step(index));
+        }
+        gate.approach(-1.0, step(10));
+        assert!(!gate.push(1.0, step(11)));
     }
 }

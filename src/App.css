@@ -55,7 +55,6 @@
 }
 
 .theme-light .brand-lockup strong,
-.theme-light .page-heading h1,
 .theme-light .layout-toolbar h1,
 .theme-light .surface-card h2,
 .theme-light .connection-title strong,
@@ -65,7 +64,6 @@
 }
 
 .theme-light .brand-subtitle,
-.theme-light .page-heading p,
 .theme-light .surface-card > p,
 .theme-light .muted-copy,
 .theme-light .connection-meta,
@@ -916,34 +914,12 @@
   padding-top: 4px;
 }
 
-.page-heading {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  align-items: flex-start;
-}
-
-.page-heading h1,
-.page-heading p,
 .surface-card h2,
 .surface-card p,
 .onboarding-copy h1,
 .onboarding-copy p,
 .role-choice-card p {
   margin: 0;
-}
-
-.page-heading h1 {
-  color: #f4f4f5;
-  font-size: 24px;
-  line-height: 1.25;
-}
-
-.page-heading p {
-  margin-top: 6px;
-  max-width: 720px;
-  color: #a1a1aa;
-  font-size: 14px;
 }
 
 .connection-stack {
@@ -1393,11 +1369,6 @@
   font-size: 13px;
 }
 
-.stack {
-  display: grid;
-  gap: 10px;
-}
-
 .device-badge {
   width: 13px;
   height: 13px;
@@ -1419,13 +1390,6 @@
 
 .danger-button {
   color: #fda4af;
-}
-
-.runtime-line {
-  margin: 8px 0;
-  color: #f4f4f5;
-  font-size: 22px;
-  font-weight: 800;
 }
 
 .network-meta {
@@ -1595,14 +1559,6 @@
 
 .diagnostic-path {
   overflow-wrap: anywhere;
-}
-
-.diagnostic-note {
-  margin-top: 0 !important;
-}
-
-.diagnostic-note strong {
-  color: #d4d4d8;
 }
 
 .diagnostic-message {
@@ -2235,17 +2191,13 @@
   .compact-meta,
   .settings-control-row,
   .role-choice-grid,
-  .page-heading,
   .runtime-meta {
     grid-template-columns: 1fr;
   }
-
-  .page-heading {
-    display: grid;
-  }
 }
 
-/* Sending-side file-transfer progress toasts (bottom-right stack). */
+/* File-transfer progress: a stack at the bottom right of the main window, and
+   the one card of the pop-up window in the corner of the screen. */
 .file-transfer-toasts {
   position: fixed;
   right: 18px;
@@ -2253,59 +2205,114 @@
   z-index: 70;
   display: grid;
   gap: 10px;
-  width: min(340px, calc(100vw - 36px));
+  width: min(352px, calc(100vw - 36px));
   pointer-events: none;
 }
 
 .file-transfer-toast {
+  --toast-accent: #2dd4bf;
+  --toast-tint: rgba(45, 212, 191, 0.14);
+  --toast-muted: #94a3b8;
   pointer-events: auto;
+  box-sizing: border-box;
   display: grid;
-  gap: 8px;
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
   padding: 12px 14px;
-  border: 1px solid rgba(45, 212, 191, 0.28);
-  border-radius: 12px;
-  background: rgba(15, 23, 32, 0.92);
-  box-shadow: 0 10px 30px rgba(2, 6, 12, 0.45);
-  color: #e2e8f0;
-  font-size: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: #141a21;
+  box-shadow:
+    0 6px 14px rgba(0, 0, 0, 0.32),
+    0 1px 2px rgba(0, 0, 0, 0.3);
+  color: #f1f5f9;
+  font-size: 11px;
+  line-height: 16px;
 }
 
 .file-transfer-toast.done {
-  border-color: rgba(45, 212, 191, 0.5);
+  --toast-accent: #34d399;
+  --toast-tint: rgba(52, 211, 153, 0.14);
 }
 
 .file-transfer-toast.failed {
-  border-color: rgba(248, 113, 113, 0.5);
+  --toast-accent: #f87171;
+  --toast-tint: rgba(248, 113, 113, 0.14);
+}
+
+.file-transfer-toast svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.file-transfer-toast-icon {
+  box-sizing: border-box;
+  width: 36px;
+  height: 36px;
+  padding: 8px;
+  border-radius: 10px;
+  background: var(--toast-tint);
+  color: var(--toast-accent);
+}
+
+.file-transfer-toast-body {
+  display: grid;
+  /* Not the `auto` a grid gives itself: that is as wide as the longest file
+     name, and pushed the button and the figures out of the card. */
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .file-transfer-toast-head {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
+  align-items: center;
+  gap: 8px;
+  height: 20px;
 }
 
 .file-transfer-toast-name {
-  font-weight: 700;
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.file-transfer-toast-status {
+.file-transfer-toast-cancel {
   flex: none;
-  font-size: 11px;
-  color: #99f6e4;
+  height: 20px;
+  padding: 0 9px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 18px;
+  cursor: pointer;
 }
 
-.file-transfer-toast.failed .file-transfer-toast-status {
-  color: #fca5a5;
+.file-transfer-toast-cancel:hover {
+  background: rgba(148, 163, 184, 0.2);
+}
+
+.file-transfer-toast-status,
+.file-transfer-toast-meta span {
+  color: var(--toast-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .file-transfer-toast-track {
-  height: 6px;
+  height: 4px;
+  margin: 8px 0 6px;
   border-radius: 999px;
-  background: rgba(148, 163, 184, 0.22);
+  background: rgba(148, 163, 184, 0.2);
   overflow: hidden;
 }
 
@@ -2313,28 +2320,86 @@
   height: 100%;
   border-radius: 999px;
   background: linear-gradient(90deg, #2dd4bf, #22d3ee);
-  transition: width 0.15s ease;
+  transition: width 0.2s ease;
 }
 
+.file-transfer-toast.done .file-transfer-toast-fill,
 .file-transfer-toast.failed .file-transfer-toast-fill {
-  background: #f87171;
+  background: var(--toast-accent);
 }
 
 .file-transfer-toast-meta {
-  color: #94a3b8;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-variant-numeric: tabular-nums;
 }
 
-.theme-light .file-transfer-toast {
-  background: rgba(255, 255, 255, 0.97);
+.file-transfer-toast-meta strong {
+  flex: none;
+  font-size: 12px;
+  color: var(--toast-accent);
+}
+
+:root[data-theme='light'] .file-transfer-toast {
+  --toast-accent: #0d9488;
+  --toast-tint: rgba(13, 148, 136, 0.12);
+  --toast-muted: #64748b;
+  border-color: rgba(15, 23, 42, 0.08);
+  background: #ffffff;
+  box-shadow:
+    0 6px 14px rgba(15, 23, 42, 0.14),
+    0 1px 2px rgba(15, 23, 42, 0.1);
   color: #0f172a;
-  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.18);
 }
 
-.theme-light .file-transfer-toast-meta {
-  color: #475569;
+:root[data-theme='light'] .file-transfer-toast.done {
+  --toast-accent: #059669;
+  --toast-tint: rgba(5, 150, 105, 0.12);
+}
+
+:root[data-theme='light'] .file-transfer-toast.failed {
+  --toast-accent: #dc2626;
+  --toast-tint: rgba(220, 38, 38, 0.1);
+}
+
+:root[data-theme='light'] .file-transfer-toast-track {
+  background: rgba(15, 23, 42, 0.08);
+}
+
+/* The pop-up window is its one card and the room that card's shadow takes;
+   the window is sized to both (`show_transfer_toast`). */
+:root[data-window='transfer-toast'],
+:root[data-window='transfer-toast'] body,
+:root[data-window='transfer-toast'] #root {
+  background: transparent;
+}
+
+.transfer-toast-window {
+  box-sizing: border-box;
+  height: 100vh;
+  padding: 8px 14px 20px;
+  display: grid;
+  grid-auto-rows: 96px;
+  gap: 8px;
+  user-select: none;
+  cursor: default;
+  /* The window as it opens, not each card: the next file of a copy is a new
+     card in the same place, and would come in again for every file. */
+  animation: transfer-toast-in 0.18s ease-out;
+}
+
+@keyframes transfer-toast-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transfer-toast-window {
+    animation: none;
+  }
 }
 
 .form-modal { width: min(500px, calc(100vw - 40px)); max-height: calc(100vh - 48px); box-sizing: border-box; border: 1px solid #7775; border-radius: 16px; padding: 24px; background: #191a1f; color: #f4f4f5; box-shadow: 0 24px 80px #0006; }

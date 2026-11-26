@@ -1,8 +1,8 @@
 use super::{RichText, MAX_FORMAT_BYTES};
 use windows_sys::Win32::Foundation::GlobalFree;
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
-    SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -133,12 +133,32 @@ pub(super) fn read() -> Option<RichText> {
     })
 }
 
-pub(super) fn write_rtf(bytes: &[u8]) -> Result<(), String> {
-    let _open = open()?;
-    unsafe { put(format("Rich Text Format"), bytes) }
+pub(super) fn write(rich: &RichText) -> Result<(), String> {
+    write_marked(rich, false)
 }
 
-pub(super) fn write(rich: &RichText) -> Result<(), String> {
+// Clipboard history and cloud sync read these when the clipboard changes, so
+// they go on in the same update as the text they describe.
+const EXCLUDE_FROM_MONITORS: &str = "ExcludeClipboardContentFromMonitorProcessing";
+const HISTORY_ALLOWED: &str = "CanIncludeInClipboardHistory";
+const CLOUD_ALLOWED: &str = "CanUploadToCloudClipboard";
+
+pub(super) fn write_concealed_text(text: &str) -> Result<(), String> {
+    write_marked(&RichText { text: text.into(), html: None, rtf: None }, true)
+}
+
+pub(super) fn is_concealed() -> bool {
+    if unsafe { IsClipboardFormatAvailable(format(EXCLUDE_FROM_MONITORS)) } != 0 {
+        return true;
+    }
+    let Ok(_open) = open() else {
+        return false;
+    };
+    // A DWORD of zero; `bytes` drops trailing zero bytes.
+    unsafe { bytes(format(HISTORY_ALLOWED)) }.is_some_and(|allowed| allowed.is_empty())
+}
+
+fn write_marked(rich: &RichText, concealed: bool) -> Result<(), String> {
     let owner = owner()?;
     let _open = open_owned(&owner)?;
     let plain: Vec<u8> = rich
@@ -158,11 +178,21 @@ pub(super) fn write(rich: &RichText) -> Result<(), String> {
         if let Some(rtf) = &rich.rtf {
             put(format("Rich Text Format"), rtf)?;
         }
+        if concealed {
+            put(format(EXCLUDE_FROM_MONITORS), &[1])?;
+            put(format(HISTORY_ALLOWED), &0_u32.to_le_bytes())?;
+            put(format(CLOUD_ALLOWED), &0_u32.to_le_bytes())?;
+        }
     }
     Ok(())
 }
 
 pub(super) fn read_files() -> Vec<String> {
+    // Files a peer copied, on this clipboard for a program to paste: asking
+    // for them here would fetch them all, as if they were being pasted.
+    if crate::windows_drag::clipboard_offer_current() {
+        return Vec::new();
+    }
     let Ok(_open) = open() else {
         return Vec::new();
     };
@@ -199,6 +229,13 @@ pub(super) fn read_files() -> Vec<String> {
 }
 
 pub(super) fn write_files(paths: &[String]) -> Result<(), String> {
+    // As Explorer itself copies files. The bare list of paths below, which
+    // some programs would not paste, is what remains if the shell refuses.
+    let files: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    match crate::windows_drag::copy_files_to_clipboard(&files) {
+        Ok(()) => return Ok(()),
+        Err(error) => log::warn!("the shell would not put the files on the clipboard ({error}); writing their paths"),
+    }
     let mut data = vec![0_u8; 20];
     data[0..4].copy_from_slice(&20_u32.to_le_bytes());
     data[16..20].copy_from_slice(&1_u32.to_le_bytes());

@@ -2,7 +2,7 @@
 name = "mykvm-input-helper"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.89"
 publish = false
 
 # The Windows-only lock-screen input helper. It lives in its own package so it is

@@ -29,14 +29,7 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<(), String> {
                 {
                     return Err("文件名不能跨平台传输。".into());
                 }
-                let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-                if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-                    || ["COM", "LPT"].iter().any(|prefix| {
-                        stem.strip_prefix(prefix).is_some_and(|n| {
-                            matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-                        })
-                    })
-                {
+                if windows_reserved_name(name) {
                     return Err("文件夹含有 Windows 保留文件名。".into());
                 }
             }
@@ -46,7 +39,26 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// CON, NUL, COM1… name a device on Windows whatever extension follows.
+pub(crate) fn windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix)
+                .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+        })
+}
+
 pub(crate) fn walk(root: &Path) -> Result<Vec<(std::path::PathBuf, bool, u64)>, String> {
+    walk_up_to(root, MAX_BYTES)
+}
+
+/// `walk` with the caller's size limit: a folder fetched as it is pasted is
+/// streamed file by file and never packed, so the bundle limit does not apply.
+pub(crate) fn walk_up_to(
+    root: &Path,
+    max_bytes: u64,
+) -> Result<Vec<(std::path::PathBuf, bool, u64)>, String> {
     let mut entries = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0)];
     let mut bytes = 0_u64;
@@ -65,7 +77,7 @@ pub(crate) fn walk(root: &Path) -> Result<Vec<(std::path::PathBuf, bool, u64)>, 
         validate_relative_path(&relative)?;
         let size = if meta.is_file() { meta.len() } else { 0 };
         bytes = bytes.checked_add(size).ok_or("文件夹过大。")?;
-        if bytes > MAX_BYTES {
+        if bytes > max_bytes {
             return Err("文件夹超过 2 GiB 传输上限。".into());
         }
         entries.push((relative, meta.is_dir(), size));

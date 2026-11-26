@@ -45,18 +45,25 @@ use windows::Win32::System::Ole::{
     DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
-use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW, PostMessageW,
-    RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
-    SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClassNameW,
+    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId,
+    KillTimer, PostMessageW, RegisterClassW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
+    WindowFromPoint, GUITHREADINFO, HWND_TOPMOST, MSG, MSGFLT_ALLOW,
+    SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_COPYDATA, WM_DROPFILES, WM_TIMER,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 // The drop-target box is ~invisible-brief but must be a real, non-transparent,
 // on-screen window or OLE drag hit-testing (WindowFromPoint) skips it.
-const CATCH_W: i32 = 36;
+const CATCH_W: i32 = 80;
 const CATCH_H: i32 = 220;
+/// How long a drop that was asked for may take to arrive. Shorter than the
+/// hook's own wait at the edge and than the hand-off's retraction, so both
+/// find the matter settled.
+const DROP_WAIT_MS: u32 = 300;
+const DROP_TIMER: usize = 1;
 // Arm/disarm are posted to the window's own (STA) thread; doing SetWindowPos /
 // ShowWindow there — not cross-thread from the capture hook — is what actually
 // moves and shows the window in time for the drag to land on it.
@@ -80,6 +87,17 @@ static HANDOFF: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 // shuttling the cursor back and forth across the edge can't read + transfer the
 // same drag again (each round used to make another copy). Reset on button-up.
 static HOLD_CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// MyKVM runs elevated, and Windows does not let a program that is not
+// (Explorer) hand an OLE drag to one that is: DragEnter never came, and every
+// drag toward the other computer ended as "catcher missed". The older
+// file-drop message can be let through, but it only arrives on a drop, so the
+// catcher asks for one (see `force_drop`).
+static LEGACY_DROP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// True from asking the drag to drop until the drop arrives or `DROP_WAIT_MS`
+/// is over. The catcher stays where it is for that long: see `drop_pending`.
+static DROP_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Where the catcher was last armed (x << 32 | y), i64::MIN while disarmed.
+static ARMED_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
 // Set while this machine is the CONTROLLED one handing its drag to a remote
 // controller. The hand-off flag is meaningless then (only a controller's
 // capture hook consumes it), so DragEnter must not leave one behind.
@@ -90,6 +108,20 @@ static RELAY_TO_CONTROLLER: std::sync::atomic::AtomicBool =
 /// capture hook then skips re-arming so no duplicate transfer happens.
 pub fn hold_consumed() -> bool {
     HOLD_CONSUMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// This hold's drag is over without having been caught: do not wait at the
+/// edge for one.
+pub fn consume_hold() {
+    HOLD_CONSUMED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True while a drop the catcher asked for is on its way. Its button-up reads
+/// as a released button everywhere, the capture hook included: crossing on the
+/// very next movement hid the catcher before the drag had dropped on it, and
+/// two drags in three were lost that way.
+pub fn drop_pending() -> bool {
+    DROP_FORCED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Clear the per-hold guard — called when the left button is released.
@@ -121,9 +153,6 @@ struct Catcher {
     device_id: Mutex<Option<String>>,
 }
 
-unsafe impl Send for Catcher {}
-unsafe impl Sync for Catcher {}
-
 fn catcher() -> Option<&'static Catcher> {
     CATCHER.get()
 }
@@ -145,7 +174,19 @@ pub fn arm(device_id: &str, x: i32, y: i32) {
         log::warn!("edge catcher: arm before init");
         return;
     };
+    // A drop already asked for lands where the catcher is: it stays put.
+    if drop_pending() {
+        return;
+    }
+    // The hook arms on every mouse event of a button held against the edge
+    // (130 in one second in a real log): only the first, or a new place, has
+    // anything to move.
+    let at = (i64::from(x) << 32) | i64::from(y as u32);
+    let moved = ARMED_AT.swap(at, std::sync::atomic::Ordering::Relaxed) != at;
     if let Ok(mut slot) = catcher.device_id.lock() {
+        if !moved && slot.as_deref() == Some(device_id) {
+            return;
+        }
         *slot = Some(device_id.to_string());
     }
     let hwnd = HWND(catcher.hwnd as *mut _);
@@ -173,12 +214,14 @@ pub fn handoff_to_controller(controller_device_id: &str) {
     // capture hook, which is not active on a controlled machine, so without
     // this the first hand-off would block every later one.
     reset_hold();
-    RELAY_TO_CONTROLLER.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut point = POINT::default();
     if unsafe { GetCursorPos(&mut point) }.is_err() {
         log::warn!("drag handoff: GetCursorPos failed");
         return;
     }
+    // After the read: set before it, a failed read left the flag up with
+    // nothing to take it down.
+    RELAY_TO_CONTROLLER.store(true, std::sync::atomic::Ordering::Relaxed);
     log::info!("drag handoff: pull from {controller_device_id}, arming under the cursor");
     arm(controller_device_id, point.x, point.y);
 
@@ -196,11 +239,20 @@ pub fn handoff_to_controller(controller_device_id: &str) {
     });
 }
 
-/// Hide the catcher (control crossed, or the drag ended).
+/// Hide the catcher (control crossed, or the drag ended). Not while a drop it
+/// asked for is on its way: that drop, or the wait for it running out, ends it.
 pub fn disarm() {
+    if !drop_pending() {
+        retract();
+    }
+}
+
+fn retract() {
     let Some(catcher) = catcher() else {
         return;
     };
+    ARMED_AT.store(i64::MIN, std::sync::atomic::Ordering::Relaxed);
+    DROP_FORCED.store(false, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut slot) = catcher.device_id.lock() {
         *slot = None;
     }
@@ -254,10 +306,23 @@ fn run_catcher_thread() {
             return;
         };
 
-        let target: IDropTarget = EdgeDropTarget.into();
-        if RegisterDragDrop(hwnd, &target).is_err() {
-            log::warn!("edge catcher: RegisterDragDrop failed");
-            return;
+        if crate::is_windows_process_elevated().unwrap_or(false) {
+            // Not registered with OLE as well: it would be asked first, and
+            // refused.
+            DragAcceptFiles(hwnd, true);
+            const WM_COPYGLOBALDATA: u32 = 0x0049;
+            for message in [WM_DROPFILES, WM_COPYDATA, WM_COPYGLOBALDATA] {
+                if let Err(error) = ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, None) {
+                    log::warn!("edge catcher: message {message:#06x} could not be let through: {error}");
+                }
+            }
+            LEGACY_DROP.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            let target: IDropTarget = EdgeDropTarget.into();
+            if RegisterDragDrop(hwnd, &target).is_err() {
+                log::warn!("edge catcher: RegisterDragDrop failed");
+                return;
+            }
         }
 
         let _ = CATCHER.set(Catcher {
@@ -279,14 +344,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     // from the capture hook did not reliably move it under the dragging cursor.
     match msg {
         WM_ARM => {
-            let x = (wparam.0 as u32) as i32;
-            let y = lparam.0 as i32;
+            // Around the cursor itself, which is not where the hook says: its
+            // point is where the cursor was heading, and the movement it
+            // swallowed left the cursor short of that. A fast drag stopped
+            // well inside the edge, beside a window centred on the edge.
+            let mut at = POINT { x: (wparam.0 as u32) as i32, y: lparam.0 as i32 };
             unsafe {
+                let _ = GetCursorPos(&mut at);
                 let _ = SetWindowPos(
                     hwnd,
                     Some(HWND_TOPMOST),
-                    x - CATCH_W / 2,
-                    y - CATCH_H / 2,
+                    at.x - CATCH_W / 2,
+                    at.y - CATCH_H / 2,
                     CATCH_W,
                     CATCH_H,
                     SWP_NOACTIVATE,
@@ -298,8 +367,44 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // showed and DragEnter can't fire. On the controller the user's own
             // motion does that, and injecting moves there would feed synthetic
             // events straight back into the capture hook.
-            if RELAY_TO_CONTROLLER.load(std::sync::atomic::Ordering::Relaxed) {
+            if LEGACY_DROP.load(std::sync::atomic::Ordering::Relaxed) {
+                // Marked as pending before the button-up goes out, so the hook
+                // never sees a released button without it.
+                if !DROP_FORCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    if force_drop(hwnd, at) {
+                        unsafe { SetTimer(Some(hwnd), DROP_TIMER, DROP_WAIT_MS, None) };
+                    } else {
+                        DROP_FORCED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            } else if RELAY_TO_CONTROLLER.load(std::sync::atomic::Ordering::Relaxed) {
                 nudge_cursor();
+            }
+            LRESULT(0)
+        }
+        WM_DROPFILES => {
+            let hdrop = HDROP(wparam.0 as *mut _);
+            let files = unsafe { hdrop_paths(hdrop) };
+            unsafe {
+                DragFinish(hdrop);
+                let _ = KillTimer(Some(hwnd), DROP_TIMER);
+            }
+            // The drop that brought this already ended the drag.
+            caught(files, false);
+            // Let go of at the edge while the drop was on its way: the hook
+            // has already seen that release, and no other will clear the hold.
+            if !crate::input::windows_local_left_button_down() {
+                reset_hold();
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == DROP_TIMER => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), DROP_TIMER);
+            }
+            if drop_pending() {
+                log::info!("edge catcher: the drag did not drop here (not files, or nothing was being dragged)");
+                retract();
             }
             LRESULT(0)
         }
@@ -330,50 +435,7 @@ impl IDropTarget_Impl for EdgeDropTarget_Impl {
         if !pdweffect.is_null() {
             unsafe { *pdweffect = DROPEFFECT_NONE };
         }
-        // One capture per button hold: shuttling back and forth across the edge
-        // must not read + transfer the drag again (that made a copy each time).
-        if HOLD_CONSUMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            disarm();
-            return Ok(());
-        }
-        let files = pdataobj
-            .as_ref()
-            .map(read_hdrop_files)
-            .unwrap_or_default();
-        if files.is_empty() {
-            HOLD_CONSUMED.store(false, std::sync::atomic::Ordering::Relaxed);
-            log::info!("edge catcher: DragEnter with no files (not a file drag)");
-            return Ok(());
-        }
-
-        let device_id = catcher()
-            .and_then(|catcher| catcher.device_id.lock().ok().and_then(|slot| slot.clone()));
-        let Some(device_id) = device_id else {
-            log::warn!("edge catcher: DragEnter but no armed device");
-            return Ok(());
-        };
-
-        log::info!(
-            "edge catcher: DragEnter read {} file(s) -> {}; transferring + handing off",
-            files.len(),
-            device_id
-        );
-        if let Some(sink) = SINK.get() {
-            sink(device_id.clone(), files);
-        }
-        // End the source app's local drag (and clear the held button) before
-        // the hand-off, so Windows doesn't come back stuck in a drag state.
-        inject_end_drag();
-        // Tell the capture hook to cross so the cursor slides onto the remote.
-        // Handing a drag UP to a controller is the opposite case: the cursor is
-        // already back on that machine and no capture hook runs here to consume
-        // the flag, so setting one would only strand a stale value.
-        if RELAY_TO_CONTROLLER.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            log::info!("drag handoff: files sent up to the controller");
-        } else if let Ok(mut slot) = handoff_slot().lock() {
-            *slot = Some(device_id);
-        }
-        disarm();
+        caught(pdataobj.as_ref().map(read_hdrop_files).unwrap_or_default(), true);
         Ok(())
     }
 
@@ -423,6 +485,94 @@ impl IDropTarget_Impl for EdgeDropTarget_Impl {
     }
 }
 
+/// A file drag reached the catcher. Send its files, end the local drag when
+/// it is still going (`end_drag`), and hand the crossing to the capture hook.
+fn caught(files: Vec<PathBuf>, end_drag: bool) {
+    // One capture per button hold: shuttling back and forth across the edge
+    // must not read + transfer the drag again (that made a copy each time).
+    if HOLD_CONSUMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        retract();
+        return;
+    }
+    if files.is_empty() {
+        HOLD_CONSUMED.store(false, std::sync::atomic::Ordering::Relaxed);
+        log::info!("edge catcher: a drag with no files (not a file drag)");
+        retract();
+        return;
+    }
+    let device_id = catcher()
+        .and_then(|catcher| catcher.device_id.lock().ok().and_then(|slot| slot.clone()));
+    let Some(device_id) = device_id else {
+        log::warn!("edge catcher: a drag arrived but no device is armed");
+        retract();
+        return;
+    };
+    log::info!(
+        "edge catcher: read {} file(s) -> {}; transferring + handing off",
+        files.len(),
+        device_id
+    );
+    if let Some(sink) = SINK.get() {
+        sink(device_id.clone(), files);
+    }
+    // End the source app's local drag (and clear the held button) before
+    // the hand-off, so Windows doesn't come back stuck in a drag state.
+    if end_drag {
+        inject_end_drag();
+    }
+    // Tell the capture hook to cross so the cursor slides onto the remote.
+    // Handing a drag UP to a controller is the opposite case: the cursor is
+    // already back on that machine and no capture hook runs here to consume
+    // the flag, so setting one would only strand a stale value.
+    if RELAY_TO_CONTROLLER.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        log::info!("drag handoff: files sent up to the controller");
+    } else if let Ok(mut slot) = handoff_slot().lock() {
+        *slot = Some(device_id);
+    }
+    retract();
+}
+
+/// Make the drag in flight drop on the catcher now: the file-drop message is
+/// the only word an elevated window gets of it. A move first, so the drag
+/// looks at what is under the cursor; then the button-up that drops it there.
+/// Only a drag: its source holds the mouse with OLE's own window, where a
+/// selection, a slider or a window being moved holds it with theirs and would
+/// only be let go of. And not unless the catcher is what the drop would land
+/// on, or the files go to whatever else is there, to be moved or opened by it.
+/// Returns whether the drop was asked for.
+fn force_drop(hwnd: HWND, at: POINT) -> bool {
+    let mut info = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    let dragging = unsafe {
+        let thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        GetGUIThreadInfo(thread, &mut info).is_ok() && class_of(info.hwndCapture) == "CLIPBRDWNDCLASS"
+    };
+    if !dragging {
+        return false;
+    }
+    let under = unsafe { WindowFromPoint(at) };
+    if under != hwnd {
+        log::warn!(
+            "edge catcher: \"{}\" is under the cursor at ({},{}), not the catcher; the drag is left alone",
+            class_of(under),
+            at.x,
+            at.y
+        );
+        return false;
+    }
+    log::info!("edge catcher: asking the drag to drop here, at ({},{})", at.x, at.y);
+    let mut inputs = [move_input(-1, 0), move_input(1, 0), left_up_input()];
+    unsafe {
+        SendInput(inputs.len() as u32, inputs.as_mut_ptr(), std::mem::size_of::<INPUT>() as i32);
+    }
+    true
+}
+
+fn class_of(hwnd: HWND) -> String {
+    let mut class = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    String::from_utf16_lossy(&class[..len])
+}
+
 fn hdrop_format() -> FORMATETC {
     FORMATETC {
         cfFormat: CF_HDROP.0,
@@ -439,26 +589,30 @@ fn read_hdrop_files(data_object: &IDataObject) -> Vec<PathBuf> {
         Ok(medium) => medium,
         Err(_) => return Vec::new(),
     };
-    let mut paths = Vec::new();
     unsafe {
-        let hdrop = HDROP(medium.u.hGlobal.0);
-        let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
-        for index in 0..count {
-            let len = DragQueryFileW(hdrop, index, None);
-            if len == 0 {
-                continue;
-            }
-            let mut buffer = vec![0u16; len as usize + 1];
-            let written = DragQueryFileW(hdrop, index, Some(&mut buffer));
-            if written == 0 {
-                continue;
-            }
-            let path = String::from_utf16_lossy(&buffer[..written as usize]);
-            if !path.is_empty() {
-                paths.push(PathBuf::from(path));
-            }
-        }
+        let paths = hdrop_paths(HDROP(medium.u.hGlobal.0));
         ReleaseStgMedium(&mut medium);
+        paths
+    }
+}
+
+unsafe fn hdrop_paths(hdrop: HDROP) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+    for index in 0..count {
+        let len = DragQueryFileW(hdrop, index, None);
+        if len == 0 {
+            continue;
+        }
+        let mut buffer = vec![0u16; len as usize + 1];
+        let written = DragQueryFileW(hdrop, index, Some(&mut buffer));
+        if written == 0 {
+            continue;
+        }
+        let path = String::from_utf16_lossy(&buffer[..written as usize]);
+        if !path.is_empty() {
+            paths.push(PathBuf::from(path));
+        }
     }
     paths
 }
@@ -508,7 +662,9 @@ fn move_input(dx: i32, dy: i32) -> INPUT {
                 mouseData: 0,
                 dwFlags: MOUSEEVENTF_MOVE,
                 time: 0,
-                dwExtraInfo: 0,
+                // Marked: the capture hook lets it through and does not take it
+                // for the user's own (a real button-up there ends the hold).
+                dwExtraInfo: crate::windows_drag::DRAG_INPUT_MARKER,
             },
         },
     }
@@ -539,7 +695,9 @@ fn left_up_input() -> INPUT {
                 mouseData: 0,
                 dwFlags: MOUSEEVENTF_LEFTUP,
                 time: 0,
-                dwExtraInfo: 0,
+                // Marked: the capture hook lets it through and does not take it
+                // for the user's own (a real button-up there ends the hold).
+                dwExtraInfo: crate::windows_drag::DRAG_INPUT_MARKER,
             },
         },
     }

@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 
 #[cfg(target_os = "windows")]
@@ -64,6 +65,7 @@ fn read_platform_process_performance() -> Result<(f64, f64), String> {
     read_unix_process_performance()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn read_unix_process_performance() -> Result<(f64, f64), String> {
     let pid = std::process::id().to_string();
     let output = command_stdout(Command::new("ps").args(["-p", &pid, "-o", "%cpu=,rss="]))?;
@@ -187,6 +189,8 @@ fn read_windows_process_performance() -> Result<(f64, f64), String> {
     ))
 }
 
+// `ps` reports the resident size in KiB.
+#[cfg(not(target_os = "windows"))]
 fn parse_process_metrics(output: &str) -> Result<(f64, f64), String> {
     let values = output
         .trim()
@@ -196,15 +200,7 @@ fn parse_process_metrics(output: &str) -> Result<(f64, f64), String> {
         .collect::<Vec<_>>();
 
     if values.len() >= 2 {
-        Ok((
-            values[0],
-            values[1]
-                / if cfg!(target_os = "windows") {
-                    1.0
-                } else {
-                    1024.0
-                },
-        ))
+        Ok((values[0], values[1] / 1024.0))
     } else {
         Err("performance command did not return process cpu and memory".into())
     }
@@ -215,6 +211,7 @@ fn filetime_to_u64(filetime: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64
 }
 
+#[cfg(not(target_os = "windows"))]
 fn command_stdout(command: &mut Command) -> Result<String, String> {
     let output = command
         .output()
@@ -227,22 +224,18 @@ fn command_stdout(command: &mut Command) -> Result<String, String> {
     }
 }
 
-#[cfg(test)]
+// Nothing here runs on Windows.
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn parses_unix_ps_cpu_and_rss_kb() {
         let (cpu, memory_mb) = parse_process_metrics(" 2.5 115664\n").expect("metrics");
 
         assert_eq!(cpu, 2.5);
-        // Windows reports bytes; the Unix ps fallback reports KiB (PR #22).
-        let expected = if cfg!(target_os = "windows") {
-            115664.0
-        } else {
-            112.953125
-        };
-        assert!((memory_mb - expected).abs() < f64::EPSILON);
+        assert!((memory_mb - 112.953125).abs() < f64::EPSILON);
     }
 
     #[cfg(target_os = "macos")]

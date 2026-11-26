@@ -12,21 +12,26 @@ use crate::shared_input::{mouse_button_mask, InputCommand, MouseButton};
 // if the controller resumes sharing before a queued injection is delivered.
 pub const KEYBOARD_INPUT_MARKER: usize = 0x4D59_4B53;
 
+/// Stamped on the mouse input injected here for a peer. Under peer control
+/// this machine captures its own mouse as well, and its hook must tell a peer
+/// driving it from the user at its desk.
+pub const PEER_MOUSE_MARKER: usize = 0x4D59_4B4D;
+
 /// Explains a refused button/key injection, throttled to one line per 10s.
 ///
 /// Windows blocks `SendInput` from a standard-user process into an elevated or
 /// uiAccess foreground window (Task Manager — which ships `uiAccess="true"` — a
 /// UAC-elevated app, etc.) with `ERROR_ACCESS_DENIED`; the events are dropped
 /// silently, which reads to the user as "remote control just stopped" even
-/// though MyKVM is still running. Cursor MOVE keeps working because it goes
-/// through SetCursorPos, not SendInput — so only clicks and keys die, exactly
-/// the reported symptom. Surface it instead of failing mutely (this replaces a
+/// though MyKVM is still running. Cursor MOVE keeps working because it falls
+/// back to SetCursorPos when SendInput is refused — so only clicks and keys
+/// die, exactly the reported symptom. Surface it instead of failing mutely (this replaces a
 /// leftover per-event debug write to C:\ProgramData\MyKVM\*.txt).
 fn note_injection_refused(kind: &str, error: u32) {
     use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 
     static LAST_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
-    let cell = LAST_WARN.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
+    let cell = LAST_WARN.get_or_init(|| Mutex::new(crate::instant_ago(Duration::from_secs(60))));
     if let Ok(mut last) = cell.lock() {
         if last.elapsed() < Duration::from_secs(10) {
             return;
@@ -54,16 +59,6 @@ pub fn inject_command(command: &InputCommand, pressed_keys: &mut Vec<u16>, butto
 
     track_pressed_inputs(command, pressed_keys, button_mask);
     let _ = inject_command_without_tracking(command);
-}
-
-pub fn release_pressed_inputs_on_fresh_input_desktop(
-    pressed_keys: &mut Vec<u16>,
-    button_mask: &mut u64,
-) -> Result<String, String> {
-    let mut desktop = DesktopAttachment::new();
-    let name = desktop.attach_current_input_desktop()?;
-    release_pressed_inputs(pressed_keys, button_mask);
-    Ok(name)
 }
 
 pub fn track_pressed_inputs(
@@ -100,7 +95,10 @@ pub fn inject_command_without_tracking(command: &InputCommand) -> Result<(), u32
             Ok(())
         }
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
-        InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
+        InputCommand::Scroll { delta_x, delta_y, fine_x, fine_y } => inject_scroll(
+            crate::shared_input::scroll_fine(delta_x, fine_x),
+            crate::shared_input::scroll_fine(delta_y, fine_y),
+        ),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
         InputCommand::ReleaseAll => Ok(()),
         InputCommand::SecureAttention => {
@@ -133,14 +131,12 @@ pub fn release_pressed_inputs(pressed_keys: &mut Vec<u16>, button_mask: &mut u64
 
 pub struct DesktopAttachment {
     desktop: windows_sys::Win32::System::StationsAndDesktops::HDESK,
-    name: String,
 }
 
 impl DesktopAttachment {
     pub fn new() -> Self {
         Self {
             desktop: ptr::null_mut(),
-            name: String::new(),
         }
     }
 
@@ -191,7 +187,6 @@ impl DesktopAttachment {
                 let _ = CloseDesktop(self.desktop);
             }
             self.desktop = desktop;
-            self.name = name.clone();
             return Ok(name);
         }
     }
@@ -261,7 +256,7 @@ pub fn inject_mouse_move(x: i32, y: i32, _drag_button: Option<MouseButton>) {
                     mouseData: 0,
                     dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: PEER_MOUSE_MARKER,
                 },
             },
         };
@@ -315,7 +310,7 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) -> R
                 mouseData: mouse_data as u32,
                 dwFlags: flag,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: PEER_MOUSE_MARKER,
             },
         },
     };
@@ -337,12 +332,13 @@ fn sent_or_refused(
     Err(error)
 }
 
-pub fn inject_scroll(delta_x: i32, delta_y: i32) -> Result<(), u32> {
+/// Scrolls by `fine_*` 1/120ths of a notch, the unit Windows itself uses.
+pub fn inject_scroll(fine_x: i32, fine_y: i32) -> Result<(), u32> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT,
     };
 
-    for (flag, delta) in [(MOUSEEVENTF_WHEEL, delta_y), (MOUSEEVENTF_HWHEEL, delta_x)] {
+    for (flag, delta) in [(MOUSEEVENTF_WHEEL, fine_y), (MOUSEEVENTF_HWHEEL, fine_x)] {
         if delta == 0 {
             continue;
         }
@@ -353,10 +349,11 @@ pub fn inject_scroll(delta_x: i32, delta_y: i32) -> Result<(), u32> {
                 mi: MOUSEINPUT {
                     dx: 0,
                     dy: 0,
-                    mouseData: (delta * 120) as u32,
+                    // The wheel amount is a signed 16-bit value once it reaches a window.
+                    mouseData: delta.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as u32,
                     dwFlags: flag,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: PEER_MOUSE_MARKER,
                 },
             },
         };

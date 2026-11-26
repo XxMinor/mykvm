@@ -2,7 +2,7 @@ export type Platform = 'windows' | 'macos' | 'unknown'
 
 export type MachineRole = 'unset' | 'server' | 'client'
 
-export type AppLanguage = 'cn' | 'en'
+export type AppLanguage = 'cn' | 'en' | 'ja' | 'ko'
 
 export type ThemeMode = 'system' | 'dark' | 'light'
 
@@ -85,6 +85,8 @@ export interface LayoutState {
   fileTransferEnabled: boolean
   /** Controller: locking this machine locks its online clients too. */
   lockSync?: boolean
+  /** Any device of the cluster may drive any other. Set on the controller. */
+  peerControl?: boolean
   inputProtection?: InputProtection
   language: AppLanguage
   themeMode: ThemeMode
@@ -104,4 +106,22 @@ export interface InputProtection {
   protectFullscreen: boolean
   blockedApplications: string[]
   lockHotkey: string
+}
+
+// Mirrors the Rust FileTransferProgress payload (camelCase serde).
+export interface FileTransferProgressEntry {
+  transferId: string
+  fileName: string
+  // The other machine: where the file goes, or where it comes from.
+  targetName: string
+  sentBytes: number
+  totalBytes: number
+  fileIndex: number
+  fileCount: number
+  done: boolean
+  error: string | null
+  // Arriving here (a copy made elsewhere being fetched), not leaving.
+  incoming: boolean
+  // Zero until it has been measured.
+  bytesPerSecond: number
 }

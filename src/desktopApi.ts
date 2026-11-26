@@ -9,7 +9,7 @@ import type {
   PerformanceSample,
   RuntimeStatus,
 } from './runtime'
-import type { LayoutState, UpdateChannel } from './types'
+import type { FileTransferProgressEntry, LayoutState, UpdateChannel } from './types'
 
 export interface AppUpdateInfo {
   version: string
@@ -160,14 +160,6 @@ export async function startRuntime(): Promise<RuntimeStatus> {
   return invoke<RuntimeStatus>('start_runtime')
 }
 
-export async function readRuntimeStatus(): Promise<RuntimeStatus> {
-  if (!isTauri()) {
-    return BROWSER_RUNTIME
-  }
-
-  return invoke<RuntimeStatus>('read_runtime_status')
-}
-
 export async function readDiagnosticInfo(): Promise<DiagnosticInfo> {
   if (!isTauri()) {
     return {
@@ -215,6 +207,12 @@ export async function pasteRemoteClipboard(): Promise<void> {
 export async function cancelFileTransfer(transferId: string): Promise<boolean> {
   if (!isTauri()) return false
   return invoke<boolean>('cancel_file_transfer', { transferId })
+}
+
+// The cards of the transfer pop-up, from the top down.
+export async function shownFileTransfers(): Promise<FileTransferProgressEntry[]> {
+  if (!isTauri()) return []
+  return invoke<FileTransferProgressEntry[]>('shown_file_transfers')
 }
 
 export async function scanLanPeers(): Promise<DiscoveryStatus> {

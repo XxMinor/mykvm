@@ -67,15 +67,42 @@ pub(crate) fn read() -> Option<RichText> {
     }
 }
 
+// Windows writes its RTF with the rest, in `write`.
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn write_rtf(bytes: &[u8]) -> Result<(), String> {
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
         platform::write_rtf(bytes)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
         let _ = bytes;
         Ok(())
+    }
+}
+
+/// Whether the clipboard's owner asked for its content to stay out of
+/// clipboard histories (a password manager does).
+pub(crate) fn is_concealed() -> bool {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        platform::is_concealed()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// Plain text, carrying the same request to this machine's clipboard history.
+pub(crate) fn write_concealed_text(text: &str) -> Result<(), String> {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        platform::write_concealed_text(text)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        crate::clipboard::write_text(text)
     }
 }
 
