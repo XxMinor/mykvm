@@ -635,11 +635,11 @@ fn transfer_speed(before: u64, moved: u64, seconds: f64) -> u64 {
 /// The pop-up in the corner of the screen that shows a transfer while the
 /// main window is not being looked at: closed to the tray it does not exist,
 /// and its own list of transfers went with it.
+#[cfg(not(test))]
 const TRANSFER_TOAST_LABEL: &str = "transfer-toast";
 /// What it shows, a card each: the last update of every transfer under way
 /// or just over, and when it came.
 static TRANSFER_TOAST: Mutex<Vec<(FileTransferProgress, Instant)>> = Mutex::new(Vec::new());
-static TRANSFER_TOAST_OPEN: AtomicBool = AtomicBool::new(false);
 static MAIN_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
 /// As many cards as the pop-up has room for.
 const TRANSFER_TOAST_CARDS: usize = 3;
@@ -701,21 +701,36 @@ fn report_transfer_progress(app: &AppHandle, mut progress: FileTransferProgress)
         note_shown_transfer(&mut shown, &mut progress);
     }
     let _ = app.emit(FILE_TRANSFER_PROGRESS_EVENT, &progress);
+    #[cfg(not(test))]
+    open_transfer_toast(app);
+}
+
+/// Open the pop-up, unless the main window is being looked at or the pop-up
+/// is open already.
+///
+/// Left out of a test program. Owning an app handle (the thread here does)
+/// is what brings in the app's menus, and with them the system's dialog
+/// library (`TaskDialogIndirect`); a test program is made without the app's
+/// manifest, and on Windows it then could not be loaded: no test ran.
+#[cfg(not(test))]
+fn open_transfer_toast(app: &AppHandle) {
+    static OPEN: AtomicBool = AtomicBool::new(false);
     let watched = MAIN_WINDOW_FOCUSED.load(Ordering::Relaxed)
         && app.try_state::<AppRuntime>().is_some_and(|state| state.main_window_visible.load(Ordering::Relaxed));
-    if !watched && !TRANSFER_TOAST_OPEN.swap(true, Ordering::Relaxed) {
+    if !watched && !OPEN.swap(true, Ordering::Relaxed) {
         let app = app.clone();
         // Off this thread: it is sending a file, and a window is made on the
         // main one.
         thread::spawn(move || {
             show_transfer_toast(&app);
-            TRANSFER_TOAST_OPEN.store(false, Ordering::Relaxed);
+            OPEN.store(false, Ordering::Relaxed);
         });
     }
 }
 
 /// Open the pop-up and keep it, as tall as its cards, until the last transfer
 /// has been over for a moment or has gone quiet.
+#[cfg(not(test))]
 fn show_transfer_toast(app: &AppHandle) {
     // A card is 352 by 96, and the next 8 under it; around them the room
     // their shadow takes: 8 above, 14 beside, 20 below
