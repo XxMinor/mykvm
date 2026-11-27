@@ -5192,6 +5192,19 @@ fn send_macos_mouse_button(
     sent
 }
 
+/// macOS folds every non-left/right button into "other" mouse events and only
+/// tells them apart by button number (2 = middle, 3 = back, 4 = forward).
+/// Devices that report unusual numbers are treated as middle, the most common
+/// other-event sender.
+#[cfg(target_os = "macos")]
+fn macos_other_event_button(button_number: i64) -> MouseButton {
+    match button_number {
+        3 => MouseButton::Back,
+        4 => MouseButton::Forward,
+        _ => MouseButton::Middle,
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn handle_macos_event(
     context: &MacCaptureContext,
@@ -5293,11 +5306,15 @@ fn handle_macos_event(
         CGEventType::RightMouseUp => {
             send_macos_mouse_button(context, &active_target, MouseButton::Right, false)
         }
-        CGEventType::OtherMouseDown => {
-            send_macos_mouse_button(context, &active_target, MouseButton::Middle, true)
-        }
-        CGEventType::OtherMouseUp => {
-            send_macos_mouse_button(context, &active_target, MouseButton::Middle, false)
+        CGEventType::OtherMouseDown | CGEventType::OtherMouseUp => {
+            // Middle, back and forward all arrive as "other" events; forward
+            // them as the button they actually are (see
+            // `macos_other_event_button`) or side buttons become middle clicks.
+            let button = macos_other_event_button(
+                event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER),
+            );
+            let down = matches!(event_type, CGEventType::OtherMouseDown);
+            send_macos_mouse_button(context, &active_target, button, down)
         }
         CGEventType::ScrollWheel => {
             let speed = active_target.target.scroll_speed;
@@ -11294,6 +11311,39 @@ mod tests {
         let after_local_use = numbers.button(MouseButton::Left, true, 500);
         assert_eq!(after_local_use, 501);
         assert_eq!(numbers.button(MouseButton::Left, false, 0), after_local_use);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_other_events_map_button_numbers_to_middle_back_and_forward() {
+        use core_graphics::{
+            event::{CGEvent, CGEventType, CGMouseButton, EventField},
+            event_source::{CGEventSource, CGEventSourceStateID}, geometry::CGPoint,
+        };
+        // Build (never post) a real "other" event per button number, mirroring
+        // what hardware taps deliver for middle/back/forward, and assert the
+        // capture path maps it to the button the user pressed.
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap();
+        for (number, expected) in [
+            (2, MouseButton::Middle),
+            (3, MouseButton::Back),
+            (4, MouseButton::Forward),
+        ] {
+            let event = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::OtherMouseDown,
+                CGPoint::new(100.0, 200.0),
+                CGMouseButton::Center,
+            )
+            .unwrap();
+            event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
+            let read = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+            assert_eq!(read, number, "CoreGraphics must round-trip button {number}");
+            assert_eq!(macos_other_event_button(read), expected);
+        }
+        // Unusual numbers fall back to middle, the most common other-event sender.
+        assert_eq!(macos_other_event_button(0), MouseButton::Middle);
+        assert_eq!(macos_other_event_button(7), MouseButton::Middle);
     }
 
     #[test]
